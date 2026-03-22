@@ -1344,1102 +1344,1124 @@ def main_page():
     with ui.header().classes("bg-blue-900 text-white items-center px-6 py-3 shadow-md"):
         ui.label("Couchbase Supportal Scraper").classes("text-xl font-bold")
 
-    with ui.column().classes("w-full max-w-5xl mx-auto p-6 gap-6"):
-
-        # ── Auth card ───────────────────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            ui.label("Authentication").classes("text-base font-semibold mb-1")
-
-            with ui.tabs().classes("w-full") as auth_tabs:
-                tab_cookie  = ui.tab("Cookie / Header")
-                tab_browser = ui.tab("Browser Login (SSO)")
-
-            with ui.tab_panels(auth_tabs, value=tab_cookie).classes("w-full border-t"):
-
-                # ── Cookie tab ──────────────────────────────────────────────
-                with ui.tab_panel(tab_cookie):
-                    ui.label(
-                        "Open DevTools → Network → any request → Headers → Cookie. "
-                        "Copy the full Cookie header value and paste it below. "
-                        "Alternatively set the SUPPORTAL_COOKIE environment variable before launching."
-                    ).classes("text-sm text-gray-500 mb-2")
-                    cookie_input = (
-                        ui.textarea(label="Cookie string", placeholder="session=abc123; other=xyz …")
-                        .classes("w-full font-mono text-sm")
-                        .props('rows=3 outlined clearable')
-                    )
-                    # Pre-fill from env if available
-                    env_cookie = os.environ.get("SUPPORTAL_COOKIE", "")
-                    if env_cookie:
-                        cookie_input.value = env_cookie
-                        ui.label("(pre-filled from SUPPORTAL_COOKIE env var)").classes("text-xs text-green-600")
-
-                # ── Browser login tab ───────────────────────────────────────
-                with ui.tab_panel(tab_browser):
-                    ui.label(
-                        "Click Open Browser. A Chromium window will appear — log in through SSO "
-                        "as normal and navigate to at least one ticket to confirm access. "
-                        "Then click Confirm Login to save the session for headless scraping."
-                    ).classes("text-sm text-gray-500 mb-3")
-
-                    browser_status = ui.label("Status: not logged in").classes(
-                        "text-sm font-semibold text-orange-500 mb-2"
-                    )
-
-                    async def do_open_browser():
-                        btn_open.props("loading disabled")
-                        browser_status.set_text("Status: browser opening…")
-                        browser_status.classes(replace="text-sm font-semibold text-blue-500 mb-2")
-                        try:
-                            await run.io_bound(open_browser_thread)
-                            browser_status.set_text("Status: browser open — log in, then click Confirm Login")
-                            browser_status.classes(replace="text-sm font-semibold text-blue-600 mb-2")
-                            btn_confirm.props(remove="disabled")
-                        except Exception as exc:
-                            browser_status.set_text(f"Error opening browser: {exc}")
-                            browser_status.classes(replace="text-sm font-semibold text-red-600 mb-2")
-                            btn_open.props(remove="loading disabled")
-
-                    async def do_confirm_login():
-                        btn_confirm.props("loading disabled")
-                        browser_status.set_text("Status: closing browser and saving session…")
-                        try:
-                            await run.io_bound(confirm_login_thread)
-                            browser_status.set_text("Status: logged in — session saved ✓")
-                            browser_status.classes(replace="text-sm font-semibold text-green-600 mb-2")
-                            ui.notify("Session saved. Ready to scrape.", type="positive")
-                        except Exception as exc:
-                            ui.notify(f"Error saving session: {exc}", type="negative")
-                            btn_confirm.props(remove="loading disabled")
-
-                    with ui.row().classes("gap-3"):
-                        btn_open = ui.button("Open Browser & Login", on_click=do_open_browser, icon="open_in_browser")
-                        btn_confirm = ui.button("Confirm Login", on_click=do_confirm_login, icon="check_circle")
-                        btn_confirm.props("disabled color=positive")
-
-        # ── Settings card ────────────────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            ui.label("Scraper Settings").classes("text-base font-semibold mb-1")
-            with ui.row().classes("gap-4 w-full flex-wrap items-start"):
-                customer_input = (
-                    ui.input(
-                        label="Customer URL or name",
-                        placeholder="https://supportal.couchbase.com/customer/American%20Express%20AZ",
-                    )
-                    .classes("flex-1 min-w-64")
-                    .props("outlined clearable")
-                )
-                ui.label(
-                    "Tip: navigate to the customer page in your browser and paste the full URL. "
-                    "The name is extracted from the URL path to ensure correct capitalisation."
-                ).classes("text-xs text-gray-400 w-full -mt-2")
-                max_pages_input = (
-                    ui.number(label="Max listing pages  (0 = all)", value=0, min=0, step=1)
-                    .classes("w-56")
-                    .props("outlined")
-                )
-
-        # ── Run card ─────────────────────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            progress_bar   = ui.linear_progress(value=0).props("stripe color=blue-9 rounded")
-            progress_label = ui.label("").classes("text-sm text-gray-500 mt-1 min-h-5")
-
-            async def do_scrape():
-                if not customer_input.value.strip():
-                    ui.notify("Enter a customer URL or name first.", type="warning")
-                    return
-                customer, _resolved_url = _resolve_customer_input(customer_input.value)
-                progress_label.set_text(f"Resolved → {_resolved_url}")
-                if not customer:
-                    ui.notify("Could not resolve a customer name from the input.", type="warning")
-                    return
-                max_pages = int(max_pages_input.value or 0)
-
-                # Resolve auth
-                active_tab = auth_tabs.value          # NiceGUI tab label text
-                using_browser = (active_tab == tab_browser.name if hasattr(tab_browser, "name")
-                                 else str(active_tab) == "Browser Login (SSO)")
-                cookie = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
-
-                if using_browser and not _browser_state.get("logged_in"):
-                    ui.notify("Complete browser login first.", type="warning")
-                    return
-                if not using_browser and not cookie:
-                    ui.notify("Paste a cookie string or set SUPPORTAL_COOKIE env var.", type="warning")
-                    return
-
-                loop = asyncio.get_event_loop()
-
-                def progress_cb(msg: str, pct: float):
-                    async def _update():
-                        progress_bar.set_value(pct)
-                        progress_label.set_text(msg)
-                    asyncio.run_coroutine_threadsafe(_update(), loop)
-
-                btn_scrape.props("loading disabled")
-                progress_bar.set_value(0)
-                progress_label.set_text("Starting…")
-
-                try:
-                    if using_browser:
-                        data = await run.io_bound(
-                            scrape_with_playwright, customer, max_pages, progress_cb
-                        )
-                    else:
-                        data = await run.io_bound(
-                            scrape_with_cookie, cookie, customer, max_pages, progress_cb
-                        )
-
-                    state["results"] = data
-                    _results.clear()
-                    _results.extend(data)
-
-                    _refresh_table(data)
-                    btn_dl_json.set_enabled(True)
-                    btn_dl_csv.set_enabled(True)
-                    btn_cb_load.set_enabled(_CB_AVAILABLE)
-                    btn_embed.set_enabled(_CB_AVAILABLE)
-                    btn_score.set_enabled(True)
-                    btn_render_charts.set_enabled(True)
-                    progress_label.set_text(f"Done — {len(data)} tickets scraped.")
-                    try:
-                        ui.notify(f"Done — {len(data)} tickets scraped.", type="positive")
-                    except RuntimeError:
-                        pass  # client context gone after long scrape; element updates above are sufficient
-
-                except Exception as exc:
-                    progress_label.set_text(f"Error: {exc}")
-                    try:
-                        ui.notify(f"Scrape error: {exc}", type="negative", timeout=10000)
-                    except RuntimeError:
-                        pass
-                finally:
-                    btn_scrape.props(remove="loading disabled")
-
-            async def do_diagnose():
-                if not customer_input.value.strip():
-                    ui.notify("Enter a customer URL or name first.", type="warning")
-                    return
-                customer, _resolved_url = _resolve_customer_input(customer_input.value)
-                if not customer:
-                    ui.notify("Could not resolve a customer name from the input.", type="warning")
-                    return
-
-                if not _browser_state.get("logged_in"):
-                    ui.notify(
-                        "Diagnose uses the browser session — complete Browser Login first.",
-                        type="warning",
-                    )
-                    return
-
-                loop = asyncio.get_event_loop()
-
-                def progress_cb(msg: str, pct: float):
-                    async def _update():
-                        progress_bar.set_value(pct)
-                        progress_label.set_text(msg)
-                    asyncio.run_coroutine_threadsafe(_update(), loop)
-
-                btn_diagnose.props("loading disabled")
-                progress_bar.set_value(0)
-                progress_label.set_text("Running diagnostics (Playwright)…")
-
-                def run_diag():
-                    os.makedirs(PROFILE_DIR, exist_ok=True)
-                    report_lines: list[str] = []
-
-                    def log_cb(msg: str, pct: float):
-                        report_lines.append(msg)
-                        progress_cb(msg, pct)
-
-                    with sync_playwright() as pw:
-                        ctx = pw.chromium.launch_persistent_context(
-                            user_data_dir=PROFILE_DIR,
-                            headless=True,
-                            user_agent=UA,
-                            ignore_https_errors=True,
-                        )
-                        pg = ctx.new_page()
-                        pg.set_default_timeout(60_000)
-                        _scrape_listing_playwright(pg, customer, max_pages=1,
-                                                   progress_cb=log_cb, debug=True)
-                        ctx.close()
-
-                    report_lines.append(f"\nDebug HTML saved to: {DEBUG_DIR}")
-                    return "\n".join(report_lines)
-
-                try:
-                    report = await run.io_bound(run_diag)
-                    diag_output.set_text(report)
-                    diag_output.set_visibility(True)
-                    progress_label.set_text("Diagnostics complete — check output and debug_html/ folder")
-                except Exception as exc:
-                    diag_output.set_text(str(exc))
-                    diag_output.set_visibility(True)
-                    progress_label.set_text(f"Diagnostics error: {exc}")
-                finally:
-                    btn_diagnose.props(remove="loading disabled")
-
-            with ui.row().classes("gap-3 items-center"):
-                btn_scrape = ui.button("Scrape Tickets", on_click=do_scrape, icon="search").props(
-                    "color=primary size=lg"
-                )
-                btn_diagnose = ui.button("Diagnose", on_click=do_diagnose, icon="bug_report").props(
-                    "color=orange outline size=lg"
-                )
-                ui.label("(Diagnose runs only the navigation steps and saves HTML to debug_html/)").classes(
-                    "text-xs text-gray-400"
-                )
-
-        # ── Diagnostics output ────────────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            ui.label("Diagnostics Output").classes("text-base font-semibold mb-1")
-            diag_output = ui.label("").classes("font-mono text-xs whitespace-pre-wrap text-gray-700")
-            diag_output.set_visibility(False)
-
-        # ── Results card ──────────────────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            ui.label("Results").classes("text-base font-semibold mb-1")
-
-            columns = [
-                {"name": "ticket_id",    "label": "Ticket",       "field": "ticket_id",    "sortable": True, "align": "left"},
-                {"name": "status",       "label": "Status",       "field": "status",       "sortable": True},
-                {"name": "priority",     "label": "Priority",     "field": "priority",     "sortable": True},
-                {"name": "subject",      "label": "Subject",      "field": "subject",      "sortable": True, "align": "left"},
-                {"name": "requester",    "label": "Requester",    "field": "requester",    "sortable": True, "align": "left"},
-                {"name": "assignee",     "label": "Assignee",     "field": "assignee",     "sortable": True, "align": "left"},
-                {"name": "organization", "label": "Org",          "field": "organization", "sortable": True, "align": "left"},
-                {"name": "created",      "label": "Created",      "field": "created",      "sortable": True},
-                {"name": "updated",      "label": "Updated",      "field": "updated",      "sortable": True},
-                {"name": "solved",       "label": "Solved",       "field": "solved",       "sortable": True},
-                {"name": "comment_count","label": "Comments",     "field": "comment_count","sortable": True},
-                {"name": "tags",         "label": "Tags",         "field": "tags",         "sortable": True, "align": "left"},
-            ]
-
-            # Pagination state
-            _page_state = {"current": 1, "per_page": 25, "all_rows": []}
-
-            with ui.row().classes("items-center gap-4 mb-1"):
-                page_info_label = ui.label("").classes("text-xs text-gray-500 flex-1")
-                ui.label("Per page:").classes("text-xs text-gray-500")
-                per_page_select = ui.select(
-                    options=[10, 25, 50, 100],
-                    value=25,
-                ).classes("w-20 text-xs")
-
-            result_table = ui.table(columns=columns, rows=[], row_key="ticket_id").classes("w-full")
-            result_table.props("flat dense")
-
-            pager = ui.pagination(1, 1, direction_links=True).classes("mt-1 self-center")
-
-            # Row click → detail dialog
-            detail_dialog = ui.dialog().props("maximized")
-            with detail_dialog:
-                with ui.card().classes("w-full h-full overflow-auto p-6"):
-                    dialog_title   = ui.label("").classes("text-lg font-bold mb-2")
-                    dialog_content = ui.column().classes("w-full gap-2")
-
-            def _show_detail(ticket: dict):
-                dialog_title.set_text(f"Ticket #{ticket.get('ticket_id')} — {ticket.get('subject', '')}")
-                dialog_content.clear()
-                with dialog_content:
-                    # Well-known fields
-                    meta_fields = [
-                        ("Status",       ticket.get("status")),
-                        ("Priority",     ticket.get("priority")),
-                        ("Requester",    ticket.get("requester")),
-                        ("Assignee",     ticket.get("assignee")),
-                        ("Organization", ticket.get("organization")),
-                        ("Created",      ticket.get("created")),
-                        ("Updated",      ticket.get("updated")),
-                        ("Solved",       ticket.get("solved")),
-                        ("Tags",         ticket.get("tags")),
-                    ]
-                    with ui.grid(columns=2).classes("w-full gap-1 text-sm"):
-                        for label, val in meta_fields:
-                            if val:
-                                ui.label(label).classes("font-semibold text-gray-500")
-                                ui.label(val).classes("text-gray-800")
-
-                    # Extra fields found on the page
-                    all_fields = ticket.get("all_fields", {})
-                    known_keys = {
-                        "status", "priority", "requester", "assignee",
-                        "organization", "created", "updated", "solved", "tags",
-                    }
-                    extra = {k: v for k, v in all_fields.items()
-                             if k.lower() not in known_keys and v}
-                    if extra:
-                        ui.separator()
-                        ui.label("Additional fields").classes("font-semibold mt-1")
-                        with ui.grid(columns=2).classes("w-full gap-1 text-sm"):
-                            for k, v in extra.items():
-                                ui.label(k).classes("font-semibold text-gray-500")
-                                ui.label(str(v)).classes("text-gray-800")
-
-                    # Named sections
-                    def _section(label: str, content: Optional[str]):
-                        if not content:
-                            return
-                        ui.separator()
-                        ui.label(label).classes("font-semibold mt-1 text-blue-800")
-                        ui.label(content).classes("text-sm whitespace-pre-wrap text-gray-700 bg-gray-50 p-2 rounded")
-
-                    _section("Description",  ticket.get("description"))
-                    _section("Ticket Fields", ticket.get("ticket_fields"))
-                    _section("Tags",          ticket.get("tags"))
-                    _section("Escalations",   ticket.get("escalations"))
-                    _section("Snapshots",     ticket.get("snapshots"))
-
-                    # Comments / conversation (stored as JSON string or list)
-                    comments = ticket.get("comments", [])
-                    if isinstance(comments, str):
-                        try:
-                            comments = json.loads(comments)
-                        except Exception:
-                            comments = []
-                    if comments:
-                        ui.separator()
-                        ui.label(f"Conversation  ({len(comments)} entries)").classes("font-semibold mt-1 text-blue-800")
-                        for c in comments:
-                            with ui.card().classes("w-full bg-gray-50"):
-                                with ui.row().classes("justify-between text-xs text-gray-400"):
-                                    ui.label(c.get("author") or "—")
-                                    ui.label(c.get("timestamp") or "")
-                                ui.label(c.get("body", "")).classes("text-sm whitespace-pre-wrap mt-1")
-
-                    ui.button("Close", on_click=detail_dialog.close).classes("mt-4").props("flat color=grey")
-                detail_dialog.open()
-
-            def _render_page():
-                pp   = _page_state["per_page"]
-                pg   = _page_state["current"]
-                all_rows = _page_state["all_rows"]
-                total = len(all_rows)
-                start = (pg - 1) * pp
-                end   = start + pp
-                result_table.rows = all_rows[start:end]
-                result_table.update()
-                pages = max(1, -(-total // pp))  # ceiling division
-                pager.max = pages
-                if pager.value > pages:
-                    pager.value = pages
-                showing_end = min(end, total)
-                page_info_label.set_text(
-                    f"Showing {start + 1}–{showing_end} of {total} tickets" if total else "No tickets"
-                )
-
-            def _refresh_table(data: list[dict]):
-                _page_state["all_rows"] = [
-                    {c["field"]: (rec.get(c["field"]) or "") for c in columns}
-                    for rec in data
-                ]
-                _page_state["current"] = 1
-                pager.value = 1
-                _render_page()
-
-            def _on_page_change(e):
-                _page_state["current"] = int(pager.value)
-                _render_page()
-
-            def _on_per_page_change(e):
-                _page_state["per_page"] = int(per_page_select.value)
-                _page_state["current"] = 1
-                pager.value = 1
-                _render_page()
-
-            pager.on("update:model-value", _on_page_change)
-            per_page_select.on("update:model-value", _on_per_page_change)
-
-            def _on_row_click(e):
-                # NiceGUI 3.x / Quasar QTable fires row-click as (evt, row, index)
-                # so e.args is a list: [quasar_evt_dict, row_dict, row_index]
-                args = e.args
-                row_data = args[1] if isinstance(args, list) and len(args) > 1 else {}
-                if isinstance(row_data, dict):
-                    ticket_id = str(row_data.get("ticket_id", ""))
-                else:
-                    return
-                ticket = next(
-                    (r for r in state["results"] if str(r.get("ticket_id")) == ticket_id), {}
-                )
-                _show_detail(ticket)
-
-            result_table.on("rowClick", _on_row_click)
-
-            # Downloads
-            with ui.row().classes("gap-3 mt-3"):
-                def dl_json():
-                    if state["results"]:
-                        ui.download(src=to_json_bytes(state["results"]), filename="tickets.json")
-
-                def dl_csv():
-                    if state["results"]:
-                        ui.download(src=to_csv_bytes(state["results"]), filename="tickets.csv")
-
-                btn_dl_json = ui.button("Download JSON", on_click=dl_json, icon="download").props("outline color=primary")
-                btn_dl_csv  = ui.button("Download CSV",  on_click=dl_csv,  icon="download").props("outline color=secondary")
-                btn_dl_json.set_enabled(False)
-                btn_dl_csv.set_enabled(False)
-
-        # ── Phase 1: Load to Couchbase ───────────────────────────────────────
-        with ui.card().classes("w-full"):
-            with ui.row().classes("items-center justify-between w-full"):
-                ui.label("Load to Couchbase").classes("text-base font-semibold")
-                if not _CB_AVAILABLE:
-                    ui.badge("SDK not installed", color="red").props("outline")
-
-            with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-2 mt-2"):
-                cb_url_input      = ui.input("Cluster URL", placeholder="127.0.0.1").classes("w-full")
-                cb_bucket_input   = ui.input("Bucket",      placeholder="supportal").classes("w-full")
-                cb_user_input     = ui.input("Username",    placeholder="Administrator").classes("w-full")
-                cb_pass_input     = ui.input("Password").props("type=password").classes("w-full")
-                cb_scope_input      = ui.input("Scope",      placeholder="_default").classes("w-full")
-                cb_collection_input = ui.input("Collection", placeholder="tickets").classes("w-full")
-
-            with ui.row().classes("items-center gap-4 mt-2"):
-                cb_tls_toggle = ui.switch("TLS (couchbases://)", value=False)
-
-            cb_status = ui.label("").classes("text-sm text-gray-500 mt-1")
-            cb_progress = ui.linear_progress(value=0).classes("w-full mt-1")
-            cb_progress.set_visibility(False)
-
-            async def _do_cb_load():
-                if not state["results"]:
-                    ui.notify("Run a scrape first — no tickets loaded.", type="warning")
-                    return
-                if not _CB_AVAILABLE:
-                    ui.notify("couchbase SDK not installed. Run: venv/bin/pip install couchbase", type="negative")
-                    return
-
-                btn_cb_load.set_enabled(False)
-                cb_progress.set_visibility(True)
-                cb_progress.set_value(0)
-                cb_status.set_text("Starting…")
-
-                loop = asyncio.get_event_loop()
-
-                def _cb_progress(msg: str, pct: float):
-                    asyncio.run_coroutine_threadsafe(
-                        _update_cb_progress(msg, pct), loop
-                    )
-
-                async def _update_cb_progress(msg: str, pct: float):
-                    cb_status.set_text(msg)
-                    cb_progress.set_value(pct)
-
-                try:
-                    upserted, errors = await run.io_bound(
-                        load_to_couchbase,
-                        state["results"],
-                        cb_url_input.value.strip(),
-                        cb_bucket_input.value.strip(),
-                        cb_user_input.value.strip(),
-                        cb_pass_input.value,
-                        cb_tls_toggle.value,
-                        cb_scope_input.value.strip() or "_default",
-                        cb_collection_input.value.strip() or "tickets",
-                        _cb_progress,
-                    )
-                    msg = f"Done — {upserted} upserted, {errors} errors."
-                    cb_status.set_text(msg)
-                    cb_progress.set_value(1.0)
-                    ui.notify(msg, type="positive" if errors == 0 else "warning")
-                except Exception as exc:
-                    cb_status.set_text(f"Error: {exc}")
-                    ui.notify(str(exc), type="negative")
-                finally:
-                    btn_cb_load.set_enabled(True)
-
-            btn_cb_load = ui.button(
-                "Load to Couchbase",
-                on_click=_do_cb_load,
-                icon="upload",
-            ).props("color=red-8").classes("mt-2")
-            btn_cb_load.set_enabled(False)
-
-            # ── Load FROM Couchbase (skip re-scrape for re-embedding) ─────────
-            ui.separator().classes("mt-4")
-            ui.label("Load tickets from Couchbase").classes("text-sm font-semibold text-gray-600 mt-1")
-            ui.label(
-                "Reload previously stored tickets into the session — useful for re-embedding "
-                "without re-scraping the site."
-            ).classes("text-xs text-gray-400")
-
-            with ui.row().classes("w-full gap-3 mt-2 items-center"):
-                cb_load_filter = ui.input(
-                    "Filter by organization (optional)",
-                    placeholder="e.g. Maccabi — leave blank for all",
-                ).classes("flex-1")
-                btn_load_from_cb = ui.button("Load from Couchbase", icon="download_for_offline").props("outline color=primary")
-
-            cb_load_status   = ui.label("").classes("text-sm text-gray-500 mt-1")
-            cb_load_progress = ui.linear_progress(value=0).classes("w-full mt-1")
-            cb_load_progress.set_visibility(False)
-
-            async def _do_load_from_cb():
-                btn_load_from_cb.set_enabled(False)
-                cb_load_progress.set_visibility(True)
-                cb_load_progress.set_value(0)
-                cb_load_status.set_text("Connecting …")
-                loop = asyncio.get_event_loop()
-
-                def _prog(msg: str, pct: float):
-                    asyncio.run_coroutine_threadsafe(
-                        _upd_load(msg, pct), loop
-                    )
-
-                async def _upd_load(msg: str, pct: float):
-                    cb_load_status.set_text(msg)
-                    cb_load_progress.set_value(pct)
-
-                try:
-                    tickets = await run.io_bound(
-                        load_tickets_from_cb,
-                        cb_url_input.value.strip(),
-                        cb_bucket_input.value.strip(),
-                        cb_user_input.value.strip(),
-                        cb_pass_input.value,
-                        cb_tls_toggle.value,
-                        cb_scope_input.value.strip() or "_default",
-                        cb_collection_input.value.strip() or "tickets",
-                        cb_load_filter.value,
-                        _prog,
-                    )
-                    state["results"] = tickets
-                    _refresh_table(tickets)
-                    btn_embed.set_enabled(_CB_AVAILABLE)
-                    btn_dl_json.set_enabled(True)
-                    btn_dl_csv.set_enabled(True)
-                    btn_score.set_enabled(True)
-                    btn_render_charts.set_enabled(True)
-                    msg = f"Loaded {len(tickets)} tickets from Couchbase."
-                    cb_load_status.set_text(msg)
-                    cb_load_progress.set_value(1.0)
-                    ui.notify(msg, type="positive")
-                except Exception as exc:
-                    cb_load_status.set_text(f"Error: {exc}")
-                    ui.notify(str(exc), type="negative")
-                finally:
-                    btn_load_from_cb.set_enabled(True)
-
-            btn_load_from_cb.on("click", _do_load_from_cb)
-
-            # Enable load button when results are available (mirrored alongside download buttons)
-            # Done by patching enable logic at the scrape-done site — see below.
-
-        # ── Phase 2: Embed Tickets ───────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            with ui.row().classes("items-center justify-between w-full"):
-                ui.label("Embed Tickets (Vector Search)").classes("text-base font-semibold")
-                ui.label("Run after 'Load to Couchbase'").classes("text-xs text-gray-400")
-
-            # Embedding provider tabs
-            with ui.tabs().classes("w-full mt-2") as emb_tabs:
-                emb_tab_ollama   = ui.tab("Ollama")
-                emb_tab_lmstudio = ui.tab("LMStudio")
-                emb_tab_gemini   = ui.tab("Gemini")
-                emb_tab_mlx      = ui.tab("MLX")
-
-            with ui.tab_panels(emb_tabs, value=emb_tab_ollama).classes("w-full border-t"):
-                with ui.tab_panel(emb_tab_ollama):
-                    with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-2"):
-                        emb_ollama_url_input   = ui.input("Ollama URL", placeholder="http://localhost:11434").classes("w-full")
-                        emb_ollama_model_input = ui.input("Embedding Model", placeholder="nomic-embed-text").classes("w-full")
-                        emb_dims_input         = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
-                with ui.tab_panel(emb_tab_lmstudio):
-                    with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-2"):
-                        emb_lms_url_input   = ui.input("LMStudio URL", placeholder="http://localhost:1234").classes("w-full")
-                        emb_lms_model_input = ui.input("Embedding Model", placeholder="text-embedding-nomic-embed-text-v1.5").classes("w-full")
-                        emb_lms_dims_input  = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
-                with ui.tab_panel(emb_tab_gemini):
-                    with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-2"):
-                        emb_gemini_key_input   = ui.input("API Key").props("type=password").classes("w-full")
-                        emb_gemini_model_input = ui.input("Embedding Model", value="text-embedding-004").classes("w-full")
-                        emb_gemini_dims_input  = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
-                with ui.tab_panel(emb_tab_mlx):
-                    ui.label(
-                        "Runs locally via mlx-embeddings — no server needed. "
-                        "Use any mlx-community embedding model from HuggingFace. "
-                        "Model is cached in memory after first load."
-                    ).classes("text-xs text-gray-500 mb-2")
-                    with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-2"):
-                        emb_mlx_model_input = ui.input(
-                            "HuggingFace model ID",
-                            value="mlx-community/nomic-embed-text-v1.5",
-                        ).classes("w-full")
-                        emb_mlx_dims_input  = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
-
-            def _get_embed_config() -> tuple[str, str, str, str, int]:
-                """Returns (provider, model, api_key, base_url, dims)."""
-                active = emb_tabs.value
-                if active == "LMStudio":
-                    return (
-                        "lmstudio",
-                        emb_lms_model_input.value.strip(),
-                        "",
-                        emb_lms_url_input.value.strip() or "http://localhost:1234",
-                        int(emb_lms_dims_input.value or 768),
-                    )
-                elif active == "Gemini":
-                    return (
-                        "gemini",
-                        emb_gemini_model_input.value.strip() or "text-embedding-004",
-                        emb_gemini_key_input.value,
-                        "",
-                        int(emb_gemini_dims_input.value or 768),
-                    )
-                elif active == "MLX":
-                    return (
-                        "mlx",
-                        emb_mlx_model_input.value.strip() or "mlx-community/nomic-embed-text-v1.5",
-                        "",
-                        "",
-                        int(emb_mlx_dims_input.value or 768),
-                    )
-                else:  # Ollama
-                    return (
-                        "ollama",
-                        emb_ollama_model_input.value.strip(),
-                        "",
-                        emb_ollama_url_input.value.strip() or "http://localhost:11434",
-                        int(emb_dims_input.value or 768),
-                    )
-
-            emb_status   = ui.label("").classes("text-sm text-gray-500 mt-1")
-            emb_progress = ui.linear_progress(value=0).classes("w-full mt-1")
-            emb_progress.set_visibility(False)
-
-            async def _do_embed():
-                if not state["results"]:
-                    ui.notify("Scrape tickets first.", type="warning")
-                    return
-                btn_embed.set_enabled(False)
-                btn_create_idx.set_enabled(False)
-                emb_progress.set_visibility(True)
-                emb_progress.set_value(0)
-                emb_status.set_text("Starting …")
-                loop = asyncio.get_event_loop()
-
-                def _prog(msg: str, pct: float):
-                    asyncio.run_coroutine_threadsafe(
-                        _upd_emb(msg, pct), loop
-                    )
-
-                async def _upd_emb(msg: str, pct: float):
-                    emb_status.set_text(msg)
-                    emb_progress.set_value(pct)
-
-                try:
-                    emb_provider, emb_model, emb_api_key, emb_base_url, emb_dims = _get_embed_config()
-                    done, errs = await run.io_bound(
-                        embed_all_tickets,
-                        state["results"],
-                        cb_url_input.value.strip(),
-                        cb_bucket_input.value.strip(),
-                        cb_user_input.value.strip(),
-                        cb_pass_input.value,
-                        cb_tls_toggle.value,
-                        cb_scope_input.value.strip() or "_default",
-                        cb_collection_input.value.strip() or "tickets",
-                        emb_provider,
-                        emb_model,
-                        emb_api_key,
-                        emb_base_url,
-                        emb_dims,
-                        _prog,
-                    )
-                    msg = f"Done — {done} embedded, {errs} errors."
-                    emb_status.set_text(msg)
-                    emb_progress.set_value(1.0)
-                    ui.notify(msg, type="positive" if errs == 0 else "warning")
-                    btn_create_idx.set_enabled(True)
-                except Exception as exc:
-                    emb_status.set_text(f"Error: {exc}")
-                    ui.notify(str(exc), type="negative")
-                finally:
-                    btn_embed.set_enabled(True)
-
-            async def _do_create_index():
-                btn_create_idx.set_enabled(False)
-                emb_status.set_text("Creating vector index …")
-                try:
-                    await run.io_bound(
-                        create_vector_index,
-                        cb_url_input.value.strip(),
-                        cb_bucket_input.value.strip(),
-                        cb_user_input.value.strip(),
-                        cb_pass_input.value,
-                        cb_tls_toggle.value,
-                        cb_scope_input.value.strip() or "_default",
-                        cb_collection_input.value.strip() or "tickets",
-                        _get_embed_config()[4],
-                    )
-                    emb_status.set_text("Vector index created — ready for chat.")
-                    ui.notify("Vector index created!", type="positive")
-                except Exception as exc:
-                    emb_status.set_text(f"Index error: {exc}")
-                    ui.notify(str(exc), type="negative")
-                finally:
-                    btn_create_idx.set_enabled(True)
-
-            with ui.row().classes("gap-3 mt-2"):
-                btn_embed      = ui.button("Embed Tickets",       on_click=_do_embed,        icon="model_training").props("outline color=primary")
-                btn_create_idx = ui.button("Create Vector Index", on_click=_do_create_index, icon="manage_search").props("outline color=secondary")
-            btn_embed.set_enabled(False)
-            btn_create_idx.set_enabled(False)
-
-        # ── Phase 2: Chat / RAG ──────────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            ui.label("Chat with Tickets (RAG)").classes("text-base font-semibold")
-
-            # LLM provider tabs
-            with ui.tabs().classes("w-full mt-2") as llm_tabs:
-                tab_claude   = ui.tab("Claude")
-                tab_gemini   = ui.tab("Gemini")
-                tab_ollama   = ui.tab("Ollama")
-                tab_lmstudio = ui.tab("LMStudio")
-
-            with ui.tab_panels(llm_tabs, value=tab_claude).classes("w-full border-t"):
-                # Claude
-                with ui.tab_panel(tab_claude):
-                    with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
-                        claude_key_input   = ui.input("API Key").props("type=password").classes("w-full")
-                        claude_model_input = ui.input("Model", value="claude-sonnet-4-6").classes("w-full")
-
-                # Gemini
-                with ui.tab_panel(tab_gemini):
-                    with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
-                        gemini_key_input   = ui.input("API Key").props("type=password").classes("w-full")
-                        gemini_model_input = ui.input("Model", value="gemini-2.0-flash").classes("w-full")
-
-                # Ollama chat
-                with ui.tab_panel(tab_ollama):
-                    with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
-                        ollama_chat_url_input   = ui.input("Ollama URL", placeholder="http://localhost:11434").classes("w-full")
-                        ollama_chat_model_input = ui.input("Model",      placeholder="llama3.3").classes("w-full")
-
-                # LMStudio
-                with ui.tab_panel(tab_lmstudio):
-                    with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
-                        lms_url_input   = ui.input("LMStudio URL", placeholder="http://localhost:1234").classes("w-full")
-                        lms_model_input = ui.input("Model",        placeholder="local-model").classes("w-full")
-
-            top_k_input = ui.number("Results to retrieve (top-K)", value=10, min=1, max=50).classes("w-48 mt-2")
-
-            # Conversation display
-            ui.separator().classes("mt-3")
-            chat_log = ui.column().classes("w-full gap-2 mt-2 max-h-96 overflow-y-auto")
-            chat_status = ui.label("").classes("text-xs text-gray-400 mt-1")
-
-            def _render_chat():
-                chat_log.clear()
-                with chat_log:
-                    for msg in state["chat_history"]:
-                        if msg["role"] == "user":
-                            with ui.row().classes("justify-end w-full"):
-                                ui.label(msg["content"]).classes(
-                                    "bg-blue-600 text-white rounded-xl px-4 py-2 max-w-xl text-sm whitespace-pre-wrap"
+    with ui.column().classes("w-full max-w-5xl mx-auto px-4 pt-2 gap-0"):
+        with ui.tabs().classes("w-full") as main_tabs:
+            tab_auth    = ui.tab("Authentication", icon="lock")
+            tab_scrape  = ui.tab("Scraping",       icon="search")
+            tab_results = ui.tab("Results",        icon="table_view")
+            tab_config  = ui.tab("Configuration",  icon="settings")
+            tab_chat    = ui.tab("Chat",           icon="chat")
+            tab_scoring = ui.tab("Scoring & Analysis", icon="analytics")
+        with ui.tab_panels(main_tabs, value=tab_auth).classes("w-full pt-4"):
+
+            with ui.tab_panel(tab_auth):
+                with ui.column().classes("w-full gap-6"):
+                    # ── Auth card ───────────────────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        ui.label("Authentication").classes("text-base font-semibold mb-1")
+
+                        with ui.tabs().classes("w-full") as auth_tabs:
+                            tab_cookie  = ui.tab("Cookie / Header")
+                            tab_browser = ui.tab("Browser Login (SSO)")
+
+                        with ui.tab_panels(auth_tabs, value=tab_cookie).classes("w-full border-t"):
+
+                            # ── Cookie tab ──────────────────────────────────────────────
+                            with ui.tab_panel(tab_cookie):
+                                ui.label(
+                                    "Open DevTools → Network → any request → Headers → Cookie. "
+                                    "Copy the full Cookie header value and paste it below. "
+                                    "Alternatively set the SUPPORTAL_COOKIE environment variable before launching."
+                                ).classes("text-sm text-gray-500 mb-2")
+                                cookie_input = (
+                                    ui.textarea(label="Cookie string", placeholder="session=abc123; other=xyz …")
+                                    .classes("w-full font-mono text-sm")
+                                    .props('rows=3 outlined clearable')
                                 )
-                        elif msg["role"] == "assistant":
-                            with ui.row().classes("justify-start w-full"):
-                                ui.label(msg["content"]).classes(
-                                    "bg-gray-100 text-gray-900 rounded-xl px-4 py-2 max-w-xl text-sm whitespace-pre-wrap"
+                                # Pre-fill from env if available
+                                env_cookie = os.environ.get("SUPPORTAL_COOKIE", "")
+                                if env_cookie:
+                                    cookie_input.value = env_cookie
+                                    ui.label("(pre-filled from SUPPORTAL_COOKIE env var)").classes("text-xs text-green-600")
+
+                            # ── Browser login tab ───────────────────────────────────────
+                            with ui.tab_panel(tab_browser):
+                                ui.label(
+                                    "Click Open Browser. A Chromium window will appear — log in through SSO "
+                                    "as normal and navigate to at least one ticket to confirm access. "
+                                    "Then click Confirm Login to save the session for headless scraping."
+                                ).classes("text-sm text-gray-500 mb-3")
+
+                                with ui.row().classes("items-center gap-2 mb-2"):
+                                    browser_dot    = ui.icon("circle").classes("text-red-500 text-sm")
+                                    browser_status = ui.label("Not logged in").classes("text-sm font-semibold text-gray-600")
+
+                                async def do_open_browser():
+                                    btn_open.props("loading disabled")
+                                    browser_dot.classes(replace="text-orange-500 text-sm")
+                                    browser_status.set_text("Browser opening…")
+                                    try:
+                                        await run.io_bound(open_browser_thread)
+                                        browser_dot.classes(replace="text-blue-500 text-sm")
+                                        browser_status.set_text("Browser open — log in then click Confirm Login")
+                                        btn_confirm.props(remove="disabled")
+                                    except Exception as exc:
+                                        browser_dot.classes(replace="text-red-600 text-sm")
+                                        browser_status.set_text(f"Error: {exc}")
+                                        btn_open.props(remove="loading disabled")
+
+                                async def do_confirm_login():
+                                    btn_confirm.props("loading disabled")
+                                    browser_status.set_text("Closing browser and saving session…")
+                                    try:
+                                        await run.io_bound(confirm_login_thread)
+                                        browser_dot.classes(replace="text-green-500 text-sm")
+                                        browser_status.set_text("Logged in ✓")
+                                        ui.notify("Session saved. Ready to scrape.", type="positive")
+                                    except Exception as exc:
+                                        browser_dot.classes(replace="text-red-600 text-sm")
+                                        browser_status.set_text(f"Error: {exc}")
+                                        ui.notify(f"Error saving session: {exc}", type="negative")
+                                        btn_confirm.props(remove="loading disabled")
+
+                                with ui.row().classes("gap-3"):
+                                    btn_open = ui.button("Open Browser & Login", on_click=do_open_browser, icon="open_in_browser")
+                                    btn_confirm = ui.button("Confirm Login", on_click=do_confirm_login, icon="check_circle")
+                                    btn_confirm.props("disabled color=positive")
+
+            with ui.tab_panel(tab_scrape):
+                with ui.column().classes("w-full gap-6"):
+                    # ── Settings card ────────────────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        ui.label("Scraper Settings").classes("text-base font-semibold mb-1")
+                        with ui.row().classes("gap-4 w-full flex-wrap items-start"):
+                            customer_input = (
+                                ui.input(
+                                    label="Customer URL or name",
+                                    placeholder="https://supportal.couchbase.com/customer/American%20Express%20AZ",
+                                )
+                                .classes("flex-1 min-w-64")
+                                .props("outlined clearable")
+                            )
+                            ui.label(
+                                "Tip: navigate to the customer page in your browser and paste the full URL. "
+                                "The name is extracted from the URL path to ensure correct capitalisation."
+                            ).classes("text-xs text-gray-400 w-full -mt-2")
+                            max_pages_input = (
+                                ui.number(label="Max listing pages  (0 = all)", value=0, min=0, step=1)
+                                .classes("w-56")
+                                .props("outlined")
+                            )
+
+                    # ── Run card ─────────────────────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        progress_bar   = ui.linear_progress(value=0).props("stripe color=blue-9 rounded")
+                        progress_label = ui.label("").classes("text-sm text-gray-500 mt-1 min-h-5")
+
+                        async def do_scrape():
+                            if not customer_input.value.strip():
+                                ui.notify("Enter a customer URL or name first.", type="warning")
+                                return
+                            customer, _resolved_url = _resolve_customer_input(customer_input.value)
+                            progress_label.set_text(f"Resolved → {_resolved_url}")
+                            if not customer:
+                                ui.notify("Could not resolve a customer name from the input.", type="warning")
+                                return
+                            max_pages = int(max_pages_input.value or 0)
+
+                            # Resolve auth
+                            active_tab = auth_tabs.value          # NiceGUI tab label text
+                            using_browser = (active_tab == tab_browser.name if hasattr(tab_browser, "name")
+                                             else str(active_tab) == "Browser Login (SSO)")
+                            cookie = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+
+                            if using_browser and not _browser_state.get("logged_in"):
+                                ui.notify("Complete browser login first.", type="warning")
+                                return
+                            if not using_browser and not cookie:
+                                ui.notify("Paste a cookie string or set SUPPORTAL_COOKIE env var.", type="warning")
+                                return
+
+                            loop = asyncio.get_event_loop()
+
+                            def progress_cb(msg: str, pct: float):
+                                async def _update():
+                                    progress_bar.set_value(pct)
+                                    progress_label.set_text(msg)
+                                asyncio.run_coroutine_threadsafe(_update(), loop)
+
+                            btn_scrape.props("loading disabled")
+                            progress_bar.set_value(0)
+                            progress_label.set_text("Starting…")
+
+                            try:
+                                if using_browser:
+                                    data = await run.io_bound(
+                                        scrape_with_playwright, customer, max_pages, progress_cb
+                                    )
+                                else:
+                                    data = await run.io_bound(
+                                        scrape_with_cookie, cookie, customer, max_pages, progress_cb
+                                    )
+
+                                state["results"] = data
+                                _results.clear()
+                                _results.extend(data)
+
+                                _refresh_table(data)
+                                btn_dl_json.set_enabled(True)
+                                btn_dl_csv.set_enabled(True)
+                                btn_cb_load.set_enabled(_CB_AVAILABLE)
+                                btn_embed.set_enabled(_CB_AVAILABLE)
+                                btn_score.set_enabled(True)
+                                btn_render_charts.set_enabled(True)
+                                progress_label.set_text(f"Done — {len(data)} tickets scraped.")
+                                try:
+                                    ui.notify(f"Done — {len(data)} tickets scraped.", type="positive")
+                                except RuntimeError:
+                                    pass  # client context gone after long scrape; element updates above are sufficient
+
+                            except Exception as exc:
+                                progress_label.set_text(f"Error: {exc}")
+                                try:
+                                    ui.notify(f"Scrape error: {exc}", type="negative", timeout=10000)
+                                except RuntimeError:
+                                    pass
+                            finally:
+                                btn_scrape.props(remove="loading disabled")
+
+                        async def do_diagnose():
+                            if not customer_input.value.strip():
+                                ui.notify("Enter a customer URL or name first.", type="warning")
+                                return
+                            customer, _resolved_url = _resolve_customer_input(customer_input.value)
+                            if not customer:
+                                ui.notify("Could not resolve a customer name from the input.", type="warning")
+                                return
+
+                            if not _browser_state.get("logged_in"):
+                                ui.notify(
+                                    "Diagnose uses the browser session — complete Browser Login first.",
+                                    type="warning",
+                                )
+                                return
+
+                            loop = asyncio.get_event_loop()
+
+                            def progress_cb(msg: str, pct: float):
+                                async def _update():
+                                    progress_bar.set_value(pct)
+                                    progress_label.set_text(msg)
+                                asyncio.run_coroutine_threadsafe(_update(), loop)
+
+                            btn_diagnose.props("loading disabled")
+                            progress_bar.set_value(0)
+                            progress_label.set_text("Running diagnostics (Playwright)…")
+
+                            def run_diag():
+                                os.makedirs(PROFILE_DIR, exist_ok=True)
+                                report_lines: list[str] = []
+
+                                def log_cb(msg: str, pct: float):
+                                    report_lines.append(msg)
+                                    progress_cb(msg, pct)
+
+                                with sync_playwright() as pw:
+                                    ctx = pw.chromium.launch_persistent_context(
+                                        user_data_dir=PROFILE_DIR,
+                                        headless=True,
+                                        user_agent=UA,
+                                        ignore_https_errors=True,
+                                    )
+                                    pg = ctx.new_page()
+                                    pg.set_default_timeout(60_000)
+                                    _scrape_listing_playwright(pg, customer, max_pages=1,
+                                                               progress_cb=log_cb, debug=True)
+                                    ctx.close()
+
+                                report_lines.append(f"\nDebug HTML saved to: {DEBUG_DIR}")
+                                return "\n".join(report_lines)
+
+                            try:
+                                report = await run.io_bound(run_diag)
+                                diag_output.set_text(report)
+                                diag_output.set_visibility(True)
+                                progress_label.set_text("Diagnostics complete — check output and debug_html/ folder")
+                            except Exception as exc:
+                                diag_output.set_text(str(exc))
+                                diag_output.set_visibility(True)
+                                progress_label.set_text(f"Diagnostics error: {exc}")
+                            finally:
+                                btn_diagnose.props(remove="loading disabled")
+
+                        with ui.row().classes("gap-3 items-center"):
+                            btn_scrape = ui.button("Scrape Tickets", on_click=do_scrape, icon="search").props(
+                                "color=primary size=lg"
+                            )
+                            btn_diagnose = ui.button("Diagnose", on_click=do_diagnose, icon="bug_report").props(
+                                "color=orange outline size=lg"
+                            )
+                            ui.label("(Diagnose runs only the navigation steps and saves HTML to debug_html/)").classes(
+                                "text-xs text-gray-400"
+                            )
+
+                    # ── Diagnostics output ────────────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        ui.label("Diagnostics Output").classes("text-base font-semibold mb-1")
+                        diag_output = ui.label("").classes("font-mono text-xs whitespace-pre-wrap text-gray-700")
+                        diag_output.set_visibility(False)
+
+            with ui.tab_panel(tab_results):
+                with ui.column().classes("w-full gap-6"):
+                    # ── Results card ──────────────────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        ui.label("Results").classes("text-base font-semibold mb-1")
+
+                        columns = [
+                            {"name": "ticket_id",    "label": "Ticket",       "field": "ticket_id",    "sortable": True, "align": "left"},
+                            {"name": "status",       "label": "Status",       "field": "status",       "sortable": True},
+                            {"name": "priority",     "label": "Priority",     "field": "priority",     "sortable": True},
+                            {"name": "subject",      "label": "Subject",      "field": "subject",      "sortable": True, "align": "left"},
+                            {"name": "requester",    "label": "Requester",    "field": "requester",    "sortable": True, "align": "left"},
+                            {"name": "assignee",     "label": "Assignee",     "field": "assignee",     "sortable": True, "align": "left"},
+                            {"name": "organization", "label": "Org",          "field": "organization", "sortable": True, "align": "left"},
+                            {"name": "created",      "label": "Created",      "field": "created",      "sortable": True},
+                            {"name": "updated",      "label": "Updated",      "field": "updated",      "sortable": True},
+                            {"name": "solved",       "label": "Solved",       "field": "solved",       "sortable": True},
+                            {"name": "comment_count","label": "Comments",     "field": "comment_count","sortable": True},
+                            {"name": "tags",         "label": "Tags",         "field": "tags",         "sortable": True, "align": "left"},
+                        ]
+
+                        # Pagination state
+                        _page_state = {"current": 1, "per_page": 25, "all_rows": []}
+
+                        with ui.row().classes("items-center gap-4 mb-1"):
+                            page_info_label = ui.label("").classes("text-xs text-gray-500 flex-1")
+                            ui.label("Per page:").classes("text-xs text-gray-500")
+                            per_page_select = ui.select(
+                                options=[10, 25, 50, 100],
+                                value=25,
+                            ).classes("w-20 text-xs")
+
+                        result_table = ui.table(columns=columns, rows=[], row_key="ticket_id").classes("w-full")
+                        result_table.props("flat dense")
+
+                        pager = ui.pagination(1, 1, direction_links=True).classes("mt-1 self-center")
+
+                        # Row click → detail dialog
+                        detail_dialog = ui.dialog().props("maximized")
+                        with detail_dialog:
+                            with ui.card().classes("w-full h-full overflow-auto p-6"):
+                                dialog_title   = ui.label("").classes("text-lg font-bold mb-2")
+                                dialog_content = ui.column().classes("w-full gap-2")
+
+                        def _show_detail(ticket: dict):
+                            dialog_title.set_text(f"Ticket #{ticket.get('ticket_id')} — {ticket.get('subject', '')}")
+                            dialog_content.clear()
+                            with dialog_content:
+                                # Well-known fields
+                                meta_fields = [
+                                    ("Status",       ticket.get("status")),
+                                    ("Priority",     ticket.get("priority")),
+                                    ("Requester",    ticket.get("requester")),
+                                    ("Assignee",     ticket.get("assignee")),
+                                    ("Organization", ticket.get("organization")),
+                                    ("Created",      ticket.get("created")),
+                                    ("Updated",      ticket.get("updated")),
+                                    ("Solved",       ticket.get("solved")),
+                                    ("Tags",         ticket.get("tags")),
+                                ]
+                                with ui.grid(columns=2).classes("w-full gap-1 text-sm"):
+                                    for label, val in meta_fields:
+                                        if val:
+                                            ui.label(label).classes("font-semibold text-gray-500")
+                                            ui.label(val).classes("text-gray-800")
+
+                                # Extra fields found on the page
+                                all_fields = ticket.get("all_fields", {})
+                                known_keys = {
+                                    "status", "priority", "requester", "assignee",
+                                    "organization", "created", "updated", "solved", "tags",
+                                }
+                                extra = {k: v for k, v in all_fields.items()
+                                         if k.lower() not in known_keys and v}
+                                if extra:
+                                    ui.separator()
+                                    ui.label("Additional fields").classes("font-semibold mt-1")
+                                    with ui.grid(columns=2).classes("w-full gap-1 text-sm"):
+                                        for k, v in extra.items():
+                                            ui.label(k).classes("font-semibold text-gray-500")
+                                            ui.label(str(v)).classes("text-gray-800")
+
+                                # Named sections
+                                def _section(label: str, content: Optional[str]):
+                                    if not content:
+                                        return
+                                    ui.separator()
+                                    ui.label(label).classes("font-semibold mt-1 text-blue-800")
+                                    ui.label(content).classes("text-sm whitespace-pre-wrap text-gray-700 bg-gray-50 p-2 rounded")
+
+                                _section("Description",  ticket.get("description"))
+                                _section("Ticket Fields", ticket.get("ticket_fields"))
+                                _section("Tags",          ticket.get("tags"))
+                                _section("Escalations",   ticket.get("escalations"))
+                                _section("Snapshots",     ticket.get("snapshots"))
+
+                                # Comments / conversation (stored as JSON string or list)
+                                comments = ticket.get("comments", [])
+                                if isinstance(comments, str):
+                                    try:
+                                        comments = json.loads(comments)
+                                    except Exception:
+                                        comments = []
+                                if comments:
+                                    ui.separator()
+                                    ui.label(f"Conversation  ({len(comments)} entries)").classes("font-semibold mt-1 text-blue-800")
+                                    for c in comments:
+                                        with ui.card().classes("w-full bg-gray-50"):
+                                            with ui.row().classes("justify-between text-xs text-gray-400"):
+                                                ui.label(c.get("author") or "—")
+                                                ui.label(c.get("timestamp") or "")
+                                            ui.label(c.get("body", "")).classes("text-sm whitespace-pre-wrap mt-1")
+
+                                ui.button("Close", on_click=detail_dialog.close).classes("mt-4").props("flat color=grey")
+                            detail_dialog.open()
+
+                        def _render_page():
+                            pp   = _page_state["per_page"]
+                            pg   = _page_state["current"]
+                            all_rows = _page_state["all_rows"]
+                            total = len(all_rows)
+                            start = (pg - 1) * pp
+                            end   = start + pp
+                            result_table.rows = all_rows[start:end]
+                            result_table.update()
+                            pages = max(1, -(-total // pp))  # ceiling division
+                            pager.max = pages
+                            if pager.value > pages:
+                                pager.value = pages
+                            showing_end = min(end, total)
+                            page_info_label.set_text(
+                                f"Showing {start + 1}–{showing_end} of {total} tickets" if total else "No tickets"
+                            )
+
+                        def _refresh_table(data: list[dict]):
+                            _page_state["all_rows"] = [
+                                {c["field"]: (rec.get(c["field"]) or "") for c in columns}
+                                for rec in data
+                            ]
+                            _page_state["current"] = 1
+                            pager.value = 1
+                            _render_page()
+
+                        def _on_page_change(e):
+                            _page_state["current"] = int(pager.value)
+                            _render_page()
+
+                        def _on_per_page_change(e):
+                            _page_state["per_page"] = int(per_page_select.value)
+                            _page_state["current"] = 1
+                            pager.value = 1
+                            _render_page()
+
+                        pager.on("update:model-value", _on_page_change)
+                        per_page_select.on("update:model-value", _on_per_page_change)
+
+                        def _on_row_click(e):
+                            # NiceGUI 3.x / Quasar QTable fires row-click as (evt, row, index)
+                            # so e.args is a list: [quasar_evt_dict, row_dict, row_index]
+                            args = e.args
+                            row_data = args[1] if isinstance(args, list) and len(args) > 1 else {}
+                            if isinstance(row_data, dict):
+                                ticket_id = str(row_data.get("ticket_id", ""))
+                            else:
+                                return
+                            ticket = next(
+                                (r for r in state["results"] if str(r.get("ticket_id")) == ticket_id), {}
+                            )
+                            _show_detail(ticket)
+
+                        result_table.on("rowClick", _on_row_click)
+
+                        # Downloads
+                        with ui.row().classes("gap-3 mt-3"):
+                            def dl_json():
+                                if state["results"]:
+                                    ui.download(src=to_json_bytes(state["results"]), filename="tickets.json")
+
+                            def dl_csv():
+                                if state["results"]:
+                                    ui.download(src=to_csv_bytes(state["results"]), filename="tickets.csv")
+
+                            btn_dl_json = ui.button("Download JSON", on_click=dl_json, icon="download").props("outline color=primary")
+                            btn_dl_csv  = ui.button("Download CSV",  on_click=dl_csv,  icon="download").props("outline color=secondary")
+                            btn_dl_json.set_enabled(False)
+                            btn_dl_csv.set_enabled(False)
+
+            with ui.tab_panel(tab_config):
+                with ui.column().classes("w-full gap-6"):
+                    # ── Phase 1: Load to Couchbase ───────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        with ui.row().classes("items-center justify-between w-full"):
+                            ui.label("Load to Couchbase").classes("text-base font-semibold")
+                            if not _CB_AVAILABLE:
+                                ui.badge("SDK not installed", color="red").props("outline")
+
+                        with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-2 mt-2"):
+                            cb_url_input      = ui.input("Cluster URL", placeholder="127.0.0.1").classes("w-full")
+                            cb_bucket_input   = ui.input("Bucket",      placeholder="supportal").classes("w-full")
+                            cb_user_input     = ui.input("Username",    placeholder="Administrator").classes("w-full")
+                            cb_pass_input     = ui.input("Password").props("type=password").classes("w-full")
+                            cb_scope_input      = ui.input("Scope",      placeholder="_default").classes("w-full")
+                            cb_collection_input = ui.input("Collection", placeholder="tickets").classes("w-full")
+
+                        with ui.row().classes("items-center gap-4 mt-2"):
+                            cb_tls_toggle = ui.switch("TLS (couchbases://)", value=False)
+
+                        cb_status = ui.label("").classes("text-sm text-gray-500 mt-1")
+                        cb_progress = ui.linear_progress(value=0).classes("w-full mt-1")
+                        cb_progress.set_visibility(False)
+
+                        async def _do_cb_load():
+                            if not state["results"]:
+                                ui.notify("Run a scrape first — no tickets loaded.", type="warning")
+                                return
+                            if not _CB_AVAILABLE:
+                                ui.notify("couchbase SDK not installed. Run: venv/bin/pip install couchbase", type="negative")
+                                return
+
+                            btn_cb_load.set_enabled(False)
+                            cb_progress.set_visibility(True)
+                            cb_progress.set_value(0)
+                            cb_status.set_text("Starting…")
+
+                            loop = asyncio.get_event_loop()
+
+                            def _cb_progress(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(
+                                    _update_cb_progress(msg, pct), loop
                                 )
 
-            def _get_llm_config() -> tuple[str, str, str, str]:
-                """Return (provider, model, api_key, base_url) from active tab."""
-                active = llm_tabs.value
-                if active == "Claude":
-                    return "claude", claude_model_input.value.strip(), claude_key_input.value, ""
-                elif active == "Gemini":
-                    return "gemini", gemini_model_input.value.strip(), gemini_key_input.value, ""
-                elif active == "Ollama":
-                    return "ollama", ollama_chat_model_input.value.strip(), "", ollama_chat_url_input.value.strip() or "http://localhost:11434"
-                else:  # LMStudio
-                    return "lmstudio", lms_model_input.value.strip(), "", lms_url_input.value.strip() or "http://localhost:1234"
+                            async def _update_cb_progress(msg: str, pct: float):
+                                cb_status.set_text(msg)
+                                cb_progress.set_value(pct)
 
-            async def _send_chat():
-                question = chat_input.value.strip()
-                if not question:
-                    return
-                if not state["results"]:
-                    ui.notify("No tickets loaded — run a scrape first.", type="warning")
-                    return
+                            try:
+                                upserted, errors = await run.io_bound(
+                                    load_to_couchbase,
+                                    state["results"],
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    _cb_progress,
+                                )
+                                msg = f"Done — {upserted} upserted, {errors} errors."
+                                cb_status.set_text(msg)
+                                cb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errors == 0 else "warning")
+                            except Exception as exc:
+                                cb_status.set_text(f"Error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_cb_load.set_enabled(True)
 
-                chat_input.value = ""
-                state["chat_history"].append({"role": "user", "content": question})
-                _render_chat()
-                chat_status.set_text("Retrieving relevant tickets …")
-                btn_send.set_enabled(False)
+                        btn_cb_load = ui.button(
+                            "Load to Couchbase",
+                            on_click=_do_cb_load,
+                            icon="upload",
+                        ).props("color=red-8").classes("mt-2")
+                        btn_cb_load.set_enabled(False)
 
-                provider, model, api_key, base_url = _get_llm_config()
-                loop = asyncio.get_event_loop()
+                        # ── Load FROM Couchbase (skip re-scrape for re-embedding) ─────────
+                        ui.separator().classes("mt-4")
+                        ui.label("Load tickets from Couchbase").classes("text-sm font-semibold text-gray-600 mt-1")
+                        ui.label(
+                            "Reload previously stored tickets into the session — useful for re-embedding "
+                            "without re-scraping the site."
+                        ).classes("text-xs text-gray-400")
 
-                try:
-                    # 1. Embed the question
-                    _ep, _em, _eak, _ebu, _ = _get_embed_config()
-                    query_vec = await run.io_bound(
-                        embed_text,
-                        question,
-                        _ep,
-                        _em,
-                        _eak,
-                        _ebu,
-                    )
+                        with ui.row().classes("w-full gap-3 mt-2 items-center"):
+                            cb_load_filter = ui.input(
+                                "Filter by organization (optional)",
+                                placeholder="e.g. Maccabi — leave blank for all",
+                            ).classes("flex-1")
+                            btn_load_from_cb = ui.button("Load from Couchbase", icon="download_for_offline").props("outline color=primary")
 
-                    # 2. Vector search
-                    chat_status.set_text("Searching Couchbase …")
-                    doc_keys = await run.io_bound(
-                        vector_search_cb,
-                        query_vec,
-                        cb_url_input.value.strip(),
-                        cb_bucket_input.value.strip(),
-                        cb_user_input.value.strip(),
-                        cb_pass_input.value,
-                        cb_tls_toggle.value,
-                        cb_scope_input.value.strip() or "_default",
-                        cb_collection_input.value.strip() or "tickets",
-                        int(top_k_input.value or 10),
-                    )
+                        cb_load_status   = ui.label("").classes("text-sm text-gray-500 mt-1")
+                        cb_load_progress = ui.linear_progress(value=0).classes("w-full mt-1")
+                        cb_load_progress.set_visibility(False)
 
-                    # 3. Look up full ticket dicts from scraped results
-                    id_set = {k.split("::")[-1] for k in doc_keys}
-                    context_tickets = [
-                        t for t in state["results"]
-                        if str(t.get("ticket_id")) in id_set
-                    ][:int(top_k_input.value or 10)]
+                        async def _do_load_from_cb():
+                            btn_load_from_cb.set_enabled(False)
+                            cb_load_progress.set_visibility(True)
+                            cb_load_progress.set_value(0)
+                            cb_load_status.set_text("Connecting …")
+                            loop = asyncio.get_event_loop()
 
-                    # 4. Build messages with RAG context in system prompt
-                    context_block = build_rag_context(context_tickets)
-                    system_msg    = SYSTEM_PROMPT_TEMPLATE.format(context=context_block)
-                    messages      = [{"role": "system", "content": system_msg}]
-                    # Include prior conversation (skip previous system messages)
-                    for h in state["chat_history"][:-1]:
-                        if h["role"] in ("user", "assistant"):
-                            messages.append(h)
-                    messages.append({"role": "user", "content": question})
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(
+                                    _upd_load(msg, pct), loop
+                                )
 
-                    # 5. Call LLM
-                    chat_status.set_text(f"Asking {provider} ({model}) …")
-                    answer = await run.io_bound(call_llm, messages, provider, model, api_key, base_url)
+                            async def _upd_load(msg: str, pct: float):
+                                cb_load_status.set_text(msg)
+                                cb_load_progress.set_value(pct)
 
-                    state["chat_history"].append({"role": "assistant", "content": answer})
-                    _render_chat()
-                    chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
+                            try:
+                                tickets = await run.io_bound(
+                                    load_tickets_from_cb,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    cb_load_filter.value,
+                                    _prog,
+                                )
+                                state["results"] = tickets
+                                _refresh_table(tickets)
+                                btn_embed.set_enabled(_CB_AVAILABLE)
+                                btn_dl_json.set_enabled(True)
+                                btn_dl_csv.set_enabled(True)
+                                btn_score.set_enabled(True)
+                                btn_render_charts.set_enabled(True)
+                                msg = f"Loaded {len(tickets)} tickets from Couchbase."
+                                cb_load_status.set_text(msg)
+                                cb_load_progress.set_value(1.0)
+                                ui.notify(msg, type="positive")
+                            except Exception as exc:
+                                cb_load_status.set_text(f"Error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_load_from_cb.set_enabled(True)
 
-                except Exception as exc:
-                    chat_status.set_text(f"Error: {exc}")
-                    ui.notify(str(exc), type="negative")
-                    # Remove the user message if we failed completely
-                    if state["chat_history"] and state["chat_history"][-1]["role"] == "user":
-                        state["chat_history"].pop()
-                    _render_chat()
-                finally:
-                    btn_send.set_enabled(True)
+                        btn_load_from_cb.on("click", _do_load_from_cb)
 
-            def _clear_chat():
-                state["chat_history"].clear()
-                _render_chat()
-                chat_status.set_text("")
+                        # Enable load button when results are available (mirrored alongside download buttons)
+                        # Done by patching enable logic at the scrape-done site — see below.
 
-            with ui.row().classes("w-full gap-2 mt-3 items-center"):
-                chat_input = ui.input(placeholder="Ask a question about the tickets …").classes("flex-1")
-                chat_input.on("keydown.enter", _send_chat)
-                btn_send  = ui.button("Send",  on_click=_send_chat,  icon="send").props("color=primary")
-                btn_clear = ui.button("Clear", on_click=_clear_chat, icon="delete").props("outline color=grey")
+                    # ── Phase 2: Embed Tickets ───────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        with ui.row().classes("items-center justify-between w-full"):
+                            ui.label("Embed Tickets (Vector Search)").classes("text-base font-semibold")
+                            ui.label("Run after 'Load to Couchbase'").classes("text-xs text-gray-400")
 
-        # ── Phase 3: Score Tickets ───────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            with ui.row().classes("items-center justify-between w-full"):
-                ui.label("Score Tickets (Sentiment & Complexity)").classes("text-base font-semibold")
-                ui.label("Uses the LLM provider configured above").classes("text-xs text-gray-400")
+                        # Embedding provider tabs
+                        with ui.tabs().classes("w-full mt-2") as emb_tabs:
+                            emb_tab_ollama   = ui.tab("Ollama")
+                            emb_tab_lmstudio = ui.tab("LMStudio")
+                            emb_tab_gemini   = ui.tab("Gemini")
+                            emb_tab_mlx      = ui.tab("MLX")
 
-            ui.label(
-                "Scores each ticket for stars (1-5), temperature (cold/warm/hot), "
-                "resolution quality, timeliness, communication clarity, and complexity "
-                "using few-shot prompting."
-            ).classes("text-xs text-gray-500 mt-1")
+                        with ui.tab_panels(emb_tabs, value=emb_tab_ollama).classes("w-full border-t"):
+                            with ui.tab_panel(emb_tab_ollama):
+                                with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-2"):
+                                    emb_ollama_url_input   = ui.input("Ollama URL", placeholder="http://localhost:11434").classes("w-full")
+                                    emb_ollama_model_input = ui.input("Embedding Model", placeholder="nomic-embed-text").classes("w-full")
+                                    emb_dims_input         = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
+                            with ui.tab_panel(emb_tab_lmstudio):
+                                with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-2"):
+                                    emb_lms_url_input   = ui.input("LMStudio URL", placeholder="http://localhost:1234").classes("w-full")
+                                    emb_lms_model_input = ui.input("Embedding Model", placeholder="text-embedding-nomic-embed-text-v1.5").classes("w-full")
+                                    emb_lms_dims_input  = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
+                            with ui.tab_panel(emb_tab_gemini):
+                                with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-2"):
+                                    emb_gemini_key_input   = ui.input("API Key").props("type=password").classes("w-full")
+                                    emb_gemini_model_input = ui.input("Embedding Model", value="text-embedding-004").classes("w-full")
+                                    emb_gemini_dims_input  = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
+                            with ui.tab_panel(emb_tab_mlx):
+                                ui.label(
+                                    "Runs locally via mlx-embeddings — no server needed. "
+                                    "Use any mlx-community embedding model from HuggingFace. "
+                                    "Model is cached in memory after first load."
+                                ).classes("text-xs text-gray-500 mb-2")
+                                with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-2"):
+                                    emb_mlx_model_input = ui.input(
+                                        "HuggingFace model ID",
+                                        value="mlx-community/nomic-embed-text-v1.5",
+                                    ).classes("w-full")
+                                    emb_mlx_dims_input  = ui.number("Vector Dims", value=768, min=64, max=8192).classes("w-full")
 
-            with ui.row().classes("items-center gap-4 mt-2"):
-                score_batch_input = ui.number("Tickets per batch", value=20, min=5, max=50).classes("w-40")
+                        def _get_embed_config() -> tuple[str, str, str, str, int]:
+                            """Returns (provider, model, api_key, base_url, dims)."""
+                            active = emb_tabs.value
+                            if active == "LMStudio":
+                                return (
+                                    "lmstudio",
+                                    emb_lms_model_input.value.strip(),
+                                    "",
+                                    emb_lms_url_input.value.strip() or "http://localhost:1234",
+                                    int(emb_lms_dims_input.value or 768),
+                                )
+                            elif active == "Gemini":
+                                return (
+                                    "gemini",
+                                    emb_gemini_model_input.value.strip() or "text-embedding-004",
+                                    emb_gemini_key_input.value,
+                                    "",
+                                    int(emb_gemini_dims_input.value or 768),
+                                )
+                            elif active == "MLX":
+                                return (
+                                    "mlx",
+                                    emb_mlx_model_input.value.strip() or "mlx-community/nomic-embed-text-v1.5",
+                                    "",
+                                    "",
+                                    int(emb_mlx_dims_input.value or 768),
+                                )
+                            else:  # Ollama
+                                return (
+                                    "ollama",
+                                    emb_ollama_model_input.value.strip(),
+                                    "",
+                                    emb_ollama_url_input.value.strip() or "http://localhost:11434",
+                                    int(emb_dims_input.value or 768),
+                                )
 
-            score_status   = ui.label("").classes("text-sm text-gray-500 mt-1")
-            score_progress = ui.linear_progress(value=0).classes("w-full mt-1")
-            score_progress.set_visibility(False)
+                        emb_status   = ui.label("").classes("text-sm text-gray-500 mt-1")
+                        emb_progress = ui.linear_progress(value=0).classes("w-full mt-1")
+                        emb_progress.set_visibility(False)
 
-            async def _do_score():
-                if not state["results"]:
-                    ui.notify("No tickets loaded.", type="warning")
-                    return
-                btn_score.set_enabled(False)
-                score_progress.set_visibility(True)
-                score_progress.set_value(0)
-                score_status.set_text("Starting …")
-                loop = asyncio.get_event_loop()
+                        async def _do_embed():
+                            if not state["results"]:
+                                ui.notify("Scrape tickets first.", type="warning")
+                                return
+                            btn_embed.set_enabled(False)
+                            btn_create_idx.set_enabled(False)
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            emb_status.set_text("Starting …")
+                            loop = asyncio.get_event_loop()
 
-                def _prog(msg: str, pct: float):
-                    asyncio.run_coroutine_threadsafe(_upd_score(msg, pct), loop)
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(
+                                    _upd_emb(msg, pct), loop
+                                )
 
-                async def _upd_score(msg: str, pct: float):
-                    score_status.set_text(msg)
-                    score_progress.set_value(pct)
+                            async def _upd_emb(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
 
-                provider, model, api_key, base_url = _get_llm_config()
-                try:
-                    scores = await run.io_bound(
-                        score_all_tickets,
-                        state["results"],
-                        provider,
-                        model,
-                        api_key,
-                        base_url,
-                        int(score_batch_input.value or 20),
-                        _prog,
-                    )
-                    state["scores"] = scores
-                    msg = f"Scored {len(scores)}/{len(state['results'])} tickets."
-                    score_status.set_text(msg)
-                    score_progress.set_value(1.0)
-                    ui.notify(msg, type="positive")
-                    btn_render_charts.set_enabled(True)
-                except Exception as exc:
-                    score_status.set_text(f"Error: {exc}")
-                    ui.notify(str(exc), type="negative")
-                finally:
-                    btn_score.set_enabled(True)
+                            try:
+                                emb_provider, emb_model, emb_api_key, emb_base_url, emb_dims = _get_embed_config()
+                                done, errs = await run.io_bound(
+                                    embed_all_tickets,
+                                    state["results"],
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    emb_provider,
+                                    emb_model,
+                                    emb_api_key,
+                                    emb_base_url,
+                                    emb_dims,
+                                    _prog,
+                                )
+                                msg = f"Done — {done} embedded, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                                btn_create_idx.set_enabled(True)
+                            except Exception as exc:
+                                emb_status.set_text(f"Error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_embed.set_enabled(True)
 
-            btn_score = ui.button(
-                "Score Tickets", on_click=_do_score, icon="psychology"
-            ).props("color=deep-purple").classes("mt-2")
-            btn_score.set_enabled(False)
+                        async def _do_create_index():
+                            btn_create_idx.set_enabled(False)
+                            emb_status.set_text("Creating vector index …")
+                            try:
+                                await run.io_bound(
+                                    create_vector_index,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    _get_embed_config()[4],
+                                )
+                                emb_status.set_text("Vector index created — ready for chat.")
+                                ui.notify("Vector index created!", type="positive")
+                            except Exception as exc:
+                                emb_status.set_text(f"Index error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_create_idx.set_enabled(True)
 
-        # ── Phase 3: Analytics ───────────────────────────────────────────────
-        with ui.card().classes("w-full"):
-            with ui.row().classes("items-center justify-between w-full"):
-                ui.label("Analytics").classes("text-base font-semibold")
-                ui.label("Score tickets first to unlock sentiment & complexity charts").classes("text-xs text-gray-400")
+                        with ui.row().classes("gap-3 mt-2"):
+                            btn_embed      = ui.button("Embed Tickets",       on_click=_do_embed,        icon="model_training").props("outline color=primary")
+                            btn_create_idx = ui.button("Create Vector Index", on_click=_do_create_index, icon="manage_search").props("outline color=secondary")
+                        btn_embed.set_enabled(False)
+                        btn_create_idx.set_enabled(False)
 
-            chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
-            charts_area  = ui.column().classes("w-full gap-4 mt-3")
+            with ui.tab_panel(tab_chat):
+                with ui.column().classes("w-full gap-6"):
+                    # ── Phase 2: Chat / RAG ──────────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        ui.label("Chat with Tickets (RAG)").classes("text-base font-semibold")
 
-            def _make_chart(container, cfg: dict):
-                with container:
-                    ui.chart(cfg).classes("w-full")
+                        # LLM provider tabs
+                        with ui.tabs().classes("w-full mt-2") as llm_tabs:
+                            tab_claude   = ui.tab("Claude")
+                            tab_gemini   = ui.tab("Gemini")
+                            tab_ollama   = ui.tab("Ollama")
+                            tab_lmstudio = ui.tab("LMStudio")
 
-            async def _render_charts():
-                if not state["results"]:
-                    ui.notify("No tickets loaded.", type="warning")
-                    return
-                btn_render_charts.set_enabled(False)
-                chart_status.set_text("Building charts …")
-                charts_area.clear()
+                        with ui.tab_panels(llm_tabs, value=tab_claude).classes("w-full border-t"):
+                            # Claude
+                            with ui.tab_panel(tab_claude):
+                                with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
+                                    claude_key_input   = ui.input("API Key").props("type=password").classes("w-full")
+                                    claude_model_input = ui.input("Model", value="claude-sonnet-4-6").classes("w-full")
 
-                data = build_analytics_data(state["results"], state["scores"])
+                            # Gemini
+                            with ui.tab_panel(tab_gemini):
+                                with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
+                                    gemini_key_input   = ui.input("API Key").props("type=password").classes("w-full")
+                                    gemini_model_input = ui.input("Model", value="gemini-2.0-flash").classes("w-full")
 
-                with charts_area:
-                    # ── Row 1: Frequency over time ────────────────────────────
-                    if data["month_keys"]:
-                        ui.chart({
-                            "chart":  {"type": "bar", "height": 280},
-                            "title":  {"text": "Ticket Volume Over Time"},
-                            "series": [{"name": "Tickets", "data": data["month_values"]}],
-                            "xaxis":  {"categories": data["month_keys"], "labels": {"rotate": -45}},
-                            "colors": ["#1565C0"],
-                        }).classes("w-full")
-                    else:
-                        ui.label("No parseable dates for frequency chart.").classes("text-sm text-gray-400")
+                            # Ollama chat
+                            with ui.tab_panel(tab_ollama):
+                                with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
+                                    ollama_chat_url_input   = ui.input("Ollama URL", placeholder="http://localhost:11434").classes("w-full")
+                                    ollama_chat_model_input = ui.input("Model",      placeholder="llama3.3").classes("w-full")
 
-                    # ── Row 2: Priority + Status side by side ─────────────────
-                    with ui.row().classes("w-full gap-4"):
-                        with ui.card().classes("flex-1"):
-                            ui.chart({
-                                "chart":  {"type": "pie", "height": 280},
-                                "title":  {"text": "Priority Distribution"},
-                                "labels": data["priority_labels"],
-                                "series": data["priority_values"],
-                                "colors": ["#43A047","#FB8C00","#E53935","#8E24AA"],
-                            }).classes("w-full")
-                        with ui.card().classes("flex-1"):
-                            ui.chart({
-                                "chart":  {"type": "donut", "height": 280},
-                                "title":  {"text": "Status Breakdown"},
-                                "labels": data["status_labels"],
-                                "series": data["status_values"],
-                            }).classes("w-full")
+                            # LMStudio
+                            with ui.tab_panel(tab_lmstudio):
+                                with ui.grid(columns=2).classes("w-full gap-4 mt-2"):
+                                    lms_url_input   = ui.input("LMStudio URL", placeholder="http://localhost:1234").classes("w-full")
+                                    lms_model_input = ui.input("Model",        placeholder="local-model").classes("w-full")
 
-                    # ── Row 3: Comment distribution + Escalation rate ─────────
-                    with ui.row().classes("w-full gap-4"):
-                        with ui.card().classes("flex-1"):
-                            ui.chart({
-                                "chart":  {"type": "bar", "height": 260},
-                                "title":  {"text": "Comment Count Distribution"},
-                                "series": [{"name": "Tickets", "data": data["comment_values"]}],
-                                "xaxis":  {"categories": data["comment_labels"]},
-                                "colors": ["#00ACC1"],
-                            }).classes("w-full")
-                        with ui.card().classes("flex-1"):
-                            ui.chart({
-                                "chart":  {"type": "donut", "height": 260},
-                                "title":  {"text": "Escalation Rate"},
-                                "labels": data["esc_labels"],
-                                "series": data["esc_values"],
-                                "colors": ["#E53935","#43A047"],
-                            }).classes("w-full")
+                        top_k_input = ui.number("Results to retrieve (top-K)", value=10, min=1, max=50).classes("w-48 mt-2")
 
-                    # ── Scored metrics (only if scores available) ─────────────
-                    if state["scores"]:
-                        ui.label("— Scored Metrics —").classes("text-sm font-semibold text-gray-500 text-center w-full")
+                        # Conversation display
+                        ui.separator().classes("mt-3")
+                        chat_log = ui.column().classes("w-full gap-2 mt-2 max-h-96 overflow-y-auto")
+                        chat_status = ui.label("").classes("text-xs text-gray-400 mt-1")
 
-                        # Row 4: Stars + Temperature
-                        with ui.row().classes("w-full gap-4"):
-                            with ui.card().classes("flex-1"):
-                                ui.chart({
-                                    "chart":  {"type": "bar", "height": 260},
-                                    "title":  {"text": "Experience Stars Distribution"},
-                                    "series": [{"name": "Tickets", "data": data["stars_values"]}],
-                                    "xaxis":  {"categories": ["★1","★2","★3","★4","★5"]},
-                                    "colors": ["#FDD835"],
-                                }).classes("w-full")
-                            with ui.card().classes("flex-1"):
-                                ui.chart({
-                                    "chart":  {"type": "donut", "height": 260},
-                                    "title":  {"text": "Temperature Distribution"},
-                                    "labels": data["temp_labels"],
-                                    "series": data["temp_values"],
-                                    "colors": ["#42A5F5","#FFA726","#EF5350"],
-                                }).classes("w-full")
+                        def _render_chat():
+                            chat_log.clear()
+                            with chat_log:
+                                for msg in state["chat_history"]:
+                                    if msg["role"] == "user":
+                                        with ui.row().classes("justify-end w-full"):
+                                            ui.label(msg["content"]).classes(
+                                                "bg-blue-600 text-white rounded-xl px-4 py-2 max-w-xl text-sm whitespace-pre-wrap"
+                                            )
+                                    elif msg["role"] == "assistant":
+                                        with ui.row().classes("justify-start w-full"):
+                                            ui.label(msg["content"]).classes(
+                                                "bg-gray-100 text-gray-900 rounded-xl px-4 py-2 max-w-xl text-sm whitespace-pre-wrap"
+                                            )
 
-                        # Row 5: Complexity + Dimension averages
-                        with ui.row().classes("w-full gap-4"):
-                            with ui.card().classes("flex-1"):
-                                ui.chart({
-                                    "chart":  {"type": "bar", "height": 260},
-                                    "title":  {"text": "Complexity Score Distribution"},
-                                    "series": [{"name": "Tickets", "data": data["complexity_values"]}],
-                                    "xaxis":  {"categories": ["1","2","3","4","5"]},
-                                    "colors": ["#8E24AA"],
-                                }).classes("w-full")
-                            with ui.card().classes("flex-1"):
-                                ui.chart({
-                                    "chart":  {"type": "bar", "height": 260, "horizontal": True},
-                                    "title":  {"text": "Avg Dimension Scores (1-5)"},
-                                    "series": [{"name": "Avg Score", "data": data["dim_avg"]}],
-                                    "xaxis":  {"categories": data["dim_categories"]},
-                                    "yaxis":  {"max": 5},
-                                    "colors": ["#26A69A"],
-                                }).classes("w-full")
+                        def _get_llm_config() -> tuple[str, str, str, str]:
+                            """Return (provider, model, api_key, base_url) from active tab."""
+                            active = llm_tabs.value
+                            if active == "Claude":
+                                return "claude", claude_model_input.value.strip(), claude_key_input.value, ""
+                            elif active == "Gemini":
+                                return "gemini", gemini_model_input.value.strip(), gemini_key_input.value, ""
+                            elif active == "Ollama":
+                                return "ollama", ollama_chat_model_input.value.strip(), "", ollama_chat_url_input.value.strip() or "http://localhost:11434"
+                            else:  # LMStudio
+                                return "lmstudio", lms_model_input.value.strip(), "", lms_url_input.value.strip() or "http://localhost:1234"
 
-                chart_status.set_text(
-                    f"{len(state['results'])} tickets · "
-                    f"{len(state['scores'])} scored · charts updated."
-                )
-                btn_render_charts.set_enabled(True)
+                        async def _send_chat():
+                            question = chat_input.value.strip()
+                            if not question:
+                                return
+                            if not state["results"]:
+                                ui.notify("No tickets loaded — run a scrape first.", type="warning")
+                                return
 
-            btn_render_charts = ui.button(
-                "Generate Charts", on_click=_render_charts, icon="bar_chart"
-            ).props("color=teal").classes("mt-2")
-            btn_render_charts.set_enabled(False)
+                            chat_input.value = ""
+                            state["chat_history"].append({"role": "user", "content": question})
+                            _render_chat()
+                            chat_status.set_text("Retrieving relevant tickets …")
+                            btn_send.set_enabled(False)
+
+                            provider, model, api_key, base_url = _get_llm_config()
+                            loop = asyncio.get_event_loop()
+
+                            try:
+                                # 1. Embed the question
+                                _ep, _em, _eak, _ebu, _ = _get_embed_config()
+                                query_vec = await run.io_bound(
+                                    embed_text,
+                                    question,
+                                    _ep,
+                                    _em,
+                                    _eak,
+                                    _ebu,
+                                )
+
+                                # 2. Vector search
+                                chat_status.set_text("Searching Couchbase …")
+                                doc_keys = await run.io_bound(
+                                    vector_search_cb,
+                                    query_vec,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    int(top_k_input.value or 10),
+                                )
+
+                                # 3. Look up full ticket dicts from scraped results
+                                id_set = {k.split("::")[-1] for k in doc_keys}
+                                context_tickets = [
+                                    t for t in state["results"]
+                                    if str(t.get("ticket_id")) in id_set
+                                ][:int(top_k_input.value or 10)]
+
+                                # 4. Build messages with RAG context in system prompt
+                                context_block = build_rag_context(context_tickets)
+                                system_msg    = SYSTEM_PROMPT_TEMPLATE.format(context=context_block)
+                                messages      = [{"role": "system", "content": system_msg}]
+                                # Include prior conversation (skip previous system messages)
+                                for h in state["chat_history"][:-1]:
+                                    if h["role"] in ("user", "assistant"):
+                                        messages.append(h)
+                                messages.append({"role": "user", "content": question})
+
+                                # 5. Call LLM
+                                chat_status.set_text(f"Asking {provider} ({model}) …")
+                                answer = await run.io_bound(call_llm, messages, provider, model, api_key, base_url)
+
+                                state["chat_history"].append({"role": "assistant", "content": answer})
+                                _render_chat()
+                                chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
+
+                            except Exception as exc:
+                                chat_status.set_text(f"Error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                                # Remove the user message if we failed completely
+                                if state["chat_history"] and state["chat_history"][-1]["role"] == "user":
+                                    state["chat_history"].pop()
+                                _render_chat()
+                            finally:
+                                btn_send.set_enabled(True)
+
+                        def _clear_chat():
+                            state["chat_history"].clear()
+                            _render_chat()
+                            chat_status.set_text("")
+
+                        with ui.row().classes("w-full gap-2 mt-3 items-center"):
+                            chat_input = ui.input(placeholder="Ask a question about the tickets …").classes("flex-1")
+                            chat_input.on("keydown.enter", _send_chat)
+                            btn_send  = ui.button("Send",  on_click=_send_chat,  icon="send").props("color=primary")
+                            btn_clear = ui.button("Clear", on_click=_clear_chat, icon="delete").props("outline color=grey")
+
+            with ui.tab_panel(tab_scoring):
+                with ui.column().classes("w-full gap-6"):
+                    # ── Phase 3: Score Tickets ───────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        with ui.row().classes("items-center justify-between w-full"):
+                            ui.label("Score Tickets (Sentiment & Complexity)").classes("text-base font-semibold")
+                            ui.label("Uses the LLM provider configured above").classes("text-xs text-gray-400")
+
+                        ui.label(
+                            "Scores each ticket for stars (1-5), temperature (cold/warm/hot), "
+                            "resolution quality, timeliness, communication clarity, and complexity "
+                            "using few-shot prompting."
+                        ).classes("text-xs text-gray-500 mt-1")
+
+                        with ui.row().classes("items-center gap-4 mt-2"):
+                            score_batch_input = ui.number("Tickets per batch", value=20, min=5, max=50).classes("w-40")
+
+                        score_status   = ui.label("").classes("text-sm text-gray-500 mt-1")
+                        score_progress = ui.linear_progress(value=0).classes("w-full mt-1")
+                        score_progress.set_visibility(False)
+
+                        async def _do_score():
+                            if not state["results"]:
+                                ui.notify("No tickets loaded.", type="warning")
+                                return
+                            btn_score.set_enabled(False)
+                            score_progress.set_visibility(True)
+                            score_progress.set_value(0)
+                            score_status.set_text("Starting …")
+                            loop = asyncio.get_event_loop()
+
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_score(msg, pct), loop)
+
+                            async def _upd_score(msg: str, pct: float):
+                                score_status.set_text(msg)
+                                score_progress.set_value(pct)
+
+                            provider, model, api_key, base_url = _get_llm_config()
+                            try:
+                                scores = await run.io_bound(
+                                    score_all_tickets,
+                                    state["results"],
+                                    provider,
+                                    model,
+                                    api_key,
+                                    base_url,
+                                    int(score_batch_input.value or 20),
+                                    _prog,
+                                )
+                                state["scores"] = scores
+                                msg = f"Scored {len(scores)}/{len(state['results'])} tickets."
+                                score_status.set_text(msg)
+                                score_progress.set_value(1.0)
+                                ui.notify(msg, type="positive")
+                                btn_render_charts.set_enabled(True)
+                            except Exception as exc:
+                                score_status.set_text(f"Error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_score.set_enabled(True)
+
+                        btn_score = ui.button(
+                            "Score Tickets", on_click=_do_score, icon="psychology"
+                        ).props("color=deep-purple").classes("mt-2")
+                        btn_score.set_enabled(False)
+
+                    # ── Phase 3: Analytics ───────────────────────────────────────────────
+                    with ui.card().classes("w-full"):
+                        with ui.row().classes("items-center justify-between w-full"):
+                            ui.label("Analytics").classes("text-base font-semibold")
+                            ui.label("Score tickets first to unlock sentiment & complexity charts").classes("text-xs text-gray-400")
+
+                        chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
+                        charts_area  = ui.column().classes("w-full gap-4 mt-3")
+
+                        def _make_chart(container, cfg: dict):
+                            with container:
+                                ui.chart(cfg).classes("w-full")
+
+                        async def _render_charts():
+                            if not state["results"]:
+                                ui.notify("No tickets loaded.", type="warning")
+                                return
+                            btn_render_charts.set_enabled(False)
+                            chart_status.set_text("Building charts …")
+                            charts_area.clear()
+
+                            data = build_analytics_data(state["results"], state["scores"])
+
+                            with charts_area:
+                                # ── Row 1: Frequency over time ────────────────────────────
+                                if data["month_keys"]:
+                                    ui.chart({
+                                        "chart":  {"type": "bar", "height": 280},
+                                        "title":  {"text": "Ticket Volume Over Time"},
+                                        "series": [{"name": "Tickets", "data": data["month_values"]}],
+                                        "xaxis":  {"categories": data["month_keys"], "labels": {"rotate": -45}},
+                                        "colors": ["#1565C0"],
+                                    }).classes("w-full")
+                                else:
+                                    ui.label("No parseable dates for frequency chart.").classes("text-sm text-gray-400")
+
+                                # ── Row 2: Priority + Status side by side ─────────────────
+                                with ui.row().classes("w-full gap-4"):
+                                    with ui.card().classes("flex-1"):
+                                        ui.chart({
+                                            "chart":  {"type": "pie", "height": 280},
+                                            "title":  {"text": "Priority Distribution"},
+                                            "labels": data["priority_labels"],
+                                            "series": data["priority_values"],
+                                            "colors": ["#43A047","#FB8C00","#E53935","#8E24AA"],
+                                        }).classes("w-full")
+                                    with ui.card().classes("flex-1"):
+                                        ui.chart({
+                                            "chart":  {"type": "donut", "height": 280},
+                                            "title":  {"text": "Status Breakdown"},
+                                            "labels": data["status_labels"],
+                                            "series": data["status_values"],
+                                        }).classes("w-full")
+
+                                # ── Row 3: Comment distribution + Escalation rate ─────────
+                                with ui.row().classes("w-full gap-4"):
+                                    with ui.card().classes("flex-1"):
+                                        ui.chart({
+                                            "chart":  {"type": "bar", "height": 260},
+                                            "title":  {"text": "Comment Count Distribution"},
+                                            "series": [{"name": "Tickets", "data": data["comment_values"]}],
+                                            "xaxis":  {"categories": data["comment_labels"]},
+                                            "colors": ["#00ACC1"],
+                                        }).classes("w-full")
+                                    with ui.card().classes("flex-1"):
+                                        ui.chart({
+                                            "chart":  {"type": "donut", "height": 260},
+                                            "title":  {"text": "Escalation Rate"},
+                                            "labels": data["esc_labels"],
+                                            "series": data["esc_values"],
+                                            "colors": ["#E53935","#43A047"],
+                                        }).classes("w-full")
+
+                                # ── Scored metrics (only if scores available) ─────────────
+                                if state["scores"]:
+                                    ui.label("— Scored Metrics —").classes("text-sm font-semibold text-gray-500 text-center w-full")
+
+                                    # Row 4: Stars + Temperature
+                                    with ui.row().classes("w-full gap-4"):
+                                        with ui.card().classes("flex-1"):
+                                            ui.chart({
+                                                "chart":  {"type": "bar", "height": 260},
+                                                "title":  {"text": "Experience Stars Distribution"},
+                                                "series": [{"name": "Tickets", "data": data["stars_values"]}],
+                                                "xaxis":  {"categories": ["★1","★2","★3","★4","★5"]},
+                                                "colors": ["#FDD835"],
+                                            }).classes("w-full")
+                                        with ui.card().classes("flex-1"):
+                                            ui.chart({
+                                                "chart":  {"type": "donut", "height": 260},
+                                                "title":  {"text": "Temperature Distribution"},
+                                                "labels": data["temp_labels"],
+                                                "series": data["temp_values"],
+                                                "colors": ["#42A5F5","#FFA726","#EF5350"],
+                                            }).classes("w-full")
+
+                                    # Row 5: Complexity + Dimension averages
+                                    with ui.row().classes("w-full gap-4"):
+                                        with ui.card().classes("flex-1"):
+                                            ui.chart({
+                                                "chart":  {"type": "bar", "height": 260},
+                                                "title":  {"text": "Complexity Score Distribution"},
+                                                "series": [{"name": "Tickets", "data": data["complexity_values"]}],
+                                                "xaxis":  {"categories": ["1","2","3","4","5"]},
+                                                "colors": ["#8E24AA"],
+                                            }).classes("w-full")
+                                        with ui.card().classes("flex-1"):
+                                            ui.chart({
+                                                "chart":  {"type": "bar", "height": 260, "horizontal": True},
+                                                "title":  {"text": "Avg Dimension Scores (1-5)"},
+                                                "series": [{"name": "Avg Score", "data": data["dim_avg"]}],
+                                                "xaxis":  {"categories": data["dim_categories"]},
+                                                "yaxis":  {"max": 5},
+                                                "colors": ["#26A69A"],
+                                            }).classes("w-full")
+
+                            chart_status.set_text(
+                                f"{len(state['results'])} tickets · "
+                                f"{len(state['scores'])} scored · charts updated."
+                            )
+                            btn_render_charts.set_enabled(True)
+
+                        btn_render_charts = ui.button(
+                            "Generate Charts", on_click=_render_charts, icon="bar_chart"
+                        ).props("color=teal").classes("mt-2")
+                        btn_render_charts.set_enabled(False)
 
 
 # ─────────────────────────── Couchbase connection helper ─────────────────────
