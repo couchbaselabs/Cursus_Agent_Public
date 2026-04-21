@@ -2298,6 +2298,7 @@ def main_page():
             tab_results = ui.tab("Results",            icon="table_view")
             tab_chat    = ui.tab("Chat",               icon="chat")
             tab_scoring = ui.tab("Scoring & Analysis", icon="analytics")
+            tab_cluster = ui.tab("Cluster Health",     icon="monitor_heart")
         with ui.tab_panels(main_tabs, value=tab_config).classes("w-full pt-4"):
 
             with ui.tab_panel(tab_scrape):
@@ -6823,6 +6824,660 @@ def main_page():
                             )
                             btn_cluster_report.set_enabled(True)
 
+            # ══════════════════════════════════════════════════════════════════
+            # Cluster Health tab
+            # ══════════════════════════════════════════════════════════════════
+            with ui.tab_panel(tab_cluster):
+                ch_snap_state: dict = {"snapshots": [], "cluster_index": {}, "health_data": {}}
+
+                with ui.column().classes("w-full gap-0"):
+                    # ── Sub-tab bar ──────────────────────────────────────────
+                    with ui.tabs().classes("w-full bg-white border-b border-gray-200") as ch_tabs:
+                        ch_overview = ui.tab("Overview",      icon="dashboard")
+                        ch_timeline = ui.tab("Timeline",      icon="timeline")
+                        ch_issues   = ui.tab("Issue Tracker", icon="warning_amber")
+                        ch_drift    = ui.tab("Config Drift",  icon="compare")
+                        ch_llm      = ui.tab("LLM Report",    icon="psychology")
+                with ui.tab_panels(ch_tabs, value=ch_overview).classes("w-full"):
+
+                    # ── Overview ─────────────────────────────────────────────
+                    with ui.tab_panel(ch_overview):
+                        with ui.column().classes("w-full gap-4 p-4"):
+
+                            # Controls row
+                            with ui.card().classes("w-full"):
+                                with ui.row().classes("w-full items-end gap-3 flex-wrap"):
+                                    ch_cust_input = ui.input(
+                                        label="Customer name or URL",
+                                        placeholder="e.g. Convera or https://supportal…/customer/convera",
+                                    ).classes("flex-1 min-w-64")
+                                    ch_max_pages = ui.number(
+                                        label="Max listing pages (0=all)", value=0, min=0, step=1,
+                                    ).classes("w-36")
+                                    ch_workers = ui.number(
+                                        label="Detail fetch workers", value=4, min=1, max=16, step=1,
+                                    ).classes("w-36")
+                                    ch_snap_coll = ui.input(
+                                        label="CB snapshot collection", value="snapshots",
+                                    ).classes("w-40")
+                                with ui.row().classes("gap-3 flex-wrap mt-2"):
+                                    btn_ch_scrape = ui.button(
+                                        "Scrape Snapshots", icon="download",
+                                        on_click=lambda: asyncio.ensure_future(_ch_scrape(ui.context.client)),
+                                    ).props("color=teal")
+                                    btn_ch_load_cb = ui.button(
+                                        "Load from Couchbase", icon="storage",
+                                        on_click=lambda: asyncio.ensure_future(_ch_load_cb()),
+                                    ).props("color=blue-grey outline")
+                                    btn_ch_save_cb = ui.button(
+                                        "Save to Couchbase", icon="save",
+                                        on_click=lambda: asyncio.ensure_future(_ch_save_cb()),
+                                    ).props("color=indigo outline")
+                                    btn_ch_save_cb.set_enabled(False)
+                                ch_status = ui.label("Ready.").classes("text-sm text-gray-500 mt-1")
+                                ch_progress = ui.linear_progress(value=0).classes("w-full mt-1")
+                                ch_progress.set_visibility(False)
+
+                            # Stat cards row
+                            with ui.row().classes("w-full gap-4 flex-wrap"):
+                                with ui.card().classes("px-6 py-3 text-center flex-1 min-w-32"):
+                                    ch_stat_snaps = ui.label("—").classes("text-3xl font-bold text-teal-600")
+                                    ui.label("Snapshots").classes("text-xs text-gray-500")
+                                with ui.card().classes("px-6 py-3 text-center flex-1 min-w-32"):
+                                    ch_stat_clusters = ui.label("—").classes("text-3xl font-bold text-blue-600")
+                                    ui.label("Clusters").classes("text-xs text-gray-500")
+                                with ui.card().classes("px-6 py-3 text-center flex-1 min-w-32"):
+                                    ch_stat_active = ui.label("—").classes("text-3xl font-bold text-green-600")
+                                    ui.label("Active (≤90d)").classes("text-xs text-gray-500")
+                                with ui.card().classes("px-6 py-3 text-center flex-1 min-w-32"):
+                                    ch_stat_retired = ui.label("—").classes("text-3xl font-bold text-gray-400")
+                                    ui.label("Retired (>90d)").classes("text-xs text-gray-500")
+                                with ui.card().classes("px-6 py-3 text-center flex-1 min-w-32"):
+                                    ch_stat_bad = ui.label("—").classes("text-3xl font-bold text-red-600")
+                                    ui.label("Total Bad Issues").classes("text-xs text-gray-500")
+                                with ui.card().classes("px-6 py-3 text-center flex-1 min-w-32"):
+                                    ch_stat_warn = ui.label("—").classes("text-3xl font-bold text-orange-500")
+                                    ui.label("Total Warn Issues").classes("text-xs text-gray-500")
+
+                            # Cluster table
+                            with ui.card().classes("w-full"):
+                                ui.label("Cluster Summary").classes("text-sm font-semibold text-gray-600 mb-2")
+                                ch_cluster_table = ui.table(
+                                    columns=[
+                                        {"name": "cluster_name",  "label": "Cluster Name",      "field": "cluster_name",  "align": "left"},
+                                        {"name": "cluster_id",    "label": "Cluster ID (short)", "field": "cluster_id",    "align": "left"},
+                                        {"name": "snapshots",     "label": "Snapshots",          "field": "snapshots",     "align": "right"},
+                                        {"name": "first_seen",    "label": "First Seen",         "field": "first_seen",    "align": "left"},
+                                        {"name": "last_seen",     "label": "Last Seen",          "field": "last_seen",     "align": "left"},
+                                        {"name": "nodes",         "label": "Nodes (min/max)",    "field": "nodes",         "align": "center"},
+                                        {"name": "versions",      "label": "Versions",           "field": "versions",      "align": "left"},
+                                        {"name": "avg_bad",       "label": "Avg Bad",            "field": "avg_bad",       "align": "right"},
+                                        {"name": "avg_warn",      "label": "Avg Warn",           "field": "avg_warn",      "align": "right"},
+                                        {"name": "status",        "label": "Status",             "field": "status",        "align": "center"},
+                                    ],
+                                    rows=[],
+                                    row_key="cluster_id",
+                                ).classes("w-full text-xs").props("dense flat")
+
+                    # ── Timeline ──────────────────────────────────────────────
+                    with ui.tab_panel(ch_timeline):
+                        with ui.column().classes("w-full gap-4 p-4"):
+                            with ui.card().classes("w-full"):
+                                with ui.row().classes("items-center gap-4"):
+                                    ch_tl_cluster_select = ui.select(
+                                        [], label="Select cluster",
+                                    ).classes("flex-1 min-w-64")
+                                    btn_ch_render_tl = ui.button(
+                                        "Render Timeline", icon="timeline",
+                                        on_click=lambda: asyncio.ensure_future(
+                                            _ch_render_timeline(ui.context.client)
+                                        ),
+                                    ).props("color=teal")
+                                    btn_ch_render_tl.set_enabled(False)
+                                ch_tl_status = ui.label("Load snapshots in Overview first.").classes("text-sm text-gray-400")
+
+                            ch_tl_area = ui.column().classes("w-full gap-4")
+
+                    # ── Issue Tracker ──────────────────────────────────────────
+                    with ui.tab_panel(ch_issues):
+                        with ui.column().classes("w-full gap-4 p-4"):
+                            with ui.card().classes("w-full"):
+                                with ui.row().classes("items-center gap-4"):
+                                    ch_iss_cluster_select = ui.select(
+                                        [], label="Cluster (blank = all)",
+                                    ).classes("flex-1 min-w-64")
+                                    btn_ch_render_iss = ui.button(
+                                        "Render Issue Charts", icon="warning_amber",
+                                        on_click=lambda: asyncio.ensure_future(
+                                            _ch_render_issues(ui.context.client)
+                                        ),
+                                    ).props("color=orange")
+                                    btn_ch_render_iss.set_enabled(False)
+                                ch_iss_status = ui.label("Load snapshots in Overview first.").classes("text-sm text-gray-400")
+                            ch_iss_area = ui.column().classes("w-full gap-4")
+
+                    # ── Config Drift ───────────────────────────────────────────
+                    with ui.tab_panel(ch_drift):
+                        with ui.column().classes("w-full gap-4 p-4"):
+                            with ui.card().classes("w-full"):
+                                ui.label("Config Drift").classes("text-base font-semibold")
+                                with ui.row().classes("items-end gap-4 flex-wrap mt-2"):
+                                    ch_drift_cluster = ui.select(
+                                        [], label="Cluster",
+                                    ).classes("flex-1 min-w-48")
+                                    ch_drift_snap_a = ui.select(
+                                        [], label="Snapshot A (earlier)",
+                                    ).classes("flex-1 min-w-48")
+                                    ch_drift_snap_b = ui.select(
+                                        [], label="Snapshot B (later)",
+                                    ).classes("flex-1 min-w-48")
+                                    btn_ch_diff = ui.button(
+                                        "Compare", icon="compare",
+                                        on_click=lambda: _ch_show_diff(),
+                                    ).props("color=indigo")
+                                    btn_ch_diff.set_enabled(False)
+                            ch_drift_out = ui.column().classes("w-full gap-2 p-2")
+
+                    # ── LLM Report ─────────────────────────────────────────────
+                    with ui.tab_panel(ch_llm):
+                        with ui.column().classes("w-full gap-4 p-4"):
+                            with ui.card().classes("w-full"):
+                                ui.label("LLM Cluster Health Report").classes("text-base font-semibold")
+                                ui.label(
+                                    "Generates a structured health narrative per cluster using the "
+                                    "configured AI model. Includes upgrade detection, lifecycle "
+                                    "assessment, and correlation with ticket history."
+                                ).classes("text-xs text-gray-500 mt-1")
+                                with ui.row().classes("items-end gap-4 flex-wrap mt-3"):
+                                    ch_llm_cluster = ui.select(
+                                        [], label="Cluster (blank = all)",
+                                    ).classes("flex-1 min-w-48")
+                                    btn_ch_llm = ui.button(
+                                        "Generate Report", icon="psychology",
+                                        on_click=lambda: asyncio.ensure_future(_ch_llm_report()),
+                                    ).props("color=deep-purple")
+                                    btn_ch_llm.set_enabled(False)
+                            ch_llm_status = ui.label("").classes("text-sm text-gray-500 px-4")
+                            ch_llm_out = ui.markdown("").classes("w-full px-4 text-sm")
+
+                # ── Cluster Health async handlers ─────────────────────────────
+
+                def _ch_update_stats():
+                    hd = ch_snap_state.get("health_data") or {}
+                    ci = ch_snap_state.get("cluster_index") or {}
+                    ch_stat_snaps.set_text(str(hd.get("total_snapshots", 0)))
+                    ch_stat_clusters.set_text(str(hd.get("total_clusters", 0)))
+                    ch_stat_active.set_text(str(hd.get("active_clusters", 0)))
+                    ch_stat_retired.set_text(str(hd.get("retired_clusters", 0)))
+                    total_bad  = sum(c.get("total_bad",  0) for c in ci.values())
+                    total_warn = sum(c.get("total_warn", 0) for c in ci.values())
+                    ch_stat_bad.set_text(str(total_bad))
+                    ch_stat_warn.set_text(str(total_warn))
+
+                def _ch_update_cluster_table():
+                    ci = ch_snap_state.get("cluster_index") or {}
+                    rows = []
+                    for cid, c in sorted(
+                        ci.items(),
+                        key=lambda kv: kv[1].get("last_seen") or "",
+                        reverse=True,
+                    ):
+                        nmin = c.get("node_count_min")
+                        nmax = c.get("node_count_max")
+                        nodes_str = (
+                            f"{nmin}/{nmax}" if nmin is not None and nmax is not None
+                            else "—"
+                        )
+                        rows.append({
+                            "cluster_id":   cid[:16] + "…" if len(cid) > 16 else cid,
+                            "cluster_name": c.get("cluster_name") or "—",
+                            "snapshots":    c.get("snapshot_count", 0),
+                            "first_seen":   (c.get("first_seen") or "")[:10],
+                            "last_seen":    (c.get("last_seen") or "")[:10],
+                            "nodes":        nodes_str,
+                            "versions":     ", ".join(c.get("version_history") or [])[:30],
+                            "avg_bad":      c.get("avg_bad", 0),
+                            "avg_warn":     c.get("avg_warn", 0),
+                            "status":       "Active" if c.get("is_active") else "Retired",
+                        })
+                    ch_cluster_table.rows = rows
+                    ch_cluster_table.update()
+
+                def _ch_populate_selectors():
+                    ci = ch_snap_state.get("cluster_index") or {}
+                    options = {
+                        cid: f"{c.get('cluster_name') or cid[:16]} ({c.get('snapshot_count',0)} snaps)"
+                        for cid, c in ci.items()
+                    }
+                    opts_with_blank = {"": "— all —", **options}
+                    ch_tl_cluster_select.set_options(options)
+                    ch_iss_cluster_select.set_options(opts_with_blank)
+                    ch_drift_cluster.set_options(options)
+                    ch_llm_cluster.set_options(opts_with_blank)
+                    btn_ch_render_tl.set_enabled(bool(options))
+                    btn_ch_render_iss.set_enabled(True)
+                    btn_ch_llm.set_enabled(True)
+                    btn_ch_diff.set_enabled(bool(options))
+
+                def _ch_refresh_drift_snaps(cid: str):
+                    """Populate Snapshot A/B selectors when a cluster is chosen in Config Drift."""
+                    by_cluster = ch_snap_state.get("health_data", {}).get("by_cluster", {})
+                    snaps = by_cluster.get(cid, [])
+                    opts = {s["snap_id"]: f"{s['date'][:10] if s['date'] else '?'} — {s['snap_id'][:12]}"
+                            for s in snaps}
+                    ch_drift_snap_a.set_options(opts)
+                    ch_drift_snap_b.set_options(opts)
+
+                ch_drift_cluster.on("update:model-value", lambda e: _ch_refresh_drift_snaps(e.value))
+
+                async def _ch_scrape(client=None):
+                    customer = (ch_cust_input.value or main_cust_input.value or "").strip()
+                    if not customer:
+                        ui.notify("Enter a customer name or URL.", type="warning")
+                        return
+                    btn_ch_scrape.set_enabled(False)
+                    ch_progress.set_visibility(True)
+                    ch_progress.set_value(0)
+                    loop = asyncio.get_event_loop()
+
+                    def _prog(msg: str, pct: float):
+                        asyncio.run_coroutine_threadsafe(
+                            _ch_prog_upd(msg, pct), loop
+                        )
+
+                    async def _ch_prog_upd(msg: str, pct: float):
+                        ch_status.set_text(msg)
+                        ch_progress.set_value(pct)
+
+                    try:
+                        max_p = int(ch_max_pages.value or 0)
+                        workers = int(ch_workers.value or 4)
+                        skip = {s["snap_id"] for s in ch_snap_state["snapshots"]}
+                        new_snaps = await run.io_bound(
+                            scrape_snapshots_for_customer,
+                            customer,
+                            cookie_input.value or None,
+                            max_p,
+                            workers,
+                            _prog,
+                            skip,
+                        )
+                        ch_snap_state["snapshots"] = ch_snap_state["snapshots"] + new_snaps
+                        tickets = state.get("results") or []
+                        ch_snap_state["health_data"] = build_cluster_health_data(
+                            ch_snap_state["snapshots"], tickets
+                        )
+                        ch_snap_state["cluster_index"] = ch_snap_state["health_data"]["cluster_index"]
+                        _ch_update_stats()
+                        _ch_update_cluster_table()
+                        _ch_populate_selectors()
+                        btn_ch_save_cb.set_enabled(bool(new_snaps) and _CB_AVAILABLE)
+                        ch_status.set_text(
+                            f"Scraped {len(new_snaps)} new snapshots "
+                            f"({len(ch_snap_state['snapshots'])} total)."
+                        )
+                        ui.notify(f"Scraped {len(new_snaps)} new snapshots.", type="positive")
+                    except Exception as exc:
+                        ch_status.set_text(f"Scrape error: {exc}")
+                        ui.notify(str(exc), type="negative")
+                    finally:
+                        btn_ch_scrape.set_enabled(True)
+                        ch_progress.set_visibility(False)
+
+                async def _ch_load_cb():
+                    if not _CB_AVAILABLE:
+                        ui.notify("Couchbase SDK not available.", type="warning")
+                        return
+                    ch_status.set_text("Loading snapshots from Couchbase…")
+                    btn_ch_load_cb.set_enabled(False)
+                    try:
+                        customer_f = (ch_cust_input.value or main_cust_input.value or "").strip()
+
+                        def _prog(msg, pct):
+                            pass
+
+                        snaps = await run.io_bound(
+                            load_snapshots_from_couchbase,
+                            cb_url_input.value.strip(),
+                            cb_bucket_input.value.strip(),
+                            cb_user_input.value.strip(),
+                            cb_pass_input.value,
+                            cb_tls_toggle.value,
+                            cb_scope_input.value.strip() or "_default",
+                            ch_snap_coll.value.strip() or "snapshots",
+                            customer_f,
+                            _prog,
+                        )
+                        ch_snap_state["snapshots"] = snaps
+                        tickets = state.get("results") or []
+                        ch_snap_state["health_data"] = build_cluster_health_data(snaps, tickets)
+                        ch_snap_state["cluster_index"] = ch_snap_state["health_data"]["cluster_index"]
+                        _ch_update_stats()
+                        _ch_update_cluster_table()
+                        _ch_populate_selectors()
+                        ch_status.set_text(f"Loaded {len(snaps)} snapshots from Couchbase.")
+                        ui.notify(f"Loaded {len(snaps)} snapshots.", type="positive")
+                    except Exception as exc:
+                        ch_status.set_text(f"CB load error: {exc}")
+                        ui.notify(str(exc), type="negative")
+                    finally:
+                        btn_ch_load_cb.set_enabled(True)
+
+                async def _ch_save_cb():
+                    if not _CB_AVAILABLE:
+                        ui.notify("Couchbase SDK not available.", type="warning")
+                        return
+                    snaps = ch_snap_state.get("snapshots") or []
+                    if not snaps:
+                        ui.notify("No snapshots to save.", type="warning")
+                        return
+                    ch_status.set_text(f"Saving {len(snaps)} snapshots to Couchbase…")
+                    btn_ch_save_cb.set_enabled(False)
+                    try:
+                        def _prog(msg, pct):
+                            pass
+
+                        upserted, errors = await run.io_bound(
+                            load_snapshots_to_couchbase,
+                            snaps,
+                            cb_url_input.value.strip(),
+                            cb_bucket_input.value.strip(),
+                            cb_user_input.value.strip(),
+                            cb_pass_input.value,
+                            cb_tls_toggle.value,
+                            cb_scope_input.value.strip() or "_default",
+                            ch_snap_coll.value.strip() or "snapshots",
+                            _prog,
+                        )
+                        ch_status.set_text(f"Saved {upserted} snapshots ({errors} errors).")
+                        ui.notify(f"Saved {upserted} snapshots.", type="positive")
+                    except Exception as exc:
+                        ch_status.set_text(f"Save error: {exc}")
+                        ui.notify(str(exc), type="negative")
+                    finally:
+                        btn_ch_save_cb.set_enabled(True)
+
+                async def _ch_render_timeline(client=None):
+                    cid = ch_tl_cluster_select.value or ""
+                    if not cid:
+                        ui.notify("Select a cluster first.", type="warning")
+                        return
+                    by_cluster = ch_snap_state.get("health_data", {}).get("by_cluster", {})
+                    series_data = by_cluster.get(cid, [])
+                    if not series_data:
+                        ch_tl_status.set_text("No timeline data for this cluster.")
+                        return
+
+                    ch_tl_status.set_text(f"Rendering {len(series_data)} snapshots…")
+                    ch_tl_area.clear()
+
+                    ci = ch_snap_state.get("cluster_index", {}).get(cid, {})
+                    cluster_label = ci.get("cluster_name") or cid[:16]
+                    dates    = [s["date"][:10] if s.get("date") else str(i) for i, s in enumerate(series_data)]
+                    bad_vals  = [s["bad_count"]  for s in series_data]
+                    warn_vals = [s["warn_count"] for s in series_data]
+                    node_vals = [s["node_count"] for s in series_data]
+
+                    _win_h = 768
+                    if client:
+                        try:
+                            _win_h = int(await client.run_javascript("window.innerHeight") or 768)
+                        except Exception:
+                            pass
+                    ch_h = max(300, int(_win_h * 0.36))
+
+                    with ch_tl_area:
+                        # Bad + Warn over time
+                        ui.highchart({
+                            "chart":  {"type": "line", "height": ch_h, "zoomType": "x"},
+                            "title":  {"text": f"Issue Count Over Time — {cluster_label}"},
+                            "subtitle": {"text": "Click and drag to zoom · bad=red, warn=orange"},
+                            "xAxis":  {"categories": dates, "labels": {"rotation": -45}},
+                            "yAxis":  {"title": {"text": "Issue Count"}, "allowDecimals": False, "min": 0},
+                            "colors": ["#E53935", "#FB8C00"],
+                            "series": [
+                                {"name": "Bad",  "data": bad_vals,  "color": "#E53935"},
+                                {"name": "Warn", "data": warn_vals, "color": "#FB8C00"},
+                            ],
+                        }).classes("w-full")
+
+                        # Node count over time
+                        if any(n > 0 for n in node_vals):
+                            ui.highchart({
+                                "chart":  {"type": "line", "height": max(240, int(_win_h * 0.25)), "zoomType": "x"},
+                                "title":  {"text": f"Node Count Over Time — {cluster_label}"},
+                                "subtitle": {"text": f"min={ci.get('node_count_min')} · max={ci.get('node_count_max')}"},
+                                "xAxis":  {"categories": dates, "labels": {"rotation": -45}},
+                                "yAxis":  {"title": {"text": "Nodes"}, "allowDecimals": False, "min": 0},
+                                "colors": ["#1E88E5"],
+                                "series": [{"name": "Nodes", "data": node_vals}],
+                            }).classes("w-full")
+
+                        # Version markers (show where version changed)
+                        version_changes = []
+                        last_ver = None
+                        for i, s in enumerate(series_data):
+                            ver = s.get("cb_version") or ""
+                            if ver and ver != last_ver:
+                                version_changes.append({"date": dates[i], "version": ver, "idx": i})
+                                last_ver = ver
+                        if len(version_changes) > 1:
+                            with ui.card().classes("w-full"):
+                                ui.label("Version History").classes("text-sm font-semibold text-gray-600 mb-1")
+                                with ui.row().classes("gap-4 flex-wrap"):
+                                    for vc in version_changes:
+                                        ui.label(f"{vc['date']}: {vc['version']}").classes(
+                                            "text-xs px-2 py-1 bg-blue-50 border border-blue-200 rounded"
+                                        )
+
+                    ch_tl_status.set_text(
+                        f"Timeline rendered: {len(series_data)} snapshots for {cluster_label}."
+                    )
+
+                async def _ch_render_issues(client=None):
+                    cid_filter = (ch_iss_cluster_select.value or "").strip()
+                    hd = ch_snap_state.get("health_data") or {}
+                    by_cluster = hd.get("by_cluster") or {}
+                    ci = ch_snap_state.get("cluster_index") or {}
+
+                    if cid_filter:
+                        clusters_to_show = {cid_filter: by_cluster.get(cid_filter, [])}
+                    else:
+                        clusters_to_show = by_cluster
+
+                    if not clusters_to_show:
+                        ui.notify("No snapshot data. Load snapshots in Overview first.", type="warning")
+                        return
+
+                    ch_iss_area.clear()
+                    ch_iss_status.set_text("Rendering issue charts…")
+
+                    _win_h = 768
+                    if client:
+                        try:
+                            _win_h = int(await client.run_javascript("window.innerHeight") or 768)
+                        except Exception:
+                            pass
+                    ch_h = max(300, int(_win_h * 0.36))
+
+                    with ch_iss_area:
+                        # Heatmap table: months × clusters
+                        heatmap = hd.get("heatmap") or {}
+                        months  = sorted(heatmap.keys())
+                        cids    = sorted(ci.keys()) if not cid_filter else [cid_filter]
+
+                        if months and cids:
+                            with ui.card().classes("w-full"):
+                                ui.label("Issue Heatmap (Bad + Warn per month × cluster)").classes(
+                                    "text-sm font-semibold text-gray-600 mb-2"
+                                )
+                                # Render as a simple table using NiceGUI ui.table
+                                hm_cols = [{"name": "month", "label": "Month", "field": "month", "align": "left"}]
+                                for cid2 in cids[:20]:  # cap at 20 clusters for readability
+                                    cname = ci.get(cid2, {}).get("cluster_name") or cid2[:12]
+                                    hm_cols.append({"name": cid2, "label": cname, "field": cid2, "align": "right"})
+                                hm_rows = []
+                                for month in months:
+                                    row = {"month": month}
+                                    for cid2 in cids[:20]:
+                                        row[cid2] = heatmap.get(month, {}).get(cid2, 0)
+                                    hm_rows.append(row)
+                                ui.table(columns=hm_cols, rows=hm_rows, row_key="month").classes(
+                                    "w-full text-xs"
+                                ).props("dense flat")
+
+                        # Per-cluster bad+warn aggregate bar chart (top 20)
+                        sorted_ci = sorted(
+                            ci.items(),
+                            key=lambda kv: kv[1].get("total_bad", 0) + kv[1].get("total_warn", 0),
+                            reverse=True,
+                        )
+                        top20 = sorted_ci[:20] if not cid_filter else [(cid_filter, ci.get(cid_filter, {}))]
+                        if top20:
+                            labels = [c.get("cluster_name") or cid2[:12] for cid2, c in top20]
+                            bad_data  = [c.get("total_bad",  0) for _, c in top20]
+                            warn_data = [c.get("total_warn", 0) for _, c in top20]
+                            ui.highchart({
+                                "chart":  {"type": "bar", "height": max(ch_h, len(top20) * 28 + 80), "zoomType": "y"},
+                                "title":  {"text": "Total Bad + Warn Issues by Cluster"},
+                                "xAxis":  {"categories": labels},
+                                "yAxis":  {"title": {"text": "Issue Count"}},
+                                "plotOptions": {"bar": {"grouping": True}},
+                                "colors": ["#E53935", "#FB8C00"],
+                                "series": [
+                                    {"name": "Bad",  "data": bad_data},
+                                    {"name": "Warn", "data": warn_data},
+                                ],
+                            }).classes("w-full")
+
+                    ch_iss_status.set_text(
+                        f"Issue charts rendered for "
+                        f"{'cluster ' + ci.get(cid_filter, {}).get('cluster_name', cid_filter[:12]) if cid_filter else 'all clusters'}."
+                    )
+
+                def _ch_show_diff():
+                    cid  = ch_drift_cluster.value or ""
+                    sid_a = ch_drift_snap_a.value or ""
+                    sid_b = ch_drift_snap_b.value or ""
+                    if not (cid and sid_a and sid_b):
+                        ui.notify("Select cluster and both snapshots.", type="warning")
+                        return
+                    if sid_a == sid_b:
+                        ui.notify("Select two different snapshots.", type="warning")
+                        return
+
+                    by_cluster = ch_snap_state.get("health_data", {}).get("by_cluster", {})
+                    snaps = {s["snap_id"]: s for s in by_cluster.get(cid, [])}
+
+                    # Also look in the flat list
+                    for s in ch_snap_state.get("snapshots", []):
+                        snaps.setdefault(s["snap_id"], s)
+
+                    def _topo(sid):
+                        s = snaps.get(sid, {})
+                        t = s.get("topology") or {}
+                        return {
+                            "cb_version":          t.get("cb_version") or s.get("cb_version") or "—",
+                            "total_nodes":         t.get("total_nodes") or s.get("node_count") or "—",
+                            "bucket_count":        t.get("bucket_count") or s.get("bucket_count") or "—",
+                            "bucket_names":        ", ".join(t.get("bucket_names") or s.get("bucket_names") or []) or "—",
+                            "ram_per_node_mib":    t.get("ram_per_node_mib") or s.get("ram_per_node_mib") or "—",
+                            "auto_failover_seconds": t.get("auto_failover_seconds") if t.get("auto_failover_seconds") is not None else (s.get("auto_failover_seconds") if s.get("auto_failover_seconds") is not None else "—"),
+                            "bad_count":           t.get("bad_count", 0) or s.get("bad_count", 0),
+                            "warn_count":          t.get("warn_count", 0) or s.get("warn_count", 0),
+                            "server_groups":       ", ".join(t.get("server_groups") or s.get("server_groups") or []) or "—",
+                        }
+
+                    topo_a = _topo(sid_a)
+                    topo_b = _topo(sid_b)
+                    fields = list(topo_a.keys())
+                    date_a = (snaps.get(sid_a) or {}).get("date", "?")[:10]
+                    date_b = (snaps.get(sid_b) or {}).get("date", "?")[:10]
+
+                    ch_drift_out.clear()
+                    with ch_drift_out:
+                        with ui.card().classes("w-full"):
+                            ui.label(
+                                f"Comparing {sid_a[:14]}… ({date_a})  vs  {sid_b[:14]}… ({date_b})"
+                            ).classes("text-sm font-semibold text-gray-600 mb-2")
+                            diff_cols = [
+                                {"name": "field",   "label": "Field",      "field": "field",   "align": "left"},
+                                {"name": "snap_a",  "label": f"A  {date_a}", "field": "snap_a", "align": "left"},
+                                {"name": "snap_b",  "label": f"B  {date_b}", "field": "snap_b", "align": "left"},
+                                {"name": "changed", "label": "Changed",    "field": "changed", "align": "center"},
+                            ]
+                            diff_rows = [
+                                {
+                                    "field":   f,
+                                    "snap_a":  str(topo_a[f]),
+                                    "snap_b":  str(topo_b[f]),
+                                    "changed": "✓" if str(topo_a[f]) != str(topo_b[f]) else "",
+                                }
+                                for f in fields
+                            ]
+                            ui.table(columns=diff_cols, rows=diff_rows, row_key="field").classes(
+                                "w-full text-xs"
+                            ).props("dense flat")
+
+                async def _ch_llm_report():
+                    cid_filter = (ch_llm_cluster.value or "").strip()
+                    ci = ch_snap_state.get("cluster_index") or {}
+                    if not ci:
+                        ui.notify("Load snapshots first.", type="warning")
+                        return
+
+                    btn_ch_llm.set_enabled(False)
+                    ch_llm_status.set_text("Generating report…")
+                    ch_llm_out.set_content("")
+
+                    # Build structured summary prompt
+                    if cid_filter and cid_filter in ci:
+                        clusters_to_report = {cid_filter: ci[cid_filter]}
+                    else:
+                        # Limit to top 10 by snapshot count to fit in context
+                        clusters_to_report = dict(
+                            sorted(ci.items(), key=lambda kv: kv[1].get("snapshot_count", 0), reverse=True)[:10]
+                        )
+
+                    lines = ["# Cluster Health Summary\n"]
+                    for cid2, c in clusters_to_report.items():
+                        lines.append(f"## Cluster: {c.get('cluster_name') or cid2[:16]}")
+                        lines.append(f"- Cluster ID: `{cid2}`")
+                        lines.append(f"- Organization: {c.get('organization') or '—'}")
+                        lines.append(f"- Snapshots: {c.get('snapshot_count', 0)}")
+                        lines.append(f"- First seen: {c.get('first_seen', '—')[:10]}")
+                        lines.append(f"- Last seen: {c.get('last_seen', '—')[:10]}")
+                        lines.append(f"- Status: {'Active' if c.get('is_active') else 'Retired'}")
+                        lines.append(f"- Nodes (min/max/last): {c.get('node_count_min')}/{c.get('node_count_max')}/{c.get('node_count_last')}")
+                        lines.append(f"- Version history: {', '.join(c.get('version_history') or [])}")
+                        lines.append(f"- Bucket names seen: {', '.join(c.get('bucket_names_seen') or [])}")
+                        lines.append(f"- Total bad issues: {c.get('total_bad', 0)}  |  avg per snapshot: {c.get('avg_bad', 0)}")
+                        lines.append(f"- Total warn issues: {c.get('total_warn', 0)}  |  avg per snapshot: {c.get('avg_warn', 0)}")
+                        lines.append("")
+
+                    system_prompt = (
+                        "You are a Couchbase support engineer analysing cluster health data. "
+                        "Given structured snapshot summaries, produce a concise health report per cluster. "
+                        "For each cluster include: overall health assessment, upgrade history and whether "
+                        "upgrades appear in-place or replaced by new cluster UUIDs, whether the cluster "
+                        "appears active or retired and why, issue trend (improving/worsening/stable), "
+                        "key configuration observations (node counts, bucket names, versions), "
+                        "and any recommended follow-up actions. "
+                        "Output as Markdown with one section per cluster."
+                    )
+                    user_msg = "\n".join(lines)
+
+                    # Use the configured LLM (reuse chat infrastructure)
+                    try:
+                        response = await _call_llm(system_prompt, user_msg)
+                        ch_llm_out.set_content(response)
+                        ch_llm_status.set_text("Report generated.")
+                    except Exception as exc:
+                        ch_llm_status.set_text(f"LLM error: {exc}")
+                        ui.notify(str(exc), type="negative")
+                    finally:
+                        btn_ch_llm.set_enabled(True)
+
     # ── Settings profile logic ───────────────────────────────────────────────
     def _tab_name(tab_val) -> str:
         """Extract the string label from a NiceGUI Tab object (or pass through if already a str)."""
@@ -9938,6 +10593,538 @@ def enrich_tickets_with_snapshots(
     return enriched, errors
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Snapshot listing scraper  (independent of ticket scrape)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SNAP_HREF_RE = re.compile(r"/snapshot/([0-9a-f]{32}::\d+)", re.IGNORECASE)
+
+
+def _find_snapshots_tab_url(html: str, current_url: str) -> Optional[str]:
+    """Find the Snapshots tab link on a customer page (same pattern as _find_tickets_tab_url)."""
+    soup = BeautifulSoup(html, "html.parser")
+    customer_base = current_url.rstrip("/")
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = a.get_text(strip=True).lower()
+        abs_href = href if href.startswith("http") else urllib.parse.urljoin(current_url, href)
+        if not abs_href.startswith(customer_base):
+            continue
+        if text == "snapshots" or re.search(r"/snapshots(?:/|\?|$|#)", abs_href, re.I):
+            return abs_href
+    return None
+
+
+def _extract_snapshot_rows(html: str) -> list[dict]:
+    """
+    Extract snapshot summary rows from a Supportal snapshot listing page.
+    Returns list of dicts with snap_id, url, date, cluster_name, cluster_id.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        m = _SNAP_HREF_RE.search(a["href"])
+        if not m:
+            continue
+        snap_id = m.group(1)
+        if snap_id in seen:
+            continue
+        seen.add(snap_id)
+        row: dict = {
+            "snap_id":      snap_id,
+            "url":          f"{BASE_URL}/snapshot/{snap_id}",
+            "date":         None,
+            "cluster_name": None,
+            "cluster_id":   snap_id.split("::")[0],
+        }
+        # Walk up to parent <tr> to read sibling cells
+        tr = a
+        for _ in range(6):
+            if tr is None or tr.name == "tr":
+                break
+            tr = tr.parent
+        if tr and tr.name == "tr":
+            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            for cell in cells:
+                if not cell:
+                    continue
+                if re.search(r"\d{4}[-/]\d{2}[-/]\d{2}", cell) and not row["date"]:
+                    row["date"] = cell
+                elif (
+                    not re.match(r"^[0-9a-f]{32}::\d+$", cell, re.I)
+                    and not cell.isdigit()
+                    and len(cell) > 2
+                    and cell.lower() not in ("open", "pending", "solved", "closed", "snapshots")
+                    and not row["cluster_name"]
+                ):
+                    row["cluster_name"] = cell
+        out.append(row)
+    return out
+
+
+def _scrape_snapshot_listing_playwright(
+    page,
+    customer_url: str,
+    max_pages: int,
+    progress_cb: Callable[[str, float], None],
+) -> list[dict]:
+    """
+    Navigate to the customer Snapshots tab and paginate through all pages.
+    Returns list of snapshot summary dicts.
+    """
+    import math as _math
+
+    def log(msg: str, pct: float):
+        print(f"[SNAP-LIST] {msg}")
+        progress_cb(msg, pct)
+
+    all_snaps: list[dict] = []
+    seen_ids: set[str] = set()
+
+    log(f"Loading customer page: {customer_url}", 0.01)
+    page.goto(customer_url, wait_until="domcontentloaded", timeout=30_000)
+    try:
+        page.wait_for_selector("ul.pagination, a[href*='/snapshot/']", timeout=20_000)
+    except Exception:
+        page.wait_for_timeout(4000)
+
+    html = page.content()
+    snaps_tab_url = _find_snapshots_tab_url(html, customer_url)
+
+    if snaps_tab_url and snaps_tab_url.rstrip("/") != page.url.rstrip("/"):
+        log(f"Navigating to Snapshots tab: {snaps_tab_url}", 0.02)
+        try:
+            page.goto(snaps_tab_url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception:
+            try:
+                page.locator("a[href*='snapshots']").first.click(timeout=5_000)
+                page.wait_for_timeout(3000)
+            except Exception:
+                pass
+    else:
+        try:
+            snap_link = page.locator("a").filter(has_text=re.compile(r"^snapshots$", re.I))
+            if snap_link.count() > 0:
+                snap_link.first.click(timeout=5_000)
+                page.wait_for_timeout(3000)
+                log("Clicked Snapshots tab", 0.025)
+        except Exception:
+            log("No dedicated Snapshots tab — scanning current page", 0.025)
+
+    try:
+        page.wait_for_selector("a[href*='/snapshot/']", timeout=20_000)
+    except Exception:
+        page.wait_for_timeout(3000)
+
+    # Dismiss intro.js overlays
+    try:
+        page.evaluate(
+            "document.querySelectorAll('.introjs-overlay,.introjs-helperLayer,"
+            ".introjs-tooltip,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())"
+        )
+    except Exception:
+        pass
+
+    def _collect() -> list[dict]:
+        return [r for r in _extract_snapshot_rows(page.content()) if r["snap_id"] not in seen_ids]
+
+    new_rows = _collect()
+    for r in new_rows:
+        all_snaps.append(r)
+        seen_ids.add(r["snap_id"])
+    log(f"Page 1: {len(new_rows)} snapshots", 0.06)
+
+    m_total = re.search(r"Showing\s+\d+\s+of\s+(\d+)\s+matching", page.content(), re.I)
+    total_snaps = int(m_total.group(1)) if m_total else None
+    per_page = max(len(new_rows), 1)
+    total_pages = _math.ceil(total_snaps / per_page) if total_snaps else 9999
+    if total_snaps:
+        log(f"Total: {total_snaps} snapshots → {total_pages} pages", 0.07)
+
+    page_num = 1
+    while page_num < total_pages:
+        if max_pages and page_num >= max_pages:
+            break
+        next_num = page_num + 1
+        pct = min(0.07 + 0.88 * (page_num / max(total_pages, 1)), 0.94)
+        btn = page.locator("ul.pagination li a").filter(
+            has_text=re.compile(rf"^\s*{next_num}\s*$")
+        )
+        if btn.count() == 0:
+            log(f"No button for page {next_num} — done at page {page_num}", 0.95)
+            break
+        log(f"Clicking page {next_num}…", pct)
+        try:
+            page.evaluate(
+                "document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],"
+                ".modal-backdrop').forEach(e=>e.remove())"
+            )
+            btn.first.scroll_into_view_if_needed()
+            try:
+                btn.first.click(timeout=10_000)
+            except Exception:
+                btn.first.click(force=True, timeout=10_000)
+            try:
+                page.wait_for_function(
+                    """(n) => {
+                        const active = document.querySelector('ul.pagination li.active a');
+                        return active && active.innerText.trim() === String(n);
+                    }""",
+                    arg=next_num,
+                    timeout=15_000,
+                )
+            except Exception:
+                page.wait_for_timeout(2000)
+            new_rows = _collect()
+            for r in new_rows:
+                all_snaps.append(r)
+                seen_ids.add(r["snap_id"])
+            log(f"Page {next_num}: +{len(new_rows)} → {len(all_snaps)} total", pct)
+            page_num = next_num
+            time.sleep(0.3)
+        except Exception as exc:
+            log(f"Page {next_num} error: {exc}", pct)
+            break
+
+    return all_snaps
+
+
+def scrape_snapshots_for_customer(
+    customer: str,
+    cookie: Optional[str],
+    max_listing_pages: int,
+    max_detail_workers: int,
+    progress_cb: Callable[[str, float], None],
+    skip_ids: Optional[set] = None,
+) -> list[dict]:
+    """
+    Full snapshot scrape for a customer:
+      1. Enumerate snapshot listing (paginated) → snap summaries
+      2. Fetch full topology for each new snapshot in parallel
+      3. Return list of snapshot dicts ready for storage
+    """
+    skip_ids = skip_ids or set()
+    customer = customer.strip().strip('"\'')
+    customer_url = (
+        customer if customer.startswith("http")
+        else f"{BASE_URL}/customer/{urllib.parse.quote(customer, safe='')}"
+    )
+
+    def log(msg: str, pct: float):
+        print(f"[SNAP] {msg}")
+        progress_cb(msg, pct)
+
+    # ── Phase 1: enumerate listing ─────────────────────────────────────────
+    log("Enumerating snapshot listing…", 0.0)
+    parsed_cookies = []
+    if cookie:
+        for part in cookie.split(";"):
+            part = part.strip()
+            if "=" in part:
+                name, _, value = part.partition("=")
+                parsed_cookies.append({"name": name.strip(), "value": value.strip(), "url": BASE_URL})
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
+        if parsed_cookies:
+            ctx.add_cookies(parsed_cookies)
+        page = ctx.new_page()
+        page.set_default_timeout(60_000)
+        try:
+            summaries = _scrape_snapshot_listing_playwright(
+                page, customer_url, max_listing_pages,
+                lambda m, p: log(m, p * 0.4),
+            )
+        finally:
+            ctx.close()
+            browser.close()
+
+    new_summaries = [s for s in summaries if s["snap_id"] not in skip_ids]
+    log(f"Listing: {len(summaries)} snapshots found, {len(new_summaries)} new", 0.40)
+    if not new_summaries:
+        log("No new snapshots to fetch.", 1.0)
+        return []
+
+    # ── Phase 2: fetch topology for each snapshot ──────────────────────────
+    results: list[dict] = []
+    total = len(new_summaries)
+    done_n = [0]
+    errors_n = [0]
+    lock = threading.Lock()
+
+    def _fetch_one(summary: dict) -> None:
+        snap_id = summary["snap_id"]
+        try:
+            topo = fetch_snapshot_topology(snap_id, cookie)
+            now_iso = (
+                datetime.datetime.now(datetime.timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            doc = {
+                "snap_id":           snap_id,
+                "cluster_id":        snap_id.split("::")[0],
+                "url":               summary["url"],
+                "date":              summary.get("date"),
+                "organization":      customer,
+                "cluster_name":      topo.get("cluster_name") or summary.get("cluster_name") or "",
+                "cluster_uuid":      topo.get("cluster_uuid") or "",
+                "capella_cluster_id": topo.get("capella_cluster_id") or "",
+                "topology":          topo,
+                "ticket_ids":        [],
+                "scraped_at":        now_iso,
+                # Flattened for fast CB querying / charting
+                "bad_count":         topo.get("bad_count", 0),
+                "warn_count":        topo.get("warn_count", 0),
+                "cb_version":        topo.get("cb_version") or "",
+                "node_count":        topo.get("total_nodes") or 0,
+                "bucket_names":      topo.get("bucket_names") or [],
+                "auto_failover_seconds": topo.get("auto_failover_seconds"),
+                "ram_per_node_mib":  topo.get("ram_per_node_mib"),
+                "bucket_count":      topo.get("bucket_count", 0),
+                "server_groups":     topo.get("server_groups") or [],
+            }
+            with lock:
+                done_n[0] += 1
+                results.append(doc)
+                pct = 0.40 + 0.58 * (done_n[0] / total)
+                log(f"[{done_n[0]}/{total}] {snap_id[:16]}… bad={doc['bad_count']} warn={doc['warn_count']}", pct)
+        except Exception as exc:
+            with lock:
+                done_n[0] += 1
+                errors_n[0] += 1
+                log(f"[{done_n[0]}/{total}] Error {snap_id[:16]}…: {exc}",
+                    0.40 + 0.58 * (done_n[0] / total))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_detail_workers) as pool:
+        list(pool.map(_fetch_one, new_summaries))
+
+    log(f"Done: {len(results)} snapshots fetched, {errors_n[0]} errors.", 1.0)
+    return results
+
+
+# ─────────────────── Snapshot Couchbase storage ───────────────────────────────
+
+def load_snapshots_to_couchbase(
+    snapshots: list[dict],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str,
+    progress_cb: Callable[[str, float], None],
+) -> tuple[int, int]:
+    """Upsert snapshot docs into a dedicated Couchbase collection (key: snapshot::{snap_id})."""
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=10))
+    col = cluster.bucket(bucket).scope(scope).collection(snap_collection)
+    upserted = errors = 0
+    total = len(snapshots)
+    try:
+        for i, snap in enumerate(snapshots):
+            key = f"snapshot::{snap['snap_id']}"
+            try:
+                col.upsert(key, snap)
+                upserted += 1
+            except Exception as exc:
+                errors += 1
+                print(f"[CB-SNAP] Upsert error {key}: {exc}")
+            progress_cb(f"Saved {i+1}/{total}", (i + 1) / total)
+    finally:
+        cluster.close()
+    return upserted, errors
+
+
+def load_snapshots_from_couchbase(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str,
+    customer_filter: str,
+    progress_cb: Callable[[str, float], None],
+) -> list[dict]:
+    """Load snapshot documents from Couchbase, optionally filtered by organization."""
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=10))
+    try:
+        filt = (customer_filter or "").strip().lower()
+        if filt:
+            q = (
+                f"SELECT s.* FROM `{bucket}`.`{scope}`.`{snap_collection}` AS s "
+                f"WHERE LOWER(s.organization) LIKE $1 ORDER BY s.date DESC"
+            )
+            result = cluster.query(q, QueryOptions(positional_parameters=[f"%{filt}%"]))
+        else:
+            q = (
+                f"SELECT s.* FROM `{bucket}`.`{scope}`.`{snap_collection}` AS s "
+                f"ORDER BY s.date DESC"
+            )
+            result = cluster.query(q)
+        rows = list(result)
+        progress_cb(f"Loaded {len(rows)} snapshots", 1.0)
+        return rows
+    except CouchbaseException:
+        return []
+    finally:
+        cluster.close()
+
+
+# ─────────────────── Cluster index + health analytics ────────────────────────
+
+def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
+    """
+    Derive a per-cluster summary from a flat list of snapshot dicts.
+    Snapshots should be sorted by date descending so node_count_last is the
+    most recent value.
+    """
+    index: dict[str, dict] = {}
+    for snap in snapshots:
+        cid = snap.get("cluster_id") or ""
+        if not cid:
+            continue
+        if cid not in index:
+            index[cid] = {
+                "cluster_id":        cid,
+                "cluster_uuid":      snap.get("cluster_uuid") or "",
+                "capella_cluster_id": snap.get("capella_cluster_id") or "",
+                "organization":      snap.get("organization") or "",
+                "cluster_names":     [],
+                "snapshot_ids":      [],
+                "ticket_ids":        [],
+                "dates":             [],
+                "node_count_min":    None,
+                "node_count_max":    None,
+                "node_count_last":   None,
+                "version_history":   [],
+                "bucket_names_seen": set(),
+                "bad_counts":        [],
+                "warn_counts":       [],
+            }
+        ci = index[cid]
+
+        name = (snap.get("cluster_name") or "").strip()
+        if name and name not in ci["cluster_names"]:
+            ci["cluster_names"].append(name)
+
+        ci["snapshot_ids"].append(snap["snap_id"])
+        for tid in snap.get("ticket_ids") or []:
+            if tid not in ci["ticket_ids"]:
+                ci["ticket_ids"].append(tid)
+
+        if snap.get("date"):
+            ci["dates"].append(snap["date"])
+
+        nc = snap.get("node_count") or 0
+        if nc > 0:
+            ci["node_count_min"] = min(ci["node_count_min"] or nc, nc)
+            ci["node_count_max"] = max(ci["node_count_max"] or nc, nc)
+            if ci["node_count_last"] is None:   # first (=newest) wins when sorted desc
+                ci["node_count_last"] = nc
+
+        ver = (snap.get("cb_version") or "").strip()
+        if ver and ver not in ci["version_history"]:
+            ci["version_history"].append(ver)
+
+        for bn in snap.get("bucket_names") or []:
+            ci["bucket_names_seen"].add(bn)
+
+        ci["bad_counts"].append(snap.get("bad_count", 0))
+        ci["warn_counts"].append(snap.get("warn_count", 0))
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cutoff  = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=90)).isoformat()
+    for ci in index.values():
+        ci["bucket_names_seen"] = sorted(ci["bucket_names_seen"])
+        ci["cluster_name"]      = ci["cluster_names"][-1] if ci["cluster_names"] else ""
+        ci["first_seen"]        = min(ci["dates"]) if ci["dates"] else None
+        ci["last_seen"]         = max(ci["dates"]) if ci["dates"] else None
+        ci["snapshot_count"]    = len(ci["snapshot_ids"])
+        ci["is_active"]         = bool(ci["last_seen"] and ci["last_seen"] >= cutoff)
+        bc = ci["bad_counts"]
+        wc = ci["warn_counts"]
+        ci["avg_bad"]  = round(sum(bc) / len(bc), 2) if bc else 0
+        ci["avg_warn"] = round(sum(wc) / len(wc), 2) if wc else 0
+        ci["total_bad"]  = sum(bc)
+        ci["total_warn"] = sum(wc)
+    return index
+
+
+def build_cluster_health_data(snapshots: list[dict], tickets: list[dict]) -> dict:
+    """
+    Assemble all analytics needed for the Cluster Health tab.
+    Snapshots are expected newest-first (as returned by CB query).
+    """
+    # Sort ascending for timeline charts
+    snaps_asc = sorted(snapshots, key=lambda s: s.get("date") or "")
+
+    cluster_index = build_cluster_index(snapshots)   # uses desc order for last-seen
+
+    # Per-cluster timeline series
+    by_cluster: dict[str, list[dict]] = {}
+    for snap in snaps_asc:
+        cid = snap.get("cluster_id") or "unknown"
+        by_cluster.setdefault(cid, []).append({
+            "date":       snap.get("date") or "",
+            "bad_count":  snap.get("bad_count", 0),
+            "warn_count": snap.get("warn_count", 0),
+            "node_count": snap.get("node_count", 0),
+            "cb_version": snap.get("cb_version") or "",
+            "snap_id":    snap["snap_id"],
+        })
+
+    # Issue heatmap: month × cluster → total issues
+    heatmap: dict[str, dict[str, int]] = {}
+    for snap in snaps_asc:
+        month = (snap.get("date") or "")[:7] or "unknown"
+        cid   = snap.get("cluster_id") or "unknown"
+        heatmap.setdefault(month, {})[cid] = (
+            heatmap[month].get(cid, 0)
+            + snap.get("bad_count", 0)
+            + snap.get("warn_count", 0)
+        )
+
+    # Ticket → cluster correlation via snapshot topology
+    ticket_by_cid: dict[str, list[dict]] = {}
+    for t in tickets:
+        topo = t.get("snapshot_topology") or {}
+        if isinstance(topo, str):
+            try:
+                topo = json.loads(topo)
+            except Exception:
+                topo = {}
+        snap_info = extract_cluster_snapshot_info(t)
+        for raw_cid in snap_info.get("cluster_ids") or []:
+            short = raw_cid.split("::")[0].replace("-", "")
+            ticket_by_cid.setdefault(short, []).append(t)
+
+    active  = sum(1 for c in cluster_index.values() if c.get("is_active"))
+    retired = len(cluster_index) - active
+
+    return {
+        "cluster_index":   cluster_index,
+        "by_cluster":      by_cluster,
+        "heatmap":         heatmap,
+        "ticket_by_cid":   ticket_by_cid,
+        "total_snapshots": len(snapshots),
+        "total_clusters":  len(cluster_index),
+        "active_clusters": active,
+        "retired_clusters": retired,
+        "all_months":      sorted(heatmap.keys()),
+        "all_cluster_ids": sorted(cluster_index.keys()),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 _AUTO_MSG_PREFIX = "this is an automated message"
 
 _PROACTIVE_SUBJECT_PREFIX = "proactive ticket:"
