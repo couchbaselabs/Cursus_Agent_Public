@@ -55,8 +55,8 @@ Timestamps are epoch seconds (`last_scraped_at`, etc.).
 
 ## Roadmap
 
-- [ ] Auto-persist toggle + `last_scraped_at` on all records
-- [ ] Decouple pipeline from UI → module-level orchestration functions
+- [x] Auto-persist toggle + `last_scraped_at` on all records
+- [x] Decouple pipeline from UI → `CbConfig` + `run_ticket_pipeline` / `run_snapshot_pipeline`
 - [ ] MCP tool server: `query_tickets`, `vector_search`, `fetch_fresh_data`, `generate_chart`, `render_pdf`
 - [ ] Fleet analysis: cross-customer snapshot queries, version distribution, CBSE trends
 - [ ] Chat agent: natural language → N1QL/vector query, PDF report generation
