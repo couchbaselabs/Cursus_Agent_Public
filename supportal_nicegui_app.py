@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.14"
+__version__ = "1.1.15"
 
 import asyncio
 import threading
@@ -11041,8 +11041,6 @@ def create_vector_index(
             "fields": [{"analyzer": "standard", "index": True, "name": name, "store": True, "type": "text"}],
         }
 
-    type_key  = f"{scope}.{collection}"
-
     index_def = {
         "type":       "fulltext-index",
         "name":       f"{bucket}.{scope}.{index_name}",
@@ -11052,10 +11050,13 @@ def create_vector_index(
         "sourceParams": {},
         "planParams": {"maxPartitionsPerPIndex": 512, "indexPartitions": 1},
         "params": {
+            # docid_prefix mode: document key prefix before "::" is the type.
+            # ticket::41130  →  type "ticket"
+            # No field stamping needed — key format already discriminates.
             "doc_config": {
-                "docid_prefix_delim": "",
+                "docid_prefix_delim": "::",
                 "docid_regexp":       "",
-                "mode":               "scope.collection.type_field",
+                "mode":               "docid_prefix",
                 "type_field":         "type",
             },
             "mapping": {
@@ -11071,7 +11072,7 @@ def create_vector_index(
                 "scoring_model":           "bm25",
                 "type_field":              "_type",
                 "types": {
-                    type_key: {
+                    "ticket": {
                         "dynamic": False,
                         "enabled": True,
                         "properties": {
@@ -11110,21 +11111,6 @@ def create_vector_index(
         timeout=30,
     )
     resp.raise_for_status()
-
-    # Stamp type = "{scope}.{collection}" on every ticket doc so the FTS index
-    # can match them against the typed mapping.  Safe to run repeatedly.
-    if _CB_AVAILABLE:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=15))
-        try:
-            ks = f"`{bucket}`.`{scope}`.`{collection}`"
-            cluster.query(
-                f"UPDATE {ks} SET `type` = $1 WHERE ticket_id IS NOT MISSING",
-                QueryOptions(positional_parameters=[f"{scope}.{collection}"]),
-            ).execute()
-        finally:
-            cluster.close()
 
 
 def vector_search_cb(
