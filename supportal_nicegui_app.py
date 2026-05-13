@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.20"
+__version__ = "1.1.21"
 
 import asyncio
 import threading
@@ -11041,10 +11041,10 @@ def create_vector_index(
             "fields": [{"analyzer": "standard", "index": True, "name": name, "store": True, "type": "text"}],
         }
 
-    # Exact structure per CB 7.6 docs — scope.collection.type_field mode.
-    # type key must be "scope.collection"; documents need type="scope.collection"
-    # stamped on them (done after PUT below).
-    type_key = f"{scope}.{collection}"
+    # scope.collection.type_field mode: CB compares the document's `type` field
+    # value against the keys in `types`.  Using "ticket" is cleaner than
+    # "scope.collection" and avoids indexing non-ticket docs in the collection.
+    type_key = "ticket"
     index_def = {
         "type":       "fulltext-index",
         "name":       f"{bucket}.{scope}.{index_name}",
