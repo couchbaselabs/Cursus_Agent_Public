@@ -133,6 +133,22 @@ try:
 except ImportError:
     _CAIROSVG_AVAILABLE = False
 
+import dataclasses
+
+
+@dataclasses.dataclass
+class CbConfig:
+    """Couchbase connection parameters — pass as a unit to pipeline functions."""
+    url: str
+    bucket: str
+    username: str
+    password: str
+    use_tls: bool = False
+    scope: str = "_default"
+    ticket_collection: str = "tickets"
+    snap_collection: str = "snapshots"
+
+
 def fetch_ollama_models(base_url: str) -> list[str]:
     """Fetch available model names from a running Ollama instance."""
     try:
@@ -3237,7 +3253,9 @@ def main_page():
                                                 if _enrich_snap_col is not None:
                                                     def _snap_upsert_fn(doc, _col=_enrich_snap_col):
                                                         try:
-                                                            _col.upsert(f"snapshot::{doc['snap_id']}", doc)
+                                                            _d = doc.copy()
+                                                            _d["last_scraped_at"] = int(time.time())
+                                                            _col.upsert(f"snapshot::{doc['snap_id']}", _d)
                                                         except Exception:
                                                             pass
                                             enriched_n, enrich_errs = await run.io_bound(
@@ -3646,6 +3664,9 @@ def main_page():
                                 on_click=lambda: asyncio.ensure_future(_ch_save_cb()),
                             ).props("color=indigo outline")
                             btn_ch_save_cb.set_enabled(False)
+                            ch_auto_save_cb = ui.checkbox(
+                                "Auto-save to Couchbase after scrape", value=False,
+                            ).tooltip("Automatically persist scraped snapshots to Couchbase when the scrape completes")
                         ch_status = ui.label("Ready.").classes("text-sm text-gray-500 mt-1")
                         ch_progress = ui.linear_progress(value=0).classes("w-full mt-1")
                         ch_progress.set_visibility(False)
@@ -8557,6 +8578,28 @@ def main_page():
                                     pass
                             elif all_snaps and not ch_status.text.startswith("Scrape error"):
                                 ch_status.set_text(f"{len(all_snaps)} snapshots in memory (no new).")
+
+                            if new_snaps and ch_auto_save_cb.value and _CB_AVAILABLE and cb_url_input.value.strip():
+                                ch_status.set_text(f"Auto-saving {len(new_snaps)} snapshots to Couchbase…")
+                                try:
+                                    _saved, _errs = await run.io_bound(
+                                        load_snapshots_to_couchbase,
+                                        new_snaps,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        ch_snap_coll.value.strip() or "snapshots",
+                                        lambda msg, pct: None,
+                                    )
+                                    ch_status.set_text(
+                                        f"Saved {_saved} snapshots ({_errs} errors). {len(all_snaps)} total in memory."
+                                    )
+                                except Exception as _ae:
+                                    ch_status.set_text(f"Auto-save error: {_ae}")
+
                             btn_ch_scrape.set_enabled(True)
                             ch_progress.set_visibility(False)
 
@@ -8747,6 +8790,28 @@ def main_page():
                             )
                             with client:
                                 ui.notify(f"Scraped {len(scraped)} snapshots.", type="positive")
+
+                            if scraped and ch_auto_save_cb.value and _CB_AVAILABLE and cb_url_input.value.strip():
+                                ch_status.set_text(f"Auto-saving {len(scraped)} snapshots to Couchbase…")
+                                try:
+                                    _saved, _errs = await run.io_bound(
+                                        load_snapshots_to_couchbase,
+                                        scraped,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        ch_snap_coll.value.strip() or "snapshots",
+                                        lambda msg, pct: None,
+                                    )
+                                    ch_status.set_text(
+                                        f"Saved {_saved} snapshots ({_errs} errors). {len(all_snaps)} total in memory."
+                                    )
+                                except Exception as _ae:
+                                    ch_status.set_text(f"Auto-save error: {_ae}")
+
                             btn_ch_scrape_stubs.set_enabled(True)
                             ch_progress.set_visibility(False)
 
@@ -9231,7 +9296,7 @@ def main_page():
                           <q-td key="total_snapshots" :props="props" class="text-center">{{ props.row.total_snapshots }}</q-td>
                           <q-td key="total_tickets"   :props="props" class="text-center">{{ props.row.total_tickets }}</q-td>
                           <q-td key="last_scraped_at" :props="props">
-                            {{ props.row.last_scraped_at ? props.row.last_scraped_at.substring(0,16).replace('T',' ') : '—' }}
+                            {{ props.row.last_scraped_at ? (typeof props.row.last_scraped_at === 'number' ? new Date(props.row.last_scraped_at * 1000) : new Date(props.row.last_scraped_at)).toISOString().substring(0,16).replace('T',' ') : '—' }}
                           </q-td>
                           <q-td key="customer_url" :props="props">
                             <a v-if="props.row.customer_url" :href="props.row.customer_url" target="_blank"
@@ -9339,6 +9404,7 @@ def main_page():
             "pipeline_score":     pipeline_score_toggle.value,
             "pipeline_enrich":    pipeline_enrich_toggle.value,
             "pipeline_validate":  pipeline_validate_toggle.value,
+            "snap_auto_save_cb":  ch_auto_save_cb.value,
             # Chat cache / memory
             "cache_collection":   cache_collection_input.value,
             "embed_cache_ttl":    embed_cache_ttl.value,
@@ -9420,6 +9486,7 @@ def main_page():
         _set(pipeline_score_toggle,   "pipeline_score")
         _set(pipeline_enrich_toggle,  "pipeline_enrich")
         _set(pipeline_validate_toggle,"pipeline_validate")
+        _set(ch_auto_save_cb,         "snap_auto_save_cb")
         _set(cache_collection_input, "cache_collection")
         _set(embed_cache_ttl,        "embed_cache_ttl")
         _set(search_cache_ttl,       "search_cache_ttl")
@@ -9865,11 +9932,14 @@ def load_to_couchbase(
     upserted = 0
     errors = 0
 
+    _now = int(time.time())
     for i, ticket in enumerate(tickets, start=1):
         tid = ticket.get("ticket_id") or f"unknown_{i}"
         doc_key = f"ticket::{tid}"
         try:
-            col.upsert(doc_key, ticket)
+            doc = ticket.copy()
+            doc["last_scraped_at"] = _now
+            col.upsert(doc_key, doc)
             upserted += 1
         except CouchbaseException as exc:
             errors += 1
@@ -10327,6 +10397,7 @@ def save_tickets_to_cb(
     total = len(tickets)
     saved = errors = 0
 
+    _now = int(time.time())
     for i, ticket in enumerate(tickets, 1):
         if cancel_event and cancel_event.is_set():
             progress_cb(f"Cancelled — {saved}/{total} saved.", i / total)
@@ -10335,9 +10406,10 @@ def save_tickets_to_cb(
         doc_key = f"ticket::{tid}"
         try:
             doc = ticket.copy()
-            doc["cb_version"]    = extract_ticket_version(ticket)
-            doc["feature_area"]  = classify_ticket_feature(ticket)
-            doc["ticket_origin"] = classify_ticket_origin(ticket)
+            doc["cb_version"]      = extract_ticket_version(ticket)
+            doc["feature_area"]    = classify_ticket_feature(ticket)
+            doc["ticket_origin"]   = classify_ticket_origin(ticket)
+            doc["last_scraped_at"] = _now
             col.upsert(doc_key, doc)
             saved += 1
         except Exception as exc:
@@ -10348,6 +10420,146 @@ def save_tickets_to_cb(
 
     cluster.close()
     return saved, errors
+
+
+def run_ticket_pipeline(
+    customer: str,
+    auth: dict,
+    cb_config: CbConfig,
+    options: dict | None = None,
+    progress_cb: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """
+    Scrape tickets for *customer* and save them to Couchbase in one call.
+
+    auth dict keys:
+      mode    – "cookie" | "browser"
+      cookie  – session cookie string (required when mode=="cookie")
+
+    options dict keys (all optional):
+      max_pages   – int, 0 = all listing pages
+      max_tickets – int, 0 = no limit
+      scrape_mode – "all" | "changed"  (default "all")
+
+    Returns:
+      {
+        "tickets": list[dict],   # scraped ticket docs
+        "saved":   int,          # docs upserted to CB
+        "errors":  int,          # upsert errors
+        "skipped": int,          # tickets skipped by change detection
+      }
+
+    Callable from CLI, tests, or MCP tools without a NiceGUI context.
+    """
+    opts = options or {}
+    _prog = progress_cb or (lambda msg, pct: None)
+
+    max_pages   = int(opts.get("max_pages",   0))
+    max_tickets = int(opts.get("max_tickets", 0))
+    scrape_mode = opts.get("scrape_mode", "all")
+
+    # Change detection
+    skip_ids: set | None       = None
+    change_signals: dict | None = None
+    n_skipped = 0
+
+    if scrape_mode == "changed" and _CB_AVAILABLE:
+        _prog("Change detection: fetching stored ticket signals from Couchbase…", 0.0)
+        change_signals = fetch_ticket_signals_from_cb(
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.ticket_collection,
+        )
+
+    # Scrape
+    _prog("Scraping tickets…", 0.05)
+    mode     = auth.get("mode", "cookie")
+    cookie   = auth.get("cookie", "")
+
+    if mode == "browser":
+        tickets = scrape_with_playwright(
+            customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
+        )
+    else:
+        tickets = scrape_with_cookie_playwright(
+            cookie, customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
+        )
+
+    _prog(f"Scraped {len(tickets)} tickets. Saving to Couchbase…", 0.7)
+
+    # Persist
+    saved = errors = 0
+    if _CB_AVAILABLE and cb_config.url:
+        saved, errors = save_tickets_to_cb(
+            tickets,
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.ticket_collection,
+            _prog, cancel_event,
+        )
+
+    _prog(f"Done — {len(tickets)} scraped, {saved} saved, {errors} errors.", 1.0)
+    return {"tickets": tickets, "saved": saved, "errors": errors, "skipped": n_skipped}
+
+
+def run_snapshot_pipeline(
+    customer: str,
+    auth: dict,
+    cb_config: CbConfig,
+    options: dict | None = None,
+    progress_cb: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """
+    Scrape snapshots for *customer* and save them to Couchbase in one call.
+
+    auth dict keys:
+      cookie – session cookie string
+
+    options dict keys (all optional):
+      max_pages     – int, 0 = all listing pages
+      max_snapshots – int, 0 = no limit
+      workers       – int (default 4), concurrent topology fetches
+
+    Returns:
+      {"snapshots": list[dict], "saved": int, "errors": int, "skipped": int}
+    """
+    opts     = options or {}
+    _prog    = progress_cb or (lambda msg, pct: None)
+    cookie   = auth.get("cookie", "")
+    max_pages = int(opts.get("max_pages",     0))
+    max_snaps = int(opts.get("max_snapshots", 0))
+    workers   = int(opts.get("workers",       4))
+
+    # Skip IDs already complete in CB
+    skip_ids: set = set()
+    n_skipped = 0
+    if _CB_AVAILABLE and cb_config.url:
+        _prog("Checking Couchbase for already-complete snapshots…", 0.0)
+        signals = fetch_snapshot_signals_from_cb(
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
+        )
+        skip_ids = {sid for sid, sig in signals.items() if sig.get("complete")}
+        n_skipped = len(skip_ids)
+
+    _prog("Scraping snapshots…", 0.05)
+    snapshots = scrape_snapshots_for_customer(
+        customer, cookie or None, max_pages, workers, _prog, skip_ids, max_snaps,
+    )
+
+    _prog(f"Scraped {len(snapshots)} snapshots. Saving to Couchbase…", 0.8)
+
+    saved = errors = 0
+    if _CB_AVAILABLE and cb_config.url:
+        saved, errors = load_snapshots_to_couchbase(
+            snapshots,
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
+            _prog,
+        )
+
+    _prog(f"Done — {len(snapshots)} scraped, {saved} saved, {errors} errors.", 1.0)
+    return {"snapshots": snapshots, "saved": saved, "errors": errors, "skipped": n_skipped}
 
 
 def embed_all_tickets(
@@ -14665,11 +14877,14 @@ def load_snapshots_to_couchbase(
     col = cluster.bucket(bucket).scope(scope).collection(snap_collection)
     upserted = errors = 0
     total = len(snapshots)
+    _now = int(time.time())
     try:
         for i, snap in enumerate(snapshots):
             key = f"snapshot::{snap['snap_id']}"
             try:
-                col.upsert(key, snap)
+                doc = snap.copy()
+                doc["last_scraped_at"] = _now
+                col.upsert(key, doc)
                 upserted += 1
             except Exception as exc:
                 errors += 1
