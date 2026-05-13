@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 
 import asyncio
 import threading
@@ -10095,7 +10095,7 @@ def load_tickets_from_cb(
     cluster.wait_until_ready(timedelta(seconds=15))
 
     _order = (
-        "CASE WHEN LOWER(t.status) IN ('closed','solved') THEN 1 ELSE 0 END ASC, "
+        "CASE WHEN LOWER(t.status) IN [\"closed\",\"solved\"] THEN 1 ELSE 0 END ASC, "
         "CASE LOWER(t.priority) "
         "WHEN 'urgent' THEN 0 WHEN 'p1' THEN 0 "
         "WHEN 'high'   THEN 1 WHEN 'p2' THEN 1 "
