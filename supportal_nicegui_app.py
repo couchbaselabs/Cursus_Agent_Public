@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.10"
+__version__ = "1.1.11"
 
 import asyncio
 import threading
@@ -4894,8 +4894,8 @@ def main_page():
                             btn_backfill   = ui.button("Backfill Analytics Fields",  on_click=_do_backfill,     icon="auto_fix_high").props("outline color=brown")
                             btn_stop_embed = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
                             btn_stop_embed.set_enabled(False)
-                        btn_embed.set_enabled(False)
-                        btn_create_idx.set_enabled(False)
+                        btn_embed.set_enabled(_CB_AVAILABLE)
+                        btn_create_idx.set_enabled(_CB_AVAILABLE)
 
                     with ui.tab_panel(cfg_chat_mem):
                         ui.label("Chat Memory & Cache").classes("text-base font-semibold")
