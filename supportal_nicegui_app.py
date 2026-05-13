@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 
 import asyncio
 import threading
@@ -10106,10 +10106,15 @@ def load_tickets_from_cb(
     )
     keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
     if customer_filter.strip():
-        query  = f"SELECT t.* FROM {keyspace} AS t WHERE LOWER(t.organization) LIKE $1 ORDER BY {_order}"
+        query  = (f"SELECT t.* FROM {keyspace} AS t "
+                  f"WHERE t.ticket_id IS NOT MISSING "
+                  f"AND LOWER(t.organization) LIKE $1 "
+                  f"ORDER BY {_order}")
         opts   = QueryOptions(positional_parameters=[f"%{customer_filter.strip().lower()}%"])
     else:
-        query  = f"SELECT t.* FROM {keyspace} AS t ORDER BY {_order}"
+        query  = (f"SELECT t.* FROM {keyspace} AS t "
+                  f"WHERE t.ticket_id IS NOT MISSING "
+                  f"ORDER BY {_order}")
         opts   = QueryOptions()
 
     progress_cb("Running query …", 0.1)
@@ -15341,13 +15346,13 @@ def ensure_cb_indexes(
             "idx_tickets_org_date",
             f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_date` "
             f"ON {ks_t} (organization, created DESC) "
-            f"WHERE organization IS NOT MISSING",
+            f"WHERE organization IS NOT MISSING AND ticket_id IS NOT MISSING",
         ),
         (
             "idx_tickets_org_status_priority",
             f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_status_priority` "
             f"ON {ks_t} (organization, status, priority, created DESC) "
-            f"WHERE organization IS NOT MISSING",
+            f"WHERE organization IS NOT MISSING AND ticket_id IS NOT MISSING",
         ),
         # ── Snapshots collection ──────────────────────────────────────────
         (
