@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.9"
+__version__ = "1.1.10"
 
 import asyncio
 import threading
@@ -11026,8 +11026,7 @@ def create_vector_index(
             "doc_config": {
                 "docid_prefix_delim": "",
                 "docid_regexp": "",
-                "mode": "scope.collection.type_field",
-                "type_field": "type",
+                "mode": "scope.collection",
             },
             "mapping": {
                 "analysis": {},
