@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.18"
+__version__ = "1.1.19"
 
 import asyncio
 import threading
@@ -11043,7 +11043,7 @@ def create_vector_index(
 
     index_def = {
         "type":       "fulltext-index",
-        "name":       f"{bucket}.{scope}.{index_name}",
+        "name":       index_name,
         "sourceType": "gocbcore",
         "sourceName": bucket,
         "sourceUUID": "",
