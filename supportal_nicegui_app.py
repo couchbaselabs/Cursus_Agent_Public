@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.11"
+__version__ = "1.1.12"
 
 import asyncio
 import threading
@@ -9631,30 +9631,32 @@ def main_page():
             # Auth
             "cookie":        cookie_input.value,
             # Couchbase
-            "cb_url":        cb_url_input.value,
-            "cb_bucket":     cb_bucket_input.value,
-            "cb_user":       cb_user_input.value,
-            "cb_pass":       cb_pass_input.value,
-            "cb_tls":        cb_tls_toggle.value,
-            "cb_scope":      cb_scope_input.value,
-            "cb_collection": cb_collection_input.value,
+            "cb_url":          cb_url_input.value,
+            "cb_bucket":       cb_bucket_input.value,
+            "cb_user":         cb_user_input.value,
+            "cb_pass":         cb_pass_input.value,
+            "cb_tls":          cb_tls_toggle.value,
+            "cb_scope":        cb_scope_input.value,
+            "cb_collection":   cb_collection_input.value,
+            "ch_snap_coll":    ch_snap_coll.value,
             # Embedding
-            "emb_provider":      ai_emb_provider.value,
-            "emb_ollama_url":    emb_ollama_url_input.value,
+            "emb_provider":       ai_emb_provider.value,
+            "emb_ollama_url":     emb_ollama_url_input.value,
             "emb_ollama_model":   emb_ollama_model_input.value or "",
             "emb_ollama_dims":    emb_dims_input.value,
             "emb_ollama_num_ctx": emb_num_ctx_input.value,
-            "emb_lms_url":       emb_lms_url_input.value,
-            "emb_lms_model":     emb_lms_model_input.value or "",
-            "emb_lms_dims":      emb_lms_dims_input.value,
-            "emb_gemini_key":    emb_gemini_key_input.value,
-            "emb_gemini_model":  emb_gemini_model_input.value or "",
-            "emb_gemini_dims":   emb_gemini_dims_input.value,
-            "emb_mlx_model":     emb_mlx_model_input.value,
-            "emb_mlx_dims":      emb_mlx_dims_input.value,
-            "emb_openai_key":    emb_openai_key_input.value,
-            "emb_openai_model":  emb_openai_model_input.value or "",
-            "emb_openai_dims":   emb_openai_dims_input.value,
+            "emb_lms_url":        emb_lms_url_input.value,
+            "emb_lms_model":      emb_lms_model_input.value or "",
+            "emb_lms_dims":       emb_lms_dims_input.value,
+            "emb_gemini_key":     emb_gemini_key_input.value,
+            "emb_gemini_model":   emb_gemini_model_input.value or "",
+            "emb_gemini_dims":    emb_gemini_dims_input.value,
+            "emb_mlx_model":      emb_mlx_model_input.value,
+            "emb_mlx_dims":       emb_mlx_dims_input.value,
+            "emb_openai_key":     emb_openai_key_input.value,
+            "emb_openai_model":   emb_openai_model_input.value or "",
+            "emb_openai_dims":    emb_openai_dims_input.value,
+            "embed_parallel":     embed_parallel_input.value,
             # LLM (chat/scoring)
             "llm_provider":       ai_llm_provider.value,
             "claude_key":         claude_key_input.value,
@@ -9666,6 +9668,7 @@ def main_page():
             "openai_llm_model":   openai_llm_model_input.value or "",
             # Scoring
             "score_batch":        score_batch_input.value,
+            "score_parallel":     score_parallel_input.value,
             "score_ctx":          score_ctx_input.value,
             "score_no_think":     score_no_think_toggle.value,
             "score_autosave":     score_autosave_toggle.value,
@@ -9676,6 +9679,18 @@ def main_page():
             "pipeline_enrich":    pipeline_enrich_toggle.value,
             "pipeline_validate":  pipeline_validate_toggle.value,
             "snap_auto_save_cb":  ch_auto_save_cb.value,
+            # CH scrape settings
+            "ch_max_pages":       ch_max_pages.value,
+            "ch_workers":         ch_workers.value,
+            "ch_max_snapshots":   ch_max_snapshots.value,
+            "ch_analytics_limit": ch_analytics_limit.value,
+            # Chat settings
+            "chat_mode":              chat_mode_select.value,
+            "top_k":                  top_k_input.value,
+            "batch_size_chat":        batch_size_chat_input.value,
+            "batch_parallel":         batch_parallel_input.value,
+            "compact_context":        compact_context_toggle.value,
+            "deep_reason":            deep_reason_toggle.value,
             # Chat cache / memory
             "cache_collection":   cache_collection_input.value,
             "embed_cache_ttl":    embed_cache_ttl.value,
@@ -9698,6 +9713,7 @@ def main_page():
         _set(cb_tls_toggle,       "cb_tls")
         _set(cb_scope_input,      "cb_scope")
         _set(cb_collection_input, "cb_collection")
+        _set(ch_snap_coll,        "ch_snap_coll")
 
         _set(emb_ollama_url_input,   "emb_ollama_url")
         if p.get("emb_ollama_model"):
@@ -9720,6 +9736,7 @@ def main_page():
         if p.get("emb_openai_model"):
             emb_openai_model_input.set_value(p["emb_openai_model"])
         _set(emb_openai_dims_input,  "emb_openai_dims")
+        _set(embed_parallel_input,   "embed_parallel")
         if p.get("emb_provider"):
             ai_emb_provider.set_value(p["emb_provider"])
 
@@ -9741,6 +9758,7 @@ def main_page():
             ai_llm_provider.set_value(p["llm_provider"])
 
         _set(score_batch_input,       "score_batch")
+        _set(score_parallel_input,    "score_parallel")
         _set(score_ctx_input,         "score_ctx")
         # If no saved value, auto-enable based on the currently saved model name
         if "score_no_think" in p:
@@ -9758,7 +9776,18 @@ def main_page():
         _set(pipeline_enrich_toggle,  "pipeline_enrich")
         _set(pipeline_validate_toggle,"pipeline_validate")
         _set(ch_auto_save_cb,         "snap_auto_save_cb")
-        _set(cache_collection_input, "cache_collection")
+        _set(ch_max_pages,            "ch_max_pages")
+        _set(ch_workers,              "ch_workers")
+        _set(ch_max_snapshots,        "ch_max_snapshots")
+        _set(ch_analytics_limit,      "ch_analytics_limit")
+        if p.get("chat_mode"):
+            chat_mode_select.set_value(p["chat_mode"])
+        _set(top_k_input,             "top_k")
+        _set(batch_size_chat_input,   "batch_size_chat")
+        _set(batch_parallel_input,    "batch_parallel")
+        _set(compact_context_toggle,  "compact_context")
+        _set(deep_reason_toggle,      "deep_reason")
+        _set(cache_collection_input,  "cache_collection")
         _set(embed_cache_ttl,        "embed_cache_ttl")
         _set(search_cache_ttl,       "search_cache_ttl")
         _set(store_memory_toggle,    "store_memory")
@@ -11025,47 +11054,48 @@ def create_vector_index(
         "params": {
             "doc_config": {
                 "docid_prefix_delim": "",
-                "docid_regexp": "",
-                "mode": "scope.collection",
+                "docid_regexp":       "",
+                "mode":               "scope.collection.type_field",
+                "type_field":         "type",
             },
             "mapping": {
                 "analysis": {},
-                "default_analyzer": "standard",
-                "default_datetime_parser": "dateTimeOptional",
-                "default_field": "_all",
-                "default_mapping": {"dynamic": False, "enabled": False},
-                "default_type": "_default",
-                "docvalues_dynamic": False,
-                "index_dynamic": False,
-                "store_dynamic": False,
-                "type_field": "_type",
-                "types": {
-                    type_key: {
-                        "dynamic": False,
-                        "enabled": True,
-                        "properties": {
-                            "embedding": {
-                                "dynamic": False,
-                                "enabled": True,
-                                "fields": [{
-                                    "dims":       vector_dims,
-                                    "index":      True,
-                                    "name":       "embedding",
-                                    "similarity": "dot_product",
-                                    "type":       "vector",
-                                }],
-                            },
-                            "subject":     _text_field("subject"),
-                            "status":      _text_field("status"),
-                            "priority":    _text_field("priority"),
-                            "requester":   _text_field("requester"),
-                            "assignee":    _text_field("assignee"),
-                            "created":     _text_field("created"),
-                            "description": _text_field("description"),
-                            "comments":    _text_field("comments"),
+                "default_analyzer":          "standard",
+                "default_datetime_parser":   "dateTimeOptional",
+                "default_field":             "_all",
+                "default_type":              "_default",
+                "docvalues_dynamic":         False,
+                "index_dynamic":             False,
+                "store_dynamic":             False,
+                "type_field":                "_type",
+                # default_mapping is enabled so docs without a `type` field
+                # (i.e. all ticket docs) fall through here and get indexed.
+                "default_mapping": {
+                    "dynamic": False,
+                    "enabled": True,
+                    "properties": {
+                        "embedding": {
+                            "dynamic": False,
+                            "enabled": True,
+                            "fields": [{
+                                "dims":       vector_dims,
+                                "index":      True,
+                                "name":       "embedding",
+                                "similarity": "dot_product",
+                                "type":       "vector",
+                            }],
                         },
-                    }
+                        "subject":     _text_field("subject"),
+                        "status":      _text_field("status"),
+                        "priority":    _text_field("priority"),
+                        "requester":   _text_field("requester"),
+                        "assignee":    _text_field("assignee"),
+                        "created":     _text_field("created"),
+                        "description": _text_field("description"),
+                        "comments":    _text_field("comments"),
+                    },
                 },
+                "types": {},
             },
             "store": {"indexType": "scorch", "segmentVersion": 16},
         },
