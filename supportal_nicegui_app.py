@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.15"
+__version__ = "1.1.16"
 
 import asyncio
 import threading
@@ -11069,7 +11069,6 @@ def create_vector_index(
                 "docvalues_dynamic":       False,
                 "index_dynamic":           False,
                 "store_dynamic":           False,
-                "scoring_model":           "bm25",
                 "type_field":              "_type",
                 "types": {
                     "ticket": {
@@ -11110,7 +11109,10 @@ def create_vector_index(
         verify=False,
         timeout=30,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(
+            f"FTS index PUT failed {resp.status_code}: {resp.text}"
+        )
 
 
 def vector_search_cb(
