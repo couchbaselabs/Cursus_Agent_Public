@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import asyncio
 import threading
@@ -9823,12 +9823,22 @@ def load_tickets_from_cb(
     cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
     cluster.wait_until_ready(timedelta(seconds=15))
 
+    _order = (
+        "CASE WHEN LOWER(t.status) IN ('closed','solved') THEN 1 ELSE 0 END ASC, "
+        "CASE LOWER(t.priority) "
+        "WHEN 'urgent' THEN 0 WHEN 'p1' THEN 0 "
+        "WHEN 'high'   THEN 1 WHEN 'p2' THEN 1 "
+        "WHEN 'normal' THEN 2 WHEN 'p3' THEN 2 WHEN 'medium' THEN 2 "
+        "WHEN 'low'    THEN 3 WHEN 'p4' THEN 3 "
+        "ELSE 4 END ASC, "
+        "t.created_at DESC"
+    )
     keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
     if customer_filter.strip():
-        query  = f"SELECT t.* FROM {keyspace} AS t WHERE LOWER(t.organization) LIKE $1 ORDER BY t.created_at DESC"
+        query  = f"SELECT t.* FROM {keyspace} AS t WHERE LOWER(t.organization) LIKE $1 ORDER BY {_order}"
         opts   = QueryOptions(positional_parameters=[f"%{customer_filter.strip().lower()}%"])
     else:
-        query  = f"SELECT t.* FROM {keyspace} AS t ORDER BY t.created_at DESC"
+        query  = f"SELECT t.* FROM {keyspace} AS t ORDER BY {_order}"
         opts   = QueryOptions()
 
     progress_cb("Running query …", 0.1)
@@ -15060,6 +15070,12 @@ def ensure_cb_indexes(
             "idx_tickets_org_date",
             f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_date` "
             f"ON {ks_t} (organization, created_at DESC) "
+            f"WHERE organization IS NOT MISSING",
+        ),
+        (
+            "idx_tickets_org_status_priority",
+            f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_status_priority` "
+            f"ON {ks_t} (organization, status, priority, created_at DESC) "
             f"WHERE organization IS NOT MISSING",
         ),
         # ── Snapshots collection ──────────────────────────────────────────
