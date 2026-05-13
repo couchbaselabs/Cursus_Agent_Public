@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import asyncio
 import threading
@@ -9825,10 +9825,10 @@ def load_tickets_from_cb(
 
     keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
     if customer_filter.strip():
-        query  = f"SELECT t.* FROM {keyspace} AS t WHERE LOWER(t.organization) LIKE $1"
+        query  = f"SELECT t.* FROM {keyspace} AS t WHERE LOWER(t.organization) LIKE $1 ORDER BY t.created_at DESC"
         opts   = QueryOptions(positional_parameters=[f"%{customer_filter.strip().lower()}%"])
     else:
-        query  = f"SELECT t.* FROM {keyspace} AS t"
+        query  = f"SELECT t.* FROM {keyspace} AS t ORDER BY t.created_at DESC"
         opts   = QueryOptions()
 
     progress_cb("Running query …", 0.1)
@@ -15059,7 +15059,7 @@ def ensure_cb_indexes(
         (
             "idx_tickets_org_date",
             f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_date` "
-            f"ON {ks_t} (organization, created_at) "
+            f"ON {ks_t} (organization, created_at DESC) "
             f"WHERE organization IS NOT MISSING",
         ),
         # ── Snapshots collection ──────────────────────────────────────────
