@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 import asyncio
 import threading
@@ -799,6 +799,19 @@ _browser_state: dict = {
 _browser_close_event:  threading.Event = threading.Event()
 _browser_closed_event: threading.Event = threading.Event()
 _browser_ready_event:  threading.Event = threading.Event()  # set when browser is open & navigated
+
+# Network API logger — captures XHR/fetch calls while user browses Supportal.
+_net_log_state: dict = {
+    "pw":      None,
+    "ctx":     None,
+    "entries": [],   # list of captured call dicts
+    "running": False,
+    "_loop":   None, # asyncio event loop for UI callbacks
+    "_ui_cb":  None, # async coroutine callback(entry) → None
+}
+_net_log_close_event:  threading.Event = threading.Event()
+_net_log_closed_event: threading.Event = threading.Event()
+_net_log_ready_event:  threading.Event = threading.Event()
 
 # Shared results — written by worker thread, read by UI download handlers.
 _results: list[dict] = []
@@ -2610,6 +2623,103 @@ def confirm_login_thread() -> None:
         raise TimeoutError("Browser did not close within 30 seconds.")
 
 
+# ─────────────────────────── Network API logger ───────────────────────────────
+
+def start_net_log_thread() -> None:
+    """
+    Open a headful Chromium window and capture every XHR/fetch call made to
+    supportal.couchbase.com into _net_log_state['entries'].
+
+    Uses a separate profile dir so it doesn't share cookies with the login
+    browser.  Blocks on _net_log_close_event — call stop_net_log_thread() to
+    shut down cleanly from another thread.
+    """
+    _net_log_close_event.clear()
+    _net_log_closed_event.clear()
+    _net_log_ready_event.clear()
+    _net_log_state["entries"] = []
+    _net_log_state["running"] = True
+
+    profile_dir = os.path.join(os.path.dirname(__file__), ".playwright_netlog")
+    os.makedirs(profile_dir, exist_ok=True)
+
+    pw  = sync_playwright().start()
+    ctx = pw.chromium.launch_persistent_context(
+        user_data_dir=profile_dir,
+        headless=False,
+        viewport={"width": 1280, "height": 900},
+        user_agent=UA,
+        ignore_https_errors=True,
+    )
+    _net_log_state["pw"]  = pw
+    _net_log_state["ctx"] = ctx
+    page = ctx.new_page() if not ctx.pages else ctx.pages[0]
+
+    def _on_response(response):
+        try:
+            if response.request.resource_type not in ("xhr", "fetch"):
+                return
+            url = response.url
+            if "supportal.couchbase.com" not in url:
+                return
+            try:
+                req_body = response.request.post_data or ""
+            except Exception:
+                req_body = ""
+            try:
+                resp_text = response.text()
+            except Exception:
+                resp_text = ""
+            entry = {
+                "ts":        int(time.time()),
+                "time":      time.strftime("%H:%M:%S"),
+                "method":    response.request.method,
+                "url":       url,
+                "status":    response.status,
+                "req_body":  req_body[:4000],
+                "resp_body": resp_text[:50000],
+            }
+            _net_log_state["entries"].append(entry)
+            cb = _net_log_state.get("_ui_cb")
+            lp = _net_log_state.get("_loop")
+            if cb and lp:
+                asyncio.run_coroutine_threadsafe(cb(entry), lp)
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+    try:
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
+    except Exception:
+        pass
+    _net_log_ready_event.set()
+    _net_log_close_event.wait()
+
+    try:
+        ctx.close()
+    finally:
+        pw.stop()
+    _net_log_state["pw"]      = None
+    _net_log_state["ctx"]     = None
+    _net_log_state["running"] = False
+    _net_log_closed_event.set()
+
+
+def stop_net_log_thread() -> None:
+    """Signal start_net_log_thread() to close the browser and wait for cleanup."""
+    _net_log_close_event.set()
+    _net_log_closed_event.wait(timeout=15)
+
+
+def save_net_log() -> str:
+    """Write captured entries to a timestamped JSON file. Returns the path."""
+    ts   = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(os.path.dirname(__file__), f"network_log_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(_net_log_state["entries"], f, indent=2)
+    return path
+
+
 # ─────────────────────────── Export helpers ───────────────────────────────────
 
 _FLAT_FIELDS = [
@@ -4087,6 +4197,95 @@ def main_page():
                                     btn_open = ui.button("Open Browser & Login", on_click=do_open_browser, icon="open_in_browser")
                                     btn_confirm = ui.button("Confirm Login", on_click=do_confirm_login, icon="check_circle")
                                     btn_confirm.props("disabled color=positive")
+
+                                # ── Network API Inspector ──────────────────────────────
+                                ui.separator().classes("mt-5")
+                                with ui.row().classes("items-center gap-2 mt-2"):
+                                    ui.icon("network_check").classes("text-purple-500")
+                                    ui.label("Network API Inspector").classes("text-sm font-semibold text-gray-700")
+                                ui.label(
+                                    "Opens a browser window — log in, then click through tickets and snapshots. "
+                                    "Every API call Supportal makes is captured here with its URL, "
+                                    "request body, and response. Save to JSON when done."
+                                ).classes("text-xs text-gray-400 mt-1 mb-2")
+
+                                with ui.row().classes("items-center gap-2"):
+                                    netlog_dot    = ui.icon("circle").classes("text-gray-400 text-sm")
+                                    netlog_status = ui.label("Not running").classes("text-sm text-gray-500")
+                                    netlog_count  = ui.badge("0 calls", color="purple").classes("ml-2")
+
+                                netlog_log = ui.log(max_lines=300).classes("w-full mt-2 font-mono text-xs")
+                                netlog_log.set_visibility(False)
+
+                                async def _do_start_netlog():
+                                    if _net_log_state["running"]:
+                                        return
+                                    btn_netlog_start.props("loading disabled")
+                                    netlog_dot.classes(replace="text-orange-400 text-sm")
+                                    netlog_status.set_text("Opening browser…")
+                                    netlog_log.clear()
+                                    netlog_log.set_visibility(True)
+                                    netlog_count.set_text("0 calls")
+
+                                    _net_log_state["_loop"] = asyncio.get_event_loop()
+
+                                    async def _on_entry(entry):
+                                        short_url = entry["url"].split("supportal.couchbase.com")[-1][:80]
+                                        netlog_log.push(
+                                            f"[{entry['time']}] {entry['method']:4} {short_url} → {entry['status']}"
+                                        )
+                                        netlog_count.set_text(f"{len(_net_log_state['entries'])} calls")
+
+                                    _net_log_state["_ui_cb"] = _on_entry
+
+                                    threading.Thread(target=start_net_log_thread, daemon=True).start()
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, _net_log_ready_event.wait
+                                    )
+                                    netlog_dot.classes(replace="text-green-500 text-sm")
+                                    netlog_status.set_text("Running — browse Supportal to capture calls")
+                                    btn_netlog_start.props(remove="loading disabled")
+                                    btn_netlog_stop.props(remove="disabled")
+                                    btn_netlog_save.props(remove="disabled")
+
+                                async def _do_stop_netlog():
+                                    btn_netlog_stop.props("loading disabled")
+                                    netlog_status.set_text("Stopping…")
+                                    await run.io_bound(stop_net_log_thread)
+                                    netlog_dot.classes(replace="text-gray-400 text-sm")
+                                    netlog_status.set_text(
+                                        f"Stopped — {len(_net_log_state['entries'])} calls captured"
+                                    )
+                                    btn_netlog_stop.props(remove="loading")
+                                    btn_netlog_stop.props("disabled")
+
+                                async def _do_save_netlog():
+                                    if not _net_log_state["entries"]:
+                                        ui.notify("No calls captured yet.", type="warning")
+                                        return
+                                    try:
+                                        path = await run.io_bound(save_net_log)
+                                        ui.notify(
+                                            f"Saved {len(_net_log_state['entries'])} calls → {os.path.basename(path)}",
+                                            type="positive",
+                                        )
+                                        netlog_status.set_text(f"Saved → {os.path.basename(path)}")
+                                    except Exception as exc:
+                                        ui.notify(f"Save error: {exc}", type="negative")
+
+                                with ui.row().classes("gap-3 mt-2"):
+                                    btn_netlog_start = ui.button(
+                                        "Start", icon="play_circle",
+                                        on_click=_do_start_netlog,
+                                    ).props("color=purple")
+                                    btn_netlog_stop = ui.button(
+                                        "Stop", icon="stop_circle",
+                                        on_click=_do_stop_netlog,
+                                    ).props("outline color=red disabled")
+                                    btn_netlog_save = ui.button(
+                                        "Save Log", icon="save",
+                                        on_click=_do_save_netlog,
+                                    ).props("outline color=green disabled")
 
                     with ui.tab_panel(cfg_cb):
                         with ui.row().classes("items-center justify-between w-full"):

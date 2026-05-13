@@ -17,6 +17,10 @@ env/
 # Playwright sessions (contain auth cookies)
 .playwright_supportal/
 .playwright_supportal_streamlit/
+.playwright_netlog/
+
+# Network capture logs (may contain session tokens)
+network_log_*.json
 
 # Debug / scratch
 debug_html/
