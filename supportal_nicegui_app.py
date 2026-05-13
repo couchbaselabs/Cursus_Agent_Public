@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 import asyncio
 import threading
@@ -6355,6 +6355,27 @@ def main_page():
                                 "Run JS diagnostics to check Highcharts availability"
                             )
 
+                        # ── Date range filter ──────────────────────────────────────────
+                        with ui.row().classes("gap-4 mt-2 flex-wrap items-end"):
+                            with ui.input("From", placeholder="YYYY-MM-DD").classes("w-36") as chart_date_from:
+                                with ui.menu().props("no-parent-event") as _date_from_menu:
+                                    with ui.date(mask="YYYY-MM-DD").bind_value(chart_date_from):
+                                        with ui.row().classes("justify-end"):
+                                            ui.button("Close", on_click=_date_from_menu.close).props("flat")
+                                with chart_date_from.add_slot("append"):
+                                    ui.icon("event").on("click", _date_from_menu.open).classes("cursor-pointer")
+                            with ui.input("To", placeholder="YYYY-MM-DD").classes("w-36") as chart_date_to:
+                                with ui.menu().props("no-parent-event") as _date_to_menu:
+                                    with ui.date(mask="YYYY-MM-DD").bind_value(chart_date_to):
+                                        with ui.row().classes("justify-end"):
+                                            ui.button("Close", on_click=_date_to_menu.close).props("flat")
+                                with chart_date_to.add_slot("append"):
+                                    ui.icon("event").on("click", _date_to_menu.open).classes("cursor-pointer")
+                            ui.button(
+                                "Clear dates", icon="clear",
+                                on_click=lambda: (chart_date_from.set_value(""), chart_date_to.set_value("")),
+                            ).props("flat color=grey-7 size=sm")
+
                         chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
                         charts_area  = ui.column().classes("w-full gap-4 mt-3")
 
@@ -6485,6 +6506,30 @@ def main_page():
                                 state["_main_chart_label"] = "All Customers"
                                 scoring_banner.set_text(
                                     f"Viewing: All Customers ({len(display_tickets)} tickets)"
+                                )
+
+                            # ── Date range filter ─────────────────────────────────────────
+                            _df = (chart_date_from.value or "").strip()[:10]
+                            _dt = (chart_date_to.value   or "").strip()[:10]
+                            if _df or _dt:
+                                _pre_filter = len(display_tickets)
+                                def _in_range(t):
+                                    raw = (t.get("created") or t.get("created_at") or "")[:10]
+                                    if not raw:
+                                        return True
+                                    if _df and raw < _df:
+                                        return False
+                                    if _dt and raw > _dt:
+                                        return False
+                                    return True
+                                display_tickets = [t for t in display_tickets if _in_range(t)]
+                                display_scores  = {
+                                    tid: sc for tid, sc in display_scores.items()
+                                    if any(str(t.get("ticket_id")) == tid for t in display_tickets)
+                                }
+                                _date_label = f"{_df or '…'} → {_dt or '…'}"
+                                chart_status.set_text(
+                                    f"Date filter: {_date_label} — {len(display_tickets)} of {_pre_filter} tickets"
                                 )
 
                             data = build_analytics_data(display_tickets, display_scores)
