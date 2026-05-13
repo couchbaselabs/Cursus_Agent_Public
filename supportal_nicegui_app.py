@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.16"
+__version__ = "1.1.17"
 
 import asyncio
 import threading
@@ -11101,6 +11101,10 @@ def create_vector_index(
             "store": {"indexType": "scorch", "segmentVersion": 16},
         },
     }
+
+    # Delete any stale index with this name before (re)creating — CB rejects
+    # PUT if the existing index was registered under a different bucket/scope.
+    requests.delete(api_url, auth=(username, password), verify=False, timeout=10)
 
     resp = requests.put(
         api_url,
