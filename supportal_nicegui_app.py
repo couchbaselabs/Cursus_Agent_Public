@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 
 import asyncio
 import threading
@@ -10102,7 +10102,7 @@ def load_tickets_from_cb(
         "WHEN 'normal' THEN 2 WHEN 'p3' THEN 2 WHEN 'medium' THEN 2 "
         "WHEN 'low'    THEN 3 WHEN 'p4' THEN 3 "
         "ELSE 4 END ASC, "
-        "t.created_at DESC"
+        "t.created DESC"
     )
     keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
     if customer_filter.strip():
@@ -11412,10 +11412,10 @@ def structured_search_cb(
 
         if date_from:
             params.append(date_from)
-            where_parts.append(f"t.created_at >= ${len(params)}")
+            where_parts.append(f"t.created >= ${len(params)}")
         if date_to:
             params.append(date_to)
-            where_parts.append(f"t.created_at <= ${len(params)}")
+            where_parts.append(f"t.created <= ${len(params)}")
 
         if statuses:
             s_idx = len(params) + 1
@@ -11437,7 +11437,7 @@ def structured_search_cb(
         n1ql = (
             f"SELECT META(t).id AS doc_key FROM {keyspace} AS t "
             f"WHERE {where_clause} "
-            f"ORDER BY t.created_at DESC "
+            f"ORDER BY t.created DESC "
             f"LIMIT {min(limit * 3, 200)}"   # fetch extra for RRF to re-rank
         )
 
@@ -11717,7 +11717,7 @@ def chat_batch_map_reduce(
 
 def _ticket_date(t: dict) -> str:
     """Return the best available ISO date string for a ticket (empty string if none)."""
-    return (t.get("created_at") or t.get("created") or t.get("date") or "").strip()
+    return (t.get("created") or t.get("created_at") or t.get("date") or "").strip()
 
 
 def _parse_ticket_date(t: dict):
@@ -15340,13 +15340,13 @@ def ensure_cb_indexes(
         (
             "idx_tickets_org_date",
             f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_date` "
-            f"ON {ks_t} (organization, created_at DESC) "
+            f"ON {ks_t} (organization, created DESC) "
             f"WHERE organization IS NOT MISSING",
         ),
         (
             "idx_tickets_org_status_priority",
             f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_status_priority` "
-            f"ON {ks_t} (organization, status, priority, created_at DESC) "
+            f"ON {ks_t} (organization, status, priority, created DESC) "
             f"WHERE organization IS NOT MISSING",
         ),
         # ── Snapshots collection ──────────────────────────────────────────
