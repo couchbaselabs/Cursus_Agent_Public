@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.17"
+__version__ = "1.1.18"
 
 import asyncio
 import threading
@@ -11102,9 +11102,16 @@ def create_vector_index(
         },
     }
 
-    # Delete any stale index with this name before (re)creating — CB rejects
+    # Delete any stale index at every possible registration level — CB rejects
     # PUT if the existing index was registered under a different bucket/scope.
-    requests.delete(api_url, auth=(username, password), verify=False, timeout=10)
+    _auth    = (username, password)
+    _base    = f"{api_scheme}://{host}:{port}"
+    for _del_url in [
+        f"{_base}/api/index/{index_name}",                                        # global
+        f"{_base}/api/bucket/{bucket}/index/{index_name}",                        # bucket
+        f"{_base}/api/bucket/{bucket}/scope/{scope}/index/{index_name}",          # scope
+    ]:
+        requests.delete(_del_url, auth=_auth, verify=False, timeout=10)
 
     resp = requests.put(
         api_url,
