@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Playwright sessions (contain auth cookies)
+.playwright_supportal/
+.playwright_supportal_streamlit/
+
+# Debug / scratch
+debug_html/
+diag_html/
+snap_debug/
+errors.txt
+diag.py
+
+# Data exports
+*.csv
+*.json
+tickets.json
+
+# Old versions / archived scripts
+supportal_nicegui_app_v*.py
+supportal_nicegui_app_v*.py
+couchbase_supportal_scraper.py
+supportal_playwright_scraper.py
+supportal_scraper1.py
+supportal_streamlit_app.py
+scraper/
+analysis/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets / env
+.env
+*.env

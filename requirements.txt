@@ -1,0 +1,16 @@
+# Core UI
+nicegui>=2.0.0
+
+# HTTP / scraping
+requests
+urllib3
+beautifulsoup4
+playwright
+
+# Couchbase
+couchbase>=4.0.0
+
+# LLM providers
+anthropic
+openai                  # also covers Ollama and LMStudio (OpenAI-compatible)
+google-genai
