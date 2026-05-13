@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.12"
+__version__ = "1.1.13"
 
 import asyncio
 import threading
@@ -11060,16 +11060,16 @@ def create_vector_index(
             },
             "mapping": {
                 "analysis": {},
-                "default_analyzer":          "standard",
-                "default_datetime_parser":   "dateTimeOptional",
-                "default_field":             "_all",
-                "default_type":              "_default",
-                "docvalues_dynamic":         False,
-                "index_dynamic":             False,
-                "store_dynamic":             False,
-                "type_field":                "_type",
-                # default_mapping is enabled so docs without a `type` field
-                # (i.e. all ticket docs) fall through here and get indexed.
+                "default_analyzer":        "standard",
+                "default_datetime_parser": "dateTimeOptional",
+                "default_field":           "_all",
+                "default_type":            "_default",
+                "docvalues_dynamic":       False,
+                "index_dynamic":           False,
+                "store_dynamic":           False,
+                "type_field":              "_type",
+                # Enabled so docs without a `type` field (all ticket docs)
+                # fall through here instead of being skipped.
                 "default_mapping": {
                     "dynamic": False,
                     "enabled": True,
@@ -11095,7 +11095,36 @@ def create_vector_index(
                         "comments":    _text_field("comments"),
                     },
                 },
-                "types": {},
+                # Typed mapping retained so the API payload matches the
+                # original accepted structure; docs matching this type
+                # (none currently) would also be indexed here.
+                "types": {
+                    type_key: {
+                        "dynamic": False,
+                        "enabled": True,
+                        "properties": {
+                            "embedding": {
+                                "dynamic": False,
+                                "enabled": True,
+                                "fields": [{
+                                    "dims":       vector_dims,
+                                    "index":      True,
+                                    "name":       "embedding",
+                                    "similarity": "dot_product",
+                                    "type":       "vector",
+                                }],
+                            },
+                            "subject":     _text_field("subject"),
+                            "status":      _text_field("status"),
+                            "priority":    _text_field("priority"),
+                            "requester":   _text_field("requester"),
+                            "assignee":    _text_field("assignee"),
+                            "created":     _text_field("created"),
+                            "description": _text_field("description"),
+                            "comments":    _text_field("comments"),
+                        },
+                    }
+                },
             },
             "store": {"indexType": "scorch", "segmentVersion": 16},
         },
