@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.13"
+__version__ = "1.1.14"
 
 import asyncio
 import threading
@@ -11063,41 +11063,13 @@ def create_vector_index(
                 "default_analyzer":        "standard",
                 "default_datetime_parser": "dateTimeOptional",
                 "default_field":           "_all",
+                "default_mapping":         {"dynamic": False, "enabled": False},
                 "default_type":            "_default",
                 "docvalues_dynamic":       False,
                 "index_dynamic":           False,
                 "store_dynamic":           False,
+                "scoring_model":           "bm25",
                 "type_field":              "_type",
-                # Enabled so docs without a `type` field (all ticket docs)
-                # fall through here instead of being skipped.
-                "default_mapping": {
-                    "dynamic": False,
-                    "enabled": True,
-                    "properties": {
-                        "embedding": {
-                            "dynamic": False,
-                            "enabled": True,
-                            "fields": [{
-                                "dims":       vector_dims,
-                                "index":      True,
-                                "name":       "embedding",
-                                "similarity": "dot_product",
-                                "type":       "vector",
-                            }],
-                        },
-                        "subject":     _text_field("subject"),
-                        "status":      _text_field("status"),
-                        "priority":    _text_field("priority"),
-                        "requester":   _text_field("requester"),
-                        "assignee":    _text_field("assignee"),
-                        "created":     _text_field("created"),
-                        "description": _text_field("description"),
-                        "comments":    _text_field("comments"),
-                    },
-                },
-                # Typed mapping retained so the API payload matches the
-                # original accepted structure; docs matching this type
-                # (none currently) would also be indexed here.
                 "types": {
                     type_key: {
                         "dynamic": False,
@@ -11138,6 +11110,21 @@ def create_vector_index(
         timeout=30,
     )
     resp.raise_for_status()
+
+    # Stamp type = "{scope}.{collection}" on every ticket doc so the FTS index
+    # can match them against the typed mapping.  Safe to run repeatedly.
+    if _CB_AVAILABLE:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=15))
+        try:
+            ks = f"`{bucket}`.`{scope}`.`{collection}`"
+            cluster.query(
+                f"UPDATE {ks} SET `type` = $1 WHERE ticket_id IS NOT MISSING",
+                QueryOptions(positional_parameters=[f"{scope}.{collection}"]),
+            ).execute()
+        finally:
+            cluster.close()
 
 
 def vector_search_cb(
