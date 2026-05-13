@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.19"
+__version__ = "1.1.20"
 
 import asyncio
 import threading
@@ -11041,22 +11041,22 @@ def create_vector_index(
             "fields": [{"analyzer": "standard", "index": True, "name": name, "store": True, "type": "text"}],
         }
 
+    # Exact structure per CB 7.6 docs — scope.collection.type_field mode.
+    # type key must be "scope.collection"; documents need type="scope.collection"
+    # stamped on them (done after PUT below).
+    type_key = f"{scope}.{collection}"
     index_def = {
         "type":       "fulltext-index",
-        "name":       index_name,
+        "name":       f"{bucket}.{scope}.{index_name}",
         "sourceType": "gocbcore",
         "sourceName": bucket,
-        "sourceUUID": "",
         "sourceParams": {},
         "planParams": {"maxPartitionsPerPIndex": 512, "indexPartitions": 1},
         "params": {
-            # docid_prefix mode: document key prefix before "::" is the type.
-            # ticket::41130  →  type "ticket"
-            # No field stamping needed — key format already discriminates.
             "doc_config": {
-                "docid_prefix_delim": "::",
+                "docid_prefix_delim": "",
                 "docid_regexp":       "",
-                "mode":               "docid_prefix",
+                "mode":               "scope.collection.type_field",
                 "type_field":         "type",
             },
             "mapping": {
@@ -11071,7 +11071,7 @@ def create_vector_index(
                 "store_dynamic":           False,
                 "type_field":              "_type",
                 "types": {
-                    "ticket": {
+                    type_key: {
                         "dynamic": False,
                         "enabled": True,
                         "properties": {
@@ -11124,6 +11124,21 @@ def create_vector_index(
         raise RuntimeError(
             f"FTS index PUT failed {resp.status_code}: {resp.text}"
         )
+
+    # Stamp type = "scope.collection" on every ticket doc so they match the
+    # typed mapping.  Idempotent — safe to run on every index (re)creation.
+    if _CB_AVAILABLE:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=15))
+        try:
+            ks = f"`{bucket}`.`{scope}`.`{collection}`"
+            list(cluster.query(
+                f"UPDATE {ks} SET `type` = $1 WHERE ticket_id IS NOT MISSING AND (`type` IS MISSING OR `type` != $1)",
+                QueryOptions(positional_parameters=[type_key]),
+            ).rows())
+        finally:
+            cluster.close()
 
 
 def vector_search_cb(
