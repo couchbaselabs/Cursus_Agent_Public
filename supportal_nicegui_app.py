@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 
 import asyncio
 import threading
@@ -2655,39 +2655,57 @@ def start_net_log_thread() -> None:
     _net_log_state["ctx"] = ctx
     page = ctx.new_page() if not ctx.pages else ctx.pages[0]
 
-    def _on_response(response):
+    def _on_request_finished(request):
+        # requestfinished fires after the full response body is received —
+        # unlike the "response" event which fires on headers only, making
+        # response.text() unreliable from that handler.
         try:
-            if response.request.resource_type not in ("xhr", "fetch"):
+            if request.resource_type not in ("xhr", "fetch"):
                 return
-            url = response.url
+            url = request.url
             if "supportal.couchbase.com" not in url:
                 return
+
             try:
-                req_body = response.request.post_data or ""
-            except Exception:
-                req_body = ""
-            try:
-                resp_text = response.text()
-            except Exception:
-                resp_text = ""
+                req_body = request.post_data or ""
+            except Exception as e:
+                req_body = f"[error: {e}]"
+
+            response   = request.response()
+            status     = response.status if response else 0
+            resp_text  = ""
+            resp_error = ""
+            if response:
+                try:
+                    raw       = response.body()           # bytes — safe for any content type
+                    resp_text = raw.decode("utf-8", errors="replace")
+                except Exception as e:
+                    resp_error = str(e)
+
             entry = {
-                "ts":        int(time.time()),
-                "time":      time.strftime("%H:%M:%S"),
-                "method":    response.request.method,
-                "url":       url,
-                "status":    response.status,
-                "req_body":  req_body[:4000],
-                "resp_body": resp_text[:50000],
+                "ts":         int(time.time()),
+                "time":       time.strftime("%H:%M:%S"),
+                "method":     request.method,
+                "url":        url,
+                "status":     status,
+                "req_body":   req_body[:4000],
+                "resp_body":  resp_text[:50000],
+                "resp_size":  len(resp_text),
+                "resp_error": resp_error,
             }
             _net_log_state["entries"].append(entry)
             cb = _net_log_state.get("_ui_cb")
             lp = _net_log_state.get("_loop")
             if cb and lp:
                 asyncio.run_coroutine_threadsafe(cb(entry), lp)
-        except Exception:
-            pass
+        except Exception as e:
+            _net_log_state.setdefault("capture_errors", []).append({
+                "time":  time.strftime("%H:%M:%S"),
+                "url":   getattr(request, "url", "?"),
+                "error": str(e),
+            })
 
-    page.on("response", _on_response)
+    page.on("requestfinished", _on_request_finished)
     try:
         page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
     except Exception:
