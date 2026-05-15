@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.52"
+__version__ = "1.1.53"
 
 import asyncio
 import threading
@@ -12766,10 +12766,31 @@ def chat_batch_map_reduce(
 
     # Filter out batches that found nothing — they are not contradictions,
     # just slices that didn't contain matching tickets.
-    matching = [
-        (idx, ans) for idx, ans in partial_answers
-        if ans.strip().upper() != _BATCH_NO_MATCH and not ans.startswith("ERROR:")
-    ]
+    # Local models rarely respond with the exact sentinel, so detect emptiness
+    # by: (a) exact/near sentinel match, or (b) no ticket ID (#NNNNN) in a
+    # short response, or (c) contains common "nothing found" phrases.
+    _NO_RESULT_PHRASES = (
+        "no_match", "no match", "no tickets", "no matching tickets",
+        "no relevant", "no results", "none found", "not found",
+        "no ticket", "no support ticket",
+    )
+
+    def _is_empty_batch(ans: str) -> bool:
+        if ans.startswith("ERROR:"):
+            return True
+        _lower = ans.strip().lower()
+        # Exact sentinel (or with trailing punctuation)
+        if _lower.rstrip(".,! ") == "no_match":
+            return True
+        # Short response with no ticket ID reference → almost certainly empty
+        if len(_lower) < 120 and "#" not in ans:
+            return True
+        # Contains a clear "nothing found" phrase and no ticket ID
+        if "#" not in ans and any(p in _lower for p in _NO_RESULT_PHRASES):
+            return True
+        return False
+
+    matching = [(idx, ans) for idx, ans in partial_answers if not _is_empty_batch(ans)]
     n_empty = len(partial_answers) - len(matching)
     ordered = [f"[Batch {idx + 1}]\n{ans}" for idx, ans in matching]
 
