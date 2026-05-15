@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.53"
+__version__ = "1.1.54"
 
 import asyncio
 import threading
@@ -13205,9 +13205,10 @@ def build_rag_context(
 
         if compact:
             desc = (t.get("description") or "")[:200].replace("\n", " ")
+            _app_tag = f"[Application: {_app_str}]" if _app_str else "[Application: ?]"
             lines.append(
                 f"#{tid} [{(t.get('priority') or '?').upper()}|{t.get('status','?')}] "
-                f"app:{_app_str or '?'} requester:{t.get('requester','?')} "
+                f"{_app_tag} requester:{t.get('requester','?')} "
                 f"created:{_created_str or '?'} resolved:{_resolved_str or '?'} "
                 f"time:{_days_str or '?'} assignee:{t.get('assignee','?')} "
                 f"clusters:{cluster_str} — {t.get('subject','N/A')} — {desc}"
