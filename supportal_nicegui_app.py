@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.21"
+__version__ = "1.1.52"
 
 import asyncio
 import threading
@@ -80,7 +80,7 @@ try:
     from couchbase.cluster import Cluster
     from couchbase.options import ClusterOptions, UpsertOptions, SearchOptions, QueryOptions
     from couchbase.exceptions import CouchbaseException
-    from couchbase.search import SearchRequest
+    from couchbase.search import SearchRequest, MatchQuery, DisjunctionQuery
     from couchbase.vector_search import VectorQuery, VectorSearch
     import couchbase.subdocument as _SD
     from datetime import timedelta
@@ -3801,6 +3801,14 @@ def main_page():
                                 on_click=lambda: asyncio.ensure_future(_ch_save_cb()),
                             ).props("color=indigo outline")
                             btn_ch_save_cb.set_enabled(False)
+                            btn_ch_embed_cb = ui.button(
+                                "Embed Snapshots", icon="hub",
+                                on_click=lambda: asyncio.ensure_future(_ch_embed_cb()),
+                            ).props("color=teal outline").tooltip(
+                                "Generate vector embeddings for loaded snapshots and upsert them to Couchbase. "
+                                "Required for vector search / topology queries."
+                            )
+                            btn_ch_embed_cb.set_enabled(False)
                             ch_auto_save_cb = ui.checkbox(
                                 "Auto-save to Couchbase after scrape", value=False,
                             ).tooltip("Automatically persist scraped snapshots to Couchbase when the scrape completes")
@@ -5593,6 +5601,18 @@ def main_page():
                             on_click=lambda: asyncio.ensure_future(_run_preflight()),
                         ).props("color=indigo").classes("mt-4")
 
+                        with ui.row().classes("items-center gap-3 mt-3"):
+                            alias_status_lbl = ui.label("").classes("text-xs text-gray-500")
+                            ui.button(
+                                "Refresh App Aliases", icon="sync",
+                                on_click=lambda: asyncio.ensure_future(
+                                    _refresh_cluster_map(alias_status_lbl)
+                                ),
+                            ).props("color=teal outline size=sm").tooltip(
+                                "Query CB snapshots + tickets to build dynamic cluster→app name mappings. "
+                                "Improves search labelling for any customer, not just AmEx."
+                            )
+
             with ui.tab_panel(tab_chat):
                 with ui.column().classes("w-full gap-6"):
                     # ── Phase 2: Chat / RAG ──────────────────────────────────────────────
@@ -5715,9 +5735,15 @@ def main_page():
                             def _worker():
                                 try:
                                     default = "http://localhost:1234" if provider == "lmstudio" else "http://localhost:11434"
+                                    # Long connect timeout for LMStudio on-demand model loading
+                                    # (model load on a 4070 Ti can take 30–90 s before first token)
+                                    _timeout = _openai_mod.Timeout(
+                                        timeout=600.0, connect=180.0
+                                    ) if provider == "lmstudio" else None
                                     client = _openai_mod.OpenAI(
                                         api_key=api_key or "ollama",
                                         base_url=_openai_base_url(base_url, default),
+                                        timeout=_timeout,
                                     )
                                     with client.chat.completions.create(
                                         model=model, messages=messages, max_tokens=4096, stream=True
@@ -5942,23 +5968,18 @@ def main_page():
                                     _emb_ttl_s    = _emb_ttl_days * 86400   # 0 = permanent
                                     _srch_ttl_s   = _srch_ttl_hrs * 3600    # 0 = permanent
 
-                                    # Conversational query rewriting: turn follow-up questions
-                                    # ("expand on MLE and safekey") into self-contained retrieval
-                                    # queries that embed well and pull the right tickets without
-                                    # needing to hard-code ticket IDs from the prior answer.
-                                    # Uses a cheap LLM call (max_tokens=120); falls back to the
-                                    # original question if the call fails or there is no history.
+                                    # Query rewriting: always strip output-format noise and
+                                    # resolve conversational references before embedding.
+                                    # Runs on every turn (first and follow-up) so the vector
+                                    # query is always retrieval-focused, not presentation-focused.
                                     _hist_for_rewrite = state["chat_history"][:-1]  # exclude current user msg
-                                    if _hist_for_rewrite:
-                                        chat_status.set_text("Rewriting query for retrieval …")
-                                        _retrieval_q = await run.io_bound(
-                                            rewrite_query_for_retrieval,
-                                            question,
-                                            _hist_for_rewrite,
-                                            provider, model, api_key, base_url,
-                                        )
-                                    else:
-                                        _retrieval_q = question
+                                    chat_status.set_text("Rewriting query for retrieval …")
+                                    _retrieval_q = await run.io_bound(
+                                        rewrite_query_for_retrieval,
+                                        question,
+                                        _hist_for_rewrite,
+                                        provider, model, api_key, base_url,
+                                    )
 
                                     # 1. Embed — always check cache; always store (TTL=0 = forever)
                                     _ekey = _chat_cache_key("embed", _retrieval_q, _ep, _em, str(_edims))
@@ -6015,12 +6036,13 @@ def main_page():
                                     chat_status.set_text("Hybrid retrieval: vector + structured search …")
                                     context_tickets, _retrieval_note = await run.io_bound(
                                         hybrid_retrieval,
-                                        _retrieval_q,   # augmented: includes prior ticket IDs
+                                        _retrieval_q,       # rewritten: used for vector embedding + expansion
                                         query_vec,
                                         *_ticket_cb,
                                         _top_k,
                                         state["results"],   # in-memory fallback
                                         _make_embed_fn(),   # for query expansion
+                                        question,           # original: used for structured filters + Stage 6
                                     )
                                     chat_status.set_text(f"Hybrid retrieval: {_retrieval_note}")
                                     doc_keys = [str(t.get("ticket_id", "")) for t in context_tickets if t.get("ticket_id")]
@@ -6030,7 +6052,28 @@ def main_page():
                                         timeout=4000,
                                     )
 
-                                    # 4. Build messages with RAG context in system prompt
+                                    # 4a. Fetch snapshot topology for retrieved tickets
+                                    _snapshot_map: dict[str, dict] = {}
+                                    if context_tickets and _CB_AVAILABLE:
+                                        _cluster_uuids: list[str] = []
+                                        for _ct in context_tickets:
+                                            for _cu in _ticket_cluster_ids(_ct):
+                                                if _cu not in _cluster_uuids:
+                                                    _cluster_uuids.append(_cu)
+                                        if _cluster_uuids:
+                                            chat_status.set_text("Fetching cluster topology from snapshots …")
+                                            _snapshot_map = await run.io_bound(
+                                                fetch_snapshots_for_clusters,
+                                                _cluster_uuids[:30],
+                                                cb_url_input.value.strip(),
+                                                cb_bucket_input.value.strip(),
+                                                cb_user_input.value.strip(),
+                                                cb_pass_input.value,
+                                                cb_tls_toggle.value,
+                                                cb_scope_input.value.strip() or "_default",
+                                            )
+
+                                    # 4b. Build messages with RAG context in system prompt
                                     _today_dt  = datetime.datetime.now()
                                     _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
                                     _stats_block = build_dataset_stats(state["results"], _today_dt)
@@ -6039,7 +6082,8 @@ def main_page():
                                         (_agg_block + "\n" if _agg_block else "") +
                                         build_rag_context(context_tickets, state["customer_name"],
                                                           compact=compact_context_toggle.value,
-                                                          filter_note=_retrieval_note)
+                                                          filter_note=_retrieval_note,
+                                                          snapshot_map=_snapshot_map)
                                     )
                                     system_msg = SYSTEM_PROMPT_TEMPLATE.format(
                                         today=_today_str,
@@ -8838,6 +8882,7 @@ def main_page():
                             # Enable save whenever there are snapshots in memory
                             all_snaps = ch_snap_state.get("snapshots") or []
                             btn_ch_save_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
+                            btn_ch_embed_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
                             if new_snaps:
                                 ch_status.set_text(
                                     f"Scraped {len(new_snaps)} new snapshots "
@@ -8954,6 +8999,7 @@ def main_page():
 
                             all_snaps = ch_snap_state.get("snapshots") or []
                             btn_ch_save_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
+                            btn_ch_embed_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
                             msg = (
                                 f"Analytics: {len(new_snaps)} new snapshots fetched "
                                 f"({len(all_snaps)} total). Topology not loaded — use Scrape for full detail."
@@ -9056,6 +9102,7 @@ def main_page():
 
                             all_snaps = ch_snap_state.get("snapshots") or []
                             btn_ch_save_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
+                            btn_ch_embed_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
                             ch_status.set_text(
                                 f"Scraped topology for {len(scraped)} snapshots ({len(all_snaps)} total)."
                             )
@@ -9158,6 +9205,7 @@ def main_page():
                                     _prog,
                                 )
                                 ch_status.set_text(f"Saved {upserted} snapshots ({errors} errors).")
+                                btn_ch_embed_cb.set_enabled(bool(snaps) and _CB_AVAILABLE)
                                 try:
                                     ui.notify(f"Saved {upserted} snapshots.", type="positive")
                                 except Exception:
@@ -9170,6 +9218,62 @@ def main_page():
                                     pass
                             finally:
                                 btn_ch_save_cb.set_enabled(True)
+
+                        async def _ch_embed_cb():
+                            if not _CB_AVAILABLE:
+                                ui.notify("Couchbase SDK not available.", type="warning")
+                                return
+                            snaps = ch_snap_state.get("snapshots") or []
+                            if not snaps:
+                                ui.notify("No snapshots in memory — scrape or load first.", type="warning")
+                                return
+                            ep, em, ek, eu, ed, _enctx = _get_embed_config()
+                            if not ep or not em:
+                                ui.notify("Configure embedding model first (Configuration tab).", type="warning")
+                                return
+                            ch_status.set_text(f"Embedding {len(snaps)} snapshots …")
+                            btn_ch_embed_cb.set_enabled(False)
+                            ch_progress.set_visibility(True)
+                            ch_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(
+                                    _ch_emb_upd(msg, pct), loop
+                                )
+
+                            async def _ch_emb_upd(msg: str, pct: float):
+                                ch_status.set_text(msg)
+                                ch_progress.set_value(pct)
+
+                            try:
+                                done, errs = await run.io_bound(
+                                    embed_all_snapshots,
+                                    snaps,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    ch_snap_coll.value.strip() or "snapshots",
+                                    ep, em, ek, eu, int(ed or 1024),
+                                    _prog,
+                                )
+                                ch_status.set_text(f"Embedded {done} snapshots ({errs} errors).")
+                                try:
+                                    ui.notify(f"Embedded {done} snapshots.", type="positive")
+                                except Exception:
+                                    pass
+                            except Exception as exc:
+                                ch_status.set_text(f"Embed error: {exc}")
+                                try:
+                                    ui.notify(str(exc), type="negative")
+                                except Exception:
+                                    pass
+                            finally:
+                                btn_ch_embed_cb.set_enabled(True)
+                                ch_progress.set_visibility(False)
 
                         async def _ch_render_timeline(client=None):
                             cid = ch_tl_cluster_select.value or ""
@@ -9804,6 +9908,29 @@ def main_page():
             cb_collection_input.value.strip() or "tickets",
         )
 
+    async def _refresh_cluster_map(status_label=None) -> str:
+        """Query CB snapshots + tickets to populate dynamic cluster↔app alias maps."""
+        args = _cb_args()
+        if not args:
+            msg = "CB not configured — aliases unchanged"
+            if status_label:
+                status_label.set_text(msg)
+            return msg
+        cb_url, bucket, cb_user, cb_pass, cb_tls, scope, _col = args
+        snap_col = ch_snap_coll.value.strip() or "snapshots"
+        if status_label:
+            status_label.set_text("Querying CB for cluster↔app mappings…")
+        n_snaps, n_tickets = await run.io_bound(
+            _load_cluster_app_map,
+            cb_url, bucket, cb_user, cb_pass, cb_tls, scope,
+            snap_col, _col,
+        )
+        total = len(_cluster_app_dynamic)
+        msg = f"Aliases refreshed — {total} cluster→app mappings ({n_snaps} from snaps, {n_tickets} from tickets)"
+        if status_label:
+            status_label.set_text(msg)
+        return msg
+
     async def _save_profile():
         profiles   = _load_settings_file()
         name       = (profile_name_input.value or profile_select.value or "default").strip()
@@ -9840,6 +9967,7 @@ def main_page():
                     local["__last__"] = name
                     _save_settings_file(local)
                     profile_status.set_text(f"Loaded \"{name}\" from Couchbase")
+                    asyncio.ensure_future(_refresh_cluster_map())
                     return
                 profile_status.set_text(f"\"{name}\" not in Couchbase — checking local…")
             except Exception as exc:
@@ -9853,6 +9981,7 @@ def main_page():
         profiles["__last__"] = name
         _save_settings_file(profiles)
         profile_status.set_text(f"Loaded \"{name}\"")
+        asyncio.ensure_future(_refresh_cluster_map())
 
     async def _delete_profile():
         profiles = _load_settings_file()
@@ -9875,13 +10004,15 @@ def main_page():
         else:
             profile_status.set_text(f"Profile \"{name}\" not found.")
 
-    # Auto-load the last-used profile on page open
+    # Auto-load the last-used profile on page open, then refresh cluster→app aliases
     _last = _load_settings_file().get("__last__")
     if _last:
         _saved = _load_settings_file().get(_last, {})
         if _saved:
             _apply_profile(_saved)
             profile_status.set_text(f"Auto-loaded \"{_last}\"")
+            # Fire alias refresh in background so it doesn't block page paint
+            asyncio.ensure_future(_refresh_cluster_map())
 
 
 # ─────────────────────────── Couchbase connection helper ─────────────────────
@@ -10170,17 +10301,25 @@ def fetch_tickets_by_keys(
     """
     if not _CB_AVAILABLE or not doc_keys:
         return []
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-    # USE KEYS is bucket-level only; use META().id IN for scoped collections
-    placeholders = ", ".join(f"${i+1}" for i in range(len(doc_keys)))
-    query  = f"SELECT t.* FROM {keyspace} AS t WHERE META(t).id IN [{placeholders}]"
-    result = cluster.query(query, QueryOptions(positional_parameters=doc_keys))
-    tickets = [row for row in result.rows()]
-    cluster.close()
-    return tickets
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=15))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+        # USE KEYS is bucket-level only; use META().id IN for scoped collections
+        placeholders = ", ".join(f"${i+1}" for i in range(len(doc_keys)))
+        query  = f"SELECT t.* FROM {keyspace} AS t WHERE META(t).id IN [{placeholders}]"
+        result = cluster.query(query, QueryOptions(positional_parameters=doc_keys))
+        tickets = [row for row in result.rows()]
+        cluster.close()
+        _missing_req = [t.get("ticket_id") for t in tickets if not t.get("requester")]
+        if _missing_req:
+            print(f"[fetch_tickets_by_keys] {len(tickets)} returned, "
+                  f"missing requester on: {_missing_req}")
+        return tickets
+    except Exception as exc:
+        print(f"[fetch_tickets_by_keys] CB fetch failed ({len(doc_keys)} keys): {exc}")
+        return []
 
 
 def _make_snap_col(
@@ -10254,6 +10393,7 @@ def load_to_couchbase(
         try:
             doc = ticket.copy()
             doc["last_scraped_at"] = _now
+            doc["type"] = "ticket"
             col.upsert(doc_key, doc)
             upserted += 1
         except CouchbaseException as exc:
@@ -10294,6 +10434,27 @@ def build_embed_text(ticket: dict) -> str:
     if ticket.get("subject"):
         parts.append(f"Subject: {ticket['subject']}")
         parts.append(f"Topic: {ticket['subject']}")
+
+    # Application alias injection: if the subject/description references a known cluster
+    # hostname but doesn't mention the application name, inject it so vector search on
+    # the app name ("MLE") finds this ticket.
+    _topo_for_alias = ticket.get("snapshot_topology") or {}
+    if isinstance(_topo_for_alias, str):
+        try:
+            _topo_for_alias = json.loads(_topo_for_alias)
+        except Exception:
+            _topo_for_alias = {}
+    _bn_for_alias = _topo_for_alias.get("bucket_names") or []
+    _bn_str = " ".join(_bn_for_alias) if isinstance(_bn_for_alias, list) else str(_bn_for_alias)
+    _text_for_alias = " ".join([
+        ticket.get("subject") or "", ticket.get("description") or "", _bn_str,
+    ]).lower()
+    _injected_apps: set[str] = set()
+    for _host, _app in _get_cluster_to_app().items():
+        if _host in _text_for_alias and _app not in _injected_apps:
+            if _app.lower() not in _text_for_alias:  # only inject if not already present
+                parts.append(f"Application: {_app.upper()}")
+                _injected_apps.add(_app)
     # Interaction summary — generated by the scoring LLM; semantically the richest
     # field for retrieval.  Placed immediately after subject so it is weighted highly.
     if ticket.get("interaction_summary"):
@@ -10371,6 +10532,11 @@ def build_embed_text(ticket: dict) -> str:
             topo_lines.append(f"  Nodes: {topo['total_nodes']}")
         if topo.get("bucket_count"):
             topo_lines.append(f"  Buckets: {topo['bucket_count']}")
+        _bn = topo.get("bucket_names") or []
+        if isinstance(_bn, list) and _bn:
+            topo_lines.append(f"  Bucket Names: {', '.join(_bn[:20])}")
+        elif isinstance(_bn, str) and _bn:
+            topo_lines.append(f"  Bucket Names: {_bn}")
         if topo.get("ram_per_node_mib"):
             topo_lines.append(f"  RAM per Node: {topo['ram_per_node_mib']} MiB")
         if topo.get("auto_failover_seconds") is not None:
@@ -10440,6 +10606,156 @@ def build_embed_text(ticket: dict) -> str:
         assembled += "\n\n" + comment_text[:remaining - 100]
 
     return assembled
+
+
+def build_snapshot_embed_text(snap: dict) -> str:
+    """
+    Build embedding text for a snapshot document so vector search can find
+    snapshots by cluster characteristics, health state, or application.
+
+    Enables queries like: "AmEx clusters running 7.6 with bad items",
+    "MLE clusters with more than 10 nodes", "clusters with high warn count".
+    """
+    parts: list[str] = []
+    if snap.get("organization"):
+        parts.append(f"Customer: {snap['organization']}")
+    if snap.get("cluster_name"):
+        parts.append(f"Cluster Name: {snap['cluster_name']}")
+        parts.append(f"Cluster: {snap['cluster_name']}")
+    if snap.get("cluster_uuid"):
+        parts.append(f"Cluster UUID: {snap['cluster_uuid']}")
+    if snap.get("cb_version"):
+        parts.append(f"Couchbase Version: {snap['cb_version']}")
+    if snap.get("date"):
+        parts.append(f"Snapshot Date: {snap['date']}")
+    _nodes = snap.get("total_nodes") or snap.get("node_count")
+    if _nodes:
+        parts.append(f"Total Nodes: {_nodes}")
+    if snap.get("ram_per_node_mib"):
+        parts.append(f"RAM per Node: {snap['ram_per_node_mib']} MiB")
+    svc_parts = []
+    for svc, key in [("KV/Data", "data_nodes"), ("Index", "index_nodes"),
+                     ("Query", "query_nodes"), ("Search", "fts_nodes"),
+                     ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
+        n = snap.get(key)
+        if n:
+            svc_parts.append(f"{svc}×{n}")
+    if svc_parts:
+        parts.append(f"Services: {', '.join(svc_parts)}")
+    _bn = snap.get("bucket_names") or []
+    if isinstance(_bn, list) and _bn:
+        parts.append(f"Bucket Names: {', '.join(_bn[:30])}")
+    elif isinstance(_bn, str) and _bn:
+        parts.append(f"Bucket Names: {_bn}")
+    _bad = snap.get("bad_items") or []
+    if isinstance(_bad, list) and _bad:
+        parts.append(f"Bad Items: {', '.join(str(b) for b in _bad[:20])}")
+    elif isinstance(_bad, str) and _bad:
+        parts.append(f"Bad Items: {_bad}")
+    _warn = snap.get("warn_items") or []
+    if isinstance(_warn, list) and _warn:
+        parts.append(f"Warning Items: {', '.join(str(w) for w in _warn[:20])}")
+    elif isinstance(_warn, str) and _warn:
+        parts.append(f"Warning Items: {_warn}")
+    if snap.get("bad_count"):
+        parts.append(f"Bad Count: {snap['bad_count']}")
+    if snap.get("warn_count"):
+        parts.append(f"Warning Count: {snap['warn_count']}")
+    _tids = snap.get("ticket_ids") or []
+    if _tids:
+        parts.append(f"Associated Tickets: {', '.join(str(t) for t in _tids[:10])}")
+    # App alias injection — same pattern as tickets
+    _alias_text = " ".join([
+        snap.get("cluster_name") or "",
+        " ".join(_bn[:30]) if isinstance(_bn, list) else (_bn or ""),
+    ]).lower()
+    for _host, _app in _get_cluster_to_app().items():
+        if _host in _alias_text and _app.lower() not in _alias_text:
+            parts.append(f"Application: {_app.upper()}")
+    return "\n".join(parts)
+
+
+def embed_all_snapshots(
+    snapshots: list[dict],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str,
+    embed_provider: str,
+    embed_model: str,
+    embed_api_key: str,
+    embed_base_url: str,
+    vector_dims: int,
+    progress_cb: Callable[[str, float], None],
+    cancel_event: threading.Event | None = None,
+    max_workers: int = 1,
+) -> tuple[int, int]:
+    """
+    For each snapshot: build embed text → call embedding provider → upsert back
+    to Couchbase with an added `embedding` field.  Returns (done, errors).
+    """
+    import concurrent.futures
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    progress_cb("Connecting to Couchbase for snapshot embedding …", 0.0)
+    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    col = cluster.bucket(bucket).scope(scope).collection(snap_collection)
+
+    total = len(snapshots)
+    done_count = error_count = 0
+    lock = threading.Lock()
+
+    def _embed_one(snap: dict) -> tuple[str, list[float] | None, str | None]:
+        sid = snap.get("snap_id") or "unknown"
+        doc_key = f"snapshot::{sid}"
+        try:
+            text = build_snapshot_embed_text(snap)
+            vec  = embed_text(text, embed_provider, embed_model, embed_api_key,
+                              embed_base_url, vector_dims)
+            if vector_dims and len(vec) > vector_dims:
+                vec = vec[:vector_dims]
+                norm = sum(x * x for x in vec) ** 0.5
+                if norm > 0:
+                    vec = [x / norm for x in vec]
+            return doc_key, vec, None
+        except Exception as exc:
+            return doc_key, None, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futs = {pool.submit(_embed_one, s): s for s in snapshots}
+        for i, fut in enumerate(concurrent.futures.as_completed(futs)):
+            if cancel_event and cancel_event.is_set():
+                break
+            doc_key, vec, err = fut.result()
+            snap = futs[fut]
+            if vec:
+                try:
+                    doc = snap.copy()
+                    doc["embedding"] = vec
+                    col.upsert(doc_key, doc)
+                    with lock:
+                        done_count += 1
+                        if done_count % 10 == 0 or done_count == total:
+                            progress_cb(f"Embedded {done_count}/{total} snapshots …",
+                                        done_count / total)
+                except Exception as exc:
+                    with lock:
+                        error_count += 1
+                    print(f"[embed_snapshots] upsert error {doc_key}: {exc}")
+            else:
+                with lock:
+                    error_count += 1
+                print(f"[embed_snapshots] embed error {doc_key}: {err}")
+
+    cluster.close()
+    return done_count, error_count
 
 
 def embed_text_ollama(text: str, model: str, base_url: str,
@@ -10725,6 +11041,7 @@ def save_tickets_to_cb(
             doc["feature_area"]    = classify_ticket_feature(ticket)
             doc["ticket_origin"]   = classify_ticket_origin(ticket)
             doc["last_scraped_at"] = _now
+            doc["type"]            = "ticket"
             col.upsert(doc_key, doc)
             saved += 1
         except Exception as exc:
@@ -10823,6 +11140,7 @@ def run_snapshot_pipeline(
     options: dict | None = None,
     progress_cb: Callable[[str, float], None] | None = None,
     cancel_event: threading.Event | None = None,
+    embed_config: dict | None = None,
 ) -> dict:
     """
     Scrape snapshots for *customer* and save them to Couchbase in one call.
@@ -10835,8 +11153,12 @@ def run_snapshot_pipeline(
       max_snapshots – int, 0 = no limit
       workers       – int (default 4), concurrent topology fetches
 
+    embed_config dict keys (all optional — omit to skip embedding):
+      provider, model, api_key, base_url, dims, max_workers
+
     Returns:
-      {"snapshots": list[dict], "saved": int, "errors": int, "skipped": int}
+      {"snapshots": list[dict], "saved": int, "errors": int, "skipped": int,
+       "embedded": int, "embed_errors": int}
     """
     opts     = options or {}
     _prog    = progress_cb or (lambda msg, pct: None)
@@ -10873,8 +11195,36 @@ def run_snapshot_pipeline(
             _prog,
         )
 
-    _prog(f"Done — {len(snapshots)} scraped, {saved} saved, {errors} errors.", 1.0)
-    return {"snapshots": snapshots, "saved": saved, "errors": errors, "skipped": n_skipped}
+    embedded = embed_errors = 0
+    if embed_config and snapshots and _CB_AVAILABLE and cb_config.url:
+        ecfg = embed_config
+        _prog(f"Embedding {len(snapshots)} snapshots …", 0.85)
+        try:
+            embedded, embed_errors = embed_all_snapshots(
+                snapshots,
+                cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+                cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
+                embed_provider   = ecfg.get("provider", ""),
+                embed_model      = ecfg.get("model", ""),
+                embed_api_key    = ecfg.get("api_key", ""),
+                embed_base_url   = ecfg.get("base_url", ""),
+                vector_dims      = int(ecfg.get("dims", 1024)),
+                progress_cb      = _prog,
+                cancel_event     = cancel_event,
+                max_workers      = int(ecfg.get("max_workers", 1)),
+            )
+        except Exception as exc:
+            _prog(f"Snapshot embedding error: {exc}", 0.95)
+
+    _prog(
+        f"Done — {len(snapshots)} scraped, {saved} saved, {errors} errors"
+        + (f", {embedded} embedded" if embed_config else "") + ".",
+        1.0,
+    )
+    return {
+        "snapshots": snapshots, "saved": saved, "errors": errors, "skipped": n_skipped,
+        "embedded": embedded, "embed_errors": embed_errors,
+    }
 
 
 def embed_all_tickets(
@@ -11041,17 +11391,32 @@ def create_vector_index(
             "fields": [{"analyzer": "standard", "index": True, "name": name, "store": True, "type": "text"}],
         }
 
-    # scope.collection.type_field mode: CB compares the document's `type` field
-    # value against the keys in `types`.  Using "ticket" is cleaner than
-    # "scope.collection" and avoids indexing non-ticket docs in the collection.
-    type_key = "ticket"
+    # In scope.collection.type_field mode, CB FTS keys docs by
+    # "{scope}.{collection}" when they have no `type` field — matching the
+    # existing production index.  No document stamping required.
+    snap_collection = "snapshots"
+    ticket_type_key  = f"{scope}.{collection}"
+    snap_type_key    = f"{scope}.{snap_collection}"
+
+    def _vec_field() -> dict:
+        return {
+            "dynamic": False,
+            "enabled": True,
+            "fields": [{"dims": vector_dims, "index": True, "name": "embedding",
+                        "similarity": "dot_product", "type": "vector"}],
+        }
+
+    def _nested(children: dict) -> dict:
+        """Nested object mapping (for arrays-of-objects or sub-documents)."""
+        return {"dynamic": False, "enabled": True, "properties": children}
+
     index_def = {
         "type":       "fulltext-index",
         "name":       f"{bucket}.{scope}.{index_name}",
         "sourceType": "gocbcore",
         "sourceName": bucket,
         "sourceParams": {},
-        "planParams": {"maxPartitionsPerPIndex": 512, "indexPartitions": 1},
+        "planParams": {"maxPartitionsPerPIndex": 1024, "indexPartitions": 1},
         "params": {
             "doc_config": {
                 "docid_prefix_delim": "",
@@ -11071,31 +11436,53 @@ def create_vector_index(
                 "store_dynamic":           False,
                 "type_field":              "_type",
                 "types": {
-                    type_key: {
+                    # ── Tickets ──────────────────────────────────────────────
+                    ticket_type_key: {
                         "dynamic": False,
                         "enabled": True,
                         "properties": {
-                            "embedding": {
-                                "dynamic": False,
-                                "enabled": True,
-                                "fields": [{
-                                    "dims":       vector_dims,
-                                    "index":      True,
-                                    "name":       "embedding",
-                                    "similarity": "dot_product",
-                                    "type":       "vector",
-                                }],
-                            },
+                            "embedding":   _vec_field(),
                             "subject":     _text_field("subject"),
+                            "description": _text_field("description"),
+                            # comments is an array of objects — must map the
+                            # nested .body field so BM25 indexes comment text.
+                            "comments":    _nested({"body": _text_field("body")}),
+                            "tags":        _text_field("tags"),
                             "status":      _text_field("status"),
                             "priority":    _text_field("priority"),
                             "requester":   _text_field("requester"),
                             "assignee":    _text_field("assignee"),
                             "created":     _text_field("created"),
-                            "description": _text_field("description"),
-                            "comments":    _text_field("comments"),
+                            # Embedded snapshot topology — cluster hostname and
+                            # bucket names let BM25 find tickets by cluster.
+                            "snapshot_topology": _nested({
+                                "cluster_name": _text_field("cluster_name"),
+                                "bucket_names": _text_field("bucket_names"),
+                            }),
+                            # Scoring system pre-computes cluster names that
+                            # span multiple snapshots — richer than topo alone.
+                            "score": _nested({
+                                "cluster_names": _text_field("cluster_names"),
+                            }),
                         },
-                    }
+                    },
+                    # ── Snapshots ─────────────────────────────────────────────
+                    # Vector enables semantic topology queries ("clusters with
+                    # memory pressure", "clusters running 7.6 with XDCR issues").
+                    # Numeric topology filters (node count, RAM) stay in SQL++
+                    # via snapshot_topology_search — FTS doesn't do numeric range.
+                    snap_type_key: {
+                        "dynamic": False,
+                        "enabled": True,
+                        "properties": {
+                            "embedding":    _vec_field(),
+                            "cluster_name": _text_field("cluster_name"),
+                            "organization": _text_field("organization"),
+                            "cb_version":   _text_field("cb_version"),
+                            "bad_items":    _text_field("bad_items"),
+                            "warn_items":   _text_field("warn_items"),
+                        },
+                    },
                 },
             },
             "store": {"indexType": "scorch", "segmentVersion": 16},
@@ -11125,20 +11512,8 @@ def create_vector_index(
             f"FTS index PUT failed {resp.status_code}: {resp.text}"
         )
 
-    # Stamp type = "scope.collection" on every ticket doc so they match the
-    # typed mapping.  Idempotent — safe to run on every index (re)creation.
-    if _CB_AVAILABLE:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=15))
-        try:
-            ks = f"`{bucket}`.`{scope}`.`{collection}`"
-            list(cluster.query(
-                f"UPDATE {ks} SET `type` = $1 WHERE ticket_id IS NOT MISSING AND (`type` IS MISSING OR `type` != $1)",
-                QueryOptions(positional_parameters=[type_key]),
-            ).rows())
-        finally:
-            cluster.close()
+    # No document stamping needed: type key is "{scope}.{collection}" which CB
+    # FTS assigns automatically to all docs that lack a `type` field.
 
 
 def vector_search_cb(
@@ -11200,6 +11575,94 @@ def vector_search_cb(
     ) from last_exc
 
 
+def _snap_keys_to_ticket_keys(
+    snap_keys: list[str],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str = "snapshots",
+) -> list[str]:
+    """Resolve snapshot doc keys → ticket doc keys via snapshot.ticket_ids.
+
+    Used when vector search returns snapshot:: keys (from the hybrid FTS index)
+    so they can be cross-referenced into the ticket retrieval pipeline.
+    Returns deduplicated ticket keys in 'ticket::<id>' format.
+    """
+    if not _CB_AVAILABLE or not snap_keys:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        ks           = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        placeholders = ", ".join(f"${i+1}" for i in range(len(snap_keys)))
+        q    = f"SELECT s.ticket_ids FROM {ks} s WHERE META(s).id IN [{placeholders}]"
+        rows = list(cluster.query(q, QueryOptions(positional_parameters=snap_keys)))
+        cluster.close()
+        seen: set[str] = set()
+        result: list[str] = []
+        for row in rows:
+            for tid in (row.get("ticket_ids") or []):
+                key = f"ticket::{tid}"
+                if key not in seen:
+                    seen.add(key)
+                    result.append(key)
+        return result
+    except Exception as exc:
+        print(f"[_snap_keys_to_ticket_keys] {exc}")
+        return []
+
+
+def fts_keyword_search_cb(
+    keywords: list[str],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    top_k: int = 50,
+) -> list[str]:
+    """FTS text search (BM25) against the hybrid FTS index.
+
+    Uses OR semantics: any ticket matching ANY keyword is a candidate.
+    The FTS index handles tokenisation, stemming, and BM25 scoring.
+    This is the correct place for keyword matching — not N1QL LIKE scans.
+
+    Returns doc keys in 'ticket::<id>' format, ranked by FTS score.
+    """
+    if not _CB_AVAILABLE or not keywords:
+        return []
+    try:
+        conn_str   = _cb_conn_str(cb_url, use_tls)
+        cluster    = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        scope_obj  = cluster.bucket(bucket).scope(scope)
+        index_name = f"{collection}_vector_idx"
+
+        kw_list = keywords[:8]
+        if len(kw_list) == 1:
+            fts_q = MatchQuery(kw_list[0])
+        else:
+            fts_q = DisjunctionQuery(*[MatchQuery(kw) for kw in kw_list])
+
+        result = scope_obj.search(
+            index_name,
+            SearchRequest.create(fts_q),
+            SearchOptions(limit=top_k),
+        )
+        ids = [row.id for row in result.rows()]
+        cluster.close()
+        return ids
+    except Exception as exc:
+        print(f"[fts_keyword_search_cb] {exc}")
+        return []
+
+
 def _extract_ticket_ids(text: str) -> set[str]:
     """Extract ticket IDs from free text.
 
@@ -11228,41 +11691,56 @@ def rewrite_query_for_retrieval(
     api_key: str,
     base_url: str,
 ) -> str:
-    """Rewrite a conversational follow-up question into a self-contained retrieval query.
+    """Rewrite any question into a focused, self-contained retrieval query.
 
-    Uses a cheap LLM call (max_tokens=120) to expand contextual pronouns and references
-    ("expand on that", "tell me more about MLE and safekey") into a fully standalone
-    query string that embeds well for dense vector retrieval.
+    Always runs — even on the first turn — so that verbose natural-language
+    questions ("give me a summary in a table with timeline, cluster name,
+    impact...") are distilled to retrieval-focused text ("MLE tickets 2026
+    authentication failure") before embedding.  This prevents output-format
+    noise from diluting the vector signal.
 
-    Returns the original question unchanged if:
-    - there is no chat history (first turn — nothing to resolve)
-    - the LLM call fails for any reason
+    On follow-up turns the chat history is included so pronouns and references
+    ("expand on that", "what about safekey?") are resolved to concrete terms.
+
+    Returns the original question unchanged if the LLM call fails.
     """
-    # No prior turns — nothing to reformulate
-    if not chat_history:
-        return question
-
     # Build a compact history block: last 3 turns (6 messages max), text only
     _turns: list[str] = []
-    for msg in chat_history[-6:]:
+    for msg in (chat_history or [])[-6:]:
         role = msg.get("role", "")
         if role == "user":
             _turns.append(f"User: {msg['content']}")
         elif role == "assistant":
-            # Truncate long answers to keep the prompt short
-            _turns.append(f"Assistant: {msg['content'][:600]}")
-    history_block = "\n".join(_turns)
+            _turns.append(f"Assistant: {msg['content'][:400]}")
+    history_block = ("\nConversation so far:\n" + "\n".join(_turns)) if _turns else ""
 
+    _today = datetime.date.today()
+    _today_str = _today.isoformat()
+    _yr = _today.year
+    _lookback = (_today - datetime.timedelta(days=90)).isoformat()
     _prompt = (
-        "You are a query rewriter for a support-ticket search system.\n"
-        "Given the conversation so far and the user's latest message, "
-        "rewrite the latest message as a single self-contained search query "
-        "that captures all necessary context (topics, applications, error types, priorities, "
-        "ticket IDs, date ranges) needed to retrieve relevant support tickets.\n"
-        "Output ONLY the rewritten query — no explanation, no prefix, no quotes.\n\n"
-        f"Conversation:\n{history_block}\n\n"
-        f"Latest message: {question}\n\n"
-        "Rewritten query:"
+        f"You are a query rewriter for a support-ticket retrieval system.\n"
+        f"Today's date is {_today_str}.\n"
+        f"Your job: extract ONLY the search intent from the user's message — "
+        f"what topics, applications, error types, priorities, ticket IDs, or "
+        f"time ranges to find — and output a concise retrieval query.\n"
+        f"STRIP all output-format instructions (tables, timelines, summaries, "
+        f"columns, 'please', 'give me', 'in a table', etc.) — those are for the "
+        f"answer formatter, not the retriever.\n"
+        f"DATE RESOLUTION (critical): Convert every relative or ambiguous date "
+        f"reference to explicit ISO-8601 dates (YYYY-MM-DD). Examples:\n"
+        f"  'this year' -> 'from {_yr}-01-01'\n"
+        f"  'since January' -> 'from {_yr}-01-01'\n"
+        f"  'last quarter' -> compute the previous calendar quarter start/end\n"
+        f"  'recent' / 'lately' -> from {_lookback}\n"
+        f"  'last month' -> from first day of the previous calendar month\n"
+        f"  'in 2025' -> 'from 2025-01-01 to 2025-12-31'\n"
+        f"Always include the resolved date range in the output query as "
+        f"'from YYYY-MM-DD' or 'from YYYY-MM-DD to YYYY-MM-DD'.\n"
+        f"Output ONLY the rewritten query — no explanation, no prefix, no quotes.\n"
+        f"{history_block}\n\n"
+        f"User message: {question}\n\n"
+        f"Retrieval query:"
     )
     try:
         result = call_llm(
@@ -11271,12 +11749,145 @@ def rewrite_query_for_retrieval(
             max_tokens=120,
         )
         rewritten = result.strip().strip('"').strip("'")
-        # Sanity check: if the model returned something clearly bad, fall back
-        if rewritten and len(rewritten) > 10 and rewritten.lower() != question.lower():
+        if rewritten and len(rewritten) > 5:
             return rewritten
     except Exception:
         pass
     return question
+
+
+# ── Dynamic cluster↔application alias maps ────────────────────────────────────
+# These maps are populated at runtime by querying CB snapshots/tickets.
+# _cluster_app_dynamic  : cluster_name (hostname) → app/org label (lowercase)
+# _app_cluster_dynamic  : app/org label → [cluster_name, ...] list
+# Both dicts start empty and are filled by _load_cluster_app_map().
+# _get_cluster_to_app() / _get_app_cluster_aliases() merge dynamic data with
+# the static seed dict so existing AmEx entries remain until CB is queried.
+_cluster_app_dynamic: dict[str, str] = {}
+_app_cluster_dynamic: dict[str, list[str]] = {}
+
+# Static seed — known AmEx mappings kept as a fallback / bootstrap until CB
+# data is loaded. Multi-word aliases that share hosts are intentionally kept
+# separate so both "mle" and "merchant list" expand to the same hosts.
+_APP_CLUSTER_ALIASES_SEED: dict[str, list[str]] = {
+    "mle":              ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129", "peuse1cbecpsd000069"],
+    "merchant list":    ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129", "peuse1cbecpsd000069"],
+    "merchant":         ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129"],
+    "safekey":          ["peusw1cbecpsd000102", "peuse1cbecpsd000103"],
+    "griffin":          ["peusw1cbecpsd2000303"],
+    "digital payments": ["peusw1cbecpsd2000086", "peuse1cbecpsd2000081"],
+}
+
+
+def _get_cluster_to_app() -> dict[str, str]:
+    """Merge static seed + dynamic CB data → cluster_name → app label."""
+    merged: dict[str, str] = {
+        host: app
+        for app, hosts in _APP_CLUSTER_ALIASES_SEED.items()
+        for host in hosts
+        if app not in ("merchant list", "merchant")
+    }
+    merged.update(_cluster_app_dynamic)
+    return merged
+
+
+def _get_app_cluster_aliases() -> dict[str, list[str]]:
+    """Merge static seed + dynamic CB data → app label → [cluster_names]."""
+    merged: dict[str, list[str]] = dict(_APP_CLUSTER_ALIASES_SEED)
+    for app, hosts in _app_cluster_dynamic.items():
+        if app in merged:
+            existing = merged[app]
+            for h in hosts:
+                if h not in existing:
+                    existing.append(h)
+        else:
+            merged[app] = list(hosts)
+    return merged
+
+
+def _load_cluster_app_map(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, snap_collection: str,
+    ticket_collection: str = "tickets",
+) -> tuple[int, int]:
+    """
+    Query CB to build dynamic cluster→app maps from snapshot organization labels
+    and ticket score.cluster_names + organization fields.  Updates the module-level
+    _cluster_app_dynamic / _app_cluster_dynamic dicts in place.
+    Returns (n_from_snaps, n_from_tickets).
+    """
+    if not _CB_AVAILABLE:
+        return (0, 0)
+    try:
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions, QueryOptions
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.exceptions import CouchbaseException
+        scheme = "couchbases" if use_tls else "couchbase"
+        cluster = Cluster(
+            f"{scheme}://{cb_url}",
+            ClusterOptions(PasswordAuthenticator(username, password)),
+        )
+        cluster.wait_until_ready(datetime.timedelta(seconds=10))
+        ks_snaps   = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        ks_tickets = f"`{bucket}`.`{scope}`.`{ticket_collection}`"
+
+        snap_n = 0
+        try:
+            q = (
+                f"SELECT DISTINCT cluster_name, organization "
+                f"FROM {ks_snaps} "
+                f"WHERE cluster_name IS NOT MISSING AND organization IS NOT MISSING "
+                f"LIMIT 2000"
+            )
+            rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
+            for row in rows:
+                cname = (row.get("cluster_name") or "").strip().lower()
+                org   = (row.get("organization") or "").strip().lower()
+                if not cname or not org:
+                    continue
+                _cluster_app_dynamic[cname] = org
+                if org not in _app_cluster_dynamic:
+                    _app_cluster_dynamic[org] = []
+                if cname not in _app_cluster_dynamic[org]:
+                    _app_cluster_dynamic[org].append(cname)
+                snap_n += 1
+        except Exception:
+            pass
+
+        ticket_n = 0
+        try:
+            q = (
+                f"SELECT organization, score.cluster_names AS cnames "
+                f"FROM {ks_tickets} "
+                f"WHERE organization IS NOT MISSING "
+                f"  AND score.cluster_names IS NOT MISSING "
+                f"LIMIT 5000"
+            )
+            rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
+            for row in rows:
+                org    = (row.get("organization") or "").strip().lower()
+                cnames = row.get("cnames") or []
+                if not org or not isinstance(cnames, list):
+                    continue
+                for cname in cnames:
+                    cname = (cname or "").strip().lower()
+                    if not cname:
+                        continue
+                    if cname not in _cluster_app_dynamic:
+                        _cluster_app_dynamic[cname] = org
+                        ticket_n += 1
+                    if org not in _app_cluster_dynamic:
+                        _app_cluster_dynamic[org] = []
+                    if cname not in _app_cluster_dynamic[org]:
+                        _app_cluster_dynamic[org].append(cname)
+        except Exception:
+            pass
+
+        cluster.close()
+        return (snap_n, ticket_n)
+    except Exception:
+        return (0, 0)
 
 
 _KEYWORD_STOPWORDS = frozenset({
@@ -11295,17 +11906,38 @@ _KEYWORD_STOPWORDS = frozenset({
     "once", "here", "there",
     # task / request words
     "tell", "get", "show", "give", "find", "list", "please", "hi", "hello",
-    "can", "could", "would", "also", "also", "now", "like",
+    "can", "could", "would", "also", "now", "like", "want", "need",
+    "help", "look", "using", "used", "use",
+    # output / format words — these describe what the user wants returned,
+    # NOT what to search for; they pollute keyword search with zero matches
+    "summary", "summarize", "summarise", "table", "timeline", "review",
+    "happened", "able", "create", "sort", "impact", "details", "detail",
+    "info", "information", "explain", "description", "describe", "reason",
+    "note", "notes", "result", "results", "output", "format", "report",
+    "chart", "graph", "compare", "comparison", "analysis", "analyze",
+    # schema / metadata words — not product names
+    "cluster", "clusters", "name", "status", "id", "date", "time",
+    "customer", "org", "organization", "account",
     # ticket domain noise
     "ticket", "tickets", "issue", "issues", "problem", "problems", "case",
     "cases", "related", "recent", "latest", "last", "first", "top", "next",
-    "new", "old", "many", "number", "count", "how", "see",
+    "new", "old", "many", "number", "count", "see", "per", "each",
     # time words (handled structurally)
     "month", "months", "week", "weeks", "day", "days", "year", "years",
     "past", "quarter", "today", "yesterday", "ago",
     # priority / status (handled structurally)
     "open", "closed", "solved", "pending", "hold", "high", "low",
     "priority", "p1", "p2", "p3", "p4",
+    # common English verbs / adjectives that pollute LIKE keyword search
+    # (not product names — these match every ticket's description text)
+    "involved", "involving", "involve", "involves",
+    "affected", "affecting", "affects", "affect",
+    "occurred", "occurring", "occur", "occurs",
+    "failed", "failing", "fails", "fail",
+    "caused", "causing", "causes", "cause",
+    "seen", "see", "far", "across", "along",
+    "means", "mean", "take", "taken", "took",
+    "since", "until", "while", "whereby",
 })
 
 
@@ -11319,23 +11951,31 @@ def build_structured_query(question: str) -> dict:
       date_to    : str | None  — ISO-8601 upper bound
       cluster_ids: list[str]   — explicit cluster identifiers mentioned
       statuses   : list[str]   — open / closed / pending / solved
-      keywords   : list[str]   — application/product names for subject/description LIKE search
-      limit      : int         — explicit N from "last N" / "top N" (0 = use default)
+      keywords      : list[str]   — all extracted terms (full set, for vector/context)
+      struct_keywords: list[str]  — alias/tech terms only; passed to FTS text search
+                                    and Stage-6 post-filter (never used in N1QL LIKE)
+      limit         : int         — explicit N from "last N" / "top N" (0 = use default)
 
-    These constraints are used for N1QL retrieval ONLY — the LLM still receives
-    the full monthly index and TODAY for its own temporal reasoning.
+    Keyword matching uses the FTS hybrid index (BM25) via fts_keyword_search_cb,
+    not N1QL LIKE scans. Structured search handles only: ticket IDs, priorities,
+    date ranges, and statuses.
     """
     q = question.lower()
     today = datetime.datetime.now()
     result: dict = {
-        "ticket_ids":  [],
-        "priorities":  [],
-        "date_from":   None,
-        "date_to":     None,
-        "cluster_ids": [],
-        "statuses":    [],
-        "keywords":    [],
-        "limit":       0,
+        "ticket_ids":            [],
+        "priorities":            [],
+        "date_from":             None,
+        "date_to":               None,
+        "cluster_ids":           [],
+        "statuses":              [],
+        "keywords":              [],
+        "limit":                 0,
+        # Topology filters — trigger snapshot_topology_search leg
+        "topology_min_nodes":    None,   # total node count lower bound
+        "topology_max_nodes":    None,   # total node count upper bound
+        "topology_min_data":     None,   # data-node lower bound
+        "topology_services":     [],     # ["fts","eventing","analytics","index","query"]
     }
 
     # ── Ticket IDs ────────────────────────────────────────────────────────
@@ -11372,27 +12012,37 @@ def build_structured_query(question: str) -> dict:
         result["date_from"] = (today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     elif any(k in q for k in ("last year", "past year", "12 month", "365 day")):
         result["date_from"] = (today - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+    elif any(k in q for k in ("this year", "year to date", "ytd", "so far this year", "current year")):
+        result["date_from"] = f"{today.year}-01-01"
     else:
-        # Explicit year — e.g. "in 2025" / "during 2024"
-        ym = re.search(r"\b(20\d{2})\b", q)
-        if ym:
-            yr = int(ym.group(1))
-            result["date_from"] = f"{yr}-01-01"
-            result["date_to"]   = f"{yr}-12-31"
-        # Explicit month+year — e.g. "March 2026" / "2026-03"
-        month_names = {"january": 1, "february": 2, "march": 3, "april": 4,
-                       "may": 5, "june": 6, "july": 7, "august": 8,
-                       "september": 9, "october": 10, "november": 11, "december": 12}
-        for name, num in month_names.items():
-            if name in q:
-                yr_m = re.search(r"\b(20\d{2})\b", q)
-                if yr_m:
-                    yr = int(yr_m.group(1))
-                    last_day = (datetime.datetime(yr, num, 1)
-                                + datetime.timedelta(days=32)).replace(day=1)
-                    result["date_from"] = f"{yr}-{num:02d}-01"
-                    result["date_to"]   = (last_day - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                break
+        # Explicit ISO date injected by query rewriter — e.g. "since 2026-01-01"
+        iso_dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", q)
+        if iso_dates:
+            iso_dates_sorted = sorted(iso_dates)
+            result["date_from"] = iso_dates_sorted[0]
+            if len(iso_dates_sorted) > 1:
+                result["date_to"] = iso_dates_sorted[-1]
+        else:
+            # Explicit year — e.g. "in 2025" / "during 2024"
+            ym = re.search(r"\b(20\d{2})\b", q)
+            if ym:
+                yr = int(ym.group(1))
+                result["date_from"] = f"{yr}-01-01"
+                result["date_to"]   = f"{yr}-12-31"
+            # Explicit month+year — e.g. "March 2026" / "2026-03"
+            month_names = {"january": 1, "february": 2, "march": 3, "april": 4,
+                           "may": 5, "june": 6, "july": 7, "august": 8,
+                           "september": 9, "october": 10, "november": 11, "december": 12}
+            for name, num in month_names.items():
+                if name in q:
+                    yr_m = re.search(r"\b(20\d{2})\b", q)
+                    if yr_m:
+                        yr = int(yr_m.group(1))
+                        last_day = (datetime.datetime(yr, num, 1)
+                                    + datetime.timedelta(days=32)).replace(day=1)
+                        result["date_from"] = f"{yr}-{num:02d}-01"
+                        result["date_to"]   = (last_day - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                    break
 
     # ── Status ────────────────────────────────────────────────────────────
     status_map = {"open": "open", "closed": "closed", "solved": "solved",
@@ -11408,6 +12058,14 @@ def build_structured_query(question: str) -> dict:
     # Strip punctuation, tokenise, remove stop words and already-structured
     # terms (IDs, priorities, dates, statuses). What remains are likely
     # application/product names (safekey, xdcr, mle, orchestration, etc.)
+    # Min length is 4 for generic terms; exact alias-key or known tech acronym
+    # matches bypass the length check so short names like "mle", "fts", "kv" work.
+    _aca = _get_app_cluster_aliases()  # dynamic + seed merged
+    _alias_key_set = set(_aca.keys())
+    _TECH_ACRONYMS = frozenset({
+        "mle", "fts", "kv", "xdcr", "cbas", "n1ql", "sdk", "ssl",
+        "tls", "ldap", "rbac", "cbse", "cbm", "dcp", "gsi", "eventing",
+    })
     _tokens = re.sub(r"[^\w\s]", " ", q).split()
     _used = set(result["ticket_ids"]) | {p.lower() for p in result["priorities"]} | \
             {s.lower() for s in result["statuses"]}
@@ -11415,12 +12073,71 @@ def build_structured_query(question: str) -> dict:
         t for t in _tokens
         if t not in _KEYWORD_STOPWORDS
         and t not in _used
-        and len(t) >= 3
         and not t.isdigit()
+        and (
+            t in _alias_key_set    # exact app alias: "mle", "safekey", etc.
+            or t in _TECH_ACRONYMS  # known short technical acronym
+            or len(t) >= 4          # everything else needs 4+ chars
+        )
     ]
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order: check membership BEFORE adding
     _seen: set[str] = set()
-    result["keywords"] = [k for k in _keywords if not (_seen.add(k) or k in _seen)]  # type: ignore[func-returns-value]
+    _deduped = [k for k in _keywords if not (k in _seen or _seen.add(k))]  # type: ignore[func-returns-value]
+
+    # Application alias expansion: "mle" → also include known cluster hostnames
+    # so tickets titled "peuse1cbecpsd2000083 warmup" are found even without "mle" in subject.
+    _alias_hosts: list[str] = []
+    for kw in _deduped:
+        for alias, hosts in _aca.items():
+            if kw == alias or alias.startswith(kw) or kw in alias:
+                for h in hosts:
+                    if h not in _alias_hosts and h not in _deduped:
+                        _alias_hosts.append(h)
+    result["keywords"] = _deduped + _alias_hosts
+    # struct_keywords = only alias app names + known tech acronyms + expanded
+    # hostnames — safe to use in N1QL LIKE clauses and Stage-6 post-filter.
+    # General English words ("reported", "relate") are excluded even if they
+    # survive the stopword filter, so they never generate noisy LIKE conditions.
+    result["struct_keywords"] = [
+        k for k in _deduped
+        if k in _alias_key_set or k in _TECH_ACRONYMS
+    ] + _alias_hosts
+
+    # ── Topology filters — node counts and service presence ───────────────
+    # Patterns: "more than 9 nodes", "> 9 nodes", "9+ nodes", "at least 9 nodes"
+    _topo_gt = re.search(
+        r"\b(?:more than|greater than|over|>\s*)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    _topo_ge = re.search(
+        r"\b(?:at least|minimum of?|min\s+)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    _topo_plus = re.search(r"\b(\d+)\+\s*nodes?\b", q)
+    _topo_lt = re.search(
+        r"\b(?:fewer than|less than|under|<\s*)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    _topo_le = re.search(
+        r"\b(?:at most|maximum of?|max\s+)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    if _topo_gt:
+        result["topology_min_nodes"] = int(_topo_gt.group(1)) + 1
+    elif _topo_ge:
+        result["topology_min_nodes"] = int(_topo_ge.group(1))
+    elif _topo_plus:
+        result["topology_min_nodes"] = int(_topo_plus.group(1))
+    if _topo_lt:
+        result["topology_max_nodes"] = int(_topo_lt.group(1)) - 1
+    elif _topo_le:
+        result["topology_max_nodes"] = int(_topo_le.group(1))
+    # Data-node specific: "more than 5 data nodes"
+    _data_gt = re.search(
+        r"\b(?:more than|greater than|over|>\s*)(\d+)\s+data\s+nodes?\b", q)
+    if _data_gt:
+        result["topology_min_data"] = int(_data_gt.group(1)) + 1
+    # Services mentioned
+    _SVC_MAP = {
+        "fts": "fts", "full text search": "fts", "full-text": "fts",
+        "eventing": "eventing", "analytics": "analytics",
+        "index": "index", "query": "query",
+    }
+    result["topology_services"] = list({
+        v for k, v in _SVC_MAP.items() if k in q
+    })
 
     return result
 
@@ -11445,11 +12162,10 @@ def structured_search_cb(
     date_from  = filters.get("date_from")
     date_to    = filters.get("date_to")
     statuses   = filters.get("statuses") or []
-    keywords   = filters.get("keywords") or []
     limit      = filters.get("limit") or default_limit
 
     # Nothing useful to query — skip
-    if not any([ticket_ids, priorities, date_from, statuses, keywords]):
+    if not any([ticket_ids, priorities, date_from, statuses]):
         return []
 
     try:
@@ -11458,7 +12174,7 @@ def structured_search_cb(
         cluster.wait_until_ready(timedelta(seconds=10))
         keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
 
-        where_parts: list[str] = []
+        where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]  # enables partial index use
         params: list = []
 
         if ticket_ids:
@@ -11487,16 +12203,6 @@ def structured_search_cb(
             where_parts.append(f"LOWER(TOSTRING(t.status)) IN [{placeholders}]")
             params.extend(statuses)
 
-        if keywords:
-            # Each keyword: subject OR description OR tags must contain it (AND across keywords)
-            for kw in keywords[:5]:   # cap at 5 to keep the query manageable
-                kw_lower = kw.lower()
-                where_parts.append(
-                    f"(LOWER(TOSTRING(t.subject)) LIKE '%{kw_lower}%' "
-                    f"OR LOWER(TOSTRING(t.description)) LIKE '%{kw_lower}%' "
-                    f"OR LOWER(TOSTRING(t.tags)) LIKE '%{kw_lower}%')"
-                )
-
         where_clause = " AND ".join(where_parts)
         n1ql = (
             f"SELECT META(t).id AS doc_key FROM {keyspace} AS t "
@@ -11514,6 +12220,137 @@ def structured_search_cb(
     except Exception as exc:
         print(f"[structured_search_cb] {exc}")
         return []
+
+
+def snapshot_topology_search(
+    topology_filters: dict,
+    date_from: str | None,
+    date_to: str | None,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, ticket_collection: str,
+    snap_collection: str = "snapshots",
+    default_limit: int = 200,
+) -> list[str]:
+    """Two-step topology-aware ticket retrieval.
+
+    Step 1: query the snapshots collection for clusters matching topology
+            criteria (node count, data nodes, services).
+    Step 2: collect ticket IDs from those snapshots, optionally filtered
+            by date from the tickets collection.
+
+    Returns ticket doc keys in 'ticket::<id>' format for RRF merging.
+    No cross-collection JOIN index required.
+    """
+    if not _CB_AVAILABLE:
+        return []
+    min_nodes = topology_filters.get("topology_min_nodes")
+    max_nodes = topology_filters.get("topology_max_nodes")
+    min_data  = topology_filters.get("topology_min_data")
+    services  = topology_filters.get("topology_services") or []
+    if not any([min_nodes, max_nodes, min_data, services]):
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cl       = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        ks_snap = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        ks_tick = f"`{bucket}`.`{scope}`.`{ticket_collection}`"
+
+        snap_where = ["ticket_ids IS NOT MISSING AND ARRAY_LENGTH(ticket_ids) > 0"]
+        if min_nodes is not None:
+            snap_where.append(f"node_count >= {min_nodes}")
+        if max_nodes is not None:
+            snap_where.append(f"node_count <= {max_nodes}")
+        if min_data is not None:
+            snap_where.append(f"topology.data_nodes >= {min_data}")
+        for svc in services:
+            snap_where.append(f"topology.{svc}_nodes > 0")
+
+        snap_q = (
+            f"SELECT cluster_uuid, cluster_name, node_count, ticket_ids "
+            f"FROM {ks_snap} WHERE {' AND '.join(snap_where)} LIMIT 500"
+        )
+        snap_rows = list(cl.query(snap_q, QueryOptions(timeout=timedelta(seconds=20))))
+        if not snap_rows:
+            cl.close()
+            return []
+
+        # Collect ticket IDs (deduplicated)
+        all_tids: list[str] = []
+        seen_tids: set[str] = set()
+        for row in snap_rows:
+            for tid in (row.get("ticket_ids") or []):
+                s = str(tid)
+                if s not in seen_tids:
+                    all_tids.append(s)
+                    seen_tids.add(s)
+        if not all_tids:
+            cl.close()
+            return []
+
+        # If a date range is required, filter tickets by date from the ticket collection
+        if date_from or date_to:
+            placeholders = ", ".join(f'"{t}"' for t in all_tids[:500])
+            tick_where   = [f"t.ticket_id IN [{placeholders}]"]
+            if date_from:
+                tick_where.append(f"t.created >= '{date_from}'")
+            if date_to:
+                tick_where.append(f"t.created <= '{date_to}'")
+            tick_q = (
+                f"SELECT META(t).id AS doc_key FROM {ks_tick} AS t "
+                f"WHERE {' AND '.join(tick_where)} "
+                f"ORDER BY t.created DESC LIMIT {default_limit}"
+            )
+            tick_rows = list(cl.query(tick_q, QueryOptions(timeout=timedelta(seconds=20))))
+            cl.close()
+            return [r["doc_key"] for r in tick_rows if r.get("doc_key")]
+
+        cl.close()
+        return [f"ticket::{tid}" for tid in all_tids[:default_limit]]
+    except Exception as exc:
+        print(f"[snapshot_topology_search] {exc}")
+        return []
+
+
+def fetch_snapshots_for_clusters(
+    cluster_uuids: list[str],
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+    snap_collection: str = "snapshots",
+) -> dict[str, dict]:
+    """Fetch the latest snapshot document for each cluster UUID.
+
+    Returns {cluster_uuid: snapshot_dict} with these topology fields:
+    cluster_name, node_count, cb_version, date, data_nodes, index_nodes,
+    query_nodes, fts_nodes, eventing_nodes, analytics_nodes,
+    warn_items, bad_items, cluster_hostname.
+    """
+    if not cluster_uuids or not _CB_AVAILABLE:
+        return {}
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cl       = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        ks   = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        uids = ", ".join(f'"{u}"' for u in cluster_uuids[:50])
+        q    = (
+            f"SELECT s.cluster_uuid, s.cluster_name, s.node_count, s.cb_version, s.date, "
+            f"s.topology.data_nodes, s.topology.index_nodes, s.topology.query_nodes, "
+            f"s.topology.fts_nodes, s.topology.eventing_nodes, s.topology.analytics_nodes, "
+            f"s.topology.warn_items, s.topology.bad_items, s.topology.cluster_hostname "
+            f"FROM {ks} s WHERE s.cluster_uuid IN [{uids}] ORDER BY s.date DESC"
+        )
+        rows = list(cl.query(q, QueryOptions(timeout=timedelta(seconds=15))))
+        cl.close()
+        result: dict[str, dict] = {}
+        for row in rows:
+            uid = row.get("cluster_uuid")
+            if uid and uid not in result:   # keep latest (first due to ORDER BY date DESC)
+                result[uid] = row
+        return result
+    except Exception as exc:
+        print(f"[fetch_snapshots_for_clusters] {exc}")
+        return {}
 
 
 def reciprocal_rank_fusion(
@@ -11544,6 +12381,7 @@ def hybrid_retrieval(
     top_k: int = 10,
     in_memory_tickets: list[dict] | None = None,
     embed_fn: "Callable[[str], list[float]] | None" = None,
+    original_question: str | None = None,
 ) -> tuple[list[dict], str]:
     """Run dense vector search + structured N1QL in parallel, merge with RRF,
     and optionally expand the query using resolved ticket content.
@@ -11568,7 +12406,10 @@ def hybrid_retrieval(
     """
     import concurrent.futures
 
-    filters = build_structured_query(question)
+    # Structured filters always built from the original question so product names
+    # (e.g. "safekey", "mle") are never stripped by the query rewriter.
+    # The rewritten question is used only for the vector embedding (query_vec).
+    filters = build_structured_query(original_question or question)
     cb_args = (cb_url, bucket, username, password, use_tls, scope, collection)
     vector_ids:    list[str] = []
     struct_ids:    list[str] = []
@@ -11579,7 +12420,7 @@ def hybrid_retrieval(
         if in_memory_tickets:
             tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
             # Apply keyword filters in-memory when CB is unavailable
-            kws = filters.get("keywords") or []
+            kws = filters.get("struct_keywords") or filters.get("keywords") or []
             if kws:
                 def _kw_match(t: dict) -> bool:
                     haystack = " ".join([
@@ -11587,7 +12428,7 @@ def hybrid_retrieval(
                         str(t.get("description") or ""),
                         str(t.get("tags") or ""),
                     ]).lower()
-                    return all(kw.lower() in haystack for kw in kws)
+                    return any(kw.lower() in haystack for kw in kws)
                 tickets = [t for t in tickets if _kw_match(t)] or tickets  # fall back to unfiltered if nothing matches
             return tickets[:top_k], f"in-memory fallback ({pf_note})"
         return [], "CB unavailable, no in-memory tickets"
@@ -11607,10 +12448,64 @@ def hybrid_retrieval(
 
         if f_vec:
             try:
-                vector_ids = f_vec.result(timeout=30)
+                _raw_vec = f_vec.result(timeout=30)
+                # Separate ticket and snapshot keys — the hybrid FTS index covers
+                # both collections.  Snapshot hits are cross-referenced to their
+                # associated ticket IDs and fed into the expansion leg.
+                _snap_from_vec   = [k for k in _raw_vec if k.startswith("snapshot::")]
+                vector_ids       = [k for k in _raw_vec if not k.startswith("snapshot::")]
                 notes.append(f"{len(vector_ids)} vector")
+                if _snap_from_vec:
+                    _xref = _snap_keys_to_ticket_keys(_snap_from_vec, *cb_args)
+                    expansion_ids.extend(k for k in _xref if k not in expansion_ids)
+                    notes.append(f"{len(_xref)} snap-vec→ticket")
             except Exception as e:
                 notes.append(f"vector err: {e}")
+
+    # ── Stage 2b: FTS keyword text search (BM25) ─────────────────────────
+    # supportal_vector_idx is a true hybrid index: embedding (vector, 1024
+    # dims, dot_product) + text fields (subject, description, comments,
+    # assignee, priority, requester, status) — all with standard analyzer.
+    # MatchQuery/DisjunctionQuery hit the text fields directly; BM25 ranking
+    # surfaces tickets by exact term match (e.g. "mle", hostname tokens).
+    # Only struct_keywords (alias/tech) are sent so question-structure words
+    # ("reported", "relate") never enter the FTS query.
+    keyword_ids: list[str] = []
+    _skw = filters.get("struct_keywords") or []
+    if _skw and _CB_AVAILABLE:
+        try:
+            _raw_kw = fts_keyword_search_cb(_skw, *cb_args, top_k * 3)
+            _snap_from_kw = [k for k in _raw_kw if k.startswith("snapshot::")]
+            keyword_ids   = [k for k in _raw_kw if not k.startswith("snapshot::")]
+            notes.append(f"{len(keyword_ids)} fts-keyword")
+            if _snap_from_kw:
+                _xref = _snap_keys_to_ticket_keys(_snap_from_kw, *cb_args)
+                expansion_ids.extend(k for k in _xref if k not in expansion_ids)
+                notes.append(f"{len(_xref)} snap-kw→ticket")
+        except Exception as e:
+            notes.append(f"fts-keyword err: {e}")
+
+    # ── Stage 2c: snapshot topology search ───────────────────────────────
+    # When the question contains topology constraints ("more than 9 nodes",
+    # "with eventing service"), query the snapshots collection for matching
+    # clusters, then cross-reference their ticket_ids — filtered by date.
+    # This leg is the only way to answer "how many clusters > 9 nodes had
+    # issues in 2026" correctly; vector + keyword search cannot do it.
+    topology_ids: list[str] = []
+    _snap_col = "snapshots"   # collection name in same scope
+    if any([filters.get("topology_min_nodes"), filters.get("topology_max_nodes"),
+            filters.get("topology_min_data"), filters.get("topology_services")]):
+        try:
+            topology_ids = snapshot_topology_search(
+                filters,
+                filters.get("date_from"), filters.get("date_to"),
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                snap_collection=_snap_col,
+            )
+            if topology_ids:
+                notes.append(f"{len(topology_ids)} topology-snapshot")
+        except Exception as e:
+            notes.append(f"topology err: {e}")
 
     # ── Stage 3: query expansion via ticket content ───────────────────────
     # When the user asks about a specific ticket (e.g. "summary of 76403"),
@@ -11651,28 +12546,65 @@ def hybrid_retrieval(
                 notes.append(f"expansion err: {e}")
 
     # ── Stage 4: RRF merge ────────────────────────────────────────────────
-    all_lists = [lst for lst in (struct_ids, vector_ids, expansion_ids) if lst]
+    all_lists = [lst for lst in (struct_ids, vector_ids, keyword_ids, topology_ids, expansion_ids) if lst]
     if not all_lists:
         if in_memory_tickets:
             tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
             return tickets[:top_k], f"in-memory fallback ({pf_note})"
         return [], "no results"
 
-    merged_ids = reciprocal_rank_fusion(*all_lists)[:top_k * 2]  # over-fetch before keyword filter
-    notes.append(f"{len(merged_ids)} after RRF")
+    _rrf_ordered = reciprocal_rank_fusion(*all_lists)
+    _rrf_cap     = top_k * 2
+    _rrf_set     = set(_rrf_ordered[:_rrf_cap])
+    # Structured results matched explicit user filters — guarantee they survive the
+    # final [:top_k] slice even if the RRF vector signal didn't rank them high enough.
+    # Cap struct_forced at top_k so a broad query can't flood the LLM context.
+    _struct_forced = [k for k in struct_ids if k not in _rrf_set][:top_k]
+    _sf_set = set(_struct_forced)
+    # BM25 keyword hits get the same guarantee: if a ticket passed FTS relevance
+    # testing for the query terms but didn't rank in the RRF top-N (because a
+    # broad date filter produces ~150 struct_ids that dilute RRF scores), force
+    # it in.  This is the main path for tickets like "Moving of partitioned
+    # index : peuse1cbecpsd2000083" — FTS matches the hostname; struct rank is
+    # too low for the RRF top-20 cut.
+    _kw_forced = [k for k in keyword_ids if k not in _rrf_set and k not in _sf_set][:top_k]
+    _kf_set = set(_kw_forced)
+    # struct_forced first → keyword_forced second → RRF-ranked fills remaining
+    merged_ids = (
+        _struct_forced
+        + _kw_forced
+        + [k for k in _rrf_ordered[:_rrf_cap] if k not in _sf_set and k not in _kf_set]
+    )
+    notes.append(f"{len(merged_ids)} after RRF (sf={len(_struct_forced)} kf={len(_kw_forced)})")
 
     # ── Stage 5: resolve keys → full ticket dicts ────────────────────────
+    # Always prefer CB when available — in-memory tickets may have stale or
+    # incomplete fields (e.g. requester=None from an older scrape).
+    # Memory is used only as a fast fallback when CB is unavailable.
     resolved: list[dict] = []
-    if in_memory_tickets:
+    if _CB_AVAILABLE:
+        resolved = fetch_tickets_by_keys(merged_ids, *cb_args)
+        if resolved:
+            notes.append(f"cb:{len(resolved)}")
+        else:
+            notes.append("cb:0(failed?)")
+        # Fill in any not found in CB from memory
+        if in_memory_tickets:
+            _cb_ids = {str(t.get("ticket_id", "")) for t in resolved}
+            mem_map = {str(t.get("ticket_id", "")): t for t in in_memory_tickets}
+            _mem_filled = 0
+            for k in merged_ids:
+                tid = k.split("::")[-1]
+                if tid not in _cb_ids and tid in mem_map:
+                    resolved.append(mem_map[tid])
+                    _mem_filled += 1
+            if _mem_filled:
+                notes.append(f"mem-fill:{_mem_filled}")
+    elif in_memory_tickets:
         mem_map = {str(t.get("ticket_id", "")): t for t in in_memory_tickets}
         resolved = [mem_map[k.split("::")[-1]] for k in merged_ids
                     if k.split("::")[-1] in mem_map]
-
-    missing = [k for k in merged_ids
-               if k.split("::")[-1] not in {str(t.get("ticket_id", "")) for t in resolved}]
-    if missing:
-        cb_fetched = fetch_tickets_by_keys(missing, *cb_args)
-        resolved.extend(cb_fetched)
+        notes.append(f"mem-only:{len(resolved)}")
 
     # Preserve RRF order
     order = {k.split("::")[-1]: i for i, k in enumerate(merged_ids)}
@@ -11680,23 +12612,77 @@ def hybrid_retrieval(
 
     # ── Stage 6: post-RRF keyword filter ─────────────────────────────────
     # When the query has keyword filters (e.g. "safekey"), remove tickets
-    # whose subject/description/tags don't actually contain the keyword.
-    # This prevents vector-similar-but-unrelated tickets from leaking through.
-    # Only applied when ALL keywords are non-trivial (≥4 chars) to avoid
+    # whose text doesn't contain ANY of the keywords.
+    # Uses ANY (not ALL) so multi-keyword questions still return results.
+    # Only applied when keywords are non-trivial (≥3 chars) to avoid
     # over-filtering on short stop-word-like terms.
-    kws = [k for k in (filters.get("keywords") or []) if len(k) >= 4]
+    kws = [k for k in (filters.get("struct_keywords") or filters.get("keywords") or []) if len(k) >= 3]
+    # Tickets that came from the FTS BM25 leg already passed relevance testing
+    # for these exact keywords — trust them and skip the text scan.
+    _kw_trusted = set(keyword_ids)
     if kws and not filters.get("ticket_ids"):  # skip if pinned by explicit ID
+        _c2a_s6 = _get_cluster_to_app()   # resolve once outside the per-ticket closure
         def _kw_match(t: dict) -> bool:
+            # FTS BM25 already validated this ticket for the query keywords
+            _key = f"ticket::{t.get('ticket_id', '')}"
+            if _key in _kw_trusted:
+                return True
+            # Build haystack from all text-bearing fields including comments
+            _comments_raw = t.get("comments") or []
+            if isinstance(_comments_raw, list):
+                _comments_str = " ".join(
+                    str(c.get("body") or c.get("content") or c)
+                    for c in _comments_raw
+                )[:1000]
+            else:
+                _comments_str = str(_comments_raw)[:1000]
             haystack = " ".join([
                 str(t.get("subject") or ""),
                 str(t.get("description") or ""),
                 str(t.get("tags") or ""),
+                _comments_str,
             ]).lower()
-            return all(kw.lower() in haystack for kw in kws)
+            # 1. Direct text match
+            if any(kw.lower() in haystack for kw in kws):
+                return True
+            # 2. Structured cluster→app match (cluster_name / UUID from snapshot_topology)
+            _ticket_apps = {
+                _c2a_s6.get(cid, "")
+                for cid in _ticket_cluster_ids(t)
+            } - {""}
+            if any(kw.lower() in _ticket_apps for kw in kws):
+                return True
+            # 3. Hostname text-scan: any known host appears in subject/desc/comments
+            #    and that host's app matches a queried keyword
+            for host, app in _c2a_s6.items():
+                if host in haystack and any(kw.lower() == app for kw in kws):
+                    return True
+            return False
         filtered = [t for t in resolved if _kw_match(t)]
         if filtered:   # only apply if something survives — never return empty
             resolved = filtered
             notes.append(f"keyword-filtered to {len(resolved)}")
+
+    # ── Stage 7: date post-filter ─────────────────────────────────────────
+    # Apply date range to ALL retrieved tickets including vector hits so that
+    # "in 2026" / "last month" constrains the final answer even when the
+    # structured search returned nothing (keyword-driven fallback path).
+    _date_from = filters.get("date_from")
+    _date_to   = filters.get("date_to")
+    if _date_from or _date_to:
+        def _in_date_range(t: dict) -> bool:
+            _cd = str(t.get("created") or "")[:10]
+            if not _cd:
+                return True   # don't drop tickets with no date field
+            if _date_from and _cd < _date_from:
+                return False
+            if _date_to and _cd > _date_to:
+                return False
+            return True
+        date_filtered = [t for t in resolved if _in_date_range(t)]
+        if date_filtered:   # never return empty just because of strict date
+            resolved = date_filtered
+            notes.append(f"date-filtered to {len(resolved)}")
 
     return resolved[:top_k], " | ".join(notes)
 
@@ -11730,18 +12716,33 @@ def chat_batch_map_reduce(
     lock = threading.Lock()
     completed = [0]
 
+    _BATCH_NO_MATCH = "NO_MATCH"
+    _batch_instruction = (
+        "\n\n━━ BATCH MODE RULES ━━\n"
+        "You are processing ONE slice of a larger dataset. Most slices will not contain "
+        "tickets matching the question — that is normal and expected.\n"
+        "RULE B1 — If NO tickets in this slice match the question, respond with exactly the "
+        "two words: NO_MATCH — nothing else.\n"
+        "RULE B2 — Only include a ticket if it DIRECTLY matches. Do NOT include tickets "
+        "because they share infrastructure, patterns, or implied relationships with matching "
+        "tickets. [Application: X] labels are authoritative — do not override them.\n"
+        "RULE B3 — Never infer that a ticket belongs to an application unless its header "
+        "explicitly shows [Application: THAT_APP] or its subject/description names it directly."
+    )
+
     def _run_batch(idx: int, batch: list[dict]) -> tuple[int, str]:
         context = build_rag_context(batch, "", compact=compact)
         system  = SYSTEM_PROMPT_TEMPLATE.format(today=_today_str, stats=_stats_block, context=context)
+        system += _batch_instruction
         msgs    = [
             {"role": "system", "content": system},
             {"role": "user",   "content": question},
         ]
         try:
             ans = call_llm(msgs, provider, model, api_key, base_url, max_tokens=4096)
-            return idx, f"[Batch {idx + 1}]\n{ans}"
+            return idx, ans.strip()
         except Exception as exc:
-            return idx, f"[Batch {idx + 1}] Error: {exc}"
+            return idx, f"ERROR: {exc}"
 
     effective = max(1, min(max_workers, len(batches)))
     progress_cb(
@@ -11762,15 +12763,36 @@ def chat_batch_map_reduce(
 
     # Restore original order before synthesis
     partial_answers.sort(key=lambda x: x[0])
-    ordered = [ans for _, ans in partial_answers]
+
+    # Filter out batches that found nothing — they are not contradictions,
+    # just slices that didn't contain matching tickets.
+    matching = [
+        (idx, ans) for idx, ans in partial_answers
+        if ans.strip().upper() != _BATCH_NO_MATCH and not ans.startswith("ERROR:")
+    ]
+    n_empty = len(partial_answers) - len(matching)
+    ordered = [f"[Batch {idx + 1}]\n{ans}" for idx, ans in matching]
+
+    if not ordered:
+        return "No matching tickets found across all batches."
 
     # Final synthesis pass
-    progress_cb(f"Synthesising {len(ordered)} batch answers …")
+    progress_cb(f"Synthesising {len(ordered)} batch answer(s) ({n_empty} empty batches excluded) …")
     combined = "\n\n".join(ordered)
     synthesis_system = (
-        "You are a support analyst. You have been given partial answers from multiple "
-        "batches of support tickets. Synthesise them into a single, coherent, concise answer. "
-        "Remove duplicates. Cite ticket IDs where relevant."
+        "You are a senior Couchbase support analyst performing the final synthesis step of a "
+        "map-reduce analysis. You have been given partial answers from batches that found "
+        "MATCHING tickets — batches that found no matches were already excluded.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Batches that found no results are NOT contradictions — they simply did not contain "
+        "matching tickets. Treat all provided partial answers as additive evidence.\n"
+        "2. Synthesise into a single coherent answer. Remove exact duplicates but preserve "
+        "all unique ticket IDs.\n"
+        "3. Never include a ticket from one application in results for a different application. "
+        "[Application: X] labels are authoritative.\n"
+        "4. Do NOT infer relationships between tickets based on infrastructure patterns. "
+        "Only report tickets explicitly identified as matching in the partial answers.\n"
+        "5. Cite ticket IDs wherever relevant. Use markdown tables for ticket lists."
     )
     synthesis_msgs = [
         {"role": "system",  "content": synthesis_system},
@@ -11798,21 +12820,57 @@ def _parse_ticket_date(t: dict):
 
 
 def _ticket_cluster_ids(t: dict) -> list[str]:
-    """Extract cluster IDs from a ticket (snap_ids, snapshot_topology, or ticket_fields)."""
+    """Extract cluster hostnames/IDs from a ticket.
+
+    Returns cluster_name (hostname) first so callers can look up _get_cluster_to_app().
+    Falls back to UUID and snap_id prefix for completeness.
+    """
     ids: list[str] = []
-    for sid in t.get("snap_ids") or []:
-        cid = sid.split("::")[0]
-        if cid and cid not in ids:
-            ids.append(cid)
     topo = t.get("snapshot_topology") or {}
     if isinstance(topo, str):
         try:
             topo = json.loads(topo)
         except Exception:
             topo = {}
-    cid = (topo.get("cluster_uuid") or topo.get("cluster_name") or "").strip()
-    if cid and cid not in ids:
-        ids.append(cid)
+    # cluster_name is the short hostname (e.g. "peuse1cbecpsd2000083") — used by _CLUSTER_TO_APP
+    _cname = (topo.get("cluster_name") or "").strip()
+    if _cname and _cname not in ids:
+        ids.append(_cname)
+    # UUID from topology
+    _cuuid = (topo.get("cluster_uuid") or "").strip()
+    if _cuuid and _cuuid not in ids:
+        ids.append(_cuuid)
+    # snap_ids prefix (UUID format — lower priority, kept for compatibility)
+    for sid in t.get("snap_ids") or []:
+        cid = sid.split("::")[0]
+        if cid and cid not in ids:
+            ids.append(cid)
+    # score.cluster_names: pre-computed cluster hostnames from the scoring step;
+    # more reliable than snapshot_topology when a ticket spans multiple clusters.
+    _score = t.get("score") or {}
+    for cname in (_score.get("cluster_names") or []):
+        cname = (cname or "").strip()
+        if cname and cname not in ids:
+            ids.append(cname)
+    # Text-scan supplement: always check subject/description/comments for known hostnames.
+    # Not a fallback — runs even when topology fields already populated, so a ticket
+    # titled "Cluster peuse1cbecpsd2000083 indexes in warmup" gets labelled MLE even
+    # if snapshot_topology references a different cluster.
+    _comments_raw = t.get("comments") or []
+    if isinstance(_comments_raw, list):
+        _comments_text = " ".join(
+            str(c.get("body") or c.get("content") or c) for c in _comments_raw
+        )[:2000]
+    else:
+        _comments_text = str(_comments_raw)[:2000]
+    _text = " ".join([
+        (t.get("subject") or ""),
+        (t.get("description") or "")[:500],
+        _comments_text,
+    ]).lower()
+    for host in _get_cluster_to_app():
+        if host in _text and host not in ids:
+            ids.append(host)
     return ids
 
 
@@ -12024,7 +13082,7 @@ def compute_aggregations(question: str, tickets: list[dict]) -> str:
             if not created:
                 continue
             # Use solved/closed date if present, else today (still open)
-            closed_raw = (t.get("solved_at") or t.get("closed_at") or t.get("updated_at") or "").strip()
+            closed_raw = (t.get("solved") or t.get("solved_at") or t.get("closed_at") or t.get("updated") or "").strip()
             closed = None
             if closed_raw:
                 closed = _parse_ticket_date({"created": closed_raw})
@@ -12062,6 +13120,7 @@ def build_rag_context(
     customer_name: str = "",
     compact: bool = False,
     filter_note: str = "",
+    snapshot_map: "dict[str, dict] | None" = None,
 ) -> str:
     """
     Format a list of ticket dicts as a context block for the LLM system prompt.
@@ -12071,6 +13130,8 @@ def build_rag_context(
     - ≤5 tickets    → deep-dive: full description, all comments, ticket_fields, tags
     - >5 tickets    → standard: description capped at 1 500 chars, 8 comments × 600 chars
     filter_note is shown in the header so the LLM knows what retrieval produced this set.
+    snapshot_map: {cluster_uuid: snapshot_doc} — when provided, topology is appended
+    after each ticket's cluster line so the LLM can answer topology questions.
     """
     header = "### Retrieved Ticket Context"
     if customer_name:
@@ -12082,28 +13143,91 @@ def build_rag_context(
     lines = [header + "\n"]
 
     deep = (not compact) and len(tickets) <= 5
+    _c2a = _get_cluster_to_app()   # resolve once per call, not per ticket
 
     for t in tickets:
         tid = t.get("ticket_id", "?")
         cluster_ids = _ticket_cluster_ids(t)
-        cluster_str = ", ".join(cluster_ids[:5]) if cluster_ids else "—"
+        # Append app name when known, e.g. "peuse1cbecpsd2000083 (MLE)"
+        _cluster_parts = []
+        for _cid in cluster_ids[:5]:
+            _app = _c2a.get(_cid, "")
+            _cluster_parts.append(f"{_cid} ({_app.upper()})" if _app else _cid)
+        cluster_str = ", ".join(_cluster_parts) if _cluster_parts else "—"
+
+        # ── Compute resolution date and time-taken (shared by compact + standard) ──
+        _created_str  = _ticket_date(t)[:10]                           # may be empty
+        _solved_raw   = (t.get("solved") or t.get("solved_at")
+                         or t.get("closed_at") or "").strip()
+        _resolved_str = _solved_raw[:10] if _solved_raw else ""
+        # Fall back to updated when ticket is closed but no explicit solved date
+        if not _resolved_str and t.get("status", "").lower() in ("closed", "solved"):
+            _resolved_str = (t.get("updated") or "").strip()[:10]
+        # Time-taken in days (only when both dates available)
+        _days_str = ""
+        if _created_str and _resolved_str:
+            try:
+                _c = datetime.datetime.strptime(_created_str, "%Y-%m-%d")
+                _r = datetime.datetime.strptime(_resolved_str, "%Y-%m-%d")
+                _days_str = f"{max(0, (_r - _c).days)}d"
+            except Exception:
+                pass
+
+        # ── Application label (shared by compact + standard) ─────────────────
+        # Derive from cluster→app map so hostname-only subjects get labelled too
+        _app_labels = list({
+            _c2a[_cid].upper()
+            for _cid in cluster_ids
+            if _c2a.get(_cid)
+        })
+        _app_str = ", ".join(sorted(_app_labels)) if _app_labels else ""
 
         if compact:
             desc = (t.get("description") or "")[:200].replace("\n", " ")
             lines.append(
                 f"#{tid} [{(t.get('priority') or '?').upper()}|{t.get('status','?')}] "
-                f"created:{_ticket_date(t)[:10]} assignee:{t.get('assignee','?')} "
+                f"app:{_app_str or '?'} requester:{t.get('requester','?')} "
+                f"created:{_created_str or '?'} resolved:{_resolved_str or '?'} "
+                f"time:{_days_str or '?'} assignee:{t.get('assignee','?')} "
                 f"clusters:{cluster_str} — {t.get('subject','N/A')} — {desc}"
             )
             continue
 
-        # ── Header fields (all modes) ─────────────────────────────────────────
-        lines.append(f"**Ticket #{tid}** — {t.get('subject', 'N/A')}")
+        # ── Header fields (standard / deep modes) ────────────────────────────
+        _subj_line = f"**Ticket #{tid}** — {t.get('subject', 'N/A')}"
+        if _app_str:
+            _subj_line += f"  [Application: {_app_str}]"
+        lines.append(_subj_line)
         lines.append(
             f"Priority: {(t.get('priority') or '?').upper()} | Status: {t.get('status','?')} "
-            f"| Created: {_ticket_date(t)[:10]} | Assignee: {t.get('assignee','?')}"
+            f"| Created: {_created_str or '?'} | Resolved: {_resolved_str or '?'} "
+            f"| Time-taken: {_days_str or '?'} | Assignee: {t.get('assignee','?')}"
         )
         lines.append(f"Requester: {t.get('requester','?')} | Clusters: {cluster_str}")
+
+        # ── Snapshot topology (when available) ────────────────────────────────
+        if snapshot_map and cluster_ids:
+            for _cid in cluster_ids[:3]:
+                _snap = snapshot_map.get(_cid)
+                if not _snap:
+                    continue
+                _svc_parts = []
+                for _svc in ("data", "index", "query", "fts", "eventing", "analytics"):
+                    _n = _snap.get(f"{_svc}_nodes") or 0
+                    if _n:
+                        _svc_parts.append(f"{_n} {_svc}")
+                _topo_line = (
+                    f"  Snapshot [{(_snap.get('date') or '?')[:10]}]: "
+                    f"Cluster={_snap.get('cluster_name') or '?'} | "
+                    f"Nodes={_snap.get('node_count') or '?'} "
+                    f"({', '.join(_svc_parts) if _svc_parts else '?'}) | "
+                    f"CB={_snap.get('cb_version') or '?'}"
+                )
+                if _snap.get("warn_items"):
+                    _topo_line += f" | Warnings: {', '.join((_snap['warn_items'] or [])[:5])}"
+                if _snap.get("bad_items"):
+                    _topo_line += f" | Issues: {', '.join((_snap['bad_items'] or [])[:5])}"
+                lines.append(_topo_line)
 
         # ── Tags ──────────────────────────────────────────────────────────────
         if t.get("tags"):
@@ -12123,11 +13247,20 @@ def build_rag_context(
             if t.get("snapshots"):
                 lines.append(f"Snapshots: {str(t['snapshots'])[:500]}")
 
-        # ── Description ───────────────────────────────────────────────────────
+        # ── AI summary (preferred) or raw description ────────────────────────
+        # interaction_summary is a pre-computed 2-4 sentence technical narrative
+        # covering problem, root cause, resolution, and patterns.  It is shown
+        # first so small models get the signal without wading through raw text.
+        _summary = (t.get("interaction_summary") or "").strip()
+        if _summary:
+            lines.append(f"Summary: {_summary}")
         if t.get("description"):
             desc_limit = None if deep else 1_500
             desc = t["description"] if deep else t["description"][:1_500]
-            lines.append(f"Description:\n{desc}")
+            # In standard mode show description only when no summary exists,
+            # or always in deep-dive mode for full fidelity.
+            if deep or not _summary:
+                lines.append(f"Description:\n{desc}")
 
         # ── Comments ─────────────────────────────────────────────────────────
         comments_raw = t.get("comments")
@@ -12162,17 +13295,37 @@ Open every response with a single sentence that directly answers the question.
 Example: "There were 4 high-priority tickets in the last month."
 Never start with a preamble, caveat, or "Based on the data…".
 
-RULE 2 — SCALE DETAIL TO QUESTION TYPE.
+RULE 2 — USE MARKDOWN TABLES for ANY response listing 2 or more tickets.
+Always render a properly formatted markdown table — never use bullet lists when a table fits.
+Standard columns: Ticket # | Subject | Priority | Status | Created | Resolved | Days | Notes
+Add columns as relevant (e.g., Cluster, Org, Assignee, Reporter). Omit columns where ALL values would be "?".
+The "Created", "Resolved", and "Days" columns come directly from the ticket context header lines:
+  Created = the "Created:" field   Resolved = the "Resolved:" field   Days = the "Time-taken:" field
+The "Reporter" (also called Requester or Submitter) comes from the "Requester:" line in the ticket context.
+  "Requester:", "Reporter:", and "Submitted by:" all refer to the same person — the one who opened the ticket.
+  When the user asks for reporter, submitter, or who raised the ticket, use the "Requester:" field value.
+Use "?" only when a field is genuinely absent — never say "Date Unavailable" or "N/A".
+Example:
+| Ticket # | Subject | Priority | Status | Created | Resolved | Days | Notes |
+|---|---|---|---|---|---|---|---|
+| #12345 | SDK crash on connect | P1 | Open | 2026-04-10 | ? | ? | Memory leak suspected |
+| #12346 | Rebalance hung | P2 | Closed | 2026-03-01 | 2026-03-15 | 14 | Fixed via rebalance retry |
+
+RULE 3 — APPLICATION MEMBERSHIP.
+Each ticket header may include [Application: NAME] derived from its cluster IDs.
+A ticket IS an MLE ticket, SafeKey ticket, etc. if its header shows [Application: MLE] or [Application: SAFEKEY],
+even when the application name does not appear in the subject line.
+Always count and include ALL tickets for an application regardless of whether the name appears in the subject.
+
+RULE 4 — SCALE DETAIL TO QUESTION TYPE.
 
 ▸ COUNT / SIMPLE FACTUAL ("how many", "when was", "who is")
-  Direct answer sentence, then a compact table or bulleted list if there are items:
-  • #NNNNN | Priority | Status | One-line description | Outcome/Impact
+  Direct answer sentence, then a markdown table if any items exist.
   Nothing more unless the user asks to expand.
 
 ▸ LIST / SURVEY ("show me", "what are the recent", "list all P1s")
-  Direct answer sentence stating the count, then one entry per ticket:
-  • #NNNNN — Subject — Priority/Status — created YYYY-MM-DD — one sentence outcome
-  Keep each entry to a single line. No sub-bullets unless asked.
+  Direct answer sentence stating the count, then a markdown table with ALL retrieved tickets.
+  NEVER use bullet points for ticket lists — always use the markdown table format from RULE 2.
 
 ▸ SPECIFIC TICKET DEEP-DIVE ("tell me about #NNNNN", "summarise ticket X",
   "expand on MLE", "what happened with SafeKey")
@@ -12187,7 +13340,7 @@ RULE 2 — SCALE DETAIL TO QUESTION TYPE.
 ▸ AGGREGATION / TREND / COMPARISON ("frequency of", "top issues", "compare clusters")
   Direct answer sentence, then:
   - Summary paragraph (2–4 sentences on the dominant pattern)
-  - Bullet list of top findings with ticket count evidence
+  - Markdown table of top findings (issue | ticket count | example ticket IDs)
   - One sentence on recommended focus area
 
 ━━ DATA RULES ━━
@@ -12608,9 +13761,13 @@ def call_llm(
             resp.raise_for_status()
             return resp.json()["message"]["content"]
 
-        client = _get_openai_client(
-            api_key or "lmstudio",
-            _openai_base_url(base_url, default),
+        _timeout = _openai_mod.Timeout(
+            timeout=600.0, connect=180.0
+        ) if provider == "lmstudio" else None
+        client = _openai_mod.OpenAI(
+            api_key=api_key or "lmstudio",
+            base_url=_openai_base_url(base_url, default),
+            timeout=_timeout,
         )
         kwargs: dict = {"model": model, "messages": messages, "max_tokens": max_tokens}
         # num_ctx is an Ollama-specific option; LM Studio context length is fixed at
