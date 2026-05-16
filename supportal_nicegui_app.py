@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.56"
+__version__ = "1.1.57"
 
 import asyncio
 import threading
@@ -5976,9 +5976,12 @@ def main_page():
                                         _today_dt  = datetime.datetime.now()
                                         _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
                                         _stats_block = build_dataset_stats(state["results"] or rr_tickets, _today_dt)
+                                        # Force compact when candidates are large
+                                        # to avoid blowing the model's context window.
+                                        _rr_compact = compact_context_toggle.value or len(rr_tickets) > 30
                                         _context = build_rag_context(
                                             rr_tickets, state["customer_name"],
-                                            compact=compact_context_toggle.value,
+                                            compact=_rr_compact,
                                         )
                                         _rerank_sys = (
                                             SYSTEM_PROMPT_TEMPLATE.format(
@@ -12172,13 +12175,20 @@ def build_structured_query(question: str) -> dict:
                     if h not in _alias_hosts and h not in _deduped:
                         _alias_hosts.append(h)
     result["keywords"] = _deduped + _alias_hosts
-    # struct_keywords = only alias app names + known tech acronyms + expanded
-    # hostnames — safe to use in N1QL LIKE clauses and Stage-6 post-filter.
-    # General English words ("reported", "relate") are excluded even if they
-    # survive the stopword filter, so they never generate noisy LIKE conditions.
+    # struct_keywords = alias app names + tech acronyms + expanded hostnames +
+    # any token that is a known cluster hostname (from cluster→app map) or that
+    # looks like a hostname pattern (long alphanumeric, e.g. peusw1cbecpsd2000129).
+    # General English words are excluded to avoid noisy LIKE conditions.
+    _known_hostnames = set(_get_cluster_to_app().keys())
+    # Hostname heuristic: 12+ char alphanumeric-with-digits token — catches cluster
+    # names typed verbatim that aren't in the alias map yet (dynamic map lag).
+    _HOSTNAME_RE = re.compile(r"^[a-z][a-z0-9]{11,}$")
     result["struct_keywords"] = [
         k for k in _deduped
-        if k in _alias_key_set or k in _TECH_ACRONYMS
+        if k in _alias_key_set
+        or k in _TECH_ACRONYMS
+        or k in _known_hostnames
+        or _HOSTNAME_RE.match(k)
     ] + _alias_hosts
 
     # ── Topology filters — node counts and service presence ───────────────
@@ -12451,6 +12461,13 @@ def search_tickets_retrieve_rerank(
     if not all_tickets and in_memory_tickets:
         all_tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
         notes.append(f"mem:{pf_note}")
+
+    # Safety cap: never send more than 150 candidates to Stage 2 LLM.
+    # Struct results are already date-DESC ordered; keep the most recent N.
+    _MAX_CANDIDATES = 150
+    if len(all_tickets) > _MAX_CANDIDATES:
+        notes.append(f"capped:{len(all_tickets)}→{_MAX_CANDIDATES}")
+        all_tickets = all_tickets[:_MAX_CANDIDATES]
 
     notes.append(f"total:{len(all_tickets)}")
     return all_tickets, " | ".join(notes)
