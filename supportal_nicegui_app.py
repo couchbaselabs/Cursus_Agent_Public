@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.54"
+__version__ = "1.1.55"
 
 import asyncio
 import threading
@@ -5628,7 +5628,7 @@ def main_page():
                             with ui.column().classes("gap-1"):
                                 ui.label("Retrieval mode").classes("text-xs text-gray-500")
                                 chat_mode_select = ui.select(
-                                    ["Hybrid Search", "All Tickets", "Batch Map-Reduce"],
+                                    ["Hybrid Search", "Retrieve + Rerank", "All Tickets", "Batch Map-Reduce"],
                                     value="Hybrid Search",
                                 ).classes("w-52")
                             top_k_input = ui.number("Top-K (vector search)", value=10, min=1, max=1600).classes("w-48")
@@ -5654,7 +5654,7 @@ def main_page():
 
                         def _update_chat_mode_visibility():
                             mode = chat_mode_select.value
-                            top_k_input.set_visibility(mode == "Hybrid Search")
+                            top_k_input.set_visibility(mode in ("Hybrid Search", "Retrieve + Rerank"))
                             batch_size_chat_input.set_visibility(mode == "Batch Map-Reduce")
                             batch_parallel_input.set_visibility(mode == "Batch Map-Reduce")
 
@@ -5937,6 +5937,84 @@ def main_page():
                                             _render_chat()
                                             chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
                                     # Record turn for session storage
+                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                    state["chat_session_turns"].append((question, answer, _ts_now))
+
+                                elif mode == "Retrieve + Rerank":
+                                    _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
+                                    _cb_rr = (
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                    )
+                                    _top_k_rr = int(top_k_input.value or 60)
+
+                                    def _embed_fn_rr(text: str) -> list[float]:
+                                        return embed_text(text, _ep, _em, _eak, _ebu,
+                                                          dims=_edims, num_ctx=_enum_ctx)
+
+                                    chat_status.set_text("Stage 1 — retrieving candidates from Couchbase …")
+                                    rr_tickets, rr_notes = await run.io_bound(
+                                        search_tickets_retrieve_rerank,
+                                        question,
+                                        question,
+                                        *_cb_rr,
+                                        _embed_fn_rr,
+                                        state["results"],
+                                        _top_k_rr,
+                                    )
+                                    if not rr_tickets:
+                                        answer = "No matching tickets found for your query."
+                                    else:
+                                        chat_status.set_text(
+                                            f"Stage 2 — reranking + answering over {len(rr_tickets)} candidates ({rr_notes}) …"
+                                        )
+                                        _today_dt  = datetime.datetime.now()
+                                        _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
+                                        _stats_block = build_dataset_stats(state["results"] or rr_tickets, _today_dt)
+                                        _context = build_rag_context(
+                                            rr_tickets, state["customer_name"],
+                                            compact=compact_context_toggle.value,
+                                        )
+                                        _rerank_sys = (
+                                            SYSTEM_PROMPT_TEMPLATE.format(
+                                                today=_today_str, stats=_stats_block, context=_context,
+                                            ) +
+                                            "\n\n━━ RETRIEVE + RERANK RULES ━━\n"
+                                            "The tickets above were retrieved by a deterministic structured query "
+                                            "plus semantic vector search — they are your complete candidate set.\n"
+                                            "RULE R1 — Answer using ONLY tickets that directly match the question. "
+                                            "[Application: X] labels in ticket headers are authoritative.\n"
+                                            "RULE R2 — Do NOT include a ticket because it shares infrastructure or "
+                                            "patterns with matching tickets. Explicit label match only.\n"
+                                            "RULE R3 — If the question asks for a list, produce a markdown table of "
+                                            "ALL matching tickets from the context, not just a sample."
+                                        )
+                                        _rr_msgs = [
+                                            {"role": "system", "content": _rerank_sys},
+                                            {"role": "user",   "content": question},
+                                        ]
+                                        if use_streaming:
+                                            answer, n_tok, elapsed, rate = await _call_llm_streaming(
+                                                _rr_msgs, provider, model, api_key, base_url
+                                            )
+                                            chat_status.set_text(
+                                                f"Retrieve+Rerank: {len(rr_tickets)} candidates → "
+                                                f"{n_tok} tokens in {elapsed:.1f}s ({rate:.1f} tok/s) | {rr_notes}"
+                                            )
+                                        else:
+                                            answer = await run.io_bound(
+                                                call_llm, _rr_msgs, provider, model, api_key, base_url, 8192
+                                            )
+                                            chat_status.set_text(
+                                                f"Retrieve+Rerank: {len(rr_tickets)} candidates | {rr_notes}"
+                                            )
+                                    state["chat_history"].append({"role": "assistant", "content": answer})
+                                    _render_chat()
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                                     state["chat_session_turns"].append((question, answer, _ts_now))
 
@@ -12220,6 +12298,162 @@ def structured_search_cb(
     except Exception as exc:
         print(f"[structured_search_cb] {exc}")
         return []
+
+
+def tool_query_tickets(
+    filters: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    limit: int = 500,
+) -> list[dict]:
+    """
+    Stage-1 structured retrieval for retrieve-then-rerank pipeline.
+    Returns full ticket docs — no top_k cap, up to `limit` results.
+    Expands app alias keywords to cluster hostnames dynamically via
+    _get_app_cluster_aliases(). Unlike structured_search_cb, returns docs
+    not keys and includes keyword/hostname LIKE conditions.
+    """
+    if not _CB_AVAILABLE:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+
+        where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]
+        params: list = []
+
+        ticket_ids = filters.get("ticket_ids") or []
+        if ticket_ids:
+            phs = ", ".join(f"${i + 1}" for i, _ in enumerate(ticket_ids))
+            where_parts.append(f"t.ticket_id IN [{phs}]")
+            params.extend(ticket_ids)
+
+        date_from = filters.get("date_from")
+        date_to   = filters.get("date_to")
+        if date_from:
+            params.append(date_from)
+            where_parts.append(f"t.created >= ${len(params)}")
+        if date_to:
+            params.append(date_to)
+            where_parts.append(f"t.created <= ${len(params)}")
+
+        priorities = filters.get("priorities") or []
+        if priorities:
+            p_idx = len(params) + 1
+            phs   = ", ".join(f"${p_idx + i}" for i, _ in enumerate(priorities))
+            where_parts.append(f"UPPER(TOSTRING(t.priority)) IN [{phs}]")
+            params.extend(priorities)
+
+        statuses = filters.get("statuses") or []
+        if statuses:
+            s_idx = len(params) + 1
+            phs   = ", ".join(f"${s_idx + i}" for i, _ in enumerate(statuses))
+            where_parts.append(f"LOWER(TOSTRING(t.status)) IN [{phs}]")
+            params.extend(statuses)
+
+        # Keyword + hostname LIKE conditions built from struct_keywords.
+        # struct_keywords contains app names ("mle") AND expanded hostnames
+        # ("peuse1cbecpsd2000083") — each generates OR conditions across
+        # subject, description, and score.cluster_names.
+        struct_kws = filters.get("struct_keywords") or []
+        if struct_kws:
+            kw_ors: list[str] = []
+            for kw in struct_kws:
+                params.append(f"%{kw.lower()}%")
+                idx = len(params)
+                kw_ors.append(
+                    f"(LOWER(t.subject) LIKE ${idx}"
+                    f" OR LOWER(t.description) LIKE ${idx}"
+                    f" OR ANY c IN t.`score`.`cluster_names`"
+                    f"   SATISFIES LOWER(c) LIKE ${idx} END)"
+                )
+            where_parts.append(f"({' OR '.join(kw_ors)})")
+
+        where_clause = " AND ".join(where_parts)
+        n1ql = (
+            f"SELECT t.* FROM {keyspace} AS t "
+            f"WHERE {where_clause} "
+            f"ORDER BY t.created DESC "
+            f"LIMIT {int(limit)}"
+        )
+        rows = list(cluster.query(
+            n1ql,
+            QueryOptions(positional_parameters=params, timeout=timedelta(seconds=30)),
+        ))
+        cluster.close()
+        return [dict(r) for r in rows if r.get("ticket_id")]
+    except Exception as exc:
+        print(f"[tool_query_tickets] {exc}")
+        return []
+
+
+def search_tickets_retrieve_rerank(
+    question: str,
+    original_question: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    embed_fn,
+    in_memory_tickets: list[dict],
+    top_k_vec: int = 60,
+    query_limit: int = 500,
+) -> tuple[list[dict], str]:
+    """
+    Two-stage retrieval pipeline:
+    Stage 1a — tool_query_tickets: complete structured set, no top_k cap
+    Stage 1b — vector_search_cb: semantic supplement for tickets not in Stage 1a
+    Stage 1c — K/V fetch full docs for vector-only hits
+    Returns (all_candidate_tickets, notes_string).
+    The caller is responsible for the Stage 2 LLM rerank + answer pass.
+    """
+    notes: list[str] = []
+    filters = build_structured_query(original_question or question)
+
+    # Stage 1a: deterministic structured retrieval
+    struct_tickets: list[dict] = []
+    if _CB_AVAILABLE and cb_url:
+        struct_tickets = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=query_limit,
+        )
+        notes.append(f"struct:{len(struct_tickets)}")
+    struct_ids = {str(t.get("ticket_id", "")) for t in struct_tickets}
+
+    # Stage 1b: semantic vector supplement
+    vec_tickets: list[dict] = []
+    if embed_fn and _CB_AVAILABLE and cb_url:
+        try:
+            query_vec = embed_fn(question)
+            if query_vec:
+                all_vec_keys = vector_search_cb(
+                    query_vec, cb_url, bucket, username, password,
+                    use_tls, scope, collection, top_k_vec,
+                )
+                new_vec_keys = [k for k in all_vec_keys
+                                if k.split("::")[-1] not in struct_ids]
+                if new_vec_keys:
+                    vec_tickets = fetch_tickets_by_keys(
+                        new_vec_keys, cb_url, bucket, username,
+                        password, use_tls, scope, collection,
+                    )
+                notes.append(f"vec_new:{len(vec_tickets)}")
+        except Exception as exc:
+            notes.append(f"vec_err:{exc}")
+
+    # Union: struct first (date-ordered), then vector supplement
+    all_tickets = struct_tickets + [
+        t for t in vec_tickets
+        if str(t.get("ticket_id", "")) not in struct_ids
+    ]
+
+    # Fallback to in-memory prefilter when CB is unavailable
+    if not all_tickets and in_memory_tickets:
+        all_tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
+        notes.append(f"mem:{pf_note}")
+
+    notes.append(f"total:{len(all_tickets)}")
+    return all_tickets, " | ".join(notes)
 
 
 def snapshot_topology_search(
