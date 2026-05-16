@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.57"
+__version__ = "1.1.58"
 
 import asyncio
 import threading
@@ -588,10 +588,12 @@ def fetch_ticket_signals_from_cb(
     cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
     scope: str, collection: str,
 ) -> dict[str, dict]:
-    """Return {ticket_id: {status, solved}} for all stored tickets.
+    """Return {ticket_id: {status, solved, is_stub}} for all stored tickets.
 
     Used for change detection: if a ticket's status or solved date differs
     from the listing page, it is re-scraped even though the ID already exists.
+    is_stub=True when the stored record has no requester (detail page was never
+    successfully scraped) so it is re-scraped on the next incremental run.
     """
     if not _CB_AVAILABLE:
         return {}
@@ -601,7 +603,7 @@ def fetch_ticket_signals_from_cb(
         cluster.wait_until_ready(timedelta(seconds=15))
         keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
         rows = list(cluster.query(
-            f"SELECT META(t).id AS doc_id, t.status, t.solved "
+            f"SELECT META(t).id AS doc_id, t.status, t.solved, t.requester "
             f"FROM {keyspace} AS t WHERE META(t).id LIKE 'ticket::%'",
             QueryOptions(timeout=timedelta(seconds=30)),
         ))
@@ -611,8 +613,9 @@ def fetch_ticket_signals_from_cb(
             tid = str(row.get("doc_id", "")).split("::")[-1]
             if tid:
                 signals[tid] = {
-                    "status": row.get("status"),
-                    "solved": row.get("solved"),
+                    "status":   row.get("status"),
+                    "solved":   row.get("solved"),
+                    "is_stub":  not row.get("requester"),
                 }
         return signals
     except Exception:
@@ -649,7 +652,9 @@ def _filter_changed_tickets(
         stored_status  = (stored.get("status") or "").strip().lower()
         listing_solved = (s.get("solved") or "").strip()
         stored_solved  = (stored.get("solved") or "").strip()
-        if listing_status != stored_status or listing_solved != stored_solved:
+        # Re-scrape stubs: CB record has no requester → detail page never succeeded
+        is_stub = stored.get("is_stub", False)
+        if listing_status != stored_status or listing_solved != stored_solved or is_stub:
             changed_tickets.append(s)
         else:
             skipped += 1
