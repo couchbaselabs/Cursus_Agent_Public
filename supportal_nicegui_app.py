@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.58"
+__version__ = "1.1.59"
 
 import asyncio
 import threading
@@ -12878,7 +12878,22 @@ def hybrid_retrieval(
     _kw_trusted = set(keyword_ids)
     if kws and not filters.get("ticket_ids"):  # skip if pinned by explicit ID
         _c2a_s6 = _get_cluster_to_app()   # resolve once outside the per-ticket closure
+        _known_apps_s6 = set(_get_app_cluster_aliases().keys())  # all known app names
+        # Which app aliases appear in the query keywords?
+        _queried_apps_s6 = {kw.lower() for kw in kws if kw.lower() in _known_apps_s6}
         def _kw_match(t: dict) -> bool:
+            # ── Cluster-authoritative exclusion (runs before FTS trust bypass) ──
+            # When the query names a known app (e.g. "safekey"), a ticket whose
+            # cluster(s) ALL resolve to a DIFFERENT known app is a cross-app false
+            # positive — exclude it even if FTS found a keyword hit in its text.
+            if _queried_apps_s6:
+                _t_cids = _ticket_cluster_ids(t)
+                _t_apps = {_c2a_s6.get(cid, "") for cid in _t_cids} - {""}
+                # Only exclude when: ticket has clusters that map to known apps
+                # AND none of those apps match the queried app(s).
+                if _t_apps and not (_t_apps & _queried_apps_s6):
+                    return False
+
             # FTS BM25 already validated this ticket for the query keywords
             _key = f"ticket::{t.get('ticket_id', '')}"
             if _key in _kw_trusted:
