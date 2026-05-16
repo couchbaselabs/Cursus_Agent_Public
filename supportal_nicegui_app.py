@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.55"
+__version__ = "1.1.56"
 
 import asyncio
 import threading
@@ -14095,7 +14095,7 @@ Schema per object:
   "complexity": <1-5>,
   "complexity_reason": "<one sentence>",
   "sentiment_summary": "<one sentence customer experience summary>",
-  "interaction_summary": "<2-4 sentence technical summary: the problem reported, key investigation findings or root cause, resolution outcome, and any notable patterns (recurring issue, escalation, workaround). Include specific CB component names, error types, version numbers, and resolution steps so this field is useful for semantic search.>"
+  "interaction_summary": "<2-4 sentence technical summary: who reported the issue (requester), when it was opened and closed, the application and cluster(s) affected, the problem reported, key investigation findings or root cause, resolution outcome, and any notable patterns (recurring issue, escalation, workaround). Include specific CB component names, error types, version numbers, and resolution steps so this field is useful for semantic search.>"
 }
 
 Definitions:
@@ -14108,12 +14108,13 @@ Definitions:
   complexity          — technical difficulty and scope (1=trivial how-to, 5=multi-team production incident)
   complexity_reason   — brief justification for complexity score
   sentiment_summary   — one-sentence description of the customer's experience
-  interaction_summary — 2-4 sentence technical narrative of the ticket: problem, investigation, resolution, patterns
+  interaction_summary — 2-4 sentence technical narrative: who reported, when opened/closed, app + clusters affected, problem, investigation, resolution, patterns
 
 --- FEW-SHOT EXAMPLES ---
 
 === TICKET_ID: EXAMPLE-A ===
   ID: EXAMPLE-A | Priority: normal | Status: solved | Comments: 2 | Escalations: none
+  Requester: jsmith@example.com | Created: 2025-03-01 | Closed: 2025-03-01
   Subject: How do I enable SSL for Python SDK connection to Capella
   Description: Customer asking for SSL configuration steps for the Python SDK.
   Last comment: "Thank you, the certificate configuration worked perfectly."
@@ -14123,13 +14124,16 @@ Output:
   "response_timeliness":5,"communication_clarity":5,"complexity":1,
   "complexity_reason":"Simple how-to answered in a single exchange.",
   "sentiment_summary":"Customer received a clear, immediate answer and confirmed success.",
-  "interaction_summary":"Customer asked how to configure SSL/TLS for a Python SDK connection to Capella. Support provided certificate configuration steps in a single exchange. Customer confirmed the solution worked immediately. No escalation or follow-up required."}]
+  "interaction_summary":"jsmith@example.com opened ticket on 2025-03-01 and it was closed the same day. No cluster or application specified. Customer asked how to configure SSL/TLS for a Python SDK connection to Capella. Support provided certificate configuration steps in a single exchange and customer confirmed success. No escalation required."}]
 
 ---
 
 === TICKET_ID: EXAMPLE-B ===
   ID: EXAMPLE-B | Priority: urgent | Status: solved | Comments: 18 | Escalations: ESC-441, ESC-442
+  Requester: ops-team@acme.com | Created: 2025-01-10 | Closed: 2025-01-31
   Subject: Production cluster completely unresponsive — possible data loss after failover
+  Application: PAYMENTS
+  Clusters: prod-cbec-node01
   Description: Customer reports all nodes showing as failed, application fully down since 2am.
   Last comment: "We finally recovered but this took 3 weeks and we lost confidence in the product."
 
@@ -14138,7 +14142,7 @@ Output:
   "response_timeliness":1,"communication_clarity":3,"complexity":5,
   "complexity_reason":"Multi-node production failure with data loss risk requiring two escalations and three weeks to resolve.",
   "sentiment_summary":"Customer experienced a prolonged critical outage and left the engagement with significantly damaged confidence.",
-  "interaction_summary":"Customer reported all Couchbase nodes showing as failed after an overnight failover event, with full application downtime and potential data loss. Investigation spanned multiple escalations (ESC-441, ESC-442) involving the engineering team to diagnose the root cause of the cluster-wide failure. Recovery was achieved after three weeks but without a definitive permanent fix. Customer expressed serious loss of confidence in product reliability."}]
+  "interaction_summary":"ops-team@acme.com opened on 2025-01-10 for the PAYMENTS application (cluster prod-cbec-node01); resolved 2025-01-31 (21 days). All Couchbase nodes reported as failed after an overnight failover event causing full application downtime and potential data loss. Two escalations (ESC-441, ESC-442) engaged engineering to diagnose the cluster-wide failure. Recovery was achieved but without a definitive permanent fix, leaving the customer with seriously damaged confidence."}]
 
 ---
 
@@ -14174,7 +14178,10 @@ Output:
 
 === TICKET_ID: EXAMPLE-E ===
   ID: EXAMPLE-E | Priority: high | Status: open | Comments: 12 | Escalations: ESC-389
+  Requester: admin@bigcorp.com | Created: 2025-08-15 | Closed: open
   Subject: Memory usage climbing indefinitely on analytics nodes — 4th report this year
+  Application: ANALYTICS-PLATFORM
+  Clusters: analytics-cbec-prod01
   Description: Customer has opened tickets about this exact issue in January, April, and July.
   Last comment: "This is the same problem again. We keep reporting it and nothing changes permanently."
 
@@ -14183,7 +14190,7 @@ Output:
   "response_timeliness":2,"communication_clarity":2,"complexity":4,
   "complexity_reason":"Recurring memory leak affecting analytics nodes with no permanent fix across four separate tickets.",
   "sentiment_summary":"Customer is visibly frustrated by the same unresolved issue recurring repeatedly with no lasting resolution.",
-  "interaction_summary":"Customer reported indefinitely climbing memory usage on Couchbase Analytics nodes, the fourth occurrence of this issue in the same year (previously reported in January, April, and July). ESC-389 was opened. Each prior ticket resulted in a temporary fix or restart, but no root cause was identified or permanently resolved. The customer expressed strong frustration and lack of confidence in the support process for this recurring analytics memory leak."}]
+  "interaction_summary":"admin@bigcorp.com opened on 2025-08-15 (still open) for ANALYTICS-PLATFORM (cluster analytics-cbec-prod01). Indefinitely climbing memory usage on Couchbase Analytics nodes — fourth occurrence this year (January, April, July, and August). ESC-389 was opened. Each prior ticket resulted in a temporary fix or restart with no permanent root-cause resolution. Customer expressed strong frustration and loss of confidence in the support process."}]
 
 --- END EXAMPLES ---
 
@@ -17341,6 +17348,21 @@ def build_scoring_input(
     """
     escs  = ticket.get("escalations") or "none"
     proactive = _is_proactive_ticket(ticket)
+
+    # Dates
+    _created_str = (ticket.get("created") or ticket.get("created_at") or "").strip()[:10]
+    _solved_raw  = (ticket.get("solved") or ticket.get("solved_at")
+                    or ticket.get("closed_at") or "").strip()
+    _solved_str  = _solved_raw[:10] if _solved_raw else ""
+    if not _solved_str and (ticket.get("status") or "").lower() in ("closed", "solved"):
+        _solved_str = (ticket.get("updated") or "").strip()[:10]
+
+    # App impact from cluster→app map
+    _c2a = _get_cluster_to_app()
+    _cids = _ticket_cluster_ids(ticket)
+    _app_labels = sorted({_c2a[c].upper() for c in _cids if _c2a.get(c)})
+    _app_str = ", ".join(_app_labels) if _app_labels else ""
+
     parts = [
         f"ID: {ticket.get('ticket_id','?')} | "
         f"Priority: {ticket.get('priority','?')} | "
@@ -17348,8 +17370,14 @@ def build_scoring_input(
         f"Origin: {'Proactive (Couchbase-initiated)' if proactive else 'Customer-initiated'} | "
         f"Comments: {ticket.get('comment_count', 0)} | "
         f"Escalations: {escs}",
+        f"Requester: {ticket.get('requester') or '?'} | "
+        f"Created: {_created_str or '?'} | Closed: {_solved_str or 'open'}",
         f"Subject: {(ticket.get('subject') or '(no subject)')[:200]}",
     ]
+    if _app_str:
+        parts.append(f"Application: {_app_str}")
+    if _cids:
+        parts.append(f"Clusters: {', '.join(_cids[:5])}")
     if ticket.get("description"):
         parts.append(f"Description: {ticket['description'][:desc_limit]}")
 
