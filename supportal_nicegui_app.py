@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.60"
+__version__ = "1.1.61"
 
 import asyncio
 import threading
@@ -6398,9 +6398,44 @@ def main_page():
                                 "Stop", icon="stop_circle",
                                 on_click=lambda: (_cancel.set(), btn_stop_score.set_enabled(False)),
                             ).props("outline color=red")
+                            async def _do_recover_clusters(client=None):
+                                _c2 = client or ui.context.client
+                                btn_recover_clusters.set_enabled(False)
+                                score_progress.set_value(0)
+                                score_status.set_text("Restoring cluster fields …")
+                                _loop2 = asyncio.get_event_loop()
+                                async def _upd_rc(msg: str, pct: float):
+                                    score_status.set_text(msg)
+                                    score_progress.set_value(pct)
+                                def _prog_rc(msg: str, pct: float):
+                                    asyncio.run_coroutine_threadsafe(_upd_rc(msg, pct), _loop2)
+                                try:
+                                    recovered, errs = await run.io_bound(
+                                        recover_score_cluster_fields_cb,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                        _prog_rc,
+                                    )
+                                    with _c2:
+                                        ui.notify(f"Cluster fields restored: {recovered} tickets, {errs} errors.", type="positive" if not errs else "warning")
+                                except Exception as exc:
+                                    with _c2:
+                                        ui.notify(f"Recovery failed: {exc}", type="negative")
+                                finally:
+                                    btn_recover_clusters.set_enabled(True)
+                            btn_recover_clusters = ui.button(
+                                "Restore Cluster Fields", icon="healing",
+                                on_click=lambda: asyncio.ensure_future(_do_recover_clusters(ui.context.client)),
+                            ).props("outline color=teal").tooltip("Restore score.cluster_names/cluster_ids wiped by a broken rescore run")
                         btn_score.set_enabled(False)
                         btn_load_scores.set_enabled(False)
                         btn_rescore_all.set_enabled(_CB_AVAILABLE)
+                        btn_recover_clusters.set_enabled(_CB_AVAILABLE)
                         btn_stop_score.set_enabled(False)
 
                         ui.separator().classes("my-2")
@@ -18024,13 +18059,15 @@ def rescore_all_customers_cb(
             _cf_rescore.wait(futs)
         errors_total = errors_total_ref[0]
 
-        # Persist scores back to CB
+        # Persist scores back to CB — merge into existing score to preserve
+        # cluster_names, cluster_ids, snapshot_count, last_snapshot_id, etc.
         for p_idx, (tid, score_data) in enumerate(scores.items()):
             doc_key = key_map.get(tid) or f"ticket::{tid}"
             try:
                 result  = col.get(doc_key)
                 doc     = result.content_as[dict]
-                doc["score"] = {**score_data, "scored_at": scored_at}
+                existing_score = doc.get("score") or {}
+                doc["score"] = {**existing_score, **score_data, "scored_at": scored_at}
                 col.upsert(doc_key, doc)
                 scored_total += 1
             except Exception as exc:
@@ -18068,6 +18105,72 @@ def rescore_all_customers_cb(
     )
     cluster.close()
     return scored_total, errors_total, error_log
+
+
+def recover_score_cluster_fields_cb(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    progress_cb: Callable[[str, float], None],
+) -> tuple[int, int]:
+    """Restore score.cluster_names/cluster_ids/snapshot_count/last_snapshot_id
+    for tickets where those fields were wiped by a broken rescore run.
+
+    Reads raw ticket fields (snapshots, ticket_fields, description, comments,
+    snapshot_topology) and calls extract_cluster_snapshot_info() — no LLM.
+    Only updates tickets that have a score but are missing cluster_names.
+    Returns (recovered, errors).
+    """
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cl  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl.wait_until_ready(timedelta(seconds=15))
+    col = cl.bucket(bucket).scope(scope).collection(collection)
+    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    # Fetch all tickets with a score but missing cluster_names
+    rows = list(cl.query(
+        f"SELECT META(t).id AS doc_id FROM {keyspace} AS t "
+        f"WHERE t.score IS NOT MISSING "
+        f"AND (t.score.cluster_names IS MISSING OR t.score.cluster_names IS NULL)",
+        QueryOptions(timeout=timedelta(seconds=60)),
+    ))
+    total = len(rows)
+    progress_cb(f"Found {total} tickets with missing cluster fields …", 0.0)
+
+    recovered = errors = 0
+    for i, row in enumerate(rows):
+        doc_key = row.get("doc_id", "")
+        if not doc_key:
+            continue
+        try:
+            result = col.get(doc_key)
+            doc    = result.content_as[dict]
+            # Recompute cluster fields from raw ticket data (deterministic, no LLM)
+            cluster_info = extract_cluster_snapshot_info(doc)
+            # Also supplement with text-scan via _ticket_cluster_ids (reads topo + text)
+            for cname in _ticket_cluster_ids(doc):
+                if cname and cname not in cluster_info["cluster_names"]:
+                    cluster_info["cluster_names"].append(cname)
+            existing_score = doc.get("score") or {}
+            existing_score.update({
+                "cluster_names":    cluster_info["cluster_names"],
+                "cluster_ids":      cluster_info["cluster_ids"],
+                "snapshot_count":   cluster_info["snapshot_count"],
+                "last_snapshot_id": cluster_info["last_snapshot_id"],
+            })
+            doc["score"] = existing_score
+            col.upsert(doc_key, doc)
+            recovered += 1
+        except Exception as exc:
+            errors += 1
+            print(f"[recover_cluster_fields] {doc_key}: {exc}")
+        if i % 100 == 0:
+            progress_cb(f"Recovered {recovered}/{total} …", i / max(total, 1))
+
+    cl.close()
+    progress_cb(f"Done — {recovered} recovered, {errors} errors.", 1.0)
+    return recovered, errors
 
 
 def persist_scores_to_cb(
@@ -18115,14 +18218,16 @@ def persist_scores_to_cb(
         try:
             result = col.get(doc_key)
             doc    = result.content_as[dict]
-            doc["score"] = {**score_data, "scored_at": scored_at}
+            existing_score = doc.get("score") or {}
+            doc["score"] = {**existing_score, **score_data, "scored_at": scored_at}
             col.upsert(doc_key, doc)
             saved += 1
         except CouchbaseException as exc:
             if "document_not_found" in str(exc) or "KEY_ENOENT" in str(exc):
                 # Ticket missing from CB — save it first if we have the data, then apply score
                 base_doc = dict(_ticket_lookup.get(str(tid), {"ticket_id": tid, "_stub": True}))
-                base_doc["score"] = {**score_data, "scored_at": scored_at}
+                existing_score = base_doc.get("score") or {}
+                base_doc["score"] = {**existing_score, **score_data, "scored_at": scored_at}
                 try:
                     col.upsert(doc_key, base_doc)
                     recovered = "_stub" not in base_doc
