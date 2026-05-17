@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.62"
+__version__ = "1.1.63"
 
 import asyncio
 import threading
@@ -5971,6 +5971,8 @@ def main_page():
                                         _embed_fn_rr,
                                         state["results"],
                                         _top_k_rr,
+                                        500,
+                                        state.get("customer_name", ""),
                                     )
                                     if not rr_tickets:
                                         answer = "No matching tickets found for your query."
@@ -5988,11 +5990,18 @@ def main_page():
                                             rr_tickets, state["customer_name"],
                                             compact=_rr_compact,
                                         )
+                                        _cust_rule = (
+                                            f"\nRULE R0 — You are answering about tickets for customer "
+                                            f"\"{state['customer_name']}\". All retrieved tickets belong to "
+                                            f"this customer. Do NOT qualify answers with \"for this customer\" "
+                                            f"on every line — the scope is implicit."
+                                            if state.get("customer_name") else ""
+                                        )
                                         _rerank_sys = (
                                             SYSTEM_PROMPT_TEMPLATE.format(
                                                 today=_today_str, stats=_stats_block, context=_context,
                                             ) +
-                                            "\n\n━━ RETRIEVE + RERANK RULES ━━\n"
+                                            "\n\n━━ RETRIEVE + RERANK RULES ━━" + _cust_rule + "\n"
                                             "The tickets above were retrieved by a deterministic structured query "
                                             "plus semantic vector search — they are your complete candidate set.\n"
                                             "RULE R1 — Answer using ONLY tickets that directly match the question. "
@@ -12374,6 +12383,11 @@ def tool_query_tickets(
         where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]
         params: list = []
 
+        organization = (filters.get("organization") or "").strip()
+        if organization:
+            params.append(f"%{organization.lower()}%")
+            where_parts.append(f"LOWER(TOSTRING(t.organization)) LIKE ${len(params)}")
+
         ticket_ids = filters.get("ticket_ids") or []
         if ticket_ids:
             phs = ", ".join(f"${i + 1}" for i, _ in enumerate(ticket_ids))
@@ -12448,6 +12462,7 @@ def search_tickets_retrieve_rerank(
     in_memory_tickets: list[dict],
     top_k_vec: int = 60,
     query_limit: int = 500,
+    customer_name: str = "",
 ) -> tuple[list[dict], str]:
     """
     Two-stage retrieval pipeline:
@@ -12459,6 +12474,11 @@ def search_tickets_retrieve_rerank(
     """
     notes: list[str] = []
     filters = build_structured_query(original_question or question)
+
+    # Scope retrieval to the loaded customer so cross-customer tickets never
+    # appear in the candidate set.
+    if customer_name:
+        filters["organization"] = customer_name
 
     # Stage 1a: deterministic structured retrieval
     struct_tickets: list[dict] = []
@@ -12487,6 +12507,13 @@ def search_tickets_retrieve_rerank(
                         new_vec_keys, cb_url, bucket, username,
                         password, use_tls, scope, collection,
                     )
+                    # Drop vector hits that belong to a different customer.
+                    if customer_name:
+                        _org_lc = customer_name.lower()
+                        vec_tickets = [
+                            t for t in vec_tickets
+                            if _org_lc in (t.get("organization") or "").lower()
+                        ]
                 notes.append(f"vec_new:{len(vec_tickets)}")
         except Exception as exc:
             notes.append(f"vec_err:{exc}")
