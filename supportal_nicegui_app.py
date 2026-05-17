@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.59"
+__version__ = "1.1.60"
 
 import asyncio
 import threading
@@ -17628,10 +17628,11 @@ def score_tickets_batch(
             {"role": "user",   "content": content},
         ]
 
-    # Scale output budget: ~800 tokens per ticket (schema + interaction_summary),
-    # min 2048, max 8192.  LMStudio/Ollama reserves max_tokens from the context
+    # Scale output budget: ~1200 tokens per ticket (schema + enriched interaction_summary
+    # now includes requester, dates, app, clusters — larger than original).
+    # min 2048, max 16384.  LMStudio/Ollama reserves max_tokens from the context
     # window before reading the prompt, so this must cover the full JSON array.
-    _score_max_tokens = max(2048, min(8192, len(batch) * 800))
+    _score_max_tokens = max(2048, min(16384, len(batch) * 1200))
     _llm = lambda msgs, max_tok=_score_max_tokens: call_llm(
         msgs, provider, model, api_key, base_url,
         max_tokens=max_tok, num_ctx=num_ctx, no_think=_effective_no_think,
