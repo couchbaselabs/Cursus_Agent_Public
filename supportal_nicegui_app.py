@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.61"
+__version__ = "1.1.62"
 
 import asyncio
 import threading
@@ -12501,6 +12501,38 @@ def search_tickets_retrieve_rerank(
     if not all_tickets and in_memory_tickets:
         all_tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
         notes.append(f"mem:{pf_note}")
+
+    # Tech-keyword grounding: when struct_keywords are pure technical terms (not
+    # app aliases) and Stage 1a returned 0 N1QL hits, validate that each vector
+    # candidate actually contains at least one keyword in its text fields.
+    # Without this, vector-only noise is passed to Stage 2 and the LLM gives
+    # inconsistent answers about whether unrelated tickets "match" the keyword.
+    _skws = filters.get("struct_keywords") or []
+    _known_apps = set(_get_app_cluster_aliases().keys())
+    _pure_tech_kws = [k for k in _skws if k not in _known_apps]
+    if _pure_tech_kws and not struct_tickets:
+        def _ticket_mentions_kw(t: dict) -> bool:
+            _comments_raw = t.get("comments") or []
+            _comments_str = " ".join(
+                str(c.get("body") or c.get("content") or c)
+                for c in (_comments_raw if isinstance(_comments_raw, list) else [])
+            )[:800]
+            haystack = " ".join([
+                str(t.get("subject") or ""),
+                str(t.get("description") or ""),
+                str(t.get("tags") or ""),
+                _comments_str,
+            ]).lower()
+            return any(kw.lower() in haystack for kw in _pure_tech_kws)
+        grounded = [t for t in all_tickets if _ticket_mentions_kw(t)]
+        if grounded:
+            all_tickets = grounded
+            notes.append(f"grounded:{len(all_tickets)}")
+        else:
+            # No candidates mention the keyword at all — return empty so the
+            # LLM consistently answers "no tickets found" rather than guessing.
+            notes.append("grounded:0→empty")
+            return [], " | ".join(notes)
 
     # Safety cap: never send more than 150 candidates to Stage 2 LLM.
     # Struct results are already date-DESC ordered; keep the most recent N.
