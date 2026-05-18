@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.64"
+__version__ = "1.1.65"
 
 import asyncio
 import threading
@@ -12233,13 +12233,30 @@ def build_structured_query(question: str) -> dict:
     # Hostname heuristic: 12+ char alphanumeric-with-digits token — catches cluster
     # names typed verbatim that aren't in the alias map yet (dynamic map lag).
     _HOSTNAME_RE = re.compile(r"^[a-z][a-z0-9]{11,}$")
-    result["struct_keywords"] = [
-        k for k in _deduped
+    # Normalize tech-acronym plurals: "cbses" → "cbse", "sdks" → "sdk".
+    # This ensures the LIKE condition and grounding check use the base form.
+    def _base_tech(tok: str) -> str:
+        if tok in _TECH_ACRONYMS:
+            return tok
+        stripped = tok.rstrip("s")
+        if stripped in _TECH_ACRONYMS:
+            return stripped
+        return tok
+
+    _struct_raw = [
+        _base_tech(k) for k in _deduped
         if k in _alias_key_set
         or k in _TECH_ACRONYMS
+        or k.rstrip("s") in _TECH_ACRONYMS
         or k in _known_hostnames
         or _HOSTNAME_RE.match(k)
-    ] + _alias_hosts
+    ]
+    # Deduplicate after normalization (e.g. "cbse" + "cbses" → ["cbse"])
+    _sk_seen: set[str] = set()
+    result["struct_keywords"] = [
+        k for k in _struct_raw + _alias_hosts
+        if not (k in _sk_seen or _sk_seen.add(k))  # type: ignore[func-returns-value]
+    ]
 
     # ── Topology filters — node counts and service presence ───────────────
     # Patterns: "more than 9 nodes", "> 9 nodes", "9+ nodes", "at least 9 nodes"
@@ -13326,6 +13343,7 @@ def build_dataset_stats(tickets: list[dict], today_dt: datetime.datetime) -> str
 
     window_7  = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 7))
     window_30 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 30))
+    window_60 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 60))
     window_90 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 90))
 
     # ── 10 most recent tickets ────────────────────────────────────────────
@@ -13362,9 +13380,11 @@ def build_dataset_stats(tickets: list[dict], today_dt: datetime.datetime) -> str
         f"STATUS:           {status_str}",
         f"UNIQUE CLUSTERS:  {len(all_cluster_ids)}",
         "",
-        "### Rolling Window Counts (computed from TODAY — use these for 'last N days/weeks/month' questions)",
+        "### Rolling Window Counts (computed from TODAY — use these for 'last N days/weeks/months' questions)",
+        "# 'Last week' = 7 days. 'Last month' = 30 days. 'Last 2 months' = 60 days. 'Last quarter' = 90 days.",
         f"  Last  7 days:  {window_7} tickets",
         f"  Last 30 days:  {window_30} tickets",
+        f"  Last 60 days:  {window_60} tickets",
         f"  Last 90 days:  {window_90} tickets",
         "",
         "### Most Recent Ticket Per Priority",
