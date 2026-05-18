@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.65"
+__version__ = "1.1.66"
 
 import asyncio
 import threading
@@ -12121,19 +12121,39 @@ def build_structured_query(question: str) -> dict:
     # ── Date range — relative phrases → absolute cutoff ──────────────────
     # Note: we compute these for *retrieval* (querying the right docs from CB).
     # The LLM independently uses the monthly index for its answer.
+
+    # Written-number → digit normalisation so "last two months" works like "last 2 months"
+    _WORD_TO_NUM = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12,
+    }
+    def _n_unit(unit: str) -> int | None:
+        """Return number of days for the first 'last/past N <unit>' phrase found, written or digit."""
+        # Digit form: "last 3 months"
+        dm = re.search(rf"\b(?:last|past)\s+(\d+)\s+{unit}s?\b", q)
+        if dm:
+            return int(dm.group(1))
+        # Written form: "last two months"
+        wm = re.search(rf"\b(?:last|past)\s+({'|'.join(_WORD_TO_NUM)})\s+{unit}s?\b", q)
+        if wm:
+            return _WORD_TO_NUM[wm.group(1)]
+        return None
+
+    _n_d = _n_unit("day")
+    _n_w = _n_unit("week")
+    _n_m = _n_unit("month")
+    _n_y = _n_unit("year")
+
     # Generic "last N days/weeks/months/years" — checked before hardcoded aliases
-    _n_days   = re.search(r"\b(?:last|past)\s+(\d+)\s+days?\b", q)
-    _n_weeks  = re.search(r"\b(?:last|past)\s+(\d+)\s+weeks?\b", q)
-    _n_months = re.search(r"\b(?:last|past)\s+(\d+)\s+months?\b", q)
-    _n_years  = re.search(r"\b(?:last|past)\s+(\d+)\s+years?\b", q)
-    if _n_days:
-        result["date_from"] = (today - datetime.timedelta(days=int(_n_days.group(1)))).strftime("%Y-%m-%d")
-    elif _n_weeks:
-        result["date_from"] = (today - datetime.timedelta(weeks=int(_n_weeks.group(1)))).strftime("%Y-%m-%d")
-    elif _n_months:
-        result["date_from"] = (today - datetime.timedelta(days=int(_n_months.group(1)) * 30)).strftime("%Y-%m-%d")
-    elif _n_years:
-        result["date_from"] = (today - datetime.timedelta(days=int(_n_years.group(1)) * 365)).strftime("%Y-%m-%d")
+    if _n_d is not None:
+        result["date_from"] = (today - datetime.timedelta(days=_n_d)).strftime("%Y-%m-%d")
+    elif _n_w is not None:
+        result["date_from"] = (today - datetime.timedelta(weeks=_n_w)).strftime("%Y-%m-%d")
+    elif _n_m is not None:
+        result["date_from"] = (today - datetime.timedelta(days=_n_m * 30)).strftime("%Y-%m-%d")
+    elif _n_y is not None:
+        result["date_from"] = (today - datetime.timedelta(days=_n_y * 365)).strftime("%Y-%m-%d")
     elif any(k in q for k in ("last week", "past week", "7 day", "past 7")):
         result["date_from"] = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
     elif any(k in q for k in ("last month", "past month", "30 day", "this month", "past 30")):
@@ -12145,6 +12165,9 @@ def build_structured_query(question: str) -> dict:
         result["date_from"] = (today - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
     elif any(k in q for k in ("this year", "year to date", "ytd", "so far this year", "current year")):
         result["date_from"] = f"{today.year}-01-01"
+    elif re.search(r"\brecent\b", q):
+        # "recent" without an explicit time qualifier → last 90 days
+        result["date_from"] = (today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     else:
         # Explicit ISO date injected by query rewriter — e.g. "since 2026-01-01"
         iso_dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", q)
