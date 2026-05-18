@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.70"
+__version__ = "1.1.71"
 
 import asyncio
 import threading
@@ -12614,6 +12614,26 @@ def search_tickets_retrieve_rerank(
         all_tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
         notes.append(f"mem:{pf_note}")
 
+    # Date post-filter: apply date_from / date_to to the full combined set so
+    # the vector leg respects the same temporal constraint as the N1QL leg.
+    # Tickets with no parseable date are kept (don't penalise missing data).
+    _date_from = filters.get("date_from")
+    _date_to   = filters.get("date_to")
+    if _date_from or _date_to:
+        _pre_date = len(all_tickets)
+        def _in_date_range(t: dict) -> bool:
+            d = _ticket_date(t)[:10]
+            if not d:
+                return True
+            if _date_from and d < _date_from:
+                return False
+            if _date_to and d > _date_to:
+                return False
+            return True
+        all_tickets = [t for t in all_tickets if _in_date_range(t)]
+        if len(all_tickets) < _pre_date:
+            notes.append(f"date_filter:{_pre_date}→{len(all_tickets)}")
+
     # Tech-keyword grounding: when struct_keywords are pure technical terms (not
     # app aliases) and Stage 1a returned 0 N1QL hits, validate that each vector
     # candidate actually contains at least one keyword in its text fields.
@@ -13659,13 +13679,19 @@ def build_rag_context(
         if compact:
             desc = (t.get("description") or "")[:200].replace("\n", " ")
             _app_tag = f"[Application: {_app_str}]" if _app_str else "[Application: ?]"
-            lines.append(
+            _summary_c = (t.get("interaction_summary") or "").strip()
+            _compact_line = (
                 f"#{tid} [{(t.get('priority') or '?').upper()}|{t.get('status','?')}] "
                 f"{_app_tag} requester:{t.get('requester','?')} "
                 f"created:{_created_str or '?'} resolved:{_resolved_str or '?'} "
                 f"time:{_days_str or '?'} assignee:{t.get('assignee','?')} "
-                f"clusters:{cluster_str} — {t.get('subject','N/A')} — {desc}"
+                f"clusters:{cluster_str} — {t.get('subject','N/A')}"
             )
+            if _summary_c:
+                _compact_line += f" | Summary: {_summary_c[:300].replace(chr(10), ' ')}"
+            elif desc:
+                _compact_line += f" — {desc}"
+            lines.append(_compact_line)
             continue
 
         # ── Header fields (standard / deep modes) ────────────────────────────
