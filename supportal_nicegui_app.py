@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.63"
+__version__ = "1.1.64"
 
 import asyncio
 import threading
@@ -5990,12 +5990,13 @@ def main_page():
                                             rr_tickets, state["customer_name"],
                                             compact=_rr_compact,
                                         )
+                                        _rr_cust = state.get("customer_name", "")
                                         _cust_rule = (
                                             f"\nRULE R0 — You are answering about tickets for customer "
-                                            f"\"{state['customer_name']}\". All retrieved tickets belong to "
+                                            f"\"{_rr_cust}\". All retrieved tickets belong to "
                                             f"this customer. Do NOT qualify answers with \"for this customer\" "
                                             f"on every line — the scope is implicit."
-                                            if state.get("customer_name") else ""
+                                            if _rr_cust and _rr_cust.lower() != "all customers" else ""
                                         )
                                         _rerank_sys = (
                                             SYSTEM_PROMPT_TEMPLATE.format(
@@ -12476,9 +12477,11 @@ def search_tickets_retrieve_rerank(
     filters = build_structured_query(original_question or question)
 
     # Scope retrieval to the loaded customer so cross-customer tickets never
-    # appear in the candidate set.
-    if customer_name:
-        filters["organization"] = customer_name
+    # appear in the candidate set. Skip the "All Customers" sentinel — that
+    # value means no filter was set and all customers should be searched.
+    _cust_for_filter = customer_name.strip()
+    if _cust_for_filter and _cust_for_filter.lower() != "all customers":
+        filters["organization"] = _cust_for_filter
 
     # Stage 1a: deterministic structured retrieval
     struct_tickets: list[dict] = []
@@ -12508,11 +12511,14 @@ def search_tickets_retrieve_rerank(
                         password, use_tls, scope, collection,
                     )
                     # Drop vector hits that belong to a different customer.
-                    if customer_name:
-                        _org_lc = customer_name.lower()
+                    # Use bidirectional substring: handles cases where the typed
+                    # customer name is shorter OR longer than the stored org value.
+                    if _cust_for_filter and _cust_for_filter.lower() != "all customers":
+                        _org_lc = _cust_for_filter.lower()
                         vec_tickets = [
                             t for t in vec_tickets
                             if _org_lc in (t.get("organization") or "").lower()
+                            or (t.get("organization") or "").lower() in _org_lc
                         ]
                 notes.append(f"vec_new:{len(vec_tickets)}")
         except Exception as exc:
