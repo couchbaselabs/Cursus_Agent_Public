@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.68"
+__version__ = "1.1.69"
 
 import asyncio
 import threading
@@ -2429,6 +2429,7 @@ def validate_and_recover_pipeline(
     use_playwright: bool,
     progress_cb: Callable[[str, float], None],
     cancel: threading.Event | None = None,
+    raw_tickets: list[dict] | None = None,
 ) -> tuple[int, int]:
     """
     Validate that every scored ticket exists in CB. For any that are missing
@@ -2439,6 +2440,30 @@ def validate_and_recover_pipeline(
         raise RuntimeError("couchbase SDK not installed")
 
     import datetime
+
+    # ── Report scraping failures from the raw ticket batch ───────────────
+    # Tickets whose subject is an HTTP error title were stored as-is in CB;
+    # log them here so the operator knows which URLs need a re-scrape.
+    _HTTP_ERR_SUBJECTS = frozenset({
+        "404 page not found", "403 forbidden", "401 unauthorized",
+        "500 internal server error", "502 bad gateway",
+        "503 service unavailable", "access denied",
+    })
+    if raw_tickets:
+        scrape_failures = [
+            t for t in raw_tickets
+            if (t.get("subject") or "").strip().lower() in _HTTP_ERR_SUBJECTS
+        ]
+        if scrape_failures:
+            progress_cb(
+                f"Scraping failures ({len(scrape_failures)} ticket(s) returned HTTP error pages "
+                f"— stored with error title, need re-scrape):", 0.0,
+            )
+            for t in scrape_failures:
+                tid = t.get("ticket_id", "?")
+                subj = (t.get("subject") or "").strip()
+                url = f"{BASE_URL}/zendesk/ticket/{tid}"
+                progress_cb(f"  ✗ #{tid}  {subj}  →  {url}", 0.0)
 
     conn_str = _cb_conn_str(cb_url, use_tls)
     cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
@@ -3547,6 +3572,7 @@ def main_page():
                                                 using_browser,
                                                 _make_step_prog("validate"),
                                                 _cancel,
+                                                data,
                                             )
                                             await _step_finish(
                                                 "validate",
