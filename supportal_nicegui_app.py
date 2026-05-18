@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.69"
+__version__ = "1.1.70"
 
 import asyncio
 import threading
@@ -2456,14 +2456,25 @@ def validate_and_recover_pipeline(
         ]
         if scrape_failures:
             progress_cb(
-                f"Scraping failures ({len(scrape_failures)} ticket(s) returned HTTP error pages "
+                f"Scraping failures ({len(scrape_failures)} doc(s) returned HTTP error pages "
                 f"— stored with error title, need re-scrape):", 0.0,
             )
             for t in scrape_failures:
-                tid = t.get("ticket_id", "?")
+                # Determine document type from whichever ID field is present
+                if t.get("ticket_id"):
+                    doc_type = "ticket"
+                    doc_id   = t["ticket_id"]
+                    url = f"{BASE_URL}/zendesk/ticket/{doc_id}"
+                elif t.get("snap_id") or t.get("snapshot_id"):
+                    doc_type = "snapshot"
+                    doc_id   = t.get("snap_id") or t.get("snapshot_id", "?")
+                    url = t.get("url") or f"{BASE_URL}/snapshot/{doc_id}"
+                else:
+                    doc_type = "unknown"
+                    doc_id   = "?"
+                    url = t.get("url", "")
                 subj = (t.get("subject") or "").strip()
-                url = f"{BASE_URL}/zendesk/ticket/{tid}"
-                progress_cb(f"  ✗ #{tid}  {subj}  →  {url}", 0.0)
+                progress_cb(f"  ✗ [{doc_type}] #{doc_id}  {subj}  →  {url}", 0.0)
 
     conn_str = _cb_conn_str(cb_url, use_tls)
     cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
