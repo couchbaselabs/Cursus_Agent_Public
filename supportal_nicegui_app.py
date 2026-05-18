@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.66"
+__version__ = "1.1.67"
 
 import asyncio
 import threading
@@ -3409,7 +3409,9 @@ def main_page():
                                                 4,
                                                 _snap_upsert_fn,
                                             )
-                                            _enrich_ok = enrich_errs < len([t for t in data if t.get("snapshots")]) or enriched_n > 0
+                                            _snap_count = len([t for t in data if t.get("snapshots")])
+                                            # ok = skipped (no snap tickets), partial success, or full success
+                                            _enrich_ok = _snap_count == 0 or enriched_n > 0 or enrich_errs < _snap_count
 
                                             # Re-save enriched tickets to Couchbase so that
                                             # snapshot_topology + snap_ids + snapshot_summary are
