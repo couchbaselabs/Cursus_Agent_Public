@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.67"
+__version__ = "1.1.68"
 
 import asyncio
 import threading
@@ -17920,6 +17920,29 @@ def score_all_tickets(
 
     # Filter out non-ticket documents (Couchbase design docs, metadata, etc.)
     tickets = [t for t in tickets if isinstance(t, dict) and t.get("ticket_id")]
+
+    # Skip scraping-failure stubs: HTTP error pages stored as ticket subjects
+    # (scraper received a 4xx/5xx response and stored the error title as subject).
+    # These have no description and no comments — the LLM would invent scores.
+    _HTTP_ERR_SUBJECTS = frozenset({
+        "404 page not found", "403 forbidden", "401 unauthorized",
+        "500 internal server error", "502 bad gateway", "503 service unavailable",
+        "access denied",
+    })
+    def _is_scrape_stub(t: dict) -> bool:
+        subj = (t.get("subject") or "").strip().lower()
+        if subj in _HTTP_ERR_SUBJECTS:
+            return True
+        # Also skip truly empty tickets (no subject, no description, no comments)
+        has_desc = bool((t.get("description") or "").strip())
+        has_cmts = bool(t.get("comments"))
+        return not subj and not has_desc and not has_cmts
+
+    scoreable = [t for t in tickets if not _is_scrape_stub(t)]
+    skipped   = len(tickets) - len(scoreable)
+    if skipped:
+        progress_cb(f"Skipping {skipped} empty/stub ticket(s) — no scoreable content.", 0.0)
+    tickets = scoreable
 
     total   = len(tickets)
     results: dict[str, dict] = {}
