@@ -14,3 +14,6 @@ couchbase>=4.0.0
 anthropic
 openai                  # also covers Ollama and LMStudio (OpenAI-compatible)
 google-genai
+
+# MCP server (Phase 2)
+mcp

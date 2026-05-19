@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.77"
+__version__ = "1.1.78"
 
 import asyncio
 import threading
@@ -409,39 +409,56 @@ def save_chat_session(
     cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
     scope: str, collection: str,
 ) -> None:
-    """Persist a full conversation session as a grouped doc for context-aware RAG recall.
+    """Persist a conversation session with ticket IDs and topic tags for staleness-aware recall.
 
-    Each turn is (question, answer, timestamp_iso).  The session is stored under
-    ``chat_cache::session::<session_id>`` with all turns embedded so future retrieval
-    can return the entire conversational thread, not just isolated Q&A pairs.
+    Each turn is (question, answer, timestamp_iso, ticket_ids) where ticket_ids is a
+    list[str] of ticket IDs that were in context for that turn (empty list for turns
+    with no retrieval, e.g. Batch mode).  Old 3-tuple turns are accepted for backward
+    compatibility.  Stored under ``chat_cache::session::<session_id>``.
     """
     if not _CB_AVAILABLE or not turns:
         return
     try:
-        doc = {
-            "type": "chat_session",
-            "session_id": session_id,
-            "organization": organization,
-            "turn_count": len(turns),
-            "turns": [
-                {"role": "user",      "content": q, "timestamp": ts}
-                for (q, a, ts) in turns
-            ] + [
-                {"role": "assistant", "content": a, "timestamp": ts}
-                for (q, a, ts) in turns
-            ],
-            # Interleaved order is more readable; rebuild it properly:
-            "started_at": turns[0][2] if turns else "",
-            "ended_at":   turns[-1][2] if turns else "",
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        # Build interleaved turns list
-        interleaved = []
-        for (q, a, ts) in turns:
-            interleaved.append({"role": "user",      "content": q, "timestamp": ts})
-            interleaved.append({"role": "assistant", "content": a, "timestamp": ts})
-        doc["turns"] = interleaved
+        # Collect all ticket IDs touched across the session (union, order-preserved)
+        _all_ticket_ids: list[str] = []
+        _seen_ids: set[str] = set()
+        interleaved: list[dict] = []
+        for turn in turns:
+            q, a, ts = turn[0], turn[1], turn[2]
+            t_ids: list[str] = list(turn[3]) if len(turn) > 3 else []
+            interleaved.append({"role": "user",      "content": q,  "timestamp": ts})
+            interleaved.append({"role": "assistant", "content": a,  "timestamp": ts,
+                                 "ticket_ids": t_ids})
+            for tid in t_ids:
+                if tid and tid not in _seen_ids:
+                    _all_ticket_ids.append(tid)
+                    _seen_ids.add(tid)
 
+        # Build topic tags: lower-case non-stopword words from questions (≥5 chars)
+        _stop = {"what", "which", "where", "there", "their", "these", "those", "about",
+                 "would", "could", "should", "please", "many", "have", "that", "with",
+                 "from", "this", "were", "show", "list", "give", "tell", "across"}
+        _tags: list[str] = []
+        for turn in turns:
+            for w in re.findall(r"[a-z][a-z0-9]{4,}", turn[0].lower()):
+                if w not in _stop and w not in _tags:
+                    _tags.append(w)
+        topic_tags = _tags[:30]
+
+        _now_epoch = int(time.time())
+        doc = {
+            "type":           "chat_session",
+            "session_id":     session_id,
+            "organization":   organization,
+            "turn_count":     len(turns),
+            "turns":          interleaved,
+            "ticket_ids":     _all_ticket_ids,    # union of all tickets touched
+            "topic_tags":     topic_tags,
+            "started_at":     turns[0][2] if turns else "",
+            "ended_at":       turns[-1][2] if turns else "",
+            "last_active_at": _now_epoch,          # epoch seconds — staleness anchor
+            "created_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
         chat_cache_set(
             f"chat_cache::session::{session_id}",
             doc,
@@ -450,6 +467,104 @@ def save_chat_session(
         )
     except Exception:
         pass
+
+
+def check_freshness(
+    ticket_ids: list[str],
+    since_epoch: int,
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+    scope: str, collection: str,
+) -> list[str]:
+    """Return ticket IDs where last_scraped_at > since_epoch.
+
+    Uses a single N1QL query so it scales to hundreds of IDs without per-doc
+    round-trips.  Returns an empty list when CB is unavailable or on error.
+    This is the staleness signal that prevents the LLM from reasoning about
+    stale ticket state carried over from a prior session.
+    """
+    if not _CB_AVAILABLE or not ticket_ids:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+        id_list  = ", ".join(json.dumps(str(tid)) for tid in ticket_ids[:500])
+        rows = list(cluster.query(
+            f"SELECT META(t).id AS doc_key, t.ticket_id, t.last_scraped_at "
+            f"FROM {keyspace} AS t "
+            f"WHERE t.ticket_id IN [{id_list}] "
+            f"AND t.last_scraped_at > $1",
+            QueryOptions(positional_parameters=[since_epoch], timeout=timedelta(seconds=15)),
+        ))
+        cluster.close()
+        stale: list[str] = []
+        for row in rows:
+            tid = str(row.get("ticket_id") or "").strip()
+            if tid and tid not in stale:
+                stale.append(tid)
+        return stale
+    except Exception:
+        return []
+
+
+def fetch_prior_session_context(
+    organization: str,
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+    scope: str, collection: str,
+    limit: int = 3,
+) -> str:
+    """Build a brief prior-session context block for system prompt injection.
+
+    Fetches the most recent sessions for the customer, runs check_freshness on
+    each session's ticket IDs, and flags which tickets have been updated since
+    that session ended.  Returns an empty string when there are no prior sessions
+    or CB is unavailable.
+
+    The block is intentionally short — it gives the model topic continuity and
+    staleness signals without re-injecting stale ticket content.
+    """
+    sessions = fetch_recent_sessions(
+        cb_url, bucket, username, password, use_tls, scope, collection,
+        limit=limit, organization=organization,
+    )
+    if not sessions:
+        return ""
+
+    lines: list[str] = ["## Prior Session Context"]
+    for sess in sessions:
+        _dt    = (sess.get("ended_at") or sess.get("created_at") or "")[:10]
+        _tc    = sess.get("turn_count", 0)
+        _tags  = ", ".join((sess.get("topic_tags") or [])[:8])
+        _tids  = sess.get("ticket_ids") or []
+        _since = sess.get("last_active_at") or 0
+
+        _stale: list[str] = []
+        if _tids and _since:
+            _stale = check_freshness(
+                _tids, _since,
+                cb_url, bucket, username, password, use_tls, scope, collection,
+            )
+
+        _line = f"Session {_dt} ({_tc} turns)"
+        if _tags:
+            _line += f" — topics: {_tags}"
+        if _tids:
+            _line += f" — {len(_tids)} tickets in scope"
+        if _stale:
+            _line += f" — ⚠ {len(_stale)} ticket(s) updated since session: {', '.join(_stale[:10])}"
+        lines.append(_line)
+
+        # Include a one-sentence distillation of the last assistant turn if available
+        _turns = sess.get("turns") or []
+        _last_a = next(
+            (t["content"][:200] for t in reversed(_turns) if t.get("role") == "assistant"),
+            None,
+        )
+        if _last_a:
+            lines.append(f"  Last answer: {_last_a}{'…' if len(_last_a) == 200 else ''}")
+
+    return "\n".join(lines)
 
 
 def fetch_recent_sessions(
@@ -3000,7 +3115,8 @@ def main_page():
         "scores":           {},         # ticket_id -> score dict from Phase 3 LLM scoring
         "customer_name":    "",         # resolved customer name from last scrape/load
         "chat_session_id":  str(uuid.uuid4()),  # unique ID for current conversation session
-        "chat_session_turns": [],       # [(question, answer, ts)] for session storage
+        "chat_session_turns": [],       # [(question, answer, ts, ticket_ids)] for session storage
+        "prior_session_block": "",      # fetched once on first turn; injected into every system prompt
     }
 
     # ── Restore from server-level state (survives page refresh) ─────────────
@@ -5893,6 +6009,27 @@ def main_page():
                                         f"context: {ctx} tokens — VRAM: {vram_s}"
                                     )
 
+                            # Fetch prior session context once per session (first turn only).
+                            # Subsequent turns reuse the cached block to avoid extra CB round-trips.
+                            if (
+                                _CB_AVAILABLE
+                                and store_memory_toggle.value
+                                and not state["chat_session_turns"]   # first turn of this session
+                                and not state["prior_session_block"]
+                                and state.get("customer_name")
+                            ):
+                                _sc_col_p = (cache_collection_input.value.strip()
+                                             or cb_collection_input.value.strip() or "tickets")
+                                state["prior_session_block"] = await run.io_bound(
+                                    fetch_prior_session_context,
+                                    state["customer_name"],
+                                    cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(), cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    _sc_col_p,
+                                )
+
                             try:
                                 mode = chat_mode_select.value
 
@@ -5924,7 +6061,7 @@ def main_page():
                                     _render_chat()
                                     chat_status.set_text(f"Batch map-reduce complete — {len(state['results'])} tickets analysed.")
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now))
+                                    state["chat_session_turns"].append((question, answer, _ts_now, []))
 
                                 elif mode == "All Tickets":
                                     if not state["results"]:
@@ -5967,6 +6104,8 @@ def main_page():
                                         _mem_block = _build_memory_section(_memories)
                                         if _mem_block:
                                             system_msg = system_msg + "\n" + _mem_block
+                                    if state.get("prior_session_block"):
+                                        system_msg = system_msg + "\n" + state["prior_session_block"]
                                     # Window history to last 20 messages (10 turns)
                                     _hist_window = state["chat_history"][-(20):-1]
                                     messages = [{"role": "system", "content": system_msg}]
@@ -6009,7 +6148,8 @@ def main_page():
                                             chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
                                     # Record turn for session storage
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now))
+                                    _turn_tids = [str(t.get("ticket_id","")) for t in context_tickets if t.get("ticket_id")]
+                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
 
                                 elif mode == "Retrieve + Rerank":
                                     _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
@@ -6090,6 +6230,7 @@ def main_page():
                                             "patterns with matching tickets. Explicit label match only.\n"
                                             "RULE R3 — If the question asks for a list, produce a markdown table of "
                                             "ALL matching tickets from the context, not just a sample."
+                                            + (("\n" + state["prior_session_block"]) if state.get("prior_session_block") else "")
                                         )
                                         _rr_msgs = [
                                             {"role": "system", "content": _rerank_sys},
@@ -6113,7 +6254,8 @@ def main_page():
                                     state["chat_history"].append({"role": "assistant", "content": answer})
                                     _render_chat()
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now))
+                                    _turn_tids = [str(t.get("ticket_id","")) for t in (rr_tickets or []) if t.get("ticket_id")]
+                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
 
                                 else:  # Hybrid Search
                                     _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
@@ -6278,6 +6420,8 @@ def main_page():
                                         _mem_block = _build_memory_section(_memories)
                                         if _mem_block:
                                             system_msg = system_msg + "\n" + _mem_block
+                                    if state.get("prior_session_block"):
+                                        system_msg = system_msg + "\n" + state["prior_session_block"]
                                     # Window history to last 20 messages (10 turns)
                                     _hist_window = state["chat_history"][-(20):-1]
                                     messages = [{"role": "system", "content": system_msg}]
@@ -6322,7 +6466,8 @@ def main_page():
                                             chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
                                     # Record turn for session storage
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now))
+                                    _turn_tids = [str(t.get("ticket_id","")) for t in context_tickets if t.get("ticket_id")]
+                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
 
                                     # 6. Write permanent memory — always store when toggle is on,
                                     #    include question_vector for future semantic retrieval
@@ -6372,6 +6517,7 @@ def main_page():
                             state["chat_history"].clear()
                             state["chat_session_turns"].clear()
                             state["chat_session_id"] = str(uuid.uuid4())
+                            state["prior_session_block"] = ""   # re-fetch on next session's first turn
                             _render_chat()
                             chat_status.set_text("")
 
