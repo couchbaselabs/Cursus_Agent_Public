@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.73"
+__version__ = "1.1.77"
 
 import asyncio
 import threading
@@ -6024,6 +6024,19 @@ def main_page():
                                     )
                                     _top_k_rr = int(top_k_input.value or 60)
 
+                                    # Rewrite follow-up questions to be self-contained so
+                                    # "out of those, how many had CBSEs?" picks up the date
+                                    # range from the previous answer rather than fetching all time.
+                                    _orig_question = question
+                                    question = await run.io_bound(
+                                        contextualize_question,
+                                        question,
+                                        state["chat_history"][:-1],  # exclude current turn
+                                        provider, model, api_key, base_url,
+                                    )
+                                    if question != _orig_question:
+                                        chat_status.set_text(f"Contextualized: {question[:80]}…")
+
                                     def _embed_fn_rr(text: str) -> list[float]:
                                         return embed_text(text, _ep, _em, _eak, _ebu,
                                                           dims=_edims, num_ctx=_enum_ctx)
@@ -6031,8 +6044,8 @@ def main_page():
                                     chat_status.set_text("Stage 1 — retrieving candidates from Couchbase …")
                                     rr_tickets, rr_notes = await run.io_bound(
                                         search_tickets_retrieve_rerank,
-                                        question,
-                                        question,
+                                        question,   # rewritten — vector embedding
+                                        question,   # rewritten — N1QL date filter via build_structured_query
                                         *_cb_rr,
                                         _embed_fn_rr,
                                         state["results"],
@@ -6198,13 +6211,13 @@ def main_page():
                                     chat_status.set_text("Hybrid retrieval: vector + structured search …")
                                     context_tickets, _retrieval_note = await run.io_bound(
                                         hybrid_retrieval,
-                                        _retrieval_q,       # rewritten: used for vector embedding + expansion
+                                        _retrieval_q,       # rewritten: vector embedding + expansion
                                         query_vec,
                                         *_ticket_cb,
                                         _top_k,
                                         state["results"],   # in-memory fallback
                                         _make_embed_fn(),   # for query expansion
-                                        question,           # original: used for structured filters + Stage 6
+                                        _retrieval_q,       # rewritten: N1QL date filter (has prior-context dates)
                                     )
                                     chat_status.set_text(f"Hybrid retrieval: {_retrieval_note}")
                                     doc_keys = [str(t.get("ticket_id", "")) for t in context_tickets if t.get("ticket_id")]
@@ -6508,10 +6521,64 @@ def main_page():
                                 "Restore Cluster Fields", icon="healing",
                                 on_click=lambda: asyncio.ensure_future(_do_recover_clusters(ui.context.client)),
                             ).props("outline color=teal").tooltip("Restore score.cluster_names/cluster_ids wiped by a broken rescore run")
+
+                            async def _do_enrich_app_labels(client=None):
+                                _c3 = client or ui.context.client
+                                btn_enrich_app_labels.set_enabled(False)
+                                score_progress.set_value(0)
+                                score_status.set_text("Enriching app labels via Analytics API + LLM…")
+                                _loop3 = asyncio.get_event_loop()
+                                async def _upd_ea(msg: str, pct: float):
+                                    score_status.set_text(msg)
+                                    score_progress.set_value(pct)
+                                def _prog_ea(msg: str, pct: float):
+                                    asyncio.run_coroutine_threadsafe(_upd_ea(msg, pct), _loop3)
+                                _cust = state.get("customer_name", "")
+                                _cookie_ea = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                                llm_prov, llm_mod, llm_key, llm_base = _get_llm_config()
+                                try:
+                                    enriched_ea, errs_ea = await run.io_bound(
+                                        enrich_ticket_apps_via_analytics,
+                                        _cust,
+                                        _cookie_ea or None,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                        llm_prov, llm_mod, llm_key, llm_base,
+                                        _prog_ea,
+                                    )
+                                    with _c3:
+                                        ui.notify(
+                                            f"App label enrichment: {enriched_ea} labels written"
+                                            + (f", {errs_ea} errors" if errs_ea else " — done"),
+                                            type="positive" if not errs_ea else "warning",
+                                        )
+                                except Exception as exc:
+                                    with _c3:
+                                        ui.notify(f"Enrichment failed: {exc}", type="negative")
+                                finally:
+                                    btn_enrich_app_labels.set_enabled(True)
+                                    score_progress.set_value(0)
+
+                            btn_enrich_app_labels = ui.button(
+                                "Enrich App Labels", icon="label",
+                                on_click=lambda: asyncio.ensure_future(_do_enrich_app_labels(ui.context.client)),
+                            ).props("outline color=indigo").tooltip(
+                                "For tickets missing [Application: X] labels: query the Analytics API "
+                                "for linked snapshot cluster names, then use LLM to extract app names "
+                                "from ticket subjects (e.g. 'Enterprise Wallet', 'DQF', 'Griffin'). "
+                                "Requires a valid session cookie and LLM configured."
+                            )
+
                         btn_score.set_enabled(False)
                         btn_load_scores.set_enabled(False)
                         btn_rescore_all.set_enabled(_CB_AVAILABLE)
                         btn_recover_clusters.set_enabled(_CB_AVAILABLE)
+                        btn_enrich_app_labels.set_enabled(_CB_AVAILABLE)
                         btn_stop_score.set_enabled(False)
 
                         ui.separator().classes("my-2")
@@ -13720,6 +13787,12 @@ def build_rag_context(
             for _cid in cluster_ids
             if _c2a.get(_cid)
         })
+        # Fallback: analytics-enriched labels stored on the ticket document
+        if not _app_labels:
+            _score_t = t.get("score") or {}
+            _analytics_labels = _score_t.get("analytics_app_labels") or []
+            if _analytics_labels:
+                _app_labels = [str(lbl).upper() for lbl in _analytics_labels]
         _app_str = ", ".join(sorted(_app_labels)) if _app_labels else ""
 
         if compact:
@@ -13734,6 +13807,27 @@ def build_rag_context(
                 f"time:{_days_str or '?'} assignee:{t.get('assignee','?')} "
                 f"clusters:{cluster_str} — {t.get('subject','N/A')}"
             )
+            # Append compact topology note when snapshot_topology is available
+            _topo_c = t.get("snapshot_topology") or {}
+            if isinstance(_topo_c, str):
+                try:
+                    _topo_c = json.loads(_topo_c)
+                except Exception:
+                    _topo_c = {}
+            if _topo_c and (_topo_c.get("total_nodes") or _topo_c.get("data_nodes") or _topo_c.get("cb_version")):
+                _tv   = _topo_c.get("cb_version") or ""
+                _tn   = _topo_c.get("total_nodes") or _topo_c.get("node_count") or "?"
+                _tbc  = _topo_c.get("bad_count") or len(_topo_c.get("bad_items") or [])
+                _twc  = _topo_c.get("warn_count") or len(_topo_c.get("warn_items") or [])
+                _tram = _topo_c.get("ram_per_node_mib")
+                _tcpu = _topo_c.get("cpus_per_node")
+                _snap_note = f" [Snap: {_tn}nodes CB={(_tv or '?')[:12]} bad={_tbc} warn={_twc}"
+                if _tram:
+                    _snap_note += f" RAM/node={round(int(_tram)/1024)}GB"
+                if _tcpu:
+                    _snap_note += f" CPU/node={_tcpu}"
+                _snap_note += "]"
+                _compact_line += _snap_note
             if _summary_c:
                 _compact_line += f" | Summary: {_summary_c[:300].replace(chr(10), ' ')}"
             elif desc:
@@ -13754,28 +13848,70 @@ def build_rag_context(
         lines.append(f"Requester: {t.get('requester','?')} | Clusters: {cluster_str}")
 
         # ── Snapshot topology (when available) ────────────────────────────────
+        # Primary: external snapshot_map (fetched from snapshots collection).
+        # Fallback: snapshot_topology stored directly on the ticket doc — populated
+        # by the Enrich pipeline step and authoritative for the linked snapshot.
+        def _render_topo_snap(snap: dict, label: str = "Snapshot") -> None:
+            _topo = snap.get("topology") or {}
+            def _f(key: str):
+                return snap.get(key) or _topo.get(key)
+            _svc_parts = []
+            for _svc in ("data", "index", "query", "fts", "eventing", "analytics"):
+                _n = _f(f"{_svc}_nodes") or 0
+                if _n:
+                    _svc_parts.append(f"{_n} {_svc}")
+            _nodes   = _f("total_nodes") or _f("node_count") or "?"
+            _vers    = _f("cb_version") or ""
+            _buckets = _f("bucket_names") or []
+            _ram_mib = _f("ram_per_node_mib")
+            _cpus    = _f("cpus_per_node")
+            _groups  = _f("server_groups") or []
+            _afo     = _f("auto_failover_seconds")
+            _topo_line = (
+                f"  {label} [{(snap.get('date') or '?')[:10]}]: "
+                f"Cluster={snap.get('cluster_name') or '?'} | "
+                f"Nodes={_nodes} ({', '.join(_svc_parts) if _svc_parts else '?'}) | "
+                f"CB={_vers or '?'}"
+            )
+            if _ram_mib:
+                _topo_line += f" | RAM/node={round(int(_ram_mib)/1024)}GB"
+            if _cpus:
+                _topo_line += f" | CPU/node={_cpus}"
+            if _groups:
+                _topo_line += f" | ServerGroups={len(_groups)}({','.join(str(g) for g in _groups[:4])})"
+            if _afo:
+                _topo_line += f" | AutoFailover={_afo}s"
+            _warns = _f("warn_items") or []
+            _bads  = _f("bad_items")  or []
+            if _bads:
+                _topo_line += f" | Issues({len(_bads)}): {', '.join(str(b) for b in _bads[:5])}"
+            if _warns:
+                _topo_line += f" | Warnings({len(_warns)}): {', '.join(str(w) for w in _warns[:5])}"
+            if _buckets:
+                _topo_line += f" | Buckets: {', '.join(str(b) for b in _buckets[:6])}"
+            lines.append(_topo_line)
+
+        _topo_rendered = False
         if snapshot_map and cluster_ids:
             for _cid in cluster_ids[:3]:
                 _snap = snapshot_map.get(_cid)
-                if not _snap:
-                    continue
-                _svc_parts = []
-                for _svc in ("data", "index", "query", "fts", "eventing", "analytics"):
-                    _n = _snap.get(f"{_svc}_nodes") or 0
-                    if _n:
-                        _svc_parts.append(f"{_n} {_svc}")
-                _topo_line = (
-                    f"  Snapshot [{(_snap.get('date') or '?')[:10]}]: "
-                    f"Cluster={_snap.get('cluster_name') or '?'} | "
-                    f"Nodes={_snap.get('node_count') or '?'} "
-                    f"({', '.join(_svc_parts) if _svc_parts else '?'}) | "
-                    f"CB={_snap.get('cb_version') or '?'}"
-                )
-                if _snap.get("warn_items"):
-                    _topo_line += f" | Warnings: {', '.join((_snap['warn_items'] or [])[:5])}"
-                if _snap.get("bad_items"):
-                    _topo_line += f" | Issues: {', '.join((_snap['bad_items'] or [])[:5])}"
-                lines.append(_topo_line)
+                if _snap and (_snap.get("node_count") or _snap.get("cb_version")):
+                    _render_topo_snap(_snap)
+                    _topo_rendered = True
+
+        # Fallback: use snapshot_topology stored on the ticket itself
+        if not _topo_rendered:
+            _topo_inline = t.get("snapshot_topology") or {}
+            if isinstance(_topo_inline, str):
+                try:
+                    _topo_inline = json.loads(_topo_inline)
+                except Exception:
+                    _topo_inline = {}
+            if _topo_inline and (
+                _topo_inline.get("total_nodes") or _topo_inline.get("node_count")
+                or _topo_inline.get("data_nodes") or _topo_inline.get("cb_version")
+            ):
+                _render_topo_snap(_topo_inline, label="Cluster Snapshot")
 
         # ── Tags ──────────────────────────────────────────────────────────────
         if t.get("tags"):
@@ -14245,6 +14381,77 @@ def _build_memory_section(memories: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# Follow-up pronouns and phrases that indicate the question depends on prior context.
+# If any of these appear at the start or as a dominant pattern the rewriter fires.
+_FOLLOWUP_TRIGGERS = re.compile(
+    r"\b(of (those|them|the(se|m)?|those issues|those tickets|the issues?|the tickets?)"
+    r"|out of|from those|from them|among those|among them"
+    r"|how many (of|were|had|have|did|do)"
+    r"|which (of|ones|tickets?|issues?)"
+    r"|what (about|were|was|is|are) (those|them|the)"
+    r"|same (tickets?|issues?|period|year|month)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def contextualize_question(
+    question: str,
+    chat_history: list[dict],
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+) -> str:
+    """Rewrite a follow-up question to be self-contained using recent conversation history.
+
+    For example:
+      History: "how many tickets in 2026?" → "31 tickets in 2026..."
+      Question: "out of those, how many had CBSEs?"
+      → "Out of the 31 tickets opened in 2026, how many had CBSEs or Jira issue references?"
+
+    Only fires when the question contains pronouns or phrases that reference prior context.
+    Returns the original question unchanged if the model is not configured or no history exists.
+    """
+    if not provider or not model or not chat_history:
+        return question
+    if not _FOLLOWUP_TRIGGERS.search(question):
+        return question
+
+    # Use last 4 messages (2 turns) — enough context without token bloat
+    recent = [m for m in chat_history[-4:] if m.get("role") in ("user", "assistant")]
+    if not recent:
+        return question
+
+    history_text = "\n".join(
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: "
+        f"{(m.get('content') or '')[:600]}"
+        for m in recent
+    )
+    prompt = (
+        "Given the conversation excerpt below, rewrite the LAST USER QUESTION so it is "
+        "fully self-contained: replace pronouns and vague references ('those', 'them', "
+        "'the issues opened', 'out of those', etc.) with the explicit date ranges, "
+        "application names, ticket IDs, or other context they refer to. "
+        "If the question is already unambiguous, return it unchanged. "
+        "Return ONLY the rewritten question — no explanation, no quotes, no preamble.\n\n"
+        f"Conversation:\n{history_text}\n\n"
+        f"Last user question: {question}"
+    )
+    try:
+        rewritten = call_llm(
+            [{"role": "user", "content": prompt}],
+            provider, model, api_key, base_url,
+            max_tokens=150,
+        ).strip().strip('"\'')
+        if rewritten and rewritten.lower() != question.lower():
+            print(f"[contextualize] '{question}' → '{rewritten}'")
+            return rewritten
+    except Exception as exc:
+        print(f"[contextualize] failed: {exc}")
+    return question
+
+
 def call_llm(
     messages: list[dict],
     provider: str,
@@ -14595,13 +14802,16 @@ def extract_cluster_snapshot_info(ticket: dict) -> dict:
         # split on commas, "and", semicolons
         parts = re.split(r"[,;]\s*|\s+and\s+", raw_list, flags=re.IGNORECASE)
         for part in parts:
-            name = part.strip().rstrip(".")
-            if name and name not in cluster_names:
+            name = re.sub(r'[^a-zA-Z0-9\-_]+$', '', part.strip())
+            if not name or len(name) < 5:
+                continue
+            if name not in cluster_names:
                 cluster_names.append(name)
 
     # Pattern 2: "<name> cluster" (e.g. "p-csmohsm09-cb52 cluster logs")
-    # Only accept names that look like real identifiers: must contain a digit,
-    # hyphen, underscore, or dot — pure English words are rejected.
+    # Accept names that: start with a letter, are >= 7 chars, contain a digit
+    # or hyphen/underscore (so plain English words like "starting" are excluded).
+    # Trailing punctuation (e.g. "starting.") is stripped before testing.
     _CLUSTER_NAME_STOPWORDS = {
         # articles / pronouns / prepositions
         "the", "a", "an", "this", "that", "these", "those",
@@ -14626,12 +14836,17 @@ def extract_cluster_snapshot_info(ticket: dict) -> dict:
         "physical", "external", "internal", "custom", "example",
     }
     for m in _CLUSTER_NAME_RE.finditer(full_text):
-        name = m.group(1).strip()
+        # Strip trailing punctuation (catches "starting." captured by the regex)
+        name = re.sub(r'[^a-zA-Z0-9\-_]+$', '', m.group(1).strip())
+        if not name or len(name) < 7:
+            continue
+        # Must start with a letter — filters "24-node", "25-node", etc.
+        if not re.match(r'^[a-zA-Z]', name):
+            continue
         if name.lower() in _CLUSTER_NAME_STOPWORDS:
             continue
-        # Require at least one non-alpha character (digit, hyphen, underscore, dot)
-        # so pure dictionary words are excluded even if not in the stopword list
-        if not re.search(r"[\d\-_\.]", name):
+        # Require at least one digit or hyphen/underscore — pure English words excluded
+        if not re.search(r"[\d\-_]", name):
             continue
         if name not in cluster_names:
             cluster_names.append(name)
@@ -16709,6 +16924,254 @@ LIMIT {int(limit)}
     return results
 
 
+def fetch_ticket_clusters_via_analytics(
+    ticket_ids: list[str],
+    cookie: str | None,
+) -> dict[str, list[str]]:
+    """Query Analytics API for cluster UI names linked to each ticket via snapshots.
+    Returns {ticket_id: [cluster_ui_name, ...]}."""
+    if not ticket_ids:
+        return {}
+    id_list = ", ".join(json.dumps(str(tid)) for tid in ticket_ids[:500])
+    statement = (
+        "SELECT DISTINCT t_id, cl.ui_name AS cluster_ui_name "
+        "FROM snapshot sn "
+        "UNNEST sn.`zendesk` AS t_id "
+        "JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.`uuid`) "
+        f"WHERE t_id IN [{id_list}]"
+    )
+    rows = query_supportal_analytics(statement, cookie)
+    result: dict[str, list[str]] = {}
+    for row in rows:
+        tid   = str(row.get("t_id") or "").strip()
+        cname = (row.get("cluster_ui_name") or "").strip()
+        if not tid or not cname:
+            continue
+        if tid not in result:
+            result[tid] = []
+        if cname not in result[tid]:
+            result[tid].append(cname)
+    return result
+
+
+def enrich_ticket_apps_via_analytics(
+    customer_name: str,
+    cookie: str | None,
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    llm_provider: str = "",
+    llm_model: str = "",
+    llm_api_key: str = "",
+    llm_base_url: str = "",
+    progress_cb: Callable[[str, float], None] | None = None,
+) -> tuple[int, int]:
+    """Enrich application labels for tickets missing them.
+
+    Two-stage approach:
+    1. Analytics API: query which clusters (ui_name) are linked to each ticket via
+       snapshots. Match ui_name against known app aliases.
+    2. LLM fallback: for tickets still unlabeled after stage 1, send a batch prompt
+       asking the LLM to extract the app name from each ticket subject. AmEx encodes
+       the application name directly in the subject (e.g. "Enterprise Wallet - Unable
+       to process transactions" → "Enterprise Wallet").
+
+    Writes results to score.analytics_app_labels and score.analytics_cluster_names
+    on each updated CB ticket document.
+
+    Returns (enriched_count, error_count).
+    """
+    def _log(msg: str, pct: float = 0.0):
+        print(f"[APP-ENRICH] {msg}")
+        if progress_cb:
+            progress_cb(msg, pct)
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions, QueryOptions
+    from couchbase.auth import PasswordAuthenticator
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    col = cluster.bucket(bucket).scope(scope).collection(collection)
+    ks  = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    # Load tickets — only id, subject, and score fields needed
+    _cust_filter = ""
+    if customer_name and customer_name.lower() != "all customers":
+        _esc = customer_name.replace("'", "\\'")
+        _cust_filter = f" AND LOWER(t.organization) LIKE '%{_esc.lower()}%'"
+
+    _log(f"Loading tickets for {customer_name!r}…", 0.02)
+    q = (
+        f"SELECT META(t).id AS _key, t.ticket_id, t.subject, t.organization, "
+        f"t.score.cluster_names AS _cluster_names, "
+        f"t.score.analytics_app_labels AS _existing_labels "
+        f"FROM {ks} AS t "
+        f"WHERE t.ticket_id IS NOT MISSING{_cust_filter} LIMIT 5000"
+    )
+    try:
+        rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
+    except Exception as exc:
+        cluster.close()
+        raise RuntimeError(f"CB query failed: {exc}") from exc
+
+    _c2a = _get_cluster_to_app()
+
+    def _has_label(row: dict) -> bool:
+        if row.get("_existing_labels"):
+            return True
+        for cname in (row.get("_cluster_names") or []):
+            if _c2a.get((cname or "").lower()):
+                return True
+        return False
+
+    needs = [r for r in rows if not _has_label(r)]
+    _log(f"{len(needs)}/{len(rows)} tickets need app label enrichment.", 0.05)
+
+    if not needs:
+        _log("All tickets already have app labels.", 1.0)
+        cluster.close()
+        return 0, 0
+
+    ticket_ids_str = [str(r["ticket_id"]) for r in needs if r.get("ticket_id")]
+
+    # ── Stage 1: Analytics API ────────────────────────────────────────────────
+    _log(f"Stage 1: querying Analytics API for {len(ticket_ids_str)} tickets…", 0.1)
+    analytics_map: dict[str, list[str]] = {}
+    _batch = 200
+    for i in range(0, len(ticket_ids_str), _batch):
+        chunk = ticket_ids_str[i:i + _batch]
+        pct = 0.1 + 0.3 * (i / len(ticket_ids_str))
+        _log(f"  Analytics batch {i // _batch + 1}…", pct)
+        try:
+            analytics_map.update(fetch_ticket_clusters_via_analytics(chunk, cookie))
+        except Exception as exc:
+            _log(f"  Analytics batch error: {exc}", pct)
+
+    _log(f"Analytics returned cluster info for {len(analytics_map)} tickets.", 0.4)
+
+    # Map ui_name → app alias using known alias keys (longest match first)
+    _known_apps = sorted(_get_app_cluster_aliases().keys(), key=len, reverse=True)
+
+    def _ui_name_to_app(ui_name: str) -> str | None:
+        ui_lc = ui_name.lower()
+        for app in _known_apps:
+            if app in ui_lc:
+                return app
+        return None
+
+    # ── Stage 2: LLM subject extraction for remaining unlabeled tickets ───────
+    # Build list of tickets that stage 1 didn't resolve
+    stage1_resolved: set[str] = set()
+    for tid, ui_names in analytics_map.items():
+        if any(_ui_name_to_app(u) for u in ui_names):
+            stage1_resolved.add(tid)
+
+    still_needs_llm = [r for r in needs if str(r.get("ticket_id") or "") not in stage1_resolved]
+    llm_labels: dict[str, str] = {}
+
+    if still_needs_llm and llm_provider and llm_model:
+        _log(f"Stage 2: LLM extraction for {len(still_needs_llm)} remaining tickets…", 0.45)
+        _BATCH_LLM = 40
+        for i in range(0, len(still_needs_llm), _BATCH_LLM):
+            chunk = still_needs_llm[i:i + _BATCH_LLM]
+            pct = 0.45 + 0.3 * (i / len(still_needs_llm))
+            _log(f"  LLM batch {i // _BATCH_LLM + 1}/{(len(still_needs_llm)-1)//_BATCH_LLM + 1}…", pct)
+            lines = "\n".join(
+                f'- #{r["ticket_id"]}: "{(r.get("subject") or "").strip()}"'
+                for r in chunk
+            )
+            prompt = (
+                "You are analyzing support tickets. For each ticket below, extract the "
+                "application or product name from the subject line. Return a JSON array "
+                "where each element is {\"ticket_id\": \"<id>\", \"app_label\": \"<name>\"} "
+                "or {\"ticket_id\": \"<id>\", \"app_label\": null} if no specific application "
+                "is identifiable. Use only the information in the subject — do not invent names. "
+                "Common patterns: app names appear at the start of the subject before a dash or "
+                "colon, e.g. 'Enterprise Wallet - issue' → 'Enterprise Wallet', "
+                "'DQF Application timeout' → 'DQF', 'Griffin-Tier 0 cluster' → 'Griffin'.\n\n"
+                f"Tickets:\n{lines}\n\n"
+                "Return ONLY the JSON array, no other text."
+            )
+            try:
+                raw = call_llm(
+                    [{"role": "user", "content": prompt}],
+                    llm_provider, llm_model, llm_api_key, llm_base_url,
+                    max_tokens=1024,
+                )
+                # Parse JSON — strip markdown fences if present
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+                parsed = json.loads(raw)
+                for item in (parsed if isinstance(parsed, list) else []):
+                    tid_v = str(item.get("ticket_id") or "").strip()
+                    lbl_v = (item.get("app_label") or "").strip()
+                    if tid_v and lbl_v and lbl_v.lower() not in ("null", "none", "unknown", "n/a"):
+                        llm_labels[tid_v] = lbl_v
+            except Exception as exc:
+                _log(f"  LLM batch error: {exc}", pct)
+
+        _log(f"LLM extracted labels for {len(llm_labels)} tickets.", 0.75)
+    elif still_needs_llm:
+        _log(f"Stage 2 skipped ({len(still_needs_llm)} tickets remain unlabeled — no LLM configured).", 0.45)
+
+    # ── Write results to CB ───────────────────────────────────────────────────
+    enriched = errors = 0
+    total = len(needs)
+    for i, row in enumerate(needs):
+        tid      = str(row.get("ticket_id") or "")
+        doc_key  = row.get("_key") or f"ticket::{tid}"
+        pct      = 0.75 + 0.23 * (i / total)
+
+        ui_names = analytics_map.get(tid, [])
+        inferred: list[str] = []
+
+        # Stage 1 result
+        for uname in ui_names:
+            lbl = _ui_name_to_app(uname)
+            if lbl and lbl not in inferred:
+                inferred.append(lbl)
+        # If no alias match from ui_names, store ui_names themselves as labels
+        if not inferred and ui_names:
+            for uname in ui_names:
+                clean = uname.strip()
+                if clean and clean not in inferred:
+                    inferred.append(clean)
+
+        # Stage 2 result
+        if not inferred and tid in llm_labels:
+            inferred = [llm_labels[tid]]
+
+        if not inferred:
+            continue
+
+        _log(f"  [{i+1}/{total}] #{tid} → {inferred}", pct)
+        try:
+            result = col.get(doc_key)
+            doc    = result.content_as[dict]
+            _score = doc.get("score") or {}
+            _score["analytics_app_labels"]    = inferred
+            if ui_names:
+                _score["analytics_cluster_names"] = ui_names
+            doc["score"] = _score
+            col.replace(doc_key, doc)
+            enriched += 1
+        except Exception as exc:
+            errors += 1
+            _log(f"  Error updating #{tid}: {exc}", pct)
+
+    cluster.close()
+    _log(f"Done — {enriched} labels written, {errors} errors.", 1.0)
+    return enriched, errors
+
+
 def scrape_snapshots_from_stubs(
     stubs: list[dict],
     cookie: str | None,
@@ -17657,10 +18120,15 @@ def build_scoring_input(
     if not _solved_str and (ticket.get("status") or "").lower() in ("closed", "solved"):
         _solved_str = (ticket.get("updated") or "").strip()[:10]
 
-    # App impact from cluster→app map
+    # App impact from cluster→app map; fallback to analytics-enriched labels
     _c2a = _get_cluster_to_app()
     _cids = _ticket_cluster_ids(ticket)
     _app_labels = sorted({_c2a[c].upper() for c in _cids if _c2a.get(c)})
+    if not _app_labels:
+        _score_fmt = ticket.get("score") or {}
+        _analytics_lbl = _score_fmt.get("analytics_app_labels") or []
+        if _analytics_lbl:
+            _app_labels = sorted(str(l).upper() for l in _analytics_lbl)
     _app_str = ", ".join(_app_labels) if _app_labels else ""
 
     _cbses_val = ticket.get("cbses") or []
