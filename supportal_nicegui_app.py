@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.72"
+__version__ = "1.1.73"
 
 import asyncio
 import threading
@@ -1116,6 +1116,8 @@ def parse_ticket_detail(html: str, url: str) -> dict:
     status = priority = created = assignee = requester = organization = None
     ticket_group = tags_text = escalations_text = snapshots_text = None
     ticket_fields: dict = {}
+    cbses: list[str] = []
+    jira_issues: list[str] = []
     comments: list[dict] = []
 
     for box in soup.select("div.box"):
@@ -1193,6 +1195,29 @@ def parse_ticket_detail(html: str, url: str) -> dict:
                     if re.match(r"ESC-\d+", a.get_text(strip=True))]
             escalations_text = ", ".join(escs) if escs else None
 
+        # ── CBSEs ──────────────────────────────────────────────────────────────
+        elif box_title.strip().lower() in ("cbses", "cbse"):
+            raw_body = body.get_text(" ", strip=True)
+            # Collect from links first, fall back to text scan
+            found = [a.get_text(strip=True) for a in body.select("a")
+                     if re.search(r"CBSE-\d+", a.get_text(strip=True), re.IGNORECASE)]
+            if not found:
+                found = re.findall(r"CBSE-\d+", raw_body, re.IGNORECASE)
+            cbses = [c.upper() for c in found]
+
+        # ── JIRA Issues ────────────────────────────────────────────────────────
+        elif "jira" in box_title:
+            raw_body = body.get_text(" ", strip=True)
+            # Jira keys: PROJECT-NUMBER (e.g. MB-12345, CB-12345, JMSE-456)
+            found = [a.get_text(strip=True) for a in body.select("a")
+                     if re.match(r"[A-Z]+-\d+", a.get_text(strip=True))]
+            if not found:
+                found = re.findall(r"\b[A-Z]{2,}-\d+\b", raw_body)
+            # Exclude CBSEs that may appear in the Jira box by accident
+            jira_issues = [j for j in found
+                           if not j.upper().startswith("CBSE-")
+                           and not j.upper().startswith("ESC-")]
+
         # ── Snapshots ─────────────────────────────────────────────────────────
         elif "snapshot" in box_title:
             lines = [t.strip() for t in body.get_text("\n").splitlines() if t.strip()
@@ -1239,6 +1264,8 @@ def parse_ticket_detail(html: str, url: str) -> dict:
         "created":       created,
         "tags":          tags_text,
         "escalations":   escalations_text,
+        "cbses":         cbses if cbses else None,
+        "jira_issues":   jira_issues if jira_issues else None,
         "snapshots":     snapshots_text,
         "ticket_fields": ticket_fields if ticket_fields else None,
         "description":   description,
@@ -2795,7 +2822,7 @@ _FLAT_FIELDS = [
     "requester", "assignee", "organization",
     "created", "updated", "solved", "tags",
     "description", "ticket_information", "ticket_timeline",
-    "escalations", "snapshots", "comment_count", "error",
+    "escalations", "cbses", "jira_issues", "snapshots", "comment_count", "error",
     # enriched snapshot topology — serialised as JSON in CSV
     "snapshot_topology",
 ]
@@ -12513,7 +12540,11 @@ def tool_query_tickets(
                     f"(LOWER(t.subject) LIKE ${idx}"
                     f" OR LOWER(t.description) LIKE ${idx}"
                     f" OR ANY c IN t.`score`.`cluster_names`"
-                    f"   SATISFIES LOWER(c) LIKE ${idx} END)"
+                    f"   SATISFIES LOWER(c) LIKE ${idx} END"
+                    f" OR ANY cb IN t.`cbses`"
+                    f"   SATISFIES LOWER(cb) LIKE ${idx} END"
+                    f" OR ANY ji IN t.`jira_issues`"
+                    f"   SATISFIES LOWER(ji) LIKE ${idx} END)"
                 )
             where_parts.append(f"({' OR '.join(kw_ors)})")
 
@@ -13757,12 +13788,19 @@ def build_rag_context(
             if tf_pairs:
                 lines.append("Fields: " + " | ".join(tf_pairs[:20 if deep else 8]))
 
-        # ── Escalations / snapshots ───────────────────────────────────────────
-        if deep:
-            if t.get("escalations"):
-                lines.append(f"Escalations: {str(t['escalations'])[:500]}")
-            if t.get("snapshots"):
-                lines.append(f"Snapshots: {str(t['snapshots'])[:500]}")
+        # ── Escalations / CBSEs / Jira / snapshots ────────────────────────────
+        if t.get("escalations"):
+            lines.append(f"Escalations: {str(t['escalations'])[:500]}")
+        _cbses_r = t.get("cbses")
+        if _cbses_r:
+            _cbses_str = ", ".join(_cbses_r) if isinstance(_cbses_r, list) else str(_cbses_r)
+            lines.append(f"CBSEs: {_cbses_str}")
+        _jira_r = t.get("jira_issues")
+        if _jira_r:
+            _jira_str_r = ", ".join(_jira_r) if isinstance(_jira_r, list) else str(_jira_r)
+            lines.append(f"Jira Issues: {_jira_str_r}")
+        if deep and t.get("snapshots"):
+            lines.append(f"Snapshots: {str(t['snapshots'])[:500]}")
 
         # ── AI summary (preferred) or raw description ────────────────────────
         # interaction_summary is a pre-computed 2-4 sentence technical narrative
@@ -17625,6 +17663,11 @@ def build_scoring_input(
     _app_labels = sorted({_c2a[c].upper() for c in _cids if _c2a.get(c)})
     _app_str = ", ".join(_app_labels) if _app_labels else ""
 
+    _cbses_val = ticket.get("cbses") or []
+    _cbse_str  = ", ".join(_cbses_val) if isinstance(_cbses_val, list) else str(_cbses_val)
+    _jira_val  = ticket.get("jira_issues") or []
+    _jira_str  = ", ".join(_jira_val) if isinstance(_jira_val, list) else str(_jira_val)
+
     parts = [
         f"ID: {ticket.get('ticket_id','?')} | "
         f"Priority: {ticket.get('priority','?')} | "
@@ -17636,6 +17679,10 @@ def build_scoring_input(
         f"Created: {_created_str or '?'} | Closed: {_solved_str or 'open'}",
         f"Subject: {(ticket.get('subject') or '(no subject)')[:200]}",
     ]
+    if _cbse_str:
+        parts.append(f"CBSEs: {_cbse_str}")
+    if _jira_str:
+        parts.append(f"Jira Issues: {_jira_str}")
     if _app_str:
         parts.append(f"Application: {_app_str}")
     if _cids:
