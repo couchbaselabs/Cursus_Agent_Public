@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.85"
+__version__ = "1.1.89"
 
 import asyncio
 import threading
@@ -5081,7 +5081,7 @@ def main_page():
                                     llm_p, llm_m, llm_k, llm_u,
                                     _prog,
                                     main_cust_input.value.strip(),
-                                    False,  # force=False — skip already-summarized
+                                    summarize_force_cb.value,  # force — overwrite existing if checked
                                     1,      # max_workers — LLM calls are sequential by default
                                 )
                                 msg = f"Summarization complete — {done} written, {errs} errors."
@@ -5164,6 +5164,9 @@ def main_page():
                                     ui.notify("Could not reach LMStudio API", type="warning")
                             ui.button("Probe LMStudio", icon="network_ping",
                                       on_click=_probe_lmstudio_concurrency).props("outline color=teal dense")
+
+                        with ui.row().classes("items-center gap-4 mt-2"):
+                            summarize_force_cb = ui.checkbox("Force re-summarize (overwrite existing)", value=False)
 
                         with ui.row().classes("gap-3 mt-2 flex-wrap"):
                             btn_embed       = ui.button("Embed Tickets",             on_click=_do_embed,                  icon="model_training").props("outline color=primary")
@@ -8277,11 +8280,11 @@ def main_page():
                         with ui.row().classes("gap-3 mt-3 flex-wrap items-center"):
                             btn_radar = ui.button(
                                 "Compare", icon="radar",
-                                on_click=_do_radar,
+                                on_click=lambda: asyncio.ensure_future(_do_radar()),
                             ).props("color=indigo")
                             btn_refresh_orgs = ui.button(
                                 "Refresh Customer List", icon="refresh",
-                                on_click=_refresh_cust_select,
+                                on_click=lambda: asyncio.ensure_future(_refresh_cust_select()),
                             ).props("outline color=grey")
 
                         ui.separator().classes("my-2")
@@ -8390,7 +8393,7 @@ def main_page():
                         async def _do_radar():
                             selected = cust_select.value or []
                             if len(selected) < 2:
-                                ui.notify("Select at least 2 customers to compare.", type="warning")
+                                radar_status.set_text("Select at least 2 customers to compare.")
                                 return
 
                             btn_radar.set_enabled(False)
@@ -19043,11 +19046,34 @@ def _build_summary_prompt(ticket: dict) -> str:
         if jiras:
             cbse_block += f"- Jira: {', '.join(jiras)}\n"
 
-    desc_raw = ticket.get("description") or ""
-    # Strip HTML tags minimally and truncate
     import re as _re
-    desc_clean = _re.sub(r"<[^>]+>", " ", desc_raw)
-    desc_clean = _re.sub(r"\s{2,}", " ", desc_clean).strip()[:2500]
+
+    def _clean(text: str) -> str:
+        text = _re.sub(r"<[^>]+>", " ", text)
+        return _re.sub(r"\s{2,}", " ", text).strip()
+
+    # Prefer comments thread over description — description is often just the
+    # final closure message; comments contain the full conversation.
+    comments_raw = ticket.get("comments")
+    if comments_raw:
+        try:
+            comments = json.loads(comments_raw) if isinstance(comments_raw, str) else comments_raw
+            comments = sorted(comments, key=lambda c: c.get("timestamp") or "")
+            lines = []
+            budget = 3500
+            for c in comments:
+                body = _clean(c.get("body") or "").strip()
+                if not body:
+                    continue
+                line = f"[{c.get('timestamp','')}] {c.get('author','')}: {body[:600]}"
+                if len("\n".join(lines)) + len(line) > budget:
+                    break
+                lines.append(line)
+            desc_clean = "\n".join(lines)
+        except Exception:
+            desc_clean = _clean(ticket.get("description") or "")[:2500]
+    else:
+        desc_clean = _clean(ticket.get("description") or "")[:2500]
 
     return _SUMMARY_PROMPT_TMPL.format(
         ticket_id   = ticket.get("ticket_id", "?"),
@@ -19090,18 +19116,36 @@ def summarize_ticket(
     api_key: str,
     base_url: str,
     max_tokens: int = 512,
+    max_retries: int = 3,
 ) -> dict:
     """
     Generate a summary document for a single ticket.
     Returns a dict ready to upsert to the summary collection.
+    Retries up to max_retries times on transient connection errors.
     """
     prompt   = _build_summary_prompt(ticket)
     messages = [
         {"role": "system",  "content": _SUMMARY_SYSTEM},
         {"role": "user",    "content": prompt},
     ]
-    raw = call_llm(messages, provider, model, api_key, base_url,
-                   max_tokens=max_tokens, no_think=True)
+    last_exc: Exception | None = None
+    for attempt in range(max(1, max_retries)):
+        try:
+            raw = call_llm(messages, provider, model, api_key, base_url,
+                           max_tokens=max_tokens, no_think=True)
+            break
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc).lower()
+            transient = any(k in err_str for k in (
+                "connection", "timeout", "reset", "eof", "broken pipe",
+                "remotedisconnected", "503", "502", "429",
+            ))
+            if not transient or attempt >= max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s …
+    else:
+        raise last_exc  # type: ignore[misc]
 
     # Split prose from tagged block
     tag_start = -1
@@ -19186,7 +19230,7 @@ def summarize_tickets_from_cb(
     rows = list(scope_obj.query(
         f"SELECT META().id AS doc_key, ticket_id, organization, subject, status, priority, "
         f"created_at, last_scraped_at, requester, cbses, jira_issues, snapshot_topology, "
-        f"SUBSTR(description, 0, 3000) AS description "
+        f"SUBSTR(description, 0, 3000) AS description, comments "
         f"FROM {fqn} WHERE {where}",
         QueryOptions(positional_parameters=params, timeout=timedelta(seconds=120)),
     ))
