@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.78"
+__version__ = "1.1.85"
 
 import asyncio
 import threading
@@ -4523,6 +4523,7 @@ def main_page():
                             cb_scope_input      = ui.input("Scope",              placeholder="_default").classes("w-full")
                             cb_collection_input = ui.input("Collection",         placeholder="tickets").classes("w-full")
                             ch_snap_coll        = ui.input("Snapshot collection", placeholder="snapshots", value="snapshots").classes("w-full")
+                            cb_summary_coll     = ui.input("Summary collection",  placeholder="summary",   value="summary").classes("w-full")
 
                         with ui.row().classes("items-center gap-4 mt-2"):
                             cb_tls_toggle = ui.switch("TLS (couchbases://)", value=False)
@@ -5012,6 +5013,87 @@ def main_page():
                             finally:
                                 btn_create_idx.set_enabled(True)
 
+                        async def _do_embed_snaps_from_cb():
+                            btn_embed_snaps.set_enabled(False)
+                            emb_status.set_text("Embedding snapshots from Couchbase …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_snaps(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_snaps(msg, pct), loop)
+
+                            try:
+                                ep, em, ek, eu, ed, _ = _get_embed_config()
+                                done, errs = await run.io_bound(
+                                    embed_snapshots_from_cb,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    ch_snap_coll.value.strip() or "snapshots",
+                                    ep, em, ek, eu, int(ed or 1024),
+                                    _prog,
+                                    int(embed_parallel_input.value or 1),
+                                )
+                                msg = f"Snapshot embed complete — {done} embedded, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"Snapshot embed error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_embed_snaps.set_enabled(True)
+
+                        async def _do_summarize():
+                            btn_summarize.set_enabled(False)
+                            emb_status.set_text("Summarizing tickets …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_sum(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_sum(msg, pct), loop)
+
+                            try:
+                                llm_p, llm_m, llm_k, llm_u = _get_llm_config()
+                                done, errs = await run.io_bound(
+                                    summarize_tickets_from_cb,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "supportal",
+                                    cb_summary_coll.value.strip() or "summary",
+                                    llm_p, llm_m, llm_k, llm_u,
+                                    _prog,
+                                    main_cust_input.value.strip(),
+                                    False,  # force=False — skip already-summarized
+                                    1,      # max_workers — LLM calls are sequential by default
+                                )
+                                msg = f"Summarization complete — {done} written, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"Summarize error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_summarize.set_enabled(True)
+
                         async def _do_backfill():
                             btn_backfill.set_enabled(False)
                             emb_status.set_text("Backfilling analytics fields …")
@@ -5084,12 +5166,16 @@ def main_page():
                                       on_click=_probe_lmstudio_concurrency).props("outline color=teal dense")
 
                         with ui.row().classes("gap-3 mt-2 flex-wrap"):
-                            btn_embed      = ui.button("Embed Tickets",              on_click=_do_embed,        icon="model_training").props("outline color=primary")
-                            btn_create_idx = ui.button("Create Vector Index",        on_click=_do_create_index, icon="manage_search").props("outline color=secondary")
-                            btn_backfill   = ui.button("Backfill Analytics Fields",  on_click=_do_backfill,     icon="auto_fix_high").props("outline color=brown")
-                            btn_stop_embed = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
+                            btn_embed       = ui.button("Embed Tickets",             on_click=_do_embed,                  icon="model_training").props("outline color=primary")
+                            btn_embed_snaps = ui.button("Embed All Snapshots",       on_click=_do_embed_snaps_from_cb,    icon="hub").props("outline color=indigo")
+                            btn_summarize   = ui.button("Summarize Tickets",         on_click=_do_summarize,              icon="summarize").props("outline color=teal")
+                            btn_create_idx  = ui.button("Create Vector Index",       on_click=_do_create_index,           icon="manage_search").props("outline color=secondary")
+                            btn_backfill    = ui.button("Backfill Analytics Fields", on_click=_do_backfill,               icon="auto_fix_high").props("outline color=brown")
+                            btn_stop_embed  = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
                             btn_stop_embed.set_enabled(False)
                         btn_embed.set_enabled(_CB_AVAILABLE)
+                        btn_embed_snaps.set_enabled(_CB_AVAILABLE)
+                        btn_summarize.set_enabled(_CB_AVAILABLE)
                         btn_create_idx.set_enabled(_CB_AVAILABLE)
 
                     with ui.tab_panel(cfg_chat_mem):
@@ -8191,11 +8277,11 @@ def main_page():
                         with ui.row().classes("gap-3 mt-3 flex-wrap items-center"):
                             btn_radar = ui.button(
                                 "Compare", icon="radar",
-                                on_click=lambda: asyncio.ensure_future(_do_radar()),
+                                on_click=_do_radar,
                             ).props("color=indigo")
                             btn_refresh_orgs = ui.button(
                                 "Refresh Customer List", icon="refresh",
-                                on_click=lambda: asyncio.ensure_future(_refresh_cust_select()),
+                                on_click=_refresh_cust_select,
                             ).props("outline color=grey")
 
                         ui.separator().classes("my-2")
@@ -10153,6 +10239,7 @@ def main_page():
             "cb_scope":        cb_scope_input.value,
             "cb_collection":   cb_collection_input.value,
             "ch_snap_coll":    ch_snap_coll.value,
+            "cb_summary_coll": cb_summary_coll.value,
             # Embedding
             "emb_provider":       ai_emb_provider.value,
             "emb_ollama_url":     emb_ollama_url_input.value,
@@ -10228,6 +10315,7 @@ def main_page():
         _set(cb_scope_input,      "cb_scope")
         _set(cb_collection_input, "cb_collection")
         _set(ch_snap_coll,        "ch_snap_coll")
+        _set(cb_summary_coll,     "cb_summary_coll")
 
         _set(emb_ollama_url_input,   "emb_ollama_url")
         if p.get("emb_ollama_model"):
@@ -10675,12 +10763,16 @@ def load_tickets_from_cb(
         "t.created DESC"
     )
     keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-    if customer_filter.strip():
-        query  = (f"SELECT t.* FROM {keyspace} AS t "
-                  f"WHERE t.ticket_id IS NOT MISSING "
-                  f"AND LOWER(t.organization) LIKE $1 "
-                  f"ORDER BY {_order}")
-        opts   = QueryOptions(positional_parameters=[f"%{customer_filter.strip().lower()}%"])
+    _terms = [t.strip() for t in customer_filter.split(",") if t.strip()]
+    if _terms:
+        _clauses = " OR ".join(
+            f"LOWER(t.organization) LIKE ${i+1}" for i in range(len(_terms))
+        )
+        query = (f"SELECT t.* FROM {keyspace} AS t "
+                 f"WHERE t.ticket_id IS NOT MISSING "
+                 f"AND ({_clauses}) "
+                 f"ORDER BY {_order}")
+        opts  = QueryOptions(positional_parameters=[f"%{t.lower()}%" for t in _terms])
     else:
         query  = (f"SELECT t.* FROM {keyspace} AS t "
                   f"WHERE t.ticket_id IS NOT MISSING "
@@ -11110,6 +11202,7 @@ def embed_all_snapshots(
     to Couchbase with an added `embedding` field.  Returns (done, errors).
     """
     import concurrent.futures
+    from couchbase.subdocument import upsert as _SD_upsert
 
     if not _CB_AVAILABLE:
         raise RuntimeError("couchbase SDK not installed")
@@ -11149,9 +11242,7 @@ def embed_all_snapshots(
             snap = futs[fut]
             if vec:
                 try:
-                    doc = snap.copy()
-                    doc["embedding"] = vec
-                    col.upsert(doc_key, doc)
+                    col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
                     with lock:
                         done_count += 1
                         if done_count % 10 == 0 or done_count == total:
@@ -11225,7 +11316,7 @@ def _get_openai_client(api_key: str, base_url: str) -> "openai.OpenAI":
         _tls_openai.client_key = key
         _tls_openai.client = _openai_mod.OpenAI(
             api_key=api_key or "lmstudio",
-            base_url=base_url,
+            base_url=base_url or None,
         )
     return _tls_openai.client
 
@@ -11244,12 +11335,7 @@ def embed_text(
         return embed_text_ollama(text, model, base_url or "http://localhost:11434", num_ctx=num_ctx)
 
     elif provider == "lmstudio":
-        if not _OPENAI_AVAILABLE:
-            raise RuntimeError("openai package not installed: venv/bin/pip install openai")
-        client = _openai_mod.OpenAI(
-            api_key="lmstudio",
-            base_url=_openai_base_url(base_url, "http://localhost:1234"),
-        )
+        client = _get_openai_client("lmstudio", _openai_base_url(base_url, "http://localhost:1234"))
         resp = client.embeddings.create(model=model, input=text, encoding_format="float")
         return resp.data[0].embedding
 
@@ -11271,7 +11357,7 @@ def embed_text(
         kwargs: dict = {"model": model, "input": text, "encoding_format": "float"}
         if dims and dims > 0:
             kwargs["dimensions"] = dims
-        client = _openai_mod.OpenAI(api_key=api_key)
+        client = _get_openai_client(api_key, "")
         resp = client.embeddings.create(**kwargs)
         return resp.data[0].embedding
 
@@ -11668,6 +11754,7 @@ def embed_all_tickets(
     """
     import concurrent.futures
     import traceback as _tb
+    from couchbase.subdocument import upsert as _SD_upsert
 
     if not _CB_AVAILABLE:
         raise RuntimeError("couchbase SDK not installed — run: venv/bin/pip install couchbase")
@@ -11746,19 +11833,10 @@ def embed_all_tickets(
                     error_count += 1
                     if not first_error:
                         first_error.append(err)
-                        progress_cb(f"Error on ticket {tid}: {err.splitlines()[0]}", done_count / total)
-                        cluster.close()
-                        raise RuntimeError(
-                            f"Embedding failed on ticket {tid}:\n{err}"
-                        )
+                    progress_cb(f"Skipped ticket {tid}: {err.splitlines()[0]}", done_count / total)
                 continue
 
-            doc = ticket.copy()
-            doc["embedding"]     = vec
-            doc["cb_version"]    = extract_ticket_version(ticket)
-            doc["feature_area"]  = classify_ticket_feature(ticket)
-            doc["ticket_origin"] = classify_ticket_origin(ticket)
-            col.upsert(doc_key, doc)
+            col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
 
             with lock:
                 done_count += 1
@@ -18813,6 +18891,384 @@ def backfill_analytics_fields(
 
     cluster.close()
     return updated, errors
+
+
+def embed_snapshots_from_cb(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str,
+    embed_provider: str,
+    embed_model: str,
+    embed_api_key: str,
+    embed_base_url: str,
+    vector_dims: int,
+    progress_cb: Callable[[str, float], None],
+    max_workers: int = 1,
+) -> tuple[int, int]:
+    """
+    Read every snapshot doc from Couchbase, embed it, and write back only the
+    `embedding` field via subdocument mutation.  Never loads snapshot data into
+    UI state — safe to run against the full collection.
+    Returns (done, errors).
+    """
+    import concurrent.futures
+    from couchbase.subdocument import upsert as _SD_upsert
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    progress_cb("Connecting to Couchbase …", 0.0)
+    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    col       = scope_obj.collection(snap_collection)
+
+    fqn = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+    progress_cb("Fetching snapshot list …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, * FROM {fqn} "
+        f"WHERE META().id LIKE 'snapshot::%'",
+        QueryOptions(timeout=timedelta(seconds=120)),
+    ))
+
+    total      = len(rows)
+    done_count = errors = 0
+    lock       = threading.Lock()
+
+    progress_cb(f"Embedding {total} snapshots …", 0.0)
+
+    def _embed_one(row: dict) -> tuple[str, list[float] | None, str | None]:
+        doc_key = row.get("doc_key")
+        snap    = row.get(snap_collection) or {k: v for k, v in row.items() if k != "doc_key"}
+        if not doc_key or not snap:
+            return doc_key or "?", None, "missing doc_key or body"
+        try:
+            text = build_snapshot_embed_text(snap)
+            vec  = embed_text(text, embed_provider, embed_model, embed_api_key,
+                              embed_base_url, dims=vector_dims)
+            if vector_dims and len(vec) > vector_dims:
+                vec = vec[:vector_dims]
+                norm = sum(x * x for x in vec) ** 0.5
+                if norm > 0:
+                    vec = [x / norm for x in vec]
+            return doc_key, vec, None
+        except Exception as exc:
+            return doc_key, None, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futs = {pool.submit(_embed_one, r): r for r in rows}
+        for fut in concurrent.futures.as_completed(futs):
+            doc_key, vec, err = fut.result()
+            if err or not vec:
+                with lock:
+                    errors += 1
+                progress_cb(f"Skipped {doc_key}: {err}", done_count / max(total, 1))
+                continue
+            try:
+                col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
+            except Exception as exc:
+                with lock:
+                    errors += 1
+                progress_cb(f"Write error {doc_key}: {exc}", done_count / max(total, 1))
+                continue
+            with lock:
+                done_count += 1
+                if done_count % 25 == 0 or done_count == total:
+                    progress_cb(f"Embedded {done_count}/{total} snapshots …", done_count / total)
+
+    cluster.close()
+    return done_count, errors
+
+
+# ─────────────────────────── Phase 2a: Ticket Summaries ──────────────────────
+
+_SUMMARY_SYSTEM = (
+    "You are a Couchbase support engineer writing concise internal ticket summaries "
+    "for a knowledge base. Be factual, technical, and brief."
+)
+
+_SUMMARY_PROMPT_TMPL = """\
+Summarize this Couchbase support ticket for an internal knowledge base.
+
+## Ticket
+- ID: {ticket_id}
+- Customer: {organization}
+- Subject: {subject}
+- Priority: {priority}
+- Status: {status}
+- Requester: {requester}
+- Created: {created_at}
+
+## Description (truncated)
+{description}
+{cluster_block}{cbse_block}
+## Instructions
+Write 2–4 sentences covering: (1) the core problem and customer impact, \
+(2) relevant cluster health if a snapshot was attached, \
+(3) how it was resolved or current status.
+
+Then output EXACTLY these tagged lines (no extra text after the block):
+CLUSTER: <cluster name or unknown>
+CB_VERSION: <version or unknown>
+HEALTH: <healthy|degraded|critical|unknown>
+RESOLUTION: <one sentence or "open">
+"""
+
+
+def _build_summary_prompt(ticket: dict) -> str:
+    topo = ticket.get("snapshot_topology") or {}
+    cluster_block = ""
+    if topo:
+        bad  = topo.get("bad_items")  or []
+        warn = topo.get("warn_items") or []
+        cluster_block = (
+            f"\n## Cluster Snapshot\n"
+            f"- Cluster: {topo.get('cluster_name','?')} | CB {topo.get('cb_version','?')} "
+            f"| {topo.get('total_nodes','?')} nodes\n"
+            f"- Bad ({topo.get('bad_count',0)}): {', '.join(bad[:8]) or 'none'}\n"
+            f"- Warn ({topo.get('warn_count',0)}): {', '.join(str(w) for w in warn[:8]) or 'none'}\n"
+        )
+    cbses  = ticket.get("cbses")  or []
+    jiras  = ticket.get("jira_issues") or []
+    cbse_block = ""
+    if cbses or jiras:
+        cbse_block = "\n## References\n"
+        if cbses:
+            cbse_block += f"- CBSEs: {', '.join(cbses)}\n"
+        if jiras:
+            cbse_block += f"- Jira: {', '.join(jiras)}\n"
+
+    desc_raw = ticket.get("description") or ""
+    # Strip HTML tags minimally and truncate
+    import re as _re
+    desc_clean = _re.sub(r"<[^>]+>", " ", desc_raw)
+    desc_clean = _re.sub(r"\s{2,}", " ", desc_clean).strip()[:2500]
+
+    return _SUMMARY_PROMPT_TMPL.format(
+        ticket_id   = ticket.get("ticket_id", "?"),
+        organization= ticket.get("organization", "?"),
+        subject     = ticket.get("subject", "?"),
+        priority    = ticket.get("priority", "?"),
+        status      = ticket.get("status", "?"),
+        requester   = ticket.get("requester", "?"),
+        created_at  = ticket.get("created_at", "?"),
+        description = desc_clean,
+        cluster_block = cluster_block,
+        cbse_block    = cbse_block,
+    )
+
+
+def _parse_summary_tags(text: str) -> dict:
+    """Extract CLUSTER/CB_VERSION/HEALTH/RESOLUTION tagged lines from LLM output."""
+    result = {"cluster": None, "cb_version": None, "health": "unknown", "resolution": None}
+    for line in text.splitlines():
+        line = line.strip()
+        for key, field in (
+            ("CLUSTER:", "cluster"),
+            ("CB_VERSION:", "cb_version"),
+            ("HEALTH:", "health"),
+            ("RESOLUTION:", "resolution"),
+        ):
+            if line.upper().startswith(key):
+                val = line[len(key):].strip()
+                if val and val.lower() != "unknown":
+                    result[field] = val
+                elif val.lower() == "unknown":
+                    result[field] = None
+    return result
+
+
+def summarize_ticket(
+    ticket: dict,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    max_tokens: int = 512,
+) -> dict:
+    """
+    Generate a summary document for a single ticket.
+    Returns a dict ready to upsert to the summary collection.
+    """
+    prompt   = _build_summary_prompt(ticket)
+    messages = [
+        {"role": "system",  "content": _SUMMARY_SYSTEM},
+        {"role": "user",    "content": prompt},
+    ]
+    raw = call_llm(messages, provider, model, api_key, base_url,
+                   max_tokens=max_tokens, no_think=True)
+
+    # Split prose from tagged block
+    tag_start = -1
+    for i, line in enumerate(raw.splitlines()):
+        if line.strip().upper().startswith("CLUSTER:"):
+            tag_start = i
+            break
+    if tag_start >= 0:
+        prose = "\n".join(raw.splitlines()[:tag_start]).strip()
+        tags  = _parse_summary_tags("\n".join(raw.splitlines()[tag_start:]))
+    else:
+        prose = raw.strip()
+        tags  = _parse_summary_tags(raw)
+
+    topo = ticket.get("snapshot_topology") or {}
+    return {
+        "type":                 "ticket_summary",
+        "ticket_id":            str(ticket.get("ticket_id", "")),
+        "organization":         ticket.get("organization"),
+        "subject":              ticket.get("subject"),
+        "status":               ticket.get("status"),
+        "priority":             ticket.get("priority"),
+        "created_at":           ticket.get("created_at"),
+        "summary_text":         prose,
+        "cluster_name":         tags["cluster"] or topo.get("cluster_name"),
+        "cb_version":           tags["cb_version"] or topo.get("cb_version"),
+        "health":               tags["health"] or "unknown",
+        "resolution":           tags["resolution"],
+        "cbses":                ticket.get("cbses") or [],
+        "jira_issues":          ticket.get("jira_issues") or [],
+        "source_last_scraped_at": ticket.get("last_scraped_at"),
+        "generated_at":         int(time.time()),
+        "model":                f"{provider}/{model}",
+    }
+
+
+def summarize_tickets_from_cb(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    summary_collection: str,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    progress_cb: Callable[[str, float], None],
+    customer_filter: str = "",
+    force: bool = False,
+    max_workers: int = 1,
+) -> tuple[int, int]:
+    """
+    Read tickets from CB, generate summaries via LLM, write to summary collection.
+    Skips tickets that already have a summary unless force=True.
+    Returns (done, errors).
+    """
+    import concurrent.futures
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    progress_cb("Connecting to Couchbase …", 0.0)
+    cluster   = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    src_col   = scope_obj.collection(collection)
+    sum_col   = scope_obj.collection(summary_collection)
+
+    fqn = f"`{bucket}`.`{scope}`.`{collection}`"
+    where_parts = ["ticket_id IS NOT MISSING"]
+    params: list = []
+    if customer_filter.strip():
+        where_parts.append("LOWER(organization) LIKE $1")
+        params.append(f"%{customer_filter.strip().lower()}%")
+    where = " AND ".join(where_parts)
+
+    progress_cb("Fetching ticket list …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, ticket_id, organization, subject, status, priority, "
+        f"created_at, last_scraped_at, requester, cbses, jira_issues, snapshot_topology, "
+        f"SUBSTR(description, 0, 3000) AS description "
+        f"FROM {fqn} WHERE {where}",
+        QueryOptions(positional_parameters=params, timeout=timedelta(seconds=120)),
+    ))
+
+    if not force:
+        # Filter to tickets without an existing summary
+        progress_cb("Checking existing summaries …", 0.0)
+        sum_fqn = f"`{bucket}`.`{scope}`.`{summary_collection}`"
+        existing_q = list(scope_obj.query(
+            f"SELECT META().id AS doc_key FROM {sum_fqn} WHERE type = 'ticket_summary'",
+            QueryOptions(timeout=timedelta(seconds=60)),
+        ))
+        existing_keys = {r.get("doc_key") for r in existing_q}
+        rows = [r for r in rows
+                if f"summary::{r.get('ticket_id','')}" not in existing_keys]
+
+    total      = len(rows)
+    done_count = errors = 0
+    lock       = threading.Lock()
+
+    progress_cb(f"Summarizing {total} tickets …", 0.0)
+
+    def _summarize_one(row: dict) -> tuple[str, dict | None, str | None]:
+        doc_key    = row.get("doc_key", "")
+        sum_key    = f"summary::{row.get('ticket_id','')}"
+        ticket     = {k: v for k, v in row.items() if k != "doc_key"}
+        try:
+            summary = summarize_ticket(ticket, provider, model, api_key, base_url)
+            return sum_key, summary, None
+        except Exception as exc:
+            return sum_key, None, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futs = {pool.submit(_summarize_one, r): r for r in rows}
+        for fut in concurrent.futures.as_completed(futs):
+            sum_key, summary, err = fut.result()
+            if err or not summary:
+                with lock:
+                    errors += 1
+                progress_cb(f"Skipped {sum_key}: {err}", done_count / max(total, 1))
+                continue
+            try:
+                sum_col.upsert(sum_key, summary)
+            except Exception as exc:
+                with lock:
+                    errors += 1
+                progress_cb(f"Write error {sum_key}: {exc}", done_count / max(total, 1))
+                continue
+            with lock:
+                done_count += 1
+                if done_count % 10 == 0 or done_count == total:
+                    progress_cb(
+                        f"Summarized {done_count}/{total} …", done_count / total
+                    )
+
+    cluster.close()
+    return done_count, errors
+
+
+def fetch_ticket_summary(
+    ticket_id: str,
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    summary_collection: str,
+) -> dict | None:
+    """Fetch a single summary doc by ticket ID. Returns None if not found."""
+    if not _CB_AVAILABLE:
+        return None
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        col  = cluster.bucket(bucket).scope(scope).collection(summary_collection)
+        doc  = col.get(f"summary::{ticket_id}").content_as[dict]
+        cluster.close()
+        return doc
+    except Exception:
+        return None
 
 
 def rescore_all_customers_cb(
