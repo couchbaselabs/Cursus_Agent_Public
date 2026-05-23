@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.99"
+__version__ = "1.1.100"
 
 import asyncio
 import threading
@@ -15194,12 +15194,15 @@ def call_llm_with_tools(
         client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
 
         def _safe_choice(r):
-            """Return the first choice or raise a clear error if choices is None/empty."""
+            """Return the first choice or raise with a diagnostic dump if empty."""
             choices = getattr(r, "choices", None)
             if not choices:
+                # Print the raw response so we can see what LMStudio actually returned
+                print(f"[agent] EMPTY choices — raw resp: {r!r}")
                 raise RuntimeError(
-                    "LLM returned no choices — the model may not support function calling. "
-                    "Try a model with tool-call support (e.g. Llama-3.1, Qwen2.5, Mistral-Nemo)."
+                    "LLM returned no choices. Check terminal for the raw response. "
+                    "If using LMStudio, ensure the model is fully loaded and the "
+                    "server supports the OpenAI tools API."
                 )
             return choices[0]
 
@@ -15207,11 +15210,13 @@ def call_llm_with_tools(
         try:
             for _round in range(max_rounds):
                 print(f"[agent] round={_round} msgs={len(_msgs)}")
+                # Omit tool_choice — LMStudio ignores or rejects it on some builds,
+                # causing it to return an empty choices array. Compliant servers
+                # default to "auto" when tools are present.
                 resp = client.chat.completions.create(
                     model=model,
                     messages=_msgs,
                     tools=tools,
-                    tool_choice="auto",
                     max_tokens=max_tokens,
                 )
                 choice = _safe_choice(resp)
