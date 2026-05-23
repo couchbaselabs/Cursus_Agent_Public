@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.94"
+__version__ = "1.1.96"
 
 import asyncio
 import threading
@@ -12080,9 +12080,12 @@ def vector_search_cb(
     cluster.wait_until_ready(timedelta(seconds=15))
     scope_obj  = cluster.bucket(bucket).scope(scope)
 
+    # num_candidates drives FTS scan depth; cap at 200 to avoid overwhelming
+    # a local CB instance when top_k is large (e.g. 150 → 450 is too heavy).
+    _num_candidates = min(top_k * 3, 200)
     search_req = SearchRequest.create(
         VectorSearch.from_vector_query(
-            VectorQuery("embedding", query_vec, num_candidates=top_k * 3)
+            VectorQuery("embedding", query_vec, num_candidates=_num_candidates)
         )
     )
 
@@ -14118,6 +14121,12 @@ def build_rag_context(
                     _snap_note += f" CPU/node={_tcpu}"
                 _snap_note += "]"
                 _compact_line += _snap_note
+            _cbses_c = t.get("cbses") or []
+            _jiras_c = t.get("jira_issues") or []
+            if _cbses_c:
+                _compact_line += f" | CBSEs: {', '.join(_cbses_c) if isinstance(_cbses_c, list) else _cbses_c}"
+            if _jiras_c:
+                _compact_line += f" | Jira: {', '.join(_jiras_c) if isinstance(_jiras_c, list) else _jiras_c}"
             if _summary_c:
                 _compact_line += f" | Summary: {_summary_c[:300].replace(chr(10), ' ')}"
             elif desc:
