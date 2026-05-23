@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.96"
+__version__ = "1.1.97"
 
 import asyncio
 import threading
@@ -5904,7 +5904,7 @@ def main_page():
                             with ui.column().classes("gap-1"):
                                 ui.label("Retrieval mode").classes("text-xs text-gray-500")
                                 chat_mode_select = ui.select(
-                                    ["Hybrid Search", "Retrieve + Rerank", "All Tickets", "Batch Map-Reduce"],
+                                    ["Hybrid Search", "Retrieve + Rerank", "All Tickets", "Batch Map-Reduce", "Agent"],
                                     value="Hybrid Search",
                                 ).classes("w-52")
                             top_k_input = ui.number("Top-K (vector search)", value=10, min=1, max=1600).classes("w-48")
@@ -5933,6 +5933,8 @@ def main_page():
                             top_k_input.set_visibility(mode in ("Hybrid Search", "Retrieve + Rerank"))
                             batch_size_chat_input.set_visibility(mode == "Batch Map-Reduce")
                             batch_parallel_input.set_visibility(mode == "Batch Map-Reduce")
+                            compact_context_toggle.set_visibility(mode != "Agent")
+                            deep_reason_toggle.set_visibility(mode != "Agent")
 
                         chat_mode_select.on("update:model-value", lambda _: _update_chat_mode_visibility())
                         _update_chat_mode_visibility()
@@ -6345,6 +6347,60 @@ def main_page():
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                                     _turn_tids = [str(t.get("ticket_id","")) for t in (rr_tickets or []) if t.get("ticket_id")]
                                     state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
+
+                                elif mode == "Agent":
+                                    if not _CB_AVAILABLE:
+                                        ui.notify("Couchbase is required for Agent mode.", type="warning")
+                                        return
+                                    _cb_agent = (
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                    )
+                                    _cust_agent = state.get("customer_name", "")
+                                    _today_str_agent = datetime.datetime.now().strftime("%Y-%m-%d (%A)")
+                                    _cust_scope = (
+                                        f" for customer \"{_cust_agent}\""
+                                        if _cust_agent and _cust_agent.lower() != "all customers"
+                                        else ""
+                                    )
+                                    _agent_sys = (
+                                        f"You are a Couchbase support ticket analyst. Today is {_today_str_agent}. "
+                                        f"You have access to tools that query a live Couchbase database containing "
+                                        f"Zendesk support tickets{_cust_scope}. "
+                                        "Use the available tools to answer questions accurately. "
+                                        "Always call tools to retrieve data — never guess at counts or ticket details. "
+                                        "For count questions, prefer count_tickets. "
+                                        "For listing tickets, use query_tickets. "
+                                        "For deep analysis of one specific ticket, use get_ticket. "
+                                        "When filtering by CBSE or Jira, set cbse_only=true or jira_only=true."
+                                    )
+                                    if state.get("prior_session_block"):
+                                        _agent_sys += "\n" + state["prior_session_block"]
+                                    _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
+                                    for _h in state["chat_history"][-(10):-1]:
+                                        if _h["role"] in ("user", "assistant"):
+                                            _agent_msgs.append(_h)
+                                    _agent_msgs.append({"role": "user", "content": question})
+                                    chat_status.set_text("Agent — planning tool calls …")
+                                    answer = await run.io_bound(
+                                        call_llm_with_tools,
+                                        _agent_msgs,
+                                        _AGENT_TOOLS,
+                                        *_cb_agent,
+                                        provider, model, api_key, base_url,
+                                        8192,
+                                        5,
+                                    )
+                                    state["chat_history"].append({"role": "assistant", "content": answer})
+                                    _render_chat()
+                                    chat_status.set_text("Agent mode complete.")
+                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                    state["chat_session_turns"].append((question, answer, _ts_now, []))
 
                                 else:  # Hybrid Search
                                     _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
@@ -14867,6 +14923,368 @@ def call_llm(
 
     else:
         raise ValueError(f"Unknown LLM provider: {provider!r}")
+
+
+# ──────────────────────────── Phase 2b: Agent Tool Calling ───────────────────
+
+_AGENT_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_tickets",
+            "description": (
+                "Query support tickets from Couchbase using structured filters. "
+                "Returns a markdown table of matching tickets with key fields. "
+                "Use this to find, list, or analyze tickets matching specific criteria."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name (partial match, case-insensitive).",
+                    },
+                    "cbse_only": {
+                        "type": "boolean",
+                        "description": "If true, only return tickets that have formal CBSE bug links.",
+                    },
+                    "jira_only": {
+                        "type": "boolean",
+                        "description": "If true, only return tickets that have formal Jira issue links.",
+                    },
+                    "cbse_id": {
+                        "type": "string",
+                        "description": "Specific CBSE ID to search for (e.g. 'MB-12345'). Partial match.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["P1", "P2", "P3", "P4", "URGENT", "HIGH", "NORMAL", "LOW"],
+                        "description": "Filter by ticket priority.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "pending", "solved", "closed", "hold"],
+                        "description": "Filter by ticket status.",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "ISO date lower bound for ticket creation (e.g. '2024-01-01').",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "ISO date upper bound for ticket creation (e.g. '2024-12-31').",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Text keyword to search in subject, description, and cluster names.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of tickets to return (default 50, max 200).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_tickets",
+            "description": (
+                "Count support tickets matching the given filters. "
+                "Returns just the count. Prefer this over query_tickets when you "
+                "only need a total, not individual ticket details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {"type": "string", "description": "Customer name (partial match)."},
+                    "cbse_only": {"type": "boolean", "description": "Only tickets with formal CBSE links."},
+                    "jira_only": {"type": "boolean", "description": "Only tickets with formal Jira links."},
+                    "priority": {
+                        "type": "string",
+                        "enum": ["P1", "P2", "P3", "P4", "URGENT", "HIGH", "NORMAL", "LOW"],
+                        "description": "Filter by priority.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "pending", "solved", "closed", "hold"],
+                        "description": "Filter by status.",
+                    },
+                    "date_from": {"type": "string", "description": "ISO date lower bound."},
+                    "date_to": {"type": "string", "description": "ISO date upper bound."},
+                    "keyword": {"type": "string", "description": "Text keyword to match in subject/description."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_ticket",
+            "description": (
+                "Fetch full details for a single support ticket by its numeric ticket ID. "
+                "Returns all fields including description, comments, CBSEs, Jira issues, "
+                "cluster topology, and AI summary. Use for deep analysis of one ticket."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "The numeric ticket ID (e.g. '123456').",
+                    }
+                },
+                "required": ["ticket_id"],
+            },
+        },
+    },
+]
+
+
+def _agent_filters_from_args(args: dict) -> dict:
+    """Map agent tool args to the filters dict expected by tool_query_tickets."""
+    filters: dict = {}
+    if args.get("organization"):
+        filters["organization"] = args["organization"]
+    if args.get("date_from"):
+        filters["date_from"] = args["date_from"]
+    if args.get("date_to"):
+        filters["date_to"] = args["date_to"]
+    if args.get("priority"):
+        filters["priorities"] = [args["priority"].upper()]
+    if args.get("status"):
+        filters["statuses"] = [args["status"].lower()]
+    struct_kws: list[str] = []
+    if args.get("cbse_only"):
+        struct_kws.append("cbse")
+    if args.get("jira_only"):
+        struct_kws.append("jira")
+    if args.get("cbse_id"):
+        struct_kws.append(args["cbse_id"].lower())
+    if args.get("keyword"):
+        struct_kws.append(args["keyword"].lower())
+    if struct_kws:
+        filters["struct_keywords"] = struct_kws
+    return filters
+
+
+def _execute_agent_tool(
+    name: str,
+    args: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+) -> str:
+    """Execute an agent tool call and return a string result for the LLM."""
+    if name == "query_tickets":
+        limit = min(int(args.get("limit") or 50), 200)
+        filters = _agent_filters_from_args(args)
+        tickets = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=limit,
+        )
+        if not tickets:
+            return "No tickets found matching the given filters."
+        lines = [
+            "| Ticket ID | Organization | Subject | Status | Priority | Created | CBSEs | Jira |",
+            "|-----------|-------------|---------|--------|----------|---------|-------|------|",
+        ]
+        for t in tickets:
+            cbses = ", ".join(t.get("cbses") or []) or "—"
+            jiras = ", ".join(t.get("jira_issues") or []) or "—"
+            subj = (t.get("subject") or "")[:60].replace("|", "/")
+            lines.append(
+                f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
+                f"| {t.get('status','')} | {t.get('priority','')} "
+                f"| {(t.get('created') or '')[:10]} | {cbses} | {jiras} |"
+            )
+        return "\n".join(lines) + f"\n\n**Total: {len(tickets)} tickets**"
+
+    elif name == "count_tickets":
+        filters = _agent_filters_from_args(args)
+        tickets = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=5000,
+        )
+        return str(len(tickets))
+
+    elif name == "get_ticket":
+        ticket_id = str(args.get("ticket_id") or "").strip()
+        if not ticket_id:
+            return "Error: ticket_id is required."
+        doc_key = f"ticket::{ticket_id}"
+        tickets = fetch_tickets_by_keys(
+            [doc_key], cb_url, bucket, username, password, use_tls, scope, collection,
+        )
+        if not tickets:
+            return f"Ticket {ticket_id} not found."
+        t = tickets[0]
+        parts = [
+            f"**Ticket {t.get('ticket_id')}** — {t.get('subject','')}",
+            f"Organization: {t.get('organization','')}",
+            f"Status: {t.get('status','')} | Priority: {t.get('priority','')}",
+            f"Created: {t.get('created','')} | Closed: {t.get('closed','')}",
+            f"Requester: {t.get('requester','')}",
+        ]
+        cbses = t.get("cbses") or []
+        if cbses:
+            parts.append(f"CBSEs: {', '.join(cbses)}")
+        jiras = t.get("jira_issues") or []
+        if jiras:
+            parts.append(f"Jira Issues: {', '.join(jiras)}")
+        _score = t.get("score") or {}
+        clusters = _score.get("cluster_names") or []
+        if clusters:
+            parts.append(f"Clusters: {', '.join(clusters)}")
+        summary = (t.get("summary_text") or _score.get("interaction_summary") or "").strip()
+        if summary:
+            parts.append(f"\n**Summary:**\n{summary}")
+        desc = (t.get("description") or "")[:2000]
+        if desc:
+            parts.append(f"\n**Description:**\n{desc}")
+        comments = t.get("comments") or []
+        if comments:
+            parts.append(f"\n**Comments ({len(comments)}):**")
+            for c in comments[:5]:
+                author = c.get("author", {})
+                author_name = author.get("name", "") if isinstance(author, dict) else str(author)
+                body = (c.get("body") or c.get("plain_body") or "")[:500]
+                parts.append(f"  [{author_name}]: {body}")
+        return "\n".join(parts)
+
+    else:
+        return f"Unknown tool: {name}"
+
+
+def call_llm_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    provider: str, model: str, api_key: str, base_url: str,
+    max_tokens: int = 8192,
+    max_rounds: int = 5,
+) -> str:
+    """
+    Agentic tool-calling loop. Sends messages + tools to the LLM, executes
+    any tool calls, appends results, and loops until the model produces a
+    final text answer or max_rounds is reached.
+
+    OpenAI-compatible function calling: lmstudio, ollama, openai, gemini.
+    Native Anthropic tool use: claude (requires anthropic package).
+    All others: falls back to plain call_llm (no tools).
+    """
+    import json as _json
+
+    _openai_compat_providers = ("lmstudio", "ollama", "openai", "gemini")
+
+    if provider in _openai_compat_providers:
+        _base = (base_url or "").rstrip("/")
+        if provider == "lmstudio":
+            _base = _base or "http://localhost:1234/v1"
+        elif provider == "ollama":
+            _base = _base or "http://localhost:11434/v1"
+        elif provider == "gemini":
+            _base = _base or "https://generativelanguage.googleapis.com/v1beta/openai"
+
+        import openai as _oai
+        client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
+
+        _msgs: list[dict] = list(messages)
+        for _round in range(max_rounds):
+            resp = client.chat.completions.create(
+                model=model,
+                messages=_msgs,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=max_tokens,
+            )
+            choice = resp.choices[0]
+            if choice.finish_reason == "stop" or not choice.message.tool_calls:
+                return choice.message.content or ""
+
+            # Append assistant message with tool_calls (preserve full object)
+            _msgs.append(choice.message.model_dump(exclude_unset=False))
+            for tc in choice.message.tool_calls:
+                try:
+                    _args = _json.loads(tc.function.arguments or "{}")
+                except _json.JSONDecodeError:
+                    _args = {}
+                print(f"[agent] tool={tc.function.name} args={_args}")
+                result = _execute_agent_tool(
+                    tc.function.name, _args,
+                    cb_url, bucket, username, password, use_tls, scope, collection,
+                )
+                _msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+        # Max rounds — ask for a final wrap-up without tools
+        _msgs.append({"role": "user", "content": "Please summarize what you found based on the tool results."})
+        resp = client.chat.completions.create(
+            model=model, messages=_msgs, max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content or ""
+
+    elif provider == "claude":
+        try:
+            import anthropic as _ant
+        except ImportError:
+            raise RuntimeError("anthropic package not installed — pip install anthropic")
+
+        _ant_client = _ant.Anthropic(api_key=api_key or "")
+        # Convert OpenAI-format tools → Anthropic format
+        _ant_tools = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"]["description"],
+                "input_schema": t["function"]["parameters"],
+            }
+            for t in tools
+        ]
+        _sys = next((m["content"] for m in messages if m["role"] == "system"), "")
+        _conv = [m for m in messages if m["role"] != "system"]
+
+        for _round in range(max_rounds):
+            resp = _ant_client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=_sys,
+                messages=_conv,
+                tools=_ant_tools,
+            )
+            if resp.stop_reason == "end_turn":
+                return next((b.text for b in resp.content if hasattr(b, "text")), "")
+
+            tool_use_blocks = [b for b in resp.content if b.type == "tool_use"]
+            if not tool_use_blocks:
+                return next((b.text for b in resp.content if hasattr(b, "text")), "")
+
+            _conv.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for tb in tool_use_blocks:
+                _args = tb.input if isinstance(tb.input, dict) else {}
+                print(f"[agent/claude] tool={tb.name} args={_args}")
+                result = _execute_agent_tool(
+                    tb.name, _args,
+                    cb_url, bucket, username, password, use_tls, scope, collection,
+                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tb.id,
+                    "content": result,
+                })
+            _conv.append({"role": "user", "content": tool_results})
+
+        return "Max tool-calling rounds reached without a final answer."
+
+    else:
+        # Bedrock or unknown — strip tools and fall back to plain call_llm
+        return call_llm(messages, provider, model, api_key, base_url, max_tokens)
 
 
 # ─────────────────────────── Phase 3: Scoring & Analytics ────────────────────
