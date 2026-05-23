@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.100"
+__version__ = "1.1.101"
 
 import asyncio
 import threading
@@ -15194,15 +15194,20 @@ def call_llm_with_tools(
         client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
 
         def _safe_choice(r):
-            """Return the first choice or raise with a diagnostic dump if empty."""
+            """Return the first choice or raise with a clear diagnostic."""
             choices = getattr(r, "choices", None)
             if not choices:
-                # Print the raw response so we can see what LMStudio actually returned
+                _err = getattr(r, "error", None)
                 print(f"[agent] EMPTY choices — raw resp: {r!r}")
+                if _err:
+                    raise RuntimeError(
+                        f"LMStudio rejected the request: {_err}\n"
+                        "To fix: in LMStudio → select your model → Server tab → "
+                        "enable 'Tool Use' (function calling) → restart server."
+                    )
                 raise RuntimeError(
-                    "LLM returned no choices. Check terminal for the raw response. "
-                    "If using LMStudio, ensure the model is fully loaded and the "
-                    "server supports the OpenAI tools API."
+                    "LLM returned no choices — model may not support function calling. "
+                    "In LMStudio: select model → Server tab → enable 'Tool Use' → restart."
                 )
             return choices[0]
 
