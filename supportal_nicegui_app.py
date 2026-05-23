@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.98"
+__version__ = "1.1.99"
 
 import asyncio
 import threading
@@ -15177,6 +15177,7 @@ def call_llm_with_tools(
     All others: falls back to plain call_llm (no tools).
     """
     import json as _json
+    import traceback as _tb
 
     _openai_compat_providers = ("lmstudio", "ollama", "openai", "gemini")
 
@@ -15203,65 +15204,78 @@ def call_llm_with_tools(
             return choices[0]
 
         _msgs: list[dict] = list(messages)
-        for _round in range(max_rounds):
-            resp = client.chat.completions.create(
-                model=model,
-                messages=_msgs,
-                tools=tools,
-                tool_choice="auto",
-                max_tokens=max_tokens,
-            )
-            choice = _safe_choice(resp)
-            if choice.finish_reason == "stop" or not choice.message.tool_calls:
-                return choice.message.content or ""
-
-            # Build the assistant turn dict manually — avoids model_dump version issues
-            # and doesn't include extra None fields that confuse some servers.
-            _tool_calls_serial = []
-            for tc in choice.message.tool_calls:
-                _fn = getattr(tc, "function", None)
-                if _fn is None:
-                    continue
-                _tool_calls_serial.append({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": _fn.name,
-                        "arguments": _fn.arguments or "{}",
-                    },
-                })
-            _msgs.append({
-                "role": "assistant",
-                "content": choice.message.content,  # may be None; servers handle it
-                "tool_calls": _tool_calls_serial,
-            })
-
-            for tc in choice.message.tool_calls:
-                _fn = getattr(tc, "function", None)
-                if _fn is None:
-                    continue
-                try:
-                    _args = _json.loads(_fn.arguments or "{}")
-                except _json.JSONDecodeError:
-                    _args = {}
-                print(f"[agent] tool={_fn.name} args={_args}")
-                result = _execute_agent_tool(
-                    _fn.name, _args,
-                    cb_url, bucket, username, password, use_tls, scope, collection,
+        try:
+            for _round in range(max_rounds):
+                print(f"[agent] round={_round} msgs={len(_msgs)}")
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=_msgs,
+                    tools=tools,
+                    tool_choice="auto",
+                    max_tokens=max_tokens,
                 )
+                choice = _safe_choice(resp)
+                print(f"[agent] finish_reason={choice.finish_reason!r} "
+                      f"tool_calls={type(choice.message.tool_calls).__name__} "
+                      f"content_type={type(choice.message.content).__name__}")
+
+                if choice.finish_reason == "stop" or not choice.message.tool_calls:
+                    return choice.message.content or ""
+
+                # Build assistant turn dict manually — avoids model_dump issues
+                # and omits extra None fields that confuse some servers.
+                _tool_calls_serial = []
+                for tc in choice.message.tool_calls:
+                    _fn = getattr(tc, "function", None)
+                    if _fn is None:
+                        print(f"[agent] WARNING: tool_call {tc!r} has no .function attr, skipping")
+                        continue
+                    print(f"[agent] serializing tool_call: name={_fn.name!r} id={tc.id!r}")
+                    _tool_calls_serial.append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": _fn.name,
+                            "arguments": _fn.arguments or "{}",
+                        },
+                    })
                 _msgs.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
+                    "role": "assistant",
+                    "content": choice.message.content or "",
+                    "tool_calls": _tool_calls_serial,
                 })
 
-        # Max rounds — ask for a final wrap-up without tools
-        _msgs.append({"role": "user", "content": "Please summarize what you found based on the tool results."})
-        resp = client.chat.completions.create(
-            model=model, messages=_msgs, max_tokens=max_tokens,
-        )
-        _final = _safe_choice(resp)
-        return _final.message.content or ""
+                for tc in choice.message.tool_calls:
+                    _fn = getattr(tc, "function", None)
+                    if _fn is None:
+                        continue
+                    try:
+                        _args = _json.loads(_fn.arguments or "{}")
+                    except _json.JSONDecodeError:
+                        _args = {}
+                    print(f"[agent] executing tool={_fn.name!r} args={_args}")
+                    result = _execute_agent_tool(
+                        _fn.name, _args,
+                        cb_url, bucket, username, password, use_tls, scope, collection,
+                    )
+                    print(f"[agent] tool result length={len(result)}")
+                    _msgs.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+
+            # Max rounds — ask for a final wrap-up without tools
+            _msgs.append({"role": "user", "content": "Please summarize what you found based on the tool results."})
+            resp = client.chat.completions.create(
+                model=model, messages=_msgs, max_tokens=max_tokens,
+            )
+            _final = _safe_choice(resp)
+            return _final.message.content or ""
+
+        except Exception:
+            _tb.print_exc()
+            raise
 
     elif provider == "claude":
         try:
