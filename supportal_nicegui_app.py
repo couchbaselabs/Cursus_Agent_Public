@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.97"
+__version__ = "1.1.98"
 
 import asyncio
 import threading
@@ -15192,6 +15192,16 @@ def call_llm_with_tools(
         import openai as _oai
         client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
 
+        def _safe_choice(r):
+            """Return the first choice or raise a clear error if choices is None/empty."""
+            choices = getattr(r, "choices", None)
+            if not choices:
+                raise RuntimeError(
+                    "LLM returned no choices — the model may not support function calling. "
+                    "Try a model with tool-call support (e.g. Llama-3.1, Qwen2.5, Mistral-Nemo)."
+                )
+            return choices[0]
+
         _msgs: list[dict] = list(messages)
         for _round in range(max_rounds):
             resp = client.chat.completions.create(
@@ -15201,20 +15211,42 @@ def call_llm_with_tools(
                 tool_choice="auto",
                 max_tokens=max_tokens,
             )
-            choice = resp.choices[0]
+            choice = _safe_choice(resp)
             if choice.finish_reason == "stop" or not choice.message.tool_calls:
                 return choice.message.content or ""
 
-            # Append assistant message with tool_calls (preserve full object)
-            _msgs.append(choice.message.model_dump(exclude_unset=False))
+            # Build the assistant turn dict manually — avoids model_dump version issues
+            # and doesn't include extra None fields that confuse some servers.
+            _tool_calls_serial = []
             for tc in choice.message.tool_calls:
+                _fn = getattr(tc, "function", None)
+                if _fn is None:
+                    continue
+                _tool_calls_serial.append({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": _fn.name,
+                        "arguments": _fn.arguments or "{}",
+                    },
+                })
+            _msgs.append({
+                "role": "assistant",
+                "content": choice.message.content,  # may be None; servers handle it
+                "tool_calls": _tool_calls_serial,
+            })
+
+            for tc in choice.message.tool_calls:
+                _fn = getattr(tc, "function", None)
+                if _fn is None:
+                    continue
                 try:
-                    _args = _json.loads(tc.function.arguments or "{}")
+                    _args = _json.loads(_fn.arguments or "{}")
                 except _json.JSONDecodeError:
                     _args = {}
-                print(f"[agent] tool={tc.function.name} args={_args}")
+                print(f"[agent] tool={_fn.name} args={_args}")
                 result = _execute_agent_tool(
-                    tc.function.name, _args,
+                    _fn.name, _args,
                     cb_url, bucket, username, password, use_tls, scope, collection,
                 )
                 _msgs.append({
@@ -15228,7 +15260,8 @@ def call_llm_with_tools(
         resp = client.chat.completions.create(
             model=model, messages=_msgs, max_tokens=max_tokens,
         )
-        return resp.choices[0].message.content or ""
+        _final = _safe_choice(resp)
+        return _final.message.content or ""
 
     elif provider == "claude":
         try:
