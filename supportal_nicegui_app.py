@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import asyncio
 import threading
@@ -15745,6 +15745,87 @@ def _execute_agent_tool(
         return f"Unknown tool: {name}"
 
 
+# Regex patterns for text-encoded tool calls that some local models emit
+# in message content instead of the proper tool_calls JSON field.
+_TC_PATTERNS = [
+    # Qwen/LMStudio native: <|tool_call>call:name{...}<tool_call|>
+    re.compile(r"<\|tool_call\>call:(\w+)\s*(\{.*?\})\s*<tool_call\|>", re.DOTALL),
+    # Hermes / ChatML: <tool_call>{"name":"...","arguments":{...}}</tool_call>
+    re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL),
+    # Qwen3 formal: <|tool_call|>{...}<|/tool_call|>
+    re.compile(r"<\|tool_call\|>\s*(\{.*?\})\s*<\|/tool_call\|>", re.DOTALL),
+]
+
+
+def _extract_text_tool_calls(content: str) -> list[tuple[str, dict]]:
+    """
+    Parse text-encoded tool calls from model content.
+    Returns [(tool_name, args_dict), ...] for each detected call.
+    Falls back to empty list if nothing parseable is found.
+    """
+    import json as _j, re as _re
+
+    results: list[tuple[str, dict]] = []
+
+    def _try_parse_args(raw: str) -> dict:
+        """Best-effort JSON parse with light cleanup for common model quirks."""
+        raw = raw.strip()
+        # Replace <|"|> (Qwen string-escape artifact) with real quotes
+        raw = raw.replace("<|\"|\">", '"').replace('<|"|>', '"')
+        try:
+            return _j.loads(raw)
+        except Exception:
+            pass
+        # Try quoting unquoted keys: {Ticket ID: 123} → {"Ticket ID": 123}
+        fixed = _re.sub(r'([{,])\s*([A-Za-z_][A-Za-z0-9_ ]*)\s*:', r'\1"\2":', raw)
+        try:
+            return _j.loads(fixed)
+        except Exception:
+            return {}
+
+    for pat in _TC_PATTERNS:
+        for m in pat.finditer(content):
+            groups = m.groups()
+            if len(groups) == 2 and not groups[0].startswith("{"):
+                # Pattern 1: (name, args_block)
+                name, args_raw = groups[0].strip(), groups[1]
+                args = _try_parse_args(args_raw)
+                results.append((name, args))
+            else:
+                # Patterns 2/3: single JSON blob with name + arguments
+                blob = _try_parse_args(groups[0])
+                if "name" in blob:
+                    results.append((blob["name"], blob.get("arguments") or blob.get("args") or {}))
+
+    return results
+
+
+def _normalise_tool_args(name: str, args: dict) -> dict:
+    """
+    Fix common arg-format mismatches from models that don't follow the schema.
+    generate_table: model may pass data=[{col:val,...}] instead of columns+rows.
+    generate_chart: model may pass data=[...] instead of labels+values.
+    """
+    if name == "generate_table":
+        if "data" in args and not args.get("columns") and not args.get("rows"):
+            data = args["data"]
+            if isinstance(data, list) and data:
+                if isinstance(data[0], dict):
+                    cols = list(data[0].keys())
+                    rows = [[str(row.get(c, "")) for c in cols] for row in data]
+                    args = {**args, "columns": cols, "rows": rows}
+    if name == "generate_chart":
+        if "data" in args and not args.get("values") and not args.get("series"):
+            data = args["data"]
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                keys = list(data[0].keys())
+                if len(keys) >= 2:
+                    args = {**args,
+                            "labels": [str(row.get(keys[0], "")) for row in data],
+                            "values": [float(row.get(keys[1], 0) or 0) for row in data]}
+    return args
+
+
 def call_llm_with_tools(
     messages: list[dict],
     tools: list[dict],
@@ -15826,7 +15907,32 @@ def call_llm_with_tools(
                 # Check tool_calls first — some models return finish_reason='stop'
                 # even when they've made tool calls (Gemma, some Qwen variants).
                 if not choice.message.tool_calls:
-                    return choice.message.content or ""
+                    _raw_content = choice.message.content or ""
+                    # Detect text-encoded tool calls in content (Qwen/Hermes/LMStudio
+                    # native formats that bypass the tool_calls field entirely).
+                    _text_calls = _extract_text_tool_calls(_raw_content)
+                    if not _text_calls:
+                        # Strip any residual noise from prior rounds before returning
+                        for _tp in _TC_PATTERNS:
+                            _raw_content = _tp.sub("", _raw_content).strip()
+                        return _raw_content
+
+                    # Execute each text-encoded tool call and inject results
+                    print(f"[agent] detected {len(_text_calls)} text-encoded tool call(s) in content — executing and retrying")
+                    _msgs.append({"role": "assistant", "content": _raw_content})
+                    for _tc_name, _tc_args in _text_calls:
+                        _tc_args = _normalise_tool_args(_tc_name, _tc_args)
+                        print(f"[agent] text-call executing tool={_tc_name!r} args_keys={list(_tc_args.keys())}")
+                        _tc_result = _execute_agent_tool(
+                            _tc_name, _tc_args,
+                            cb_url, bucket, username, password, use_tls, scope, collection,
+                            default_customer=default_customer,
+                        )
+                        print(f"[agent] text-call result length={len(_tc_result)}")
+                        # Inject as a user-visible tool result so the model can reference it
+                        _msgs.append({"role": "user", "content": f"[Tool result for {_tc_name}]:\n{_tc_result}"})
+                    _tool_calls_made = True
+                    continue  # retry: model will now write a clean final response
 
                 # Build assistant turn dict — omit content when null (matches LMStudio format)
                 _tool_calls_serial = []
@@ -15870,7 +15976,11 @@ def call_llm_with_tools(
                 model=model, messages=_msgs, max_tokens=max_tokens,
             )
             _final = _safe_choice(resp)
-            return _final.message.content or ""
+            _final_content = _final.message.content or ""
+            # Strip any residual text-encoded tool call blocks from the output
+            for _tp in _TC_PATTERNS:
+                _final_content = _tp.sub("", _final_content).strip()
+            return _final_content
 
         except Exception:
             _tb.print_exc()
