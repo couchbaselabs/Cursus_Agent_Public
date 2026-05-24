@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.6"
+__version__ = "1.2.7"
 
 import asyncio
 import threading
@@ -15323,10 +15323,30 @@ def _execute_agent_tool(
         if not fresh or not fresh.get("ticket_id"):
             return f"Scrape returned no data for ticket {ticket_id}."
 
-        # Stamp freshness and upsert to Couchbase
         fresh["last_scraped_at"] = int(time.time())
         fresh["type"] = "ticket"
         doc_key = f"ticket::{ticket_id}"
+
+        # ── Inline snapshot topology enrichment ──────────────────────────────
+        # Attempt before the CB write so topology lands in the same upsert.
+        topo_enriched = False
+        snap_ids_found = _SNAP_ID_RE.findall(fresh.get("snapshots", ""))
+        if not snap_ids_found:
+            snap_ids_found = _UUID_RE.findall(fresh.get("snapshots", ""))
+        if snap_ids_found:
+            fresh["snap_ids"] = list(dict.fromkeys(snap_ids_found))  # dedup, preserve order
+            best_snap = _highest_snap_id(snap_ids_found)
+            try:
+                topo = fetch_snapshot_topology(best_snap, cookie=cookie)
+                if topo:
+                    fresh["snapshot_topology"] = topo
+                    topo_enriched = True
+                    print(f"[rescrape_ticket] topology enriched from snap {best_snap[:16]}…")
+            except Exception as _te:
+                print(f"[rescrape_ticket] topology fetch failed for {best_snap}: {_te}")
+
+        # ── Merge onto existing CB doc (preserve score, embedding, etc.) ─────
+        _saved = False
         try:
             from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
@@ -15335,12 +15355,21 @@ def _execute_agent_tool(
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
             cluster.wait_until_ready(timedelta(seconds=10))
             col = cluster.bucket(bucket).scope(scope).collection(collection)
-            col.upsert(doc_key, fresh)
+            try:
+                existing = col.get(doc_key).content_as[dict]
+                # Fresh scrape fields take priority; preserved: score, embedding, analytics labels
+                _preserve = {k: existing[k] for k in ("score", "embedding", "summary_text",
+                                                        "analytics_app_labels", "snapshot_topology")
+                             if k in existing and k not in fresh}
+                merged = {**existing, **fresh, **_preserve}
+            except Exception:
+                merged = fresh  # doc doesn't exist yet — insert as-is
+            col.upsert(doc_key, merged)
             cluster.close()
+            fresh = merged  # use merged for summary output
             _saved = True
         except Exception as exc:
             print(f"[rescrape_ticket] CB upsert failed: {exc}")
-            _saved = False
 
         _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
         summary_lines = [
@@ -15357,6 +15386,18 @@ def _execute_agent_tool(
         jiras = fresh.get("jira_issues") or []
         if jiras:
             summary_lines.append(f"Jira Issues: {', '.join(jiras)}")
+        topo = fresh.get("snapshot_topology") or {}
+        if isinstance(topo, dict) and topo:
+            topo_note = []
+            if topo.get("cluster_name"):  topo_note.append(f"cluster={topo['cluster_name']}")
+            if topo.get("cb_version"):    topo_note.append(f"CB={topo['cb_version']}")
+            if topo.get("total_nodes"):   topo_note.append(f"nodes={topo['total_nodes']}")
+            bad  = topo.get("bad_items",  topo.get("bad_count",  0)) or 0
+            warn = topo.get("warn_items", topo.get("warn_count", 0)) or 0
+            if bad or warn:               topo_note.append(f"bad={bad} warn={warn}")
+            if topo_note:
+                src = " (freshly enriched)" if topo_enriched else " (from prior enrichment)"
+                summary_lines.append(f"Topology{src}: {', '.join(topo_note)}")
         return "\n".join(summary_lines)
 
     else:
