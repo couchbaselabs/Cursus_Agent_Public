@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.9"
+__version__ = "1.3.0"
 
 import asyncio
 import threading
@@ -6006,7 +6006,76 @@ def main_page():
                                         _content = msg["content"]
                                         with ui.row().classes("justify-start w-full items-start gap-1"):
                                             with ui.column().classes("bg-gray-100 text-gray-900 rounded-xl px-4 py-2 max-w-3xl text-sm"):
-                                                ui.markdown(_content).classes("prose prose-sm max-w-none")
+                                                # Render text + artifact (echart/table) blocks interleaved
+                                                _last_pos = 0
+                                                _has_artifact = bool(_ARTIFACT_RE.search(_content))
+                                                for _am in _ARTIFACT_RE.finditer(_content):
+                                                    _pre = _content[_last_pos:_am.start()].strip()
+                                                    if _pre:
+                                                        ui.markdown(_pre).classes("prose prose-sm max-w-none")
+                                                    _atype, _araw = _am.group(1), _am.group(2)
+                                                    _last_pos = _am.end()
+                                                    try:
+                                                        _ap = json.loads(_araw)
+                                                    except Exception:
+                                                        ui.label(f"[{_atype} parse error]").classes("text-red-500 text-xs")
+                                                        continue
+                                                    if _atype == "echart":
+                                                        _cuid = f"agchart-{abs(hash(_araw)):x}"
+                                                        _ctitle = ((_ap.get("title") or {}).get("text") or "chart").replace(" ", "_")
+                                                        with ui.element("div").classes(f"w-full {_cuid} mt-2"):
+                                                            ui.echart(_ap).classes("w-full").style("height:320px")
+                                                        ui.button(
+                                                            "PNG", icon="image",
+                                                            on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
+                                                                f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
+                                                                f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
+                                                                f"if(!inst)return;var img=inst.getDataURL({{type:'png',pixelRatio:2,backgroundColor:'#fff'}});"
+                                                                f"var a=document.createElement('a');a.href=img;a.download='{fn}.png';a.click();}})();"
+                                                            ),
+                                                        ).props("flat dense size=sm color=blue-grey").classes("mt-1").tooltip("Download PNG")
+                                                    elif _atype == "table":
+                                                        import html as _hmod
+                                                        _tcols = _ap.get("columns") or []
+                                                        _trows = _ap.get("rows") or []
+                                                        _tname = _ap.get("title") or "table"
+                                                        if _tname:
+                                                            ui.label(_tname).classes("font-semibold text-sm mt-2 mb-1")
+                                                        if _ap.get("description"):
+                                                            ui.markdown(_ap["description"]).classes("prose prose-sm mb-1")
+                                                        _th = "".join(f'<th class="border border-gray-300 px-2 py-1 bg-gray-200 font-semibold whitespace-nowrap">{_hmod.escape(str(c))}</th>' for c in _tcols)
+                                                        _tb = "".join(
+                                                            "<tr>" + "".join(f'<td class="border border-gray-300 px-2 py-1 whitespace-nowrap">{_hmod.escape(str(cell))}</td>' for cell in row) + "</tr>"
+                                                            for row in _trows
+                                                        )
+                                                        ui.html(f'<div class="overflow-x-auto mt-1"><table class="border-collapse text-xs"><thead><tr>{_th}</tr></thead><tbody>{_tb}</tbody></table></div>')
+                                                        with ui.row().classes("gap-1 mt-1"):
+                                                            def _dl_csv(_c=_tcols, _r=_trows, _n=_tname):
+                                                                import csv as _cm, io as _im
+                                                                buf = _im.StringIO()
+                                                                w = _cm.writer(buf)
+                                                                w.writerow(_c)
+                                                                w.writerows(_r)
+                                                                ui.download(buf.getvalue().encode(), f"{_n}.csv", "text/csv")
+                                                            ui.button("CSV", icon="download", on_click=_dl_csv).props("flat dense size=sm color=green").tooltip("Download CSV")
+                                                            def _dl_xlsx(_c=_tcols, _r=_trows, _n=_tname):
+                                                                try:
+                                                                    import openpyxl as _xl, io as _im
+                                                                    wb = _xl.Workbook()
+                                                                    ws = wb.active
+                                                                    ws.title = _n[:31]
+                                                                    ws.append(_c)
+                                                                    for row in _r:
+                                                                        ws.append([str(c) for c in row])
+                                                                    buf = _im.BytesIO()
+                                                                    wb.save(buf)
+                                                                    ui.download(buf.getvalue(), f"{_n}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                                                                except ImportError:
+                                                                    ui.notify("Install openpyxl: pip install openpyxl", type="warning")
+                                                            ui.button("Excel", icon="table_view", on_click=_dl_xlsx).props("flat dense size=sm color=green").tooltip("Download Excel")
+                                                _post = _content[_last_pos:].strip()
+                                                if _post or not _has_artifact:
+                                                    ui.markdown(_post or _content).classes("prose prose-sm max-w-none")
                                             # Copy button — writes raw markdown to clipboard
                                             ui.button(
                                                 icon="content_copy",
@@ -6429,7 +6498,13 @@ def main_page():
                                         "It fetches the live ticket from Supportal and saves the updated data to Couchbase "
                                         "in a single step — always prefer this over just linking the URL when the user "
                                         "says 'verify', 'refresh', 'update', or 'check the latest'.\n"
-                                        "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true."
+                                        "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true.\n"
+                                        "- generate_chart: call this to render a bar, line, pie, donut, or horizontal_bar "
+                                        "chart inline in the chat. Use it proactively when counts or trends are involved.\n"
+                                        "- generate_table: call this to render a formatted table with CSV/Excel download "
+                                        "buttons. Prefer this over a plain markdown table when the user may want to export "
+                                        "the data. Always call generate_table BEFORE your final summary text so the table "
+                                        "appears above your explanation."
                                     )
                                     if _cust_agent and _cust_agent.lower() != "all customers":
                                         _agent_sys += (
@@ -15119,11 +15194,166 @@ _AGENT_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_chart",
+            "description": (
+                "Render a chart in the chat UI from structured data. "
+                "Supported types: bar, horizontal_bar, line, pie, donut. "
+                "Use this whenever a visual summary would help — ticket counts by "
+                "priority/status, trends over time, distribution breakdowns, etc. "
+                "For multi-series data pass series instead of labels+values."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chart_type": {
+                        "type": "string",
+                        "enum": ["bar", "horizontal_bar", "line", "pie", "donut"],
+                        "description": "Chart type.",
+                    },
+                    "title": {"type": "string", "description": "Chart title."},
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Category labels (x-axis for bar/line, slice names for pie).",
+                    },
+                    "values": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Numeric values — one per label. Use for single-series charts.",
+                    },
+                    "series": {
+                        "type": "array",
+                        "description": "Multi-series data. Each item: {name, data: [numbers]}.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "data": {"type": "array", "items": {"type": "number"}},
+                            },
+                        },
+                    },
+                    "x_label": {"type": "string", "description": "X-axis label (bar/line only)."},
+                    "y_label": {"type": "string", "description": "Y-axis label (bar/line only)."},
+                },
+                "required": ["chart_type", "title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_table",
+            "description": (
+                "Render a data table in the chat UI with CSV and Excel download buttons. "
+                "Use this to present structured query results, ticket lists, or any "
+                "tabular data that the user may want to export to a spreadsheet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Table title (also used as filename)."},
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Column header names.",
+                    },
+                    "rows": {
+                        "type": "array",
+                        "description": "Data rows — each row is an array of cell values.",
+                        "items": {"type": "array", "items": {}},
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional short description shown above the table.",
+                    },
+                },
+                "required": ["title", "columns", "rows"],
+            },
+        },
+    },
 ]
 
 
 _SUPPORTAL_TICKET_URL = "https://supportal.couchbase.com/zendesk/ticket/{ticket_id}"
 _SUPPORTAL_CUSTOMER_URL = "https://supportal.couchbase.com/customer/{customer}"
+
+# ── Chat artifact rendering ──────────────────────────────────────────────────
+# Fenced blocks ```echart ... ``` and ```table ... ``` are embedded in agent
+# responses and rendered as live ECharts elements or HTML tables with download
+# buttons by _render_chat.
+_ARTIFACT_RE = re.compile(r"```(echart|table)\n(.*?)\n```", re.DOTALL)
+
+
+def _build_agent_echart_option(args: dict) -> dict:
+    """Build an ECharts option dict from generate_chart tool arguments."""
+    chart_type = (args.get("chart_type") or "bar").lower()
+    title      = args.get("title") or ""
+    labels     = args.get("labels") or []
+    values     = args.get("values") or []
+    series     = args.get("series") or []
+    x_label    = args.get("x_label") or ""
+    y_label    = args.get("y_label") or ""
+
+    _CB_PALETTE = ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6",
+                   "#06B6D4","#F97316","#84CC16","#EC4899","#6B7280"]
+
+    if chart_type in ("pie", "donut"):
+        if series:
+            data = [{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
+        else:
+            data = [{"name": l, "value": v} for l, v in zip(labels, values)]
+        radius = ["40%", "70%"] if chart_type == "donut" else "60%"
+        return {
+            "title":   {"text": title, "left": "center"},
+            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+            "legend":  {"orient": "vertical", "left": "left"},
+            "color":   _CB_PALETTE,
+            "series":  [{"type": "pie", "radius": radius, "data": data,
+                         "label": {"formatter": "{b}: {c}"}}],
+        }
+
+    ec_type = "line" if chart_type == "line" else "bar"
+    if series:
+        ec_series = [{"name": s["name"], "type": ec_type, "data": s.get("data") or []}
+                     for s in series]
+        legend_data = [s["name"] for s in series]
+    else:
+        ec_series = [{"type": ec_type, "data": values}]
+        legend_data = []
+
+    cat_axis = {"type": "category", "data": labels}
+    val_axis: dict = {"type": "value"}
+    if x_label: cat_axis["name"] = x_label       # type: ignore[index]
+    if y_label: val_axis["name"] = y_label
+
+    smooth = chart_type == "line"
+    for s in ec_series:
+        if smooth:
+            s["smooth"] = True
+
+    if chart_type == "horizontal_bar":
+        return {
+            "title":   {"text": title},
+            "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+            "legend":  {"data": legend_data} if legend_data else {},
+            "color":   _CB_PALETTE,
+            "grid":    {"left": "20%"},
+            "xAxis":   val_axis,
+            "yAxis":   cat_axis,
+            "series":  ec_series,
+        }
+    return {
+        "title":   {"text": title},
+        "tooltip": {"trigger": "axis"},
+        "legend":  {"data": legend_data} if legend_data else {},
+        "color":   _CB_PALETTE,
+        "xAxis":   cat_axis,
+        "yAxis":   val_axis,
+        "series":  ec_series,
+    }
 
 
 def _agent_filters_from_args(args: dict) -> dict:
@@ -15495,6 +15725,21 @@ def _execute_agent_tool(
                 src = " (freshly enriched)" if topo_enriched else " (from prior enrichment)"
                 summary_lines.append(f"Topology{src}: {', '.join(topo_note)}")
         return "\n".join(summary_lines)
+
+    elif name == "generate_chart":
+        opt = _build_agent_echart_option(args)
+        # Return a fenced ```echart block — _render_chat renders it as a live ui.echart
+        return "```echart\n" + json.dumps(opt, ensure_ascii=False) + "\n```"
+
+    elif name == "generate_table":
+        title       = args.get("title") or "Table"
+        columns     = args.get("columns") or []
+        rows        = args.get("rows") or []
+        description = args.get("description") or ""
+        payload = {"title": title, "columns": columns, "rows": rows}
+        if description:
+            payload["description"] = description
+        return "```table\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
 
     else:
         return f"Unknown tool: {name}"

@@ -17,3 +17,7 @@ google-genai
 
 # MCP server (Phase 2)
 mcp
+
+# Export (agent-generated tables and documents)
+openpyxl                # Excel (.xlsx) export
+python-docx             # Word (.docx) export — Phase 2 conversation exports
