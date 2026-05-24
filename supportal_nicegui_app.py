@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 import asyncio
 import threading
@@ -15224,9 +15224,9 @@ def _execute_agent_tool(
         # Read session cookie from saved app profile
         cookie = ""
         try:
-            _profiles = _load_profiles()
-            _active = _profiles.get("active_profile", "default")
-            _prof = _profiles.get("profiles", {}).get(_active, {})
+            _settings = _load_settings_file()
+            _active = _settings.get("active_profile", "default")
+            _prof = _settings.get("profiles", {}).get(_active, {})
             cookie = _prof.get("cookie", "")
         except Exception as _pe:
             print(f"[rescrape_ticket] profile read failed: {_pe}")
