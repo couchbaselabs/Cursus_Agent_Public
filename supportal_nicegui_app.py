@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.104"
+__version__ = "1.1.105"
 
 import asyncio
 import threading
@@ -15230,11 +15230,14 @@ def call_llm_with_tools(
                     _kwargs["tools"] = _req_tools
                 resp = client.chat.completions.create(**_kwargs)
                 choice = _safe_choice(resp)
+                _tc_count = len(choice.message.tool_calls) if choice.message.tool_calls else 0
                 print(f"[agent] finish_reason={choice.finish_reason!r} "
-                      f"tool_calls={type(choice.message.tool_calls).__name__} "
-                      f"content_type={type(choice.message.content).__name__}")
+                      f"tool_calls_count={_tc_count} "
+                      f"content={repr((choice.message.content or '')[:120])}")
 
-                if choice.finish_reason == "stop" or not choice.message.tool_calls:
+                # Check tool_calls first — some models return finish_reason='stop'
+                # even when they've made tool calls (Gemma, some Qwen variants).
+                if not choice.message.tool_calls:
                     return choice.message.content or ""
 
                 # Build assistant turn dict — omit content when null (matches LMStudio format)
