@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.106"
+__version__ = "1.2.1"
 
 import asyncio
 import threading
@@ -7212,9 +7212,9 @@ def main_page():
                         chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
                         charts_area  = ui.column().classes("w-full gap-4 mt-3")
 
-                        def _make_chart(container, cfg: dict):
+                        def _make_chart(container, cfg: dict, height: int = 380):
                             with container:
-                                ui.highchart(cfg).classes("w-full")
+                                ui.echart(cfg).classes("w-full").style(f"height:{height}px")
 
                         async def _render_charts(client=None):
                             cust_filter = (main_cust_input.value or "").strip()
@@ -7285,23 +7285,6 @@ def main_page():
                             _title_sz = f"{max(13, min(18, _fs + 2))}px"
                             _sub_sz   = f"{max(10, _fs - 1)}px"
 
-                            # Push global Highcharts text defaults for this render pass
-                            if client:
-                                try:
-                                    await client.run_javascript(
-                                        "Highcharts.setOptions({"
-                                        f"  chart:    {{style: {{fontSize: '{_fs_str}'}}}},"
-                                        f"  title:    {{style: {{fontSize: '{_title_sz}'}}}},"
-                                        f"  subtitle: {{style: {{fontSize: '{_sub_sz}'}}}},"
-                                        f"  xAxis:    {{labels: {{style: {{fontSize: '{_fs_str}'}}}}, title: {{style: {{fontSize: '{_fs_str}'}}}}}},"
-                                        f"  yAxis:    {{labels: {{style: {{fontSize: '{_fs_str}'}}}}, title: {{style: {{fontSize: '{_fs_str}'}}}}}},"
-                                        f"  legend:   {{itemStyle: {{fontSize: '{_fs_str}'}}}},"
-                                        f"  tooltip:  {{style: {{fontSize: '{_fs_str}'}}}}"
-                                        "});"
-                                    )
-                                except Exception:
-                                    pass
-
                             # Build org-name consolidation map for this ticket set
                             _oc = _load_settings_file().get("__org_consolidation__", {})
                             _org_map = build_org_name_map(
@@ -7370,83 +7353,79 @@ def main_page():
                             with charts_area:
                                 # ── Row 1: Stacked volume by origin over time ─────────────
                                 if data["month_keys"]:
-                                    ui.highchart({
-                                        "chart":       {"type": "column", "height": ch, "zoomType": "x"},
-                                        "title":       {"text": "Ticket Volume Over Time by Origin"},
-                                        "subtitle":    {"text": "Click and drag to zoom"},
-                                        "xAxis":       {"categories": data["month_keys"], "labels": {"rotation": -45, "style": {"fontSize": _fs_str}, "overflow": "allow"}},
-                                        "yAxis":       {"title": {"text": "Tickets"}, "stackLabels": {"enabled": True}},
-                                        "plotOptions": {"column": {"stacking": "normal"}},
-                                        "colors":      ["#1E88E5", "#FB8C00", "#6D4C41"],
+                                    ui.echart({
+                                        "title":    {"text": "Ticket Volume Over Time by Origin", "subtext": "Drag to zoom"},
+                                        "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                        "legend":   {"bottom": 0},
+                                        "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                        "grid":     {"bottom": 80},
+                                        "xAxis":    {"type": "category", "data": data["month_keys"], "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                        "yAxis":    {"type": "value", "name": "Tickets"},
+                                        "color":    ["#1E88E5", "#FB8C00", "#6D4C41"],
                                         "series": [
-                                            {"name": "Customer-Initiated",  "data": data["month_customer"]},
-                                            {"name": "Agent-Initiated",     "data": data["month_agent"]},
-                                            {"name": "Proactive/Automated", "data": data["month_proactive"]},
+                                            {"name": "Customer-Initiated",  "type": "bar", "stack": "total", "data": data["month_customer"]},
+                                            {"name": "Agent-Initiated",     "type": "bar", "stack": "total", "data": data["month_agent"]},
+                                            {"name": "Proactive/Automated", "type": "bar", "stack": "total", "data": data["month_proactive"]},
                                         ],
-                                    }).classes("w-full")
+                                    }).classes("w-full").style(f"height:{ch}px")
                                 else:
                                     ui.label("No parseable dates for frequency chart.").classes("text-sm text-gray-400")
 
                                 # ── Row 1b: Tickets per year ──────────────────────────────
                                 if data["year_keys"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":   {"type": "column", "height": ch_sm, "zoomType": "x"},
+                                        ui.echart({
                                             "title":   {"text": "Tickets per Year"},
-                                            "xAxis":   {"categories": data["year_keys"], "title": {"text": "Year"}},
-                                            "yAxis":   {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                            "colors":  ["#039BE5"],
-                                            "series":  [{"name": "Tickets", "data": data["year_values"]}],
-                                            "plotOptions": {"column": {"dataLabels": {"enabled": True}}},
-                                        }).classes("w-full")
+                                            "tooltip": {"trigger": "axis"},
+                                            "xAxis":   {"type": "category", "data": data["year_keys"], "name": "Year"},
+                                            "yAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                            "color":   ["#039BE5"],
+                                            "series":  [{"name": "Tickets", "type": "bar", "data": data["year_values"], "label": {"show": True, "position": "top"}}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Row 2: Priority + Status side by side ─────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "pie", "height": ch_sm},
-                                            "title":  {"text": "Priority Distribution"},
-                                            "colors": ["#43A047","#FB8C00","#E53935","#8E24AA"],
-                                            "series": [{"name": "Tickets", "data": list(zip(data["priority_labels"], data["priority_values"]))}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Priority Distribution"},
+                                            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                            "color":   ["#43A047","#FB8C00","#E53935","#8E24AA"],
+                                            "series":  [{"name": "Tickets", "type": "pie", "radius": "62%", "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["priority_labels"], data["priority_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "pie", "height": ch_sm},
-                                            "title":  {"text": "Status Breakdown"},
-                                            "plotOptions": {"pie": {"innerSize": "50%"}},
-                                            "series": [{"name": "Tickets", "data": list(zip(data["status_labels"], data["status_values"]))}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Status Breakdown"},
+                                            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                            "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["status_labels"], data["status_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Row 3: Comment distribution + Escalation rate ─────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                            "title":  {"text": "Comment Count Distribution"},
-                                            "xAxis":  {"categories": data["comment_labels"]},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "colors": ["#00ACC1"],
-                                            "series": [{"name": "Tickets", "data": data["comment_values"]}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Comment Count Distribution"},
+                                            "tooltip": {"trigger": "axis"},
+                                            "xAxis":   {"type": "category", "data": data["comment_labels"]},
+                                            "yAxis":   {"type": "value", "name": "Tickets"},
+                                            "color":   ["#00ACC1"],
+                                            "series":  [{"name": "Tickets", "type": "bar", "data": data["comment_values"]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "pie", "height": ch_sm},
-                                            "title":  {"text": "Escalation Rate"},
-                                            "plotOptions": {"pie": {"innerSize": "50%"}},
-                                            "colors": ["#E53935","#43A047"],
-                                            "series": [{"name": "Tickets", "data": list(zip(data["esc_labels"], data["esc_values"]))}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Escalation Rate"},
+                                            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                            "color":   ["#E53935","#43A047"],
+                                            "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["esc_labels"], data["esc_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Row 4: Ticket origin ──────────────────────────────────
                                 with ui.card().classes("w-full"):
-                                    ui.highchart({
-                                        "chart":  {"type": "pie", "height": ch_sm},
-                                        "title":  {"text": "Ticket Origin"},
-                                        "subtitle": {"text": "How the ticket was opened"},
-                                        "plotOptions": {"pie": {"innerSize": "50%", "dataLabels": {"enabled": True, "format": "<b>{point.name}</b>: {point.y} ({point.percentage:.1f}%)"}}},
-                                        "colors": ["#1E88E5", "#FB8C00", "#6D4C41"],
-                                        "series": [{"name": "Tickets", "data": list(zip(data["origin_labels"], data["origin_values"]))}],
-                                    }).classes("w-full")
+                                    ui.echart({
+                                        "title":   {"text": "Ticket Origin", "subtext": "How the ticket was opened"},
+                                        "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                        "color":   ["#1E88E5", "#FB8C00", "#6D4C41"],
+                                        "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"formatter": "{b}: {c} ({d}%)", "fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["origin_labels"], data["origin_values"])]}],
+                                    }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # Proactive diagnostic breakdown
                                 if data["origin_values"][2] > 0:  # Proactive/Automated count
@@ -7475,28 +7454,30 @@ def main_page():
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
                                         if data["version_labels"]:
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch, "zoomType": "x"},
-                                                "title":  {"text": "Tickets by Couchbase Version"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": data["version_labels"], "title": {"text": "Version"}, "labels": {"rotation": -45, "style": {"fontSize": _fs_str}, "overflow": "allow"}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#0277BD"],
-                                                "series": [{"name": "Tickets", "data": data["version_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Tickets by Couchbase Version", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis"},
+                                                "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                "grid":     {"bottom": 60},
+                                                "xAxis":    {"type": "category", "data": data["version_labels"], "name": "Version", "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                                "yAxis":    {"type": "value", "name": "Tickets"},
+                                                "color":    ["#0277BD"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["version_values"]}],
+                                            }).classes("w-full").style(f"height:{ch}px")
                                         else:
                                             ui.label("No version data found in ticket fields.").classes("text-sm text-gray-400 p-4")
                                     with ui.card().classes("flex-1"):
                                         if data["feature_labels"]:
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch, "zoomType": "y", "marginLeft": 160},
-                                                "title":  {"text": "Tickets by Feature Area"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": data["feature_labels"], "labels": {"style": {"fontSize": _fs_sm_str}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#00838F"],
-                                                "series": [{"name": "Tickets", "data": data["feature_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Tickets by Feature Area", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 170, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["feature_labels"], "axisLabel": {"overflow": "truncate", "width": 140, "fontSize": _fs_sm}},
+                                                "color":    ["#00838F"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["feature_values"]}],
+                                            }).classes("w-full").style(f"height:{ch}px")
                                         else:
                                             ui.label("No component/feature data found.").classes("text-sm text-gray-400 p-4")
 
@@ -7507,43 +7488,43 @@ def main_page():
                                     # Row 4: Stars + Temperature
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Experience Stars Distribution"},
-                                                "xAxis":  {"categories": ["★1","★2","★3","★4","★5"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#FDD835"],
-                                                "series": [{"name": "Tickets", "data": data["stars_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Experience Stars Distribution"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": ["★1","★2","★3","★4","★5"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#FDD835"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["stars_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "pie", "height": ch_sm},
-                                                "title":  {"text": "Temperature Distribution"},
-                                                "plotOptions": {"pie": {"innerSize": "50%"}},
-                                                "colors": ["#42A5F5","#FFA726","#EF5350"],
-                                                "series": [{"name": "Tickets", "data": list(zip(data["temp_labels"], data["temp_values"]))}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Temperature Distribution"},
+                                                "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                                "color":   ["#42A5F5","#FFA726","#EF5350"],
+                                                "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["temp_labels"], data["temp_values"])]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 5: Complexity + Dimension averages
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Complexity Score Distribution"},
-                                                "xAxis":  {"categories": ["1","2","3","4","5"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#8E24AA"],
-                                                "series": [{"name": "Tickets", "data": data["complexity_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Complexity Score Distribution"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": ["1","2","3","4","5"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#8E24AA"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["complexity_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 170},
-                                                "title":  {"text": "Avg Dimension Scores (1-5)"},
-                                                "xAxis":  {"categories": data["dim_categories"], "labels": {"style": {"fontSize": _fs_sm_str}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Avg Score"}, "max": 5},
-                                                "colors": ["#26A69A"],
-                                                "series": [{"name": "Avg Score", "data": data["dim_avg"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Avg Dimension Scores (1-5)"},
+                                                "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "grid":    {"left": 180},
+                                                "xAxis":   {"type": "value", "name": "Avg Score", "max": 5},
+                                                "yAxis":   {"type": "category", "data": data["dim_categories"], "axisLabel": {"overflow": "truncate", "width": 160, "fontSize": _fs_sm}},
+                                                "color":   ["#26A69A"],
+                                                "series":  [{"name": "Avg Score", "type": "bar", "data": data["dim_avg"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 6: Customer portfolio scatter
                                     cust_data = build_customer_analytics(display_tickets, display_scores)
@@ -7560,16 +7541,15 @@ def main_page():
                                         ]
                                         if bubble_pts:
                                             with ui.card().classes("w-full"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "bubble", "height": ch_bbl, "zoomType": "xy"},
-                                                    "title":  {"text": "Customer Portfolio: Volume vs Satisfaction"},
-                                                    "subtitle": {"text": "Bubble size = avg complexity · Hover for customer name"},
-                                                    "xAxis":  {"title": {"text": "Ticket Count"}},
-                                                    "yAxis":  {"title": {"text": "Avg Stars (1-5)"}, "min": 0, "max": 5},
-                                                    "tooltip": {"pointFormat": "<b>{point.name}</b><br>Tickets: {point.x}<br>Avg Stars: {point.y}<br>Avg Complexity: {point.z}"},
-                                                    "plotOptions": {"bubble": {"minSize": 8, "maxSize": 50, "dataLabels": {"enabled": False}}},
-                                                    "series": [{"name": "Customers", "data": bubble_pts, "color": "rgba(30,136,229,0.6)"}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":     {"text": "Customer Portfolio: Volume vs Satisfaction", "subtext": "Bubble size = avg complexity · Hover for customer name"},
+                                                    "tooltip":   {"trigger": "item", "formatter": "{b}<br/>Tickets: {c[0]}<br/>Avg Stars: {c[1]}<br/>Avg Complexity: {c[2]}"},
+                                                    "xAxis":     {"type": "value", "name": "Ticket Count"},
+                                                    "yAxis":     {"type": "value", "name": "Avg Stars (1-5)", "min": 0, "max": 5},
+                                                    "visualMap": {"show": False, "dimension": 2, "min": 3, "max": 50, "inRange": {"symbolSize": [8, 50]}},
+                                                    "color":     ["rgba(30,136,229,0.65)"],
+                                                    "series":    [{"name": "Customers", "type": "scatter", "data": [{"name": pt["name"], "value": [pt["x"], pt["y"], pt["z"]]} for pt in bubble_pts]}],
+                                                }).classes("w-full").style(f"height:{ch_bbl}px")
 
                                 # ── Cluster & Snapshot metrics ──────────────────────────
                                 ui.label("— Cluster & Snapshot Metrics —").classes("text-sm font-semibold text-gray-500 text-center w-full mt-2")
@@ -7577,47 +7557,40 @@ def main_page():
                                 with ui.row().classes("w-full gap-4"):
                                     # Snapshot count distribution
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                            "title":  {"text": "Snapshots per Ticket"},
-                                            "subtitle": {"text": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot"},
-                                            "xAxis":  {"categories": data["snap_bucket_labels"], "title": {"text": "Snapshot Count"}},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "colors": ["#00ACC1"],
-                                            "series": [{"name": "Tickets", "data": data["snap_bucket_values"]}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Snapshots per Ticket", "subtext": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot"},
+                                            "tooltip": {"trigger": "axis"},
+                                            "xAxis":   {"type": "category", "data": data["snap_bucket_labels"], "name": "Snapshot Count"},
+                                            "yAxis":   {"type": "value", "name": "Tickets"},
+                                            "color":   ["#00ACC1"],
+                                            "series":  [{"name": "Tickets", "type": "bar", "data": data["snap_bucket_values"]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Cluster names (if any detected)
                                     if data["cluster_name_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 180},
-                                                "title":  {"text": "Top Cluster Names by Ticket Count"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": data["cluster_name_labels"], "labels": {"style": {"fontSize": _fs_sm_str}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#5E35B1"],
-                                                "tooltip": {"pointFormat": "<b>{point.name}</b><br/>Tickets: {point.y}"},
-                                                "series":  [{"name": "Tickets", "data": [
-                                                    {"y": v, "name": data["cluster_name_labels"][i]}
-                                                    for i, v in enumerate(data["cluster_name_values"])
-                                                ]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Top Cluster Names by Ticket Count", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 190, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["cluster_name_labels"], "axisLabel": {"overflow": "truncate", "width": 170, "fontSize": _fs_sm}},
+                                                "color":    ["#5E35B1"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["cluster_name_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                     elif data["cluster_id_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 100},
-                                                "title":  {"text": "Top Cluster IDs by Ticket Count"},
-                                                "subtitle": {"text": "Hover bar for full UUID · click and drag to zoom"},
-                                                "xAxis":  {"categories": data["cluster_id_labels"], "labels": {"style": {"fontSize": _fs_sm_str, "fontFamily": "monospace"}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#5E35B1"],
-                                                "tooltip": {"pointFormat": "<span style='font-family:monospace'>{point.name}</span><br/>Tickets: {point.y}"},
-                                                "series":  [{"name": "Tickets", "data": [
-                                                    {"y": v, "name": data["cluster_id_full"][i]}
-                                                    for i, v in enumerate(data["cluster_id_values"])
-                                                ]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 110, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["cluster_id_labels"], "axisLabel": {"fontFamily": "monospace", "overflow": "truncate", "width": 90, "fontSize": _fs_sm}},
+                                                "color":    ["#5E35B1"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                     else:
                                         with ui.card().classes("flex-1"):
                                             ui.label("No cluster names or IDs detected in ticket data.").classes("text-sm text-gray-400 p-4")
@@ -7625,41 +7598,38 @@ def main_page():
                                 # Cluster IDs (separate row, only if both names and IDs exist)
                                 if data["cluster_name_labels"] and data["cluster_id_labels"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":  {"type": "bar", "height": ch, "zoomType": "y", "marginLeft": 100},
-                                            "title":  {"text": "Top Cluster IDs by Ticket Count"},
-                                            "subtitle": {"text": "Hover bar for full UUID · click and drag to zoom"},
-                                            "xAxis":  {"categories": data["cluster_id_labels"], "labels": {"style": {"fontSize": _fs_sm_str, "fontFamily": "monospace"}, "overflow": "allow", "crop": False}},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "colors": ["#3949AB"],
-                                            "tooltip": {"pointFormat": "<span style='font-family:monospace'>{point.name}</span><br/>Tickets: {point.y}"},
-                                            "series":  [{"name": "Tickets", "data": [
-                                                {"y": v, "name": data["cluster_id_full"][i]}
-                                                for i, v in enumerate(data["cluster_id_values"])
-                                            ]}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                            "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                            "grid":     {"left": 110, "right": 60},
+                                            "xAxis":    {"type": "value", "name": "Tickets"},
+                                            "yAxis":    {"type": "category", "data": data["cluster_id_labels"], "axisLabel": {"fontFamily": "monospace", "overflow": "truncate", "width": 90, "fontSize": _fs_sm}},
+                                            "color":    ["#3949AB"],
+                                            "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch}px")
 
                                 # Unique clusters vs tickets per version
                                 if data["clusters_by_version_labels"]:
+                                    _cv_h = max(ch, len(data["clusters_by_version_labels"]) * 36 + 80)
                                     with ui.row().classes("w-full gap-4 items-center mt-2"):
                                         with ui.card().classes("px-6 py-3 text-center"):
                                             ui.label(str(data["unique_cluster_total"])).classes("text-3xl font-bold text-teal-600")
                                             ui.label("Unique Clusters Seen (all tickets)").classes("text-xs text-gray-500")
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":  {"type": "bar", "height": max(ch, len(data["clusters_by_version_labels"]) * 36 + 80), "zoomType": "y", "marginLeft": 90},
-                                            "title":  {"text": "Unique Clusters vs Tickets — by Version"},
-                                            "subtitle": {"text": f"{data['unique_cluster_total']} unique cluster UUIDs across all tickets · click and drag to zoom"},
-                                            "xAxis":  {"categories": data["clusters_by_version_labels"], "title": {"text": "Version"}, "labels": {"style": {"fontSize": _fs_str}, "overflow": "allow", "crop": False}},
-                                            "yAxis":  {"title": {"text": "Count"}, "allowDecimals": False},
-                                            "tooltip": {"shared": True},
-                                            "plotOptions": {"bar": {"grouping": True}},
-                                            "colors": ["#00897B", "#1E88E5"],
-                                            "series": [
-                                                {"name": "Unique Clusters", "data": data["clusters_by_version_values"]},
-                                                {"name": "Tickets",         "data": data["tickets_by_version_for_clusters"]},
+                                        ui.echart({
+                                            "title":   {"text": "Unique Clusters vs Tickets — by Version", "subtext": f"{data['unique_cluster_total']} unique cluster UUIDs · drag to zoom"},
+                                            "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "legend":  {"bottom": 0},
+                                            "grid":    {"left": 100, "bottom": 50},
+                                            "xAxis":   {"type": "value", "name": "Count", "minInterval": 1},
+                                            "yAxis":   {"type": "category", "data": data["clusters_by_version_labels"], "axisLabel": {"fontSize": _fs_sm}},
+                                            "color":   ["#00897B", "#1E88E5"],
+                                            "series":  [
+                                                {"name": "Unique Clusters", "type": "bar", "data": data["clusters_by_version_values"]},
+                                                {"name": "Tickets",         "type": "bar", "data": data["tickets_by_version_for_clusters"]},
                                             ],
-                                        }).classes("w-full")
+                                        }).classes("w-full").style(f"height:{_cv_h}px")
 
                                 # ── CBSE Document Analytics ──────────────────────────────────────
                                 if data["cbse_total"] > 0:
@@ -7679,26 +7649,27 @@ def main_page():
                                     with ui.row().classes("w-full gap-4"):
                                         if data["cbse_year_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                    "title":  {"text": "CBSEs Generated per Year"},
-                                                    "xAxis":  {"categories": data["cbse_year_labels"], "title": {"text": "Year"}},
-                                                    "yAxis":  {"title": {"text": "CBSE Count"}, "allowDecimals": False},
-                                                    "colors": ["#7B1FA2"],
-                                                    "series": [{"name": "CBSEs", "data": data["cbse_year_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "CBSEs Generated per Year"},
+                                                    "tooltip": {"trigger": "axis"},
+                                                    "xAxis":   {"type": "category", "data": data["cbse_year_labels"], "name": "Year"},
+                                                    "yAxis":   {"type": "value", "name": "CBSE Count", "minInterval": 1},
+                                                    "color":   ["#7B1FA2"],
+                                                    "series":  [{"name": "CBSEs", "type": "bar", "data": data["cbse_year_values"], "label": {"show": True, "position": "top"}}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         if data["cbse_month_keys"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "line", "height": ch_sm, "zoomType": "x"},
-                                                    "title":  {"text": "CBSEs Generated per Month"},
-                                                    "subtitle": {"text": "Click and drag to zoom"},
-                                                    "xAxis":  {"categories": data["cbse_month_keys"], "title": {"text": "Month"}, "labels": {"rotation": -45, "style": {"fontSize": _fs_str}, "overflow": "allow"}},
-                                                    "yAxis":  {"title": {"text": "CBSE Count"}, "allowDecimals": False},
-                                                    "colors": ["#5C6BC0"],
-                                                    "series": [{"name": "CBSEs", "data": data["cbse_month_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":    {"text": "CBSEs Generated per Month", "subtext": "Drag to zoom"},
+                                                    "tooltip":  {"trigger": "axis"},
+                                                    "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                    "grid":     {"bottom": 60},
+                                                    "xAxis":    {"type": "category", "data": data["cbse_month_keys"], "name": "Month", "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                                    "yAxis":    {"type": "value", "name": "CBSE Count", "minInterval": 1},
+                                                    "color":    ["#5C6BC0"],
+                                                    "series":   [{"name": "CBSEs", "type": "line", "smooth": True, "data": data["cbse_month_values"]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Enriched topology charts (only when ≥1 ticket enriched) ──────
                                 if data["enriched_ticket_count"] > 0:
@@ -7712,96 +7683,85 @@ def main_page():
                                     # Row 1: Node count distribution + Bucket count distribution
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Node Count Distribution"},
-                                                "subtitle": {"text": "Cluster size across enriched tickets"},
-                                                "xAxis":  {"categories": data["node_dist_labels"], "title": {"text": "Nodes"}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#1E88E5"],
-                                                "series": [{"name": "Tickets", "data": data["node_dist_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Node Count Distribution", "subtext": "Cluster size across enriched tickets"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": data["node_dist_labels"], "name": "Nodes"},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#1E88E5"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["node_dist_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         if data["bucket_dist_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                    "title":  {"text": "Bucket Count per Cluster"},
-                                                    "subtitle": {"text": "Number of buckets configured"},
-                                                    "xAxis":  {"categories": data["bucket_dist_labels"], "title": {"text": "Buckets"}},
-                                                    "yAxis":  {"title": {"text": "Tickets"}},
-                                                    "colors": ["#43A047"],
-                                                    "series": [{"name": "Tickets", "data": data["bucket_dist_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "Bucket Count per Cluster", "subtext": "Number of buckets configured"},
+                                                    "tooltip": {"trigger": "axis"},
+                                                    "xAxis":   {"type": "category", "data": data["bucket_dist_labels"], "name": "Buckets"},
+                                                    "yAxis":   {"type": "value", "name": "Tickets"},
+                                                    "color":   ["#43A047"],
+                                                    "series":  [{"name": "Tickets", "type": "bar", "data": data["bucket_dist_values"]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 2: RAM per node tier + Auto-failover distribution
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "RAM per Node"},
-                                                "subtitle": {"text": "Memory tier across enriched clusters"},
-                                                "xAxis":  {"categories": data["ram_labels"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#FB8C00"],
-                                                "series": [{"name": "Tickets", "data": data["ram_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "RAM per Node", "subtext": "Memory tier across enriched clusters"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": data["ram_labels"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#FB8C00"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["ram_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Auto-Failover Setting"},
-                                                "subtitle": {"text": "Configured threshold across enriched clusters"},
-                                                "xAxis":  {"categories": data["af_labels"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#E53935"],
-                                                "series": [{"name": "Tickets", "data": data["af_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Auto-Failover Setting", "subtext": "Configured threshold across enriched clusters"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": data["af_labels"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#E53935"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["af_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 3: LDAP status + CB version from snapshot
                                     with ui.row().classes("w-full gap-4"):
                                         _ldap_total = sum(data["ldap_values"])
                                         if _ldap_total > 0:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "pie", "height": ch_sm},
-                                                    "title":  {"text": "LDAP Status"},
-                                                    "subtitle": {"text": "Across enriched clusters"},
-                                                    "colors": ["#43A047", "#E53935", "#9E9E9E"],
-                                                    "series": [{
-                                                        "name": "Tickets",
-                                                        "data": [
-                                                            {"name": l, "y": v}
-                                                            for l, v in zip(data["ldap_labels"], data["ldap_values"])
-                                                            if v > 0
-                                                        ],
-                                                    }],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "LDAP Status", "subtext": "Across enriched clusters"},
+                                                    "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                                    "color":   ["#43A047", "#E53935", "#9E9E9E"],
+                                                    "series":  [{"name": "Tickets", "type": "pie", "radius": "62%", "data": [{"name": l, "value": v} for l, v in zip(data["ldap_labels"], data["ldap_values"]) if v > 0]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         if data["topo_version_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 90},
-                                                    "title":  {"text": "CB Version Distribution"},
-                                                    "subtitle": {"text": "All tickets — ticket fields primary, snapshot fallback"},
-                                                    "xAxis":  {"categories": data["topo_version_labels"], "labels": {"style": {"fontSize": _fs_str}, "overflow": "allow", "crop": False}},
-                                                    "yAxis":  {"title": {"text": "Tickets"}},
-                                                    "colors": ["#8E24AA"],
-                                                    "series": [{"name": "Tickets", "data": data["topo_version_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "CB Version Distribution", "subtext": "Ticket fields primary, snapshot fallback"},
+                                                    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                    "grid":    {"left": 100},
+                                                    "xAxis":   {"type": "value", "name": "Tickets"},
+                                                    "yAxis":   {"type": "category", "data": data["topo_version_labels"], "axisLabel": {"fontSize": _fs_sm}},
+                                                    "color":   ["#8E24AA"],
+                                                    "series":  [{"name": "Tickets", "type": "bar", "data": data["topo_version_values"]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 4: Orchestrator hotspot (full width if data present)
                                     if data["orchestrator_labels"]:
                                         with ui.card().classes("w-full"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch, "zoomType": "y", "marginLeft": 180},
-                                                "title":  {"text": "Orchestrator Node Hotspot"},
-                                                "subtitle": {"text": "Top 10 nodes most often acting as orchestrator · click and drag to zoom"},
-                                                "xAxis":  {"categories": data["orchestrator_labels"], "labels": {"style": {"fontSize": _fs_sm_str, "fontFamily": "monospace"}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#00ACC1"],
-                                                "series": [{"name": "Tickets", "data": data["orchestrator_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Orchestrator Node Hotspot", "subtext": "Top 10 nodes most often acting as orchestrator · drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 190, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["orchestrator_labels"], "axisLabel": {"fontFamily": "monospace", "overflow": "truncate", "width": 170, "fontSize": _fs_sm}},
+                                                "color":    ["#00ACC1"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["orchestrator_values"]}],
+                                            }).classes("w-full").style(f"height:{ch}px")
 
                             cust_label = state.get("_main_chart_label", "All Customers")
                             chart_status.set_text(
@@ -7810,7 +7770,7 @@ def main_page():
                                 f"Customer: {cust_label}"
                             )
                             # Record how many charts belong to the main section
-                            js_count = "document.querySelectorAll('svg.highcharts-root').length"
+                            js_count = "(function(){var EC=window.echarts;if(!EC)return 0;var n=0;document.querySelectorAll('.nicegui-echart').forEach(function(el){if(EC.getInstanceByDom(el))n++;});return n;})()"
                             if client:
                                 try:
                                     state["_main_chart_count"] = await client.run_javascript(js_count)
@@ -8057,44 +8017,27 @@ def main_page():
                             btn_export_pdf.set_enabled(False)
                             chart_status.set_text("Collecting chart data …")
                             try:
-                                # ── Collect SVG + title text from every live Highcharts instance ──
+                                # ── Collect PNG data URLs from every live ECharts instance ──
                                 collect_js = """
                                 (function() {
-                                    var out = [], ser = new XMLSerializer();
-                                    var HC = window.Highcharts || window._Highcharts;
-                                    if (HC && HC.charts) {
-                                        for (var j = 0; j < HC.charts.length; j++) {
-                                            var c = HC.charts[j];
-                                            if (!c) continue;
-                                            var el = c.container && c.container.querySelector('svg');
-                                            if (!el) continue;
-                                            try {
-                                                out.push({
-                                                    svg:      ser.serializeToString(el),
-                                                    title:    (c.title    && c.title.textStr)    || '',
-                                                    subtitle: (c.subtitle && c.subtitle.textStr) || ''
-                                                });
-                                            } catch(e) {}
-                                        }
-                                    }
-                                    if (out.length === 0) {
-                                        var els = document.querySelectorAll('svg.highcharts-root');
-                                        for (var i = 0; i < els.length; i++) {
-                                            var tEl = els[i].querySelector('.highcharts-title');
-                                            var sEl = els[i].querySelector('.highcharts-subtitle');
-                                            try {
-                                                out.push({
-                                                    svg:      ser.serializeToString(els[i]),
-                                                    title:    tEl ? tEl.textContent.trim() : '',
-                                                    subtitle: sEl ? sEl.textContent.trim() : ''
-                                                });
-                                            } catch(e) {}
-                                        }
-                                    }
+                                    var out = [], EC = window.echarts;
+                                    if (!EC) return out;
+                                    document.querySelectorAll('.nicegui-echart').forEach(function(el) {
+                                        var inst = EC.getInstanceByDom(el);
+                                        if (!inst) return;
+                                        var opts  = inst.getOption();
+                                        var tArr  = opts.title || [];
+                                        var title = (tArr[0] && tArr[0].text)    || '';
+                                        var sub   = (tArr[0] && tArr[0].subtext) || '';
+                                        try {
+                                            var img = inst.getDataURL({type: 'png', pixelRatio: 2, backgroundColor: '#fff'});
+                                            out.push({img: img, title: title, subtitle: sub});
+                                        } catch(e) {}
+                                    });
                                     return out;
                                 })()
                                 """
-                                charts = await _cl.run_javascript(collect_js, timeout=15.0)
+                                charts = await _cl.run_javascript(collect_js, timeout=20.0)
                                 if not charts:
                                     ui.notify("No charts found — generate charts first.",
                                               type="warning")
@@ -8153,12 +8096,6 @@ def main_page():
                                     f"{'landscape' if _landscape else 'portrait'}; margin: 0.5in; }}"
                                 )
 
-                                def _fix_svg(svg: str) -> str:
-                                    svg = re.sub(r'(\d+(?:\.\d+)?)rem',
-                                                 lambda m: f"{float(m.group(1)) * 16:.1f}px", svg)
-                                    svg = re.sub(r'<foreignObject[\s\S]*?</foreignObject>', '', svg)
-                                    return svg
-
                                 def _section_page(title: str, desc: str) -> str:
                                     return (
                                         f'<div class="page section-page">'
@@ -8172,14 +8109,14 @@ def main_page():
                                 def _chart_page(ch: dict) -> str:
                                     title = (ch.get("title") or "").strip()
                                     desc  = _CHART_DESC.get(title, "")
-                                    svg   = _fix_svg(ch.get("svg", ""))
+                                    img   = ch.get("img", "")
                                     cap   = (
                                         f'<p class="caption">{_html.escape(desc)}</p>'
                                         if desc else ""
                                     )
                                     return (
                                         f'<div class="page chart-page">'
-                                        f'<div class="chart-wrap">{svg}</div>'
+                                        f'<div class="chart-wrap"><img src="{img}" alt="{_html.escape(title)}"></div>'
                                         f'{cap}</div>'
                                     )
 
@@ -8244,8 +8181,8 @@ def main_page():
 
   /* Chart */
   .chart-page{{justify-content:flex-start;padding-top:0.4in}}
-  .chart-wrap{{width:100%;flex:1}}
-  .chart-wrap svg{{width:100%!important;height:auto!important;max-height:80vh}}
+  .chart-wrap{{width:100%;flex:1;display:flex;align-items:center;justify-content:center}}
+  .chart-wrap img{{width:100%;height:auto;max-height:80vh;object-fit:contain}}
   .caption{{width:100%;margin-top:0.3rem;font-size:0.72rem;color:#555;
             line-height:1.5;border-top:1px solid #e0e0e0;padding-top:0.25rem;
             max-width:9in}}
@@ -8297,37 +8234,37 @@ def main_page():
                         async def _diag_charts():
                             diag_js = """
                             (function() {
-                                var ser = new XMLSerializer();
-                                var domSvgs = document.querySelectorAll('svg.highcharts-root');
-                                var svgLen = 0, svgErr = null;
-                                if (domSvgs.length > 0) {
-                                    try {
-                                        var s = ser.serializeToString(domSvgs[0]);
-                                        svgLen = s ? s.length : 0;
-                                    } catch(e) { svgErr = e.toString(); }
-                                }
-                                var HC = window.Highcharts || window._Highcharts;
-                                var hcLen = (HC && HC.charts) ? HC.charts.length : -1;
-                                var live  = (HC && HC.charts) ? HC.charts.filter(function(c){ return !!c; }).length : 0;
+                                var EC = window.echarts;
+                                var containers = document.querySelectorAll('.nicegui-echart');
+                                var live = 0, dataUrlLen = 0, dataUrlErr = null;
+                                containers.forEach(function(el) {
+                                    var inst = EC && EC.getInstanceByDom(el);
+                                    if (!inst) return;
+                                    live++;
+                                    if (dataUrlLen === 0) {
+                                        try {
+                                            var d = inst.getDataURL({type:'png', pixelRatio:1, backgroundColor:'#fff'});
+                                            dataUrlLen = d ? d.length : 0;
+                                        } catch(e) { dataUrlErr = e.toString(); }
+                                    }
+                                });
                                 return {
-                                    domSvgCount:    domSvgs.length,
-                                    svgLen:         svgLen,
-                                    svgErr:         svgErr,
-                                    has_Highcharts: typeof window.Highcharts !== 'undefined',
-                                    hcChartsLen:    hcLen,
-                                    liveCharts:     live,
+                                    ecContainers: containers.length,
+                                    liveCharts:   live,
+                                    has_ECharts:  typeof EC !== 'undefined',
+                                    dataUrlLen:   dataUrlLen,
+                                    dataUrlErr:   dataUrlErr,
                                 };
                             })()
                             """
                             try:
                                 result = await ui.run_javascript(diag_js, timeout=10.0)
                                 msg = (
-                                    f"DOM svgs: {result.get('domSvgCount')} | "
-                                    f"svgLen: {result.get('svgLen')} | "
-                                    f"Highcharts global: {result.get('has_Highcharts')} | "
-                                    f"HC.charts[]: {result.get('hcChartsLen')} | "
-                                    f"live: {result.get('liveCharts')}"
-                                    + (f" | svgErr: {result.get('svgErr')}" if result.get('svgErr') else "")
+                                    f"EC containers: {result.get('ecContainers')} | "
+                                    f"live instances: {result.get('liveCharts')} | "
+                                    f"echarts global: {result.get('has_ECharts')} | "
+                                    f"dataUrl len: {result.get('dataUrlLen')}"
+                                    + (f" | err: {result.get('dataUrlErr')}" if result.get('dataUrlErr') else "")
                                 )
                                 chart_status.set_text(msg)
                                 ui.notify(msg, timeout=15000)
@@ -8516,43 +8453,34 @@ def main_page():
                             dim_keys  = ["avg_stars", "avg_complexity", "avg_resolution_quality",
                                          "avg_response_timeliness", "avg_communication_clarity"]
 
-                            series = []
+                            ec_series = []
                             for org in selected:
                                 v = cust_data.get(org)
                                 if not v or v["scored_count"] == 0:
                                     radar_status.set_text(f"No scored tickets for: {org}")
                                     continue
-                                series.append({
-                                    "name": org,
-                                    "data": [v[k] for k in dim_keys],
-                                    "pointPlacement": "on",
+                                ec_series.append({
+                                    "name":  org,
+                                    "value": [round(v[k], 2) for k in dim_keys],
                                 })
 
-                            if not series:
+                            if not ec_series:
                                 radar_status.set_text("No scored data for selected customers.")
                                 btn_radar.set_enabled(True)
                                 return
 
                             with radar_area:
-                                ui.highchart({
-                                    "chart":   {"polar": True, "type": "line", "height": 420},
+                                ui.echart({
                                     "title":   {"text": "Customer Dimension Comparison"},
-                                    "pane":    {"size": "75%"},
-                                    "xAxis":   {
-                                        "categories":        dims,
-                                        "tickmarkPlacement": "on",
-                                        "lineWidth":         0,
+                                    "tooltip": {"trigger": "item"},
+                                    "legend":  {"bottom": 0, "data": [s["name"] for s in ec_series]},
+                                    "radar":   {
+                                        "indicator": [{"name": d, "max": 5} for d in dims],
+                                        "shape": "polygon",
+                                        "splitNumber": 5,
                                     },
-                                    "yAxis":   {
-                                        "gridLineInterpolation": "polygon",
-                                        "lineWidth": 0,
-                                        "min": 0, "max": 5,
-                                        "tickInterval": 1,
-                                    },
-                                    "tooltip": {"shared": True, "pointFormat": "<b>{series.name}</b>: {point.y:.2f}<br/>"},
-                                    "legend":  {"enabled": True},
-                                    "series":  series,
-                                }).classes("w-full")
+                                    "series":  [{"type": "radar", "data": ec_series}],
+                                }).classes("w-full").style("height:420px")
 
                                 # Summary table below radar
                                 rows = []
@@ -8583,14 +8511,14 @@ def main_page():
 
                                 # ── Ticket count per customer ─────────────────────────────
                                 with ui.card().classes("w-full mt-4"):
-                                    ui.highchart({
-                                        "chart":  {"type": "column", "height": 280, "zoomType": "x"},
-                                        "title":  {"text": "Ticket Count by Customer"},
-                                        "xAxis":  {"categories": selected, "labels": {"rotation": -30, "style": {"fontSize": "11px"}, "overflow": "allow"}},
-                                        "yAxis":  {"title": {"text": "Tickets"}},
-                                        "series": [{"name": "Total Tickets", "color": "#1E88E5",
-                                                    "data": [cust_data.get(o, {}).get("ticket_count", 0) for o in selected]}],
-                                    }).classes("w-full")
+                                    ui.echart({
+                                        "title":   {"text": "Ticket Count by Customer"},
+                                        "tooltip": {"trigger": "axis"},
+                                        "xAxis":   {"type": "category", "data": selected, "axisLabel": {"rotate": 30, "fontSize": 11, "overflow": "truncate", "width": 100}},
+                                        "yAxis":   {"type": "value", "name": "Tickets"},
+                                        "color":   ["#1E88E5"],
+                                        "series":  [{"name": "Total Tickets", "type": "bar", "data": [cust_data.get(o, {}).get("ticket_count", 0) for o in selected]}],
+                                    }).classes("w-full").style("height:280px")
 
                                 # ── Priority breakdown per customer ───────────────────────
                                 from collections import Counter as _Counter
@@ -8609,18 +8537,20 @@ def main_page():
                                 }
                                 all_priorities = sorted({p for d in pri_counts.values() for p in d})
                                 with ui.card().classes("w-full mt-4"):
-                                    ui.highchart({
-                                        "chart":       {"type": "column", "height": 300, "zoomType": "x"},
-                                        "title":       {"text": "Priority Breakdown by Customer"},
-                                        "xAxis":       {"categories": selected, "labels": {"rotation": -30, "style": {"fontSize": "11px"}, "overflow": "allow"}},
-                                        "yAxis":       {"title": {"text": "Tickets"}, "stackLabels": {"enabled": True}},
-                                        "plotOptions": {"column": {"stacking": "normal"}},
-                                        "series": [
-                                            {"name": p, "data": [pri_counts[o].get(p, 0) for o in selected],
-                                             "color": _CMP_PRI_COLOR_MAP.get(p.lower(), "#9E9E9E")}
+                                    ui.echart({
+                                        "title":   {"text": "Priority Breakdown by Customer"},
+                                        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                        "legend":  {"bottom": 0},
+                                        "grid":    {"bottom": 50},
+                                        "xAxis":   {"type": "category", "data": selected, "axisLabel": {"rotate": 30, "fontSize": 11, "overflow": "truncate", "width": 100}},
+                                        "yAxis":   {"type": "value", "name": "Tickets"},
+                                        "series":  [
+                                            {"name": p, "type": "bar", "stack": "total",
+                                             "itemStyle": {"color": _CMP_PRI_COLOR_MAP.get(p.lower(), "#9E9E9E")},
+                                             "data": [pri_counts[o].get(p, 0) for o in selected]}
                                             for p in all_priorities
                                         ],
-                                    }).classes("w-full")
+                                    }).classes("w-full").style("height:300px")
 
                                 # ── Stars distribution per customer ───────────────────────
                                 if state["scores"]:
@@ -8635,19 +8565,20 @@ def main_page():
                                             idx = min(max(int(float(sc["stars"])), 1), 5) - 1
                                             star_by_org[org][idx] += 1
                                     with ui.card().classes("w-full mt-4"):
-                                        ui.highchart({
-                                            "chart":  {"type": "column", "height": 320, "zoomType": "x"},
-                                            "title":  {"text": "Experience Stars Distribution by Customer"},
-                                            "xAxis":  {"categories": ["★1", "★2", "★3", "★4", "★5"]},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "plotOptions": {"column": {"grouping": True}},
-                                            "series": [
-                                                {"name": org, "data": star_by_org[org]}
+                                        ui.echart({
+                                            "title":   {"text": "Experience Stars Distribution by Customer"},
+                                            "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "legend":  {"bottom": 0},
+                                            "grid":    {"bottom": 50},
+                                            "xAxis":   {"type": "category", "data": ["★1","★2","★3","★4","★5"]},
+                                            "yAxis":   {"type": "value", "name": "Tickets"},
+                                            "series":  [
+                                                {"name": org, "type": "bar", "data": star_by_org[org]}
                                                 for org in selected
                                             ],
-                                        }).classes("w-full")
+                                        }).classes("w-full").style("height:320px")
 
-                            radar_status.set_text(f"Comparing {len(series)} customers.")
+                            radar_status.set_text(f"Comparing {len(ec_series)} customers.")
                             state["_comparison_orgs"] = selected
                             btn_radar.set_enabled(True)
 
@@ -8770,79 +8701,82 @@ def main_page():
                                 with ui.row().classes("w-full gap-4"):
                                     if prof["year_keys"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": 240},
-                                                "title":  {"text": "Tickets per Year"},
-                                                "xAxis":  {"categories": prof["year_keys"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                                "colors": ["#3949AB"],
-                                                "plotOptions": {"column": {"dataLabels": {"enabled": True}}},
-                                                "series": [{"name": "Tickets", "data": prof["year_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Tickets per Year"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": prof["year_keys"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                "color":   ["#3949AB"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": prof["year_values"], "label": {"show": True, "position": "top"}}],
+                                            }).classes("w-full").style("height:240px")
 
                                     if prof["month_keys"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": 240, "zoomType": "x"},
-                                                "title":  {"text": "Tickets per Month"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": prof["month_keys"], "labels": {"rotation": -45, "style": {"fontSize": "10px"}}},
-                                                "yAxis":  {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                                "colors": ["#1E88E5"],
-                                                "series": [{"name": "Tickets", "data": prof["month_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Tickets per Month", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis"},
+                                                "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                "grid":     {"bottom": 50},
+                                                "xAxis":    {"type": "category", "data": prof["month_keys"], "axisLabel": {"rotate": 45, "fontSize": 10}},
+                                                "yAxis":    {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                "color":    ["#1E88E5"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": prof["month_values"]}],
+                                            }).classes("w-full").style("height:240px")
 
                                 # ── Row 2: Priority per month (stacked) ───────────────────
                                 if prof["month_keys"] and prof["all_priorities"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":       {"type": "column", "height": 300, "zoomType": "x"},
-                                            "title":       {"text": "Ticket Priority per Month"},
-                                            "subtitle":    {"text": "Click and drag to zoom"},
-                                            "xAxis":       {"categories": prof["pri_month_keys"], "labels": {"rotation": -45, "style": {"fontSize": "10px"}}},
-                                            "yAxis":       {"title": {"text": "Tickets"}, "stackLabels": {"enabled": True}},
-                                            "plotOptions": {"column": {"stacking": "normal"}},
-                                            "series":      [
-                                                {"name": p, "data": prof["pri_by_month"][p], "color": _pri_color(p)}
+                                        ui.echart({
+                                            "title":    {"text": "Ticket Priority per Month", "subtext": "Drag to zoom"},
+                                            "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "legend":   {"bottom": 0},
+                                            "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                            "grid":     {"bottom": 80},
+                                            "xAxis":    {"type": "category", "data": prof["pri_month_keys"], "axisLabel": {"rotate": 45, "fontSize": 10}},
+                                            "yAxis":    {"type": "value", "name": "Tickets"},
+                                            "series":   [
+                                                {"name": p, "type": "bar", "stack": "total",
+                                                 "itemStyle": {"color": _pri_color(p)},
+                                                 "data": prof["pri_by_month"][p]}
                                                 for p in prof["all_priorities"]
                                             ],
-                                        }).classes("w-full")
+                                        }).classes("w-full").style("height:300px")
 
                                 # ── Row 3: Composition ────────────────────────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     if prof["feature_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "pie", "height": 280},
-                                                "title":  {"text": "Feature Area Breakdown"},
-                                                "plotOptions": {"pie": {"innerSize": "40%", "dataLabels": {"enabled": True, "format": "<b>{point.name}</b>: {point.percentage:.1f}%"}}},
-                                                "series":  [{"name": "Tickets", "data": list(zip(prof["feature_labels"], prof["feature_values"]))}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Feature Area Breakdown"},
+                                                "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                                "series":  [{"name": "Tickets", "type": "pie", "radius": ["38%", "65%"], "label": {"formatter": "{b}: {d}%", "fontSize": 10}, "data": [{"name": l, "value": v} for l, v in zip(prof["feature_labels"], prof["feature_values"])]}],
+                                            }).classes("w-full").style("height:280px")
 
                                     if prof["version_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": 280, "zoomType": "y", "marginLeft": 90},
-                                                "title":  {"text": "CB Version Distribution"},
-                                                "subtitle": {"text": "From ticket fields + snapshots"},
-                                                "xAxis":  {"categories": prof["version_labels"], "labels": {"style": {"fontSize": "10px"}}},
-                                                "yAxis":  {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                                "colors": ["#0277BD"],
-                                                "series": [{"name": "Tickets", "data": prof["version_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "CB Version Distribution", "subtext": "From ticket fields + snapshots"},
+                                                "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "grid":    {"left": 100},
+                                                "xAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                "yAxis":   {"type": "category", "data": prof["version_labels"], "axisLabel": {"fontSize": 10}},
+                                                "color":   ["#0277BD"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": prof["version_values"]}],
+                                            }).classes("w-full").style("height:280px")
 
                                 # ── Row 4: Satisfaction trend ─────────────────────────────
                                 if prof["stars_trend_keys"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":  {"type": "line", "height": 240, "zoomType": "x"},
-                                            "title":  {"text": "Avg Satisfaction Stars per Month"},
-                                            "subtitle": {"text": "Based on AI-scored tickets · click and drag to zoom"},
-                                            "xAxis":  {"categories": prof["stars_trend_keys"], "labels": {"rotation": -45, "style": {"fontSize": "10px"}}},
-                                            "yAxis":  {"title": {"text": "Avg Stars"}, "min": 1, "max": 5, "tickInterval": 1},
-                                            "colors": ["#F9A825"],
-                                            "series": [{"name": "Avg Stars", "data": prof["stars_trend_values"], "marker": {"enabled": True}}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":    {"text": "Avg Satisfaction Stars per Month", "subtext": "AI-scored · drag to zoom"},
+                                            "tooltip":  {"trigger": "axis"},
+                                            "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                            "grid":     {"bottom": 50},
+                                            "xAxis":    {"type": "category", "data": prof["stars_trend_keys"], "axisLabel": {"rotate": 45, "fontSize": 10}},
+                                            "yAxis":    {"type": "value", "name": "Avg Stars", "min": 1, "max": 5, "minInterval": 1},
+                                            "color":    ["#F9A825"],
+                                            "series":   [{"name": "Avg Stars", "type": "line", "smooth": True, "symbol": "circle", "data": prof["stars_trend_values"]}],
+                                        }).classes("w-full").style("height:240px")
 
                                 # ── Cluster list (if any) ─────────────────────────────────
                                 if prof["cluster_list"]:
@@ -9034,8 +8968,9 @@ def main_page():
 
                                 # ── Time-series charts ────────────────────────────────────
                                 for spec in chart_specs:
+                                    _ch = spec.pop("_height", 280)
                                     with ui.card().classes("w-full"):
-                                        ui.highchart(spec).classes("w-full")
+                                        ui.echart(spec).classes("w-full").style(f"height:{_ch}px")
 
                                 # ── CB Version & Orchestrator change log ──────────────────
                                 version_changes = [
@@ -9869,30 +9804,34 @@ def main_page():
 
                             with ch_tl_area:
                                 # Bad + Warn over time
-                                ui.highchart({
-                                    "chart":  {"type": "line", "height": ch_h, "zoomType": "x"},
-                                    "title":  {"text": f"Issue Count Over Time — {cluster_label}"},
-                                    "subtitle": {"text": "Click and drag to zoom · bad=red, warn=orange"},
-                                    "xAxis":  {"categories": dates, "labels": {"rotation": -45}},
-                                    "yAxis":  {"title": {"text": "Issue Count"}, "allowDecimals": False, "min": 0},
-                                    "colors": ["#E53935", "#FB8C00"],
-                                    "series": [
-                                        {"name": "Bad",  "data": bad_vals,  "color": "#E53935"},
-                                        {"name": "Warn", "data": warn_vals, "color": "#FB8C00"},
+                                ui.echart({
+                                    "title":    {"text": f"Issue Count Over Time — {cluster_label}", "subtext": "bad=red, warn=orange · drag to zoom"},
+                                    "tooltip":  {"trigger": "axis"},
+                                    "legend":   {"bottom": 0},
+                                    "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                    "grid":     {"bottom": 70},
+                                    "xAxis":    {"type": "category", "data": dates, "axisLabel": {"rotate": 45}},
+                                    "yAxis":    {"type": "value", "name": "Issue Count", "minInterval": 1, "min": 0},
+                                    "color":    ["#E53935", "#FB8C00"],
+                                    "series":   [
+                                        {"name": "Bad",  "type": "line", "smooth": True, "data": bad_vals,  "itemStyle": {"color": "#E53935"}},
+                                        {"name": "Warn", "type": "line", "smooth": True, "data": warn_vals, "itemStyle": {"color": "#FB8C00"}},
                                     ],
-                                }).classes("w-full")
+                                }).classes("w-full").style(f"height:{ch_h}px")
 
                                 # Node count over time
                                 if any(n > 0 for n in node_vals):
-                                    ui.highchart({
-                                        "chart":  {"type": "line", "height": max(240, int(_win_h * 0.25)), "zoomType": "x"},
-                                        "title":  {"text": f"Node Count Over Time — {cluster_label}"},
-                                        "subtitle": {"text": f"min={ci.get('node_count_min')} · max={ci.get('node_count_max')}"},
-                                        "xAxis":  {"categories": dates, "labels": {"rotation": -45}},
-                                        "yAxis":  {"title": {"text": "Nodes"}, "allowDecimals": False, "min": 0},
-                                        "colors": ["#1E88E5"],
-                                        "series": [{"name": "Nodes", "data": node_vals}],
-                                    }).classes("w-full")
+                                    _nc_h = max(240, int(_win_h * 0.25))
+                                    ui.echart({
+                                        "title":    {"text": f"Node Count Over Time — {cluster_label}", "subtext": f"min={ci.get('node_count_min')} · max={ci.get('node_count_max')}"},
+                                        "tooltip":  {"trigger": "axis"},
+                                        "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                        "grid":     {"bottom": 70},
+                                        "xAxis":    {"type": "category", "data": dates, "axisLabel": {"rotate": 45}},
+                                        "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1, "min": 0},
+                                        "color":    ["#1E88E5"],
+                                        "series":   [{"name": "Nodes", "type": "line", "smooth": True, "data": node_vals}],
+                                    }).classes("w-full").style(f"height:{_nc_h}px")
 
                                 # Version markers (show where version changed)
                                 version_changes = []
@@ -9978,18 +9917,20 @@ def main_page():
                                     labels = [c.get("cluster_name") or cid2[:12] for cid2, c in top20]
                                     bad_data  = [c.get("total_bad",  0) for _, c in top20]
                                     warn_data = [c.get("total_warn", 0) for _, c in top20]
-                                    ui.highchart({
-                                        "chart":  {"type": "bar", "height": max(ch_h, len(top20) * 28 + 80), "zoomType": "y"},
-                                        "title":  {"text": "Total Bad + Warn Issues by Cluster"},
-                                        "xAxis":  {"categories": labels},
-                                        "yAxis":  {"title": {"text": "Issue Count"}},
-                                        "plotOptions": {"bar": {"grouping": True}},
-                                        "colors": ["#E53935", "#FB8C00"],
-                                        "series": [
-                                            {"name": "Bad",  "data": bad_data},
-                                            {"name": "Warn", "data": warn_data},
+                                    _iss_h = max(ch_h, len(top20) * 28 + 80)
+                                    ui.echart({
+                                        "title":   {"text": "Total Bad + Warn Issues by Cluster"},
+                                        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                        "legend":  {"bottom": 0},
+                                        "grid":    {"left": 140, "right": 20, "bottom": 40},
+                                        "xAxis":   {"type": "value", "name": "Issue Count"},
+                                        "yAxis":   {"type": "category", "data": labels, "axisLabel": {"overflow": "truncate", "width": 120}},
+                                        "color":   ["#E53935", "#FB8C00"],
+                                        "series":  [
+                                            {"name": "Bad",  "type": "bar", "data": bad_data},
+                                            {"name": "Warn", "type": "bar", "data": warn_data},
                                         ],
-                                    }).classes("w-full")
+                                    }).classes("w-full").style(f"height:{_iss_h}px")
 
                             ch_iss_status.set_text(
                                 f"Issue charts rendered for "
@@ -21049,21 +20990,22 @@ def build_cluster_timeline(tickets: list[dict], cluster_key: str) -> list[dict]:
 
 def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
     """
-    Convert a sorted list of timeline points into a list of Highcharts option
-    dicts ready to be passed to ui.highchart().  Returns an empty list when
-    there is no plottable data.
+    Convert a sorted list of timeline points into a list of ECharts option
+    dicts ready to be passed to ui.echart().  Each dict has a '_height' key
+    (popped at render time) so the caller can set the container height.
+    Returns an empty list when there is no plottable data.
     """
     if not points:
         return []
 
     dates = [p["date_label"] for p in points]
+    _zoom = [{"type": "inside"}, {"type": "slider", "bottom": 30}]
 
     charts = []
 
     # ── 1. Node count over time ────────────────────────────────────────────────
     node_vals = [p["node_count"] for p in points]
     if any(v is not None for v in node_vals):
-        # MDS service breakdown as stacked series when available
         svc_fields = [
             ("Data", "data_nodes"), ("Query", "query_nodes"),
             ("Index", "index_nodes"), ("Search", "fts_nodes"),
@@ -21072,51 +21014,63 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
         has_mds = any(p.get(f) for p in points for _, f in svc_fields)
         if has_mds:
             charts.append({
-                "chart":  {"type": "column", "height": 300},
-                "title":  {"text": "Node Count Over Time (by Service)"},
-                "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-                "yAxis":  {"title": {"text": "Nodes"}, "stackLabels": {"enabled": True}},
-                "plotOptions": {"column": {"stacking": "normal"}},
-                "series": [
-                    {"name": label, "data": [p.get(field, 0) or 0 for p in points]}
+                "_height": 300,
+                "title":    {"text": "Node Count Over Time (by Service)"},
+                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                "legend":   {"bottom": 0},
+                "dataZoom": _zoom,
+                "grid":     {"bottom": 70},
+                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+                "yAxis":    {"type": "value", "name": "Nodes"},
+                "series":   [
+                    {"name": label, "type": "bar", "stack": "total", "data": [p.get(field, 0) or 0 for p in points]}
                     for label, field in svc_fields
                     if any(p.get(field, 0) for p in points)
                 ],
             })
         else:
             charts.append({
-                "chart":  {"type": "spline", "height": 280},
-                "title":  {"text": "Node Count Over Time"},
-                "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-                "yAxis":  {"title": {"text": "Nodes"}, "allowDecimals": False},
-                "colors": ["#1E88E5"],
-                "series": [{"name": "Total Nodes", "data": [p["node_count"] for p in points]}],
+                "_height": 280,
+                "title":    {"text": "Node Count Over Time"},
+                "tooltip":  {"trigger": "axis"},
+                "dataZoom": _zoom,
+                "grid":     {"bottom": 70},
+                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+                "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1},
+                "color":    ["#1E88E5"],
+                "series":   [{"name": "Total Nodes", "type": "line", "smooth": True, "data": [p["node_count"] for p in points]}],
             })
 
     # ── 2. Bucket count over time ──────────────────────────────────────────────
     bucket_vals = [p["bucket_count"] for p in points]
     if any(v is not None for v in bucket_vals):
         charts.append({
-            "chart":  {"type": "spline", "height": 280},
-            "title":  {"text": "Bucket Count Over Time"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "Buckets"}, "allowDecimals": False},
-            "colors": ["#43A047"],
-            "series": [{"name": "Buckets", "data": [p["bucket_count"] for p in points]}],
+            "_height": 280,
+            "title":    {"text": "Bucket Count Over Time"},
+            "tooltip":  {"trigger": "axis"},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "Buckets", "minInterval": 1},
+            "color":    ["#43A047"],
+            "series":   [{"name": "Buckets", "type": "line", "smooth": True, "data": [p["bucket_count"] for p in points]}],
         })
 
     # ── 3. Checker health (BAD + WARN) over time ───────────────────────────────
     if any(p["bad_count"] or p["warn_count"] for p in points):
         charts.append({
-            "chart":  {"type": "spline", "height": 280},
-            "title":  {"text": "Checker Health Over Time"},
-            "subtitle": {"text": "Lower is better"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "Issue Count"}, "allowDecimals": False},
-            "colors": ["#E53935", "#FB8C00"],
-            "series": [
-                {"name": "BAD checks",  "data": [p["bad_count"]  for p in points]},
-                {"name": "WARN checks", "data": [p["warn_count"] for p in points]},
+            "_height": 280,
+            "title":    {"text": "Checker Health Over Time", "subtext": "Lower is better"},
+            "tooltip":  {"trigger": "axis"},
+            "legend":   {"bottom": 0},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "Issue Count", "minInterval": 1},
+            "color":    ["#E53935", "#FB8C00"],
+            "series":   [
+                {"name": "BAD checks",  "type": "line", "smooth": True, "data": [p["bad_count"]  for p in points]},
+                {"name": "WARN checks", "type": "line", "smooth": True, "data": [p["warn_count"] for p in points]},
             ],
         })
 
@@ -21124,25 +21078,30 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
     af_vals = [p["auto_failover_sec"] for p in points]
     if any(v is not None for v in af_vals):
         charts.append({
-            "chart":  {"type": "line", "height": 280},
-            "title":  {"text": "Auto-Failover Threshold Over Time"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "Seconds"}, "allowDecimals": False},
-            "colors": ["#8E24AA"],
-            "plotOptions": {"line": {"step": "left"}},
-            "series": [{"name": "Auto-failover (s)", "data": [p["auto_failover_sec"] for p in points]}],
+            "_height": 280,
+            "title":    {"text": "Auto-Failover Threshold Over Time"},
+            "tooltip":  {"trigger": "axis"},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "Seconds", "minInterval": 1},
+            "color":    ["#8E24AA"],
+            "series":   [{"name": "Auto-failover (s)", "type": "line", "step": "start", "data": [p["auto_failover_sec"] for p in points]}],
         })
 
     # ── 5. RAM per node over time ─────────────────────────────────────────────
     ram_vals = [p["ram_mib"] for p in points]
     if any(v is not None for v in ram_vals):
         charts.append({
-            "chart":  {"type": "spline", "height": 280},
-            "title":  {"text": "RAM per Node Over Time"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "MiB"}, "allowDecimals": False},
-            "colors": ["#FB8C00"],
-            "series": [{"name": "RAM (MiB)", "data": [p["ram_mib"] for p in points]}],
+            "_height": 280,
+            "title":    {"text": "RAM per Node Over Time"},
+            "tooltip":  {"trigger": "axis"},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "MiB", "minInterval": 1},
+            "color":    ["#FB8C00"],
+            "series":   [{"name": "RAM (MiB)", "type": "line", "smooth": True, "data": [p["ram_mib"] for p in points]}],
         })
 
     return charts
