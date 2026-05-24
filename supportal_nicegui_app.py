@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 
 import asyncio
 import threading
@@ -12868,10 +12868,21 @@ def tool_query_tickets(
         date_to   = filters.get("date_to")
         if date_from:
             params.append(date_from)
-            where_parts.append(f"t.created >= ${len(params)}")
+            _df_idx = len(params)
+            # Fallback: tickets with null created compare scraped-at epoch as ISO string
+            where_parts.append(
+                f"(t.created >= ${_df_idx}"
+                f" OR (t.created IS NULL"
+                f" AND MILLIS_TO_STR(t.last_scraped_at * 1000) >= ${_df_idx}))"
+            )
         if date_to:
-            params.append(date_to)
-            where_parts.append(f"t.created <= ${len(params)}")
+            params.append(date_to + "T23:59:59Z")
+            _dt_idx = len(params)
+            where_parts.append(
+                f"(t.created <= ${_dt_idx}"
+                f" OR (t.created IS NULL"
+                f" AND MILLIS_TO_STR(t.last_scraped_at * 1000) <= ${_dt_idx}))"
+            )
 
         priorities = filters.get("priorities") or []
         if priorities:
@@ -12926,7 +12937,7 @@ def tool_query_tickets(
         n1ql = (
             f"SELECT t.* FROM {keyspace} AS t "
             f"WHERE {where_clause} "
-            f"ORDER BY t.created DESC "
+            f"ORDER BY IFNULL(t.created, MILLIS_TO_STR(t.last_scraped_at * 1000)) DESC "
             f"LIMIT {int(limit)}"
         )
         rows = list(cluster.query(
@@ -15357,11 +15368,14 @@ def _execute_agent_tool(
             col = cluster.bucket(bucket).scope(scope).collection(collection)
             try:
                 existing = col.get(doc_key).content_as[dict]
-                # Fresh scrape fields take priority; preserved: score, embedding, analytics labels
-                _preserve = {k: existing[k] for k in ("score", "embedding", "summary_text",
-                                                        "analytics_app_labels", "snapshot_topology")
-                             if k in existing and k not in fresh}
-                merged = {**existing, **fresh, **_preserve}
+                # Start from existing; let fresh override, but skip None/empty fresh values
+                # so immutable fields (created, organization, requester) are never wiped.
+                merged = {**existing}
+                for _k, _v in fresh.items():
+                    if _v is not None and _v != "" and _v != [] and _v != {}:
+                        merged[_k] = _v
+                    elif _k not in merged:
+                        merged[_k] = _v  # key is new — write even if null
             except Exception:
                 merged = fresh  # doc doesn't exist yet — insert as-is
             col.upsert(doc_key, merged)
