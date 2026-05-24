@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.105"
+__version__ = "1.1.106"
 
 import asyncio
 import threading
@@ -6373,11 +6373,19 @@ def main_page():
                                         f"You have access to tools that query a live Couchbase database containing "
                                         f"Zendesk support tickets{_cust_scope}. "
                                         "Use the available tools to answer questions accurately. "
-                                        "Always call tools to retrieve data — never guess at counts or ticket details. "
-                                        "For count questions, prefer count_tickets. "
-                                        "For listing tickets, use query_tickets. "
-                                        "For deep analysis of one specific ticket, use get_ticket. "
-                                        "When filtering by CBSE or Jira, set cbse_only=true or jira_only=true."
+                                        "Always call tools to retrieve data — never guess at counts or ticket details.\n\n"
+                                        "TOOL GUIDANCE:\n"
+                                        "- count_tickets: for total/count questions\n"
+                                        "- query_tickets: to list or filter tickets (returns Last Scraped age per ticket)\n"
+                                        "- get_ticket: full detail on one ticket (includes data freshness + live Supportal URL)\n"
+                                        "- check_data_freshness: ALWAYS call this when the user asks about 'current status', "
+                                        "'latest', 'live', 'today', or 'has this changed'. Pass the ticket_ids from a prior "
+                                        "query_tickets call. Report the age and include Supportal URLs for live verification.\n"
+                                        "- rescrape_ticket: call this when data is stale AND the user wants it refreshed. "
+                                        "It fetches the live ticket from Supportal and saves the updated data to Couchbase "
+                                        "in a single step — always prefer this over just linking the URL when the user "
+                                        "says 'verify', 'refresh', 'update', or 'check the latest'.\n"
+                                        "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true."
                                     )
                                     if state.get("prior_session_block"):
                                         _agent_sys += "\n" + state["prior_session_block"]
@@ -15041,7 +15049,56 @@ _AGENT_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_data_freshness",
+            "description": (
+                "Check how recently ticket data was scraped from Supportal. "
+                "Use this whenever the user asks about 'current', 'live', 'latest', "
+                "or 'today's' status. Returns last_scraped_at age in hours and the "
+                "Supportal Analytics URL for manual live verification."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Ticket IDs to check freshness for (from a prior query_tickets call).",
+                    },
+                },
+                "required": ["ticket_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rescrape_ticket",
+            "description": (
+                "Re-fetch a ticket directly from Supportal Analytics and update Couchbase "
+                "with the latest status, priority, comments, and metadata. Use this when "
+                "the user wants to verify or refresh a specific ticket's current state. "
+                "Requires a valid session cookie saved in the app profile."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "The numeric ticket ID to re-scrape.",
+                    },
+                },
+                "required": ["ticket_id"],
+            },
+        },
+    },
 ]
+
+
+_SUPPORTAL_TICKET_URL = "https://supportal.couchbase.com/zendesk/ticket/{ticket_id}"
+_SUPPORTAL_CUSTOMER_URL = "https://supportal.couchbase.com/customer/{customer}"
 
 
 def _agent_filters_from_args(args: dict) -> dict:
@@ -15087,18 +15144,22 @@ def _execute_agent_tool(
         )
         if not tickets:
             return "No tickets found matching the given filters."
+        _now_epoch = time.time()
         lines = [
-            "| Ticket ID | Organization | Subject | Status | Priority | Created | CBSEs | Jira |",
-            "|-----------|-------------|---------|--------|----------|---------|-------|------|",
+            "| Ticket ID | Organization | Subject | Status | Priority | Created | Last Scraped | CBSEs | Jira |",
+            "|-----------|-------------|---------|--------|----------|---------|-------------|-------|------|",
         ]
         for t in tickets:
             cbses = ", ".join(t.get("cbses") or []) or "—"
             jiras = ", ".join(t.get("jira_issues") or []) or "—"
-            subj = (t.get("subject") or "")[:60].replace("|", "/")
+            subj = (t.get("subject") or "")[:55].replace("|", "/")
+            _lsa = t.get("last_scraped_at") or 0
+            _age_h = (_now_epoch - _lsa) / 3600 if _lsa else None
+            _age_str = f"{_age_h:.0f}h ago" if _age_h is not None else "unknown"
             lines.append(
                 f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
                 f"| {t.get('status','')} | {t.get('priority','')} "
-                f"| {(t.get('created') or '')[:10]} | {cbses} | {jiras} |"
+                f"| {(t.get('created') or '')[:10]} | {_age_str} | {cbses} | {jiras} |"
             )
         return "\n".join(lines) + f"\n\n**Total: {len(tickets)} tickets**"
 
@@ -15121,12 +15182,19 @@ def _execute_agent_tool(
         if not tickets:
             return f"Ticket {ticket_id} not found."
         t = tickets[0]
+        _tid = t.get("ticket_id", ticket_id)
+        _lsa = t.get("last_scraped_at") or 0
+        _age_h = (time.time() - _lsa) / 3600 if _lsa else None
+        _age_str = f"{_age_h:.1f} hours ago" if _age_h is not None else "unknown"
+        _supportal_url = _SUPPORTAL_TICKET_URL.format(ticket_id=_tid)
         parts = [
-            f"**Ticket {t.get('ticket_id')}** — {t.get('subject','')}",
+            f"**Ticket {_tid}** — {t.get('subject','')}",
             f"Organization: {t.get('organization','')}",
             f"Status: {t.get('status','')} | Priority: {t.get('priority','')}",
             f"Created: {t.get('created','')} | Closed: {t.get('closed','')}",
             f"Requester: {t.get('requester','')}",
+            f"**Data freshness:** last scraped {_age_str}",
+            f"**Live verification:** {_supportal_url}",
         ]
         cbses = t.get("cbses") or []
         if cbses:
@@ -15153,6 +15221,130 @@ def _execute_agent_tool(
                 body = (c.get("body") or c.get("plain_body") or "")[:500]
                 parts.append(f"  [{author_name}]: {body}")
         return "\n".join(parts)
+
+    elif name == "check_data_freshness":
+        ticket_ids = args.get("ticket_ids") or []
+        if not ticket_ids:
+            return "No ticket IDs provided."
+        if not _CB_AVAILABLE:
+            return "Couchbase not available."
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator  # type: ignore
+            from couchbase.options import QueryOptions  # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            cluster.wait_until_ready(timedelta(seconds=10))
+            keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+            phs = ", ".join(f"${i+1}" for i in range(len(ticket_ids)))
+            rows = list(cluster.query(
+                f"SELECT ticket_id, status, last_scraped_at "
+                f"FROM {keyspace} WHERE ticket_id IN [{phs}]",
+                QueryOptions(positional_parameters=[str(t) for t in ticket_ids],
+                             timeout=timedelta(seconds=15)),
+            ))
+            cluster.close()
+        except Exception as exc:
+            return f"Freshness check failed: {exc}"
+
+        _now = time.time()
+        lines = [
+            "| Ticket ID | Status (local) | Last Scraped | Age | Verify Live |",
+            "|-----------|---------------|-------------|-----|------------|",
+        ]
+        for r in rows:
+            _lsa = r.get("last_scraped_at") or 0
+            _age_h = (_now - _lsa) / 3600 if _lsa else None
+            _age_str = f"{_age_h:.1f}h" if _age_h is not None else "unknown"
+            _stale = "⚠️ STALE" if (_age_h or 0) > 4 else "✓ fresh"
+            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=r.get("ticket_id", ""))
+            lines.append(
+                f"| {r.get('ticket_id','')} | {r.get('status','')} "
+                f"| {_age_str} ago | {_stale} | {_url} |"
+            )
+        result = "\n".join(lines)
+        stale_count = sum(1 for r in rows if ((_now - (r.get("last_scraped_at") or 0)) / 3600) > 4)
+        if stale_count:
+            result += (
+                f"\n\n⚠️ {stale_count}/{len(rows)} tickets have data older than 4 hours. "
+                f"Use rescrape_ticket to refresh individual tickets, or click the Verify Live "
+                f"links above to check current status on Supportal directly."
+            )
+        else:
+            result += f"\n\n✓ All {len(rows)} tickets have fresh data (scraped within 4 hours)."
+        return result
+
+    elif name == "rescrape_ticket":
+        ticket_id = str(args.get("ticket_id") or "").strip()
+        if not ticket_id:
+            return "Error: ticket_id is required."
+
+        # Read session cookie from saved app profile
+        cookie = ""
+        try:
+            _profiles = _load_profiles()
+            _active = _profiles.get("active_profile", "default")
+            _prof = _profiles.get("profiles", {}).get(_active, {})
+            cookie = _prof.get("cookie", "")
+        except Exception as _pe:
+            print(f"[rescrape_ticket] profile read failed: {_pe}")
+
+        if not cookie:
+            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+            return (
+                f"No session cookie found in saved profile — cannot scrape automatically.\n"
+                f"Verify manually: {_url}"
+            )
+
+        # Scrape fresh data from Supportal
+        try:
+            fresh = scrape_single_ticket_cookie(cookie, ticket_id)
+        except Exception as exc:
+            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+            return (
+                f"Scrape failed ({exc}). Session cookie may have expired.\n"
+                f"Verify manually: {_url}"
+            )
+
+        if not fresh or not fresh.get("ticket_id"):
+            return f"Scrape returned no data for ticket {ticket_id}."
+
+        # Stamp freshness and upsert to Couchbase
+        fresh["last_scraped_at"] = int(time.time())
+        fresh["type"] = "ticket"
+        doc_key = f"ticket::{ticket_id}"
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator  # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            cluster.wait_until_ready(timedelta(seconds=10))
+            col = cluster.bucket(bucket).scope(scope).collection(collection)
+            col.upsert(doc_key, fresh)
+            cluster.close()
+            _saved = True
+        except Exception as exc:
+            print(f"[rescrape_ticket] CB upsert failed: {exc}")
+            _saved = False
+
+        _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+        summary_lines = [
+            f"**Ticket {ticket_id} re-scraped from Supportal** {'(saved to CB ✓)' if _saved else '(CB save failed ✗)'}",
+            f"Status: {fresh.get('status','')} | Priority: {fresh.get('priority','')}",
+            f"Subject: {fresh.get('subject','')}",
+            f"Created: {fresh.get('created','')} | Closed: {fresh.get('closed','')}",
+            f"Scraped at: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+            f"Supportal URL: {_url}",
+        ]
+        cbses = fresh.get("cbses") or []
+        if cbses:
+            summary_lines.append(f"CBSEs: {', '.join(cbses)}")
+        jiras = fresh.get("jira_issues") or []
+        if jiras:
+            summary_lines.append(f"Jira Issues: {', '.join(jiras)}")
+        return "\n".join(summary_lines)
 
     else:
         return f"Unknown tool: {name}"
