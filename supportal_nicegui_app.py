@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 import asyncio
 import threading
@@ -6390,6 +6390,13 @@ def main_page():
                                         "says 'verify', 'refresh', 'update', or 'check the latest'.\n"
                                         "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true."
                                     )
+                                    if _cust_agent and _cust_agent.lower() != "all customers":
+                                        _agent_sys += (
+                                            f"\n\nSCOPING RULE: A specific customer is loaded: \"{_cust_agent}\". "
+                                            f"You MUST include customer=\"{_cust_agent}\" in EVERY query_tickets and "
+                                            f"count_tickets call. Never omit it. Never query across all customers. "
+                                            f"Never ask the user for the customer name — it is already set."
+                                        )
                                     if state.get("prior_session_block"):
                                         _agent_sys += "\n" + state["prior_session_block"]
                                     _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
@@ -6406,6 +6413,7 @@ def main_page():
                                         provider, model, api_key, base_url,
                                         8192,
                                         5,
+                                        _cust_agent,
                                     )
                                     state["chat_history"].append({"role": "assistant", "content": answer})
                                     _render_chat()
@@ -15083,11 +15091,15 @@ def _execute_agent_tool(
     args: dict,
     cb_url: str, bucket: str, username: str, password: str,
     use_tls: bool, scope: str, collection: str,
+    default_customer: str = "",
 ) -> str:
     """Execute an agent tool call and return a string result for the LLM."""
     if name == "query_tickets":
         limit = min(int(args.get("limit") or 50), 200)
         filters = _agent_filters_from_args(args)
+        # Auto-scope to loaded customer when LLM omits the filter
+        if default_customer and not filters.get("organization"):
+            filters["organization"] = default_customer
         tickets = tool_query_tickets(
             filters, cb_url, bucket, username, password,
             use_tls, scope, collection, limit=limit,
@@ -15115,6 +15127,8 @@ def _execute_agent_tool(
 
     elif name == "count_tickets":
         filters = _agent_filters_from_args(args)
+        if default_customer and not filters.get("organization"):
+            filters["organization"] = default_customer
         tickets = tool_query_tickets(
             filters, cb_url, bucket, username, password,
             use_tls, scope, collection, limit=5000,
@@ -15357,6 +15371,7 @@ def call_llm_with_tools(
     provider: str, model: str, api_key: str, base_url: str,
     max_tokens: int = 8192,
     max_rounds: int = 5,
+    default_customer: str = "",
 ) -> str:
     """
     Agentic tool-calling loop. Sends messages + tools to the LLM, executes
@@ -15461,6 +15476,7 @@ def call_llm_with_tools(
                     result = _execute_agent_tool(
                         _fn.name, _args,
                         cb_url, bucket, username, password, use_tls, scope, collection,
+                        default_customer=default_customer,
                     )
                     print(f"[agent] tool result length={len(result)}")
                     _msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -15520,6 +15536,7 @@ def call_llm_with_tools(
                 result = _execute_agent_tool(
                     tb.name, _args,
                     cb_url, bucket, username, password, use_tls, scope, collection,
+                    default_customer=default_customer,
                 )
                 tool_results.append({
                     "type": "tool_result",
