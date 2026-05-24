@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.8"
+__version__ = "1.2.9"
 
 import asyncio
 import threading
@@ -718,7 +718,7 @@ def fetch_ticket_signals_from_cb(
         cluster.wait_until_ready(timedelta(seconds=15))
         keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
         rows = list(cluster.query(
-            f"SELECT META(t).id AS doc_id, t.status, t.solved, t.requester "
+            f"SELECT META(t).id AS doc_id, t.status, t.solved, t.requester, t.`_deleted` "
             f"FROM {keyspace} AS t WHERE META(t).id LIKE 'ticket::%'",
             QueryOptions(timeout=timedelta(seconds=30)),
         ))
@@ -730,7 +730,8 @@ def fetch_ticket_signals_from_cb(
                 signals[tid] = {
                     "status":   row.get("status"),
                     "solved":   row.get("solved"),
-                    "is_stub":  not row.get("requester"),
+                    "is_stub":  not row.get("requester") and not row.get("_deleted"),
+                    "_deleted": bool(row.get("_deleted")),
                 }
         return signals
     except Exception:
@@ -763,6 +764,10 @@ def _filter_changed_tickets(
             new_tickets.append(s)
             continue
         stored = stored_signals[tid]
+        # Skip permanently deleted tickets — never re-scrape them
+        if stored.get("_deleted"):
+            skipped += 1
+            continue
         listing_status = (s.get("status") or "").strip().lower()
         stored_status  = (stored.get("status") or "").strip().lower()
         listing_solved = (s.get("solved") or "").strip()
@@ -2067,8 +2072,11 @@ def scrape_with_cookie(
         url = f"{BASE_URL}/zendesk/ticket/{tid}"  # always use canonical URL
         try:
             resp = _worker_session().get(url, timeout=30, allow_redirects=True, verify=False)
-            resp.raise_for_status()
-            rec = parse_ticket_detail(resp.text, url)
+            if _is_deleted_ticket_page(resp.status_code, resp.text):
+                rec = {"ticket_id": tid, "url": url, "_deleted": True}
+            else:
+                resp.raise_for_status()
+                rec = parse_ticket_detail(resp.text, url)
         except Exception as exc:
             rec = {"ticket_id": tid, "url": url, "error": str(exc)}
         results[idx] = rec
@@ -2177,10 +2185,13 @@ def scrape_with_cookie_playwright(
                 except PWTimeoutError:
                     pass
                 html = page.content()
-                rec  = parse_ticket_detail(html, url)
-                for field in ("status", "priority", "subject", "created", "solved"):
-                    if not rec.get(field) and summary.get(field):
-                        rec[field] = summary[field]
+                if _is_deleted_ticket_page(200, html):
+                    rec = {**summary, "url": url, "_deleted": True}
+                else:
+                    rec = parse_ticket_detail(html, url)
+                    for field in ("status", "priority", "subject", "created", "solved"):
+                        if not rec.get(field) and summary.get(field):
+                            rec[field] = summary[field]
             except PWTimeoutError:
                 rec = {**summary, "url": url, "error": "timeout"}
             except Exception as exc:
@@ -2488,10 +2499,13 @@ def scrape_with_playwright(
                 except PWTimeoutError:
                     pass
                 html = page.content()
-                rec  = parse_ticket_detail(html, url)
-                for field in ("status", "priority", "subject", "created", "solved"):
-                    if not rec.get(field) and summary.get(field):
-                        rec[field] = summary[field]
+                if _is_deleted_ticket_page(200, html):
+                    rec = {**summary, "url": url, "_deleted": True}
+                else:
+                    rec = parse_ticket_detail(html, url)
+                    for field in ("status", "priority", "subject", "created", "solved"):
+                        if not rec.get(field) and summary.get(field):
+                            rec[field] = summary[field]
             except PWTimeoutError:
                 rec = {**summary, "url": url, "error": "timeout"}
             except Exception as exc:
@@ -2506,6 +2520,31 @@ def scrape_with_playwright(
     return results
 
 
+_DELETED_TICKET_PHRASES = (
+    "ticket has been deleted",
+    "ticket was deleted",
+    "this ticket no longer exists",
+    "has been permanently deleted",
+    "this record has been deleted",
+    "record not found",
+    "ticket not found",
+    "no longer available",
+)
+
+
+def _is_deleted_ticket_page(status_code: int, html: str) -> bool:
+    """Return True if the page indicates the ticket was deleted or does not exist."""
+    if status_code not in (200, 404):
+        return False
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True).lower()
+    if any(phrase in text for phrase in _DELETED_TICKET_PHRASES):
+        return True
+    # 404 pages with generic "not found" copy also count as deleted
+    if status_code == 404 and "not found" in text:
+        return True
+    return False
+
+
 def scrape_single_ticket_cookie(cookie: str, ticket_id: str) -> dict:
     """Fetch and parse a single ticket detail page using cookie auth."""
     session = requests.Session()
@@ -2516,6 +2555,8 @@ def scrape_single_ticket_cookie(cookie: str, ticket_id: str) -> dict:
     })
     url = f"{BASE_URL}/zendesk/ticket/{ticket_id}"
     resp = session.get(url, timeout=30, allow_redirects=True, verify=False)
+    if _is_deleted_ticket_page(resp.status_code, resp.text):
+        return {"ticket_id": ticket_id, "url": url, "_deleted": True}
     resp.raise_for_status()
     return parse_ticket_detail(resp.text, url)
 
@@ -11598,6 +11639,21 @@ def save_tickets_to_cb(
         tid     = ticket.get("ticket_id") or f"unknown_{i}"
         doc_key = f"ticket::{tid}"
         try:
+            if ticket.get("_deleted"):
+                # Store a minimal deletion marker; merge with existing if present
+                try:
+                    existing = col.get(doc_key).content_as[dict]
+                    existing["_deleted"] = True
+                    existing["last_scraped_at"] = _now
+                    col.upsert(doc_key, existing)
+                except Exception:
+                    col.upsert(doc_key, {
+                        "ticket_id": tid, "_deleted": True,
+                        "type": "ticket", "last_scraped_at": _now,
+                    })
+                saved += 1
+                progress_cb(f"  ✗ Ticket #{tid} is deleted on Supportal — marked, will skip future scrapes.", i / total)
+                continue
             doc = ticket.copy()
             doc["cb_version"]      = extract_ticket_version(ticket)
             doc["feature_area"]    = classify_ticket_feature(ticket)
@@ -15333,6 +15389,32 @@ def _execute_agent_tool(
 
         if not fresh or not fresh.get("ticket_id"):
             return f"Scrape returned no data for ticket {ticket_id}."
+
+        if fresh.get("_deleted"):
+            # Persist the deletion marker so future incremental scrapes skip it
+            doc_key = f"ticket::{ticket_id}"
+            try:
+                from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+                from couchbase.auth import PasswordAuthenticator  # type: ignore
+                from datetime import timedelta
+                conn_str = _cb_conn_str(cb_url, use_tls)
+                cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+                cluster.wait_until_ready(timedelta(seconds=10))
+                col = cluster.bucket(bucket).scope(scope).collection(collection)
+                try:
+                    existing = col.get(doc_key).content_as[dict]
+                    existing["_deleted"] = True
+                    existing["last_scraped_at"] = int(time.time())
+                    col.upsert(doc_key, existing)
+                except Exception:
+                    col.upsert(doc_key, {
+                        "ticket_id": ticket_id, "_deleted": True, "type": "ticket",
+                        "last_scraped_at": int(time.time()),
+                    })
+                cluster.close()
+            except Exception as _de:
+                print(f"[rescrape_ticket] failed to persist deletion marker: {_de}")
+            return f"Ticket {ticket_id} has been deleted on Supportal — marked in Couchbase, will be skipped in future scrapes."
 
         fresh["last_scraped_at"] = int(time.time())
         fresh["type"] = "ticket"
