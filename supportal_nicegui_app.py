@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.103"
+__version__ = "1.1.104"
 
 import asyncio
 import threading
@@ -15195,6 +15195,7 @@ def call_llm_with_tools(
             _base = _base or "https://generativelanguage.googleapis.com/v1beta/openai"
 
         import openai as _oai
+        print(f"[agent] base_url={_base!r}  → will POST to {_base}/chat/completions")
         client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
 
         def _safe_choice(r):
@@ -15216,18 +15217,18 @@ def call_llm_with_tools(
             return choices[0]
 
         _msgs: list[dict] = list(messages)
+        _tool_calls_made = False
         try:
             for _round in range(max_rounds):
-                print(f"[agent] round={_round} msgs={len(_msgs)}")
-                # Omit tool_choice — LMStudio ignores or rejects it on some builds,
-                # causing it to return an empty choices array. Compliant servers
-                # default to "auto" when tools are present.
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=_msgs,
-                    tools=tools,
-                    max_tokens=max_tokens,
-                )
+                print(f"[agent] round={_round} msgs={len(_msgs)} tools_active={not _tool_calls_made}")
+                # Per LMStudio docs: after tool results are in the history,
+                # send the final request WITHOUT tools so the model writes
+                # a natural-language answer rather than calling more tools.
+                _req_tools = tools if not _tool_calls_made else None
+                _kwargs: dict = {"model": model, "messages": _msgs, "max_tokens": max_tokens}
+                if _req_tools:
+                    _kwargs["tools"] = _req_tools
+                resp = client.chat.completions.create(**_kwargs)
                 choice = _safe_choice(resp)
                 print(f"[agent] finish_reason={choice.finish_reason!r} "
                       f"tool_calls={type(choice.message.tool_calls).__name__} "
@@ -15236,22 +15237,18 @@ def call_llm_with_tools(
                 if choice.finish_reason == "stop" or not choice.message.tool_calls:
                     return choice.message.content or ""
 
-                # Build assistant turn dict manually — avoids model_dump issues
-                # and omits extra None fields that confuse some servers.
+                # Build assistant turn dict — omit content when null (matches LMStudio format)
                 _tool_calls_serial = []
                 for tc in choice.message.tool_calls:
                     _fn = getattr(tc, "function", None)
                     if _fn is None:
-                        print(f"[agent] WARNING: tool_call {tc!r} has no .function attr, skipping")
+                        print(f"[agent] WARNING: tool_call {tc!r} has no .function, skipping")
                         continue
                     print(f"[agent] serializing tool_call: name={_fn.name!r} id={tc.id!r}")
                     _tool_calls_serial.append({
                         "id": tc.id,
                         "type": "function",
-                        "function": {
-                            "name": _fn.name,
-                            "arguments": _fn.arguments or "{}",
-                        },
+                        "function": {"name": _fn.name, "arguments": _fn.arguments or "{}"},
                     })
                 _asst_msg: dict = {"role": "assistant", "tool_calls": _tool_calls_serial}
                 if choice.message.content:
@@ -15272,14 +15269,11 @@ def call_llm_with_tools(
                         cb_url, bucket, username, password, use_tls, scope, collection,
                     )
                     print(f"[agent] tool result length={len(result)}")
-                    _msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    })
+                    _msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-            # Max rounds — ask for a final wrap-up without tools
-            _msgs.append({"role": "user", "content": "Please summarize what you found based on the tool results."})
+                _tool_calls_made = True  # next round: no tools in request
+
+            # Exhausted rounds — final answer without tools
             resp = client.chat.completions.create(
                 model=model, messages=_msgs, max_tokens=max_tokens,
             )
