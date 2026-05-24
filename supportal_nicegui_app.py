@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.102"
+__version__ = "1.1.103"
 
 import asyncio
 import threading
@@ -15185,8 +15185,12 @@ def call_llm_with_tools(
         _base = (base_url or "").rstrip("/")
         if provider == "lmstudio":
             _base = _base or "http://localhost:1234/v1"
+            if not _base.endswith("/v1"):
+                _base += "/v1"
         elif provider == "ollama":
             _base = _base or "http://localhost:11434/v1"
+            if not _base.endswith("/v1"):
+                _base += "/v1"
         elif provider == "gemini":
             _base = _base or "https://generativelanguage.googleapis.com/v1beta/openai"
 
