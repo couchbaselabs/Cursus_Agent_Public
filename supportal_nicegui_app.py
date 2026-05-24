@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 import asyncio
 import threading
@@ -8039,8 +8039,9 @@ def main_page():
                                 """
                                 charts = await _cl.run_javascript(collect_js, timeout=20.0)
                                 if not charts:
-                                    ui.notify("No charts found — generate charts first.",
-                                              type="warning")
+                                    with _cl:
+                                        ui.notify("No charts found — generate charts first.",
+                                                  type="warning")
                                     btn_export_pdf.set_enabled(True)
                                     return
 
@@ -8057,7 +8058,8 @@ def main_page():
                                 selected = (main_charts if _opts["main"] else []) + \
                                            (comp_charts if _opts["comp"] else [])
                                 if not selected:
-                                    ui.notify("No charts selected.", type="warning")
+                                    with _cl:
+                                        ui.notify("No charts selected.", type="warning")
                                     btn_export_pdf.set_enabled(True)
                                     return
 
@@ -8227,7 +8229,8 @@ def main_page():
                                 )
                             except Exception as exc:
                                 chart_status.set_text(f"Export error: {exc}")
-                                ui.notify(str(exc), type="negative")
+                                with _cl:
+                                    ui.notify(str(exc), type="negative")
                             finally:
                                 btn_export_pdf.set_enabled(True)
 
