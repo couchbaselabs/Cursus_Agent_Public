@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.1.101"
+__version__ = "1.1.102"
 
 import asyncio
 import threading
@@ -15249,11 +15249,10 @@ def call_llm_with_tools(
                             "arguments": _fn.arguments or "{}",
                         },
                     })
-                _msgs.append({
-                    "role": "assistant",
-                    "content": choice.message.content or "",
-                    "tool_calls": _tool_calls_serial,
-                })
+                _asst_msg: dict = {"role": "assistant", "tool_calls": _tool_calls_serial}
+                if choice.message.content:
+                    _asst_msg["content"] = choice.message.content
+                _msgs.append(_asst_msg)
 
                 for tc in choice.message.tool_calls:
                     _fn = getattr(tc, "function", None)
