@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 import asyncio
 import threading
@@ -6377,7 +6377,10 @@ def main_page():
                                         "TOOL GUIDANCE:\n"
                                         "- count_tickets: for total/count questions\n"
                                         "- query_tickets: to list or filter tickets (returns Last Scraped age per ticket)\n"
-                                        "- get_ticket: full detail on one ticket (includes data freshness + live Supportal URL)\n"
+                                        "- get_ticket: full detail on one ticket including cluster topology from the linked "
+                                        "snapshot (node count, CB version, services, buckets, RAM, auto-failover, bad/warn "
+                                        "health counts). Use this whenever the user asks about cluster configuration, "
+                                        "node count, topology, or infrastructure details for a specific ticket.\n"
                                         "- check_data_freshness: ALWAYS call this when the user asks about 'current status', "
                                         "'latest', 'live', 'today', or 'has this changed'. Pass the ticket_ids from a prior "
                                         "query_tickets call. Report the age and include Supportal URLs for live verification.\n"
@@ -14978,8 +14981,11 @@ _AGENT_TOOLS: list[dict] = [
             "name": "get_ticket",
             "description": (
                 "Fetch full details for a single support ticket by its numeric ticket ID. "
-                "Returns all fields including description, comments, CBSEs, Jira issues, "
-                "cluster topology, and AI summary. Use for deep analysis of one ticket."
+                "Returns description, comments, CBSEs, Jira issues, AI summary, data freshness, "
+                "and cluster topology from the linked snapshot — including node count, CB version, "
+                "service layout, bucket names, RAM per node, auto-failover setting, and health "
+                "(bad/warn item counts). Use this when the user asks about cluster configuration, "
+                "node count, topology, or any infrastructure details for a specific ticket."
             ),
             "parameters": {
                 "type": "object",
@@ -15150,6 +15156,55 @@ def _execute_agent_tool(
         clusters = _score.get("cluster_names") or []
         if clusters:
             parts.append(f"Clusters: {', '.join(clusters)}")
+
+        # ── Snapshot topology ────────────────────────────────────────────────
+        topo = t.get("snapshot_topology") or {}
+        if isinstance(topo, str):
+            try:
+                topo = json.loads(topo)
+            except Exception:
+                topo = {}
+        if isinstance(topo, dict) and topo:
+            topo_lines = []
+            if topo.get("cluster_name"):
+                topo_lines.append(f"  Cluster Name:    {topo['cluster_name']}")
+            if topo.get("cluster_uuid"):
+                topo_lines.append(f"  Cluster UUID:    {topo['cluster_uuid']}")
+            if topo.get("cb_version"):
+                topo_lines.append(f"  CB Version:      {topo['cb_version']}")
+            if topo.get("total_nodes"):
+                topo_lines.append(f"  Nodes:           {topo['total_nodes']}")
+            svc_parts = []
+            for svc, key in [("KV/Data", "data_nodes"), ("Index", "index_nodes"),
+                              ("Query", "query_nodes"), ("Search", "fts_nodes"),
+                              ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
+                n = topo.get(key)
+                if n:
+                    svc_parts.append(f"{svc}×{n}")
+            if svc_parts:
+                topo_lines.append(f"  Services:        {', '.join(svc_parts)}")
+            if topo.get("bucket_count"):
+                topo_lines.append(f"  Buckets:         {topo['bucket_count']}")
+            _bn = topo.get("bucket_names") or []
+            if isinstance(_bn, list) and _bn:
+                topo_lines.append(f"  Bucket Names:    {', '.join(_bn[:10])}")
+            if topo.get("ram_per_node_mib"):
+                topo_lines.append(f"  RAM/Node:        {topo['ram_per_node_mib']} MiB")
+            if topo.get("auto_failover_seconds") is not None:
+                topo_lines.append(f"  Auto-failover:   {topo['auto_failover_seconds']}s")
+            bad  = topo.get("bad_items",  topo.get("bad_count",  0)) or 0
+            warn = topo.get("warn_items", topo.get("warn_count", 0)) or 0
+            if bad or warn:
+                topo_lines.append(f"  Health:          bad={bad}  warn={warn}")
+            if topo.get("os_name"):
+                topo_lines.append(f"  OS:              {topo['os_name']}")
+            if topo_lines:
+                parts.append("\n**Cluster Topology (snapshot):**\n" + "\n".join(topo_lines))
+        elif not topo:
+            snap_ids = t.get("snap_ids") or []
+            if snap_ids:
+                parts.append(f"\n*Snapshot IDs linked: {len(snap_ids)} — topology not yet enriched.*")
+
         summary = (t.get("summary_text") or _score.get("interaction_summary") or "").strip()
         if summary:
             parts.append(f"\n**Summary:**\n{summary}")
