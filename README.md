@@ -180,6 +180,6 @@ requirements.txt           Python dependencies
 - [x] Chainlit chat UI — thread persistence, asset storage, shared history
 - [x] Supportal Analytics API tools — live cross-customer queries
 - [x] Bulk rescrape tool — agent-triggered refresh of stale tickets
-- [ ] MCP tool server — expose pipeline as MCP tools for external agents
-- [ ] PDF report generation — per-customer or per-cluster summary export
-- [ ] Fleet analytics — cross-customer version distribution, CBSE trend detection
+- [x] MCP tool server — `mcp_server.py` exposes `query_tickets`, `vector_search`, `get_ticket`, `check_freshness`, `fetch_fresh_data` to Claude Desktop and any MCP client
+- [ ] PDF report generation — full per-customer or per-cluster narrative report (chart PDF export exists; prose report does not)
+- [ ] Fleet analytics — dedicated cross-customer dashboards for CB version distribution and CBSE trend detection (live agent queries via `query_supportal` work; pre-built charts do not exist)
