@@ -1,0 +1,21 @@
+/* Widen the chat content area so tables don't overflow */
+.main > .MuiBox-root,
+.main > .MuiContainer-root {
+    max-width: 100% !important;
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+}
+
+/* Dataframe / table: allow horizontal scroll instead of clipping */
+.cl-dataframe-container,
+[data-testid="dataframe"] {
+    overflow-x: auto !important;
+    max-width: 100% !important;
+}
+
+/* Step output containers */
+.step-content,
+.message-content {
+    max-width: 100% !important;
+    overflow-x: auto !important;
+}

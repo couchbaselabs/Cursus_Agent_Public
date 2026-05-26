@@ -14,3 +14,15 @@ couchbase>=4.0.0
 anthropic
 openai                  # also covers Ollama and LMStudio (OpenAI-compatible)
 google-genai
+
+# MCP server (Phase 2)
+mcp
+
+# Export (agent-generated tables and documents)
+openpyxl                # Excel (.xlsx) export
+python-docx             # Word (.docx) export — Phase 2 conversation exports
+
+# Chainlit professional chat sidecar
+chainlit                # run: chainlit run chainlit_app.py --port 8766
+plotly                  # chart rendering in Chainlit (Plotly native support)
+pandas                  # DataFrame tables in Chainlit

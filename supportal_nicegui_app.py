@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.0.5"
+__version__ = "1.3.6"
 
 import asyncio
 import threading
@@ -38,6 +38,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 from nicegui import run, ui
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+
+def _safe_notify(client, message: str, type: str = "info") -> None:  # noqa: A002
+    """Notify the client only if it is still connected; silently no-ops on disconnect."""
+    if client is None:
+        ui.notify(message, type=type)
+        return
+    try:
+        from nicegui.client import Client as _NClient
+        if client.id not in _NClient.instances:
+            return
+        with client:
+            ui.notify(message, type=type)
+    except Exception:
+        pass
 
 
 def _run_in_playwright_thread(fn, *args, timeout: int = 90, **kwargs):
@@ -80,7 +95,7 @@ try:
     from couchbase.cluster import Cluster
     from couchbase.options import ClusterOptions, UpsertOptions, SearchOptions, QueryOptions
     from couchbase.exceptions import CouchbaseException
-    from couchbase.search import SearchRequest
+    from couchbase.search import SearchRequest, MatchQuery, DisjunctionQuery
     from couchbase.vector_search import VectorQuery, VectorSearch
     import couchbase.subdocument as _SD
     from datetime import timedelta
@@ -132,6 +147,22 @@ try:
     _CAIROSVG_AVAILABLE = True
 except ImportError:
     _CAIROSVG_AVAILABLE = False
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class CbConfig:
+    """Couchbase connection parameters — pass as a unit to pipeline functions."""
+    url: str
+    bucket: str
+    username: str
+    password: str
+    use_tls: bool = False
+    scope: str = "_default"
+    ticket_collection: str = "tickets"
+    snap_collection: str = "snapshots"
+
 
 def fetch_ollama_models(base_url: str) -> list[str]:
     """Fetch available model names from a running Ollama instance."""
@@ -386,6 +417,71 @@ def chat_memory_clear(
     return _chat_cache_delete_by_prefix("chat_cache::memory::", cb_url, bucket, username, password, use_tls, scope, collection)
 
 
+def _ensure_chat_history_col(bkt) -> None:
+    """Create chat scope + history collection if missing. Ignores errors."""
+    try:
+        from couchbase.management.collections import CollectionSpec
+        cm = bkt.collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if "chat" not in existing:
+            cm.create_scope("chat")
+        if "history" not in existing.get("chat", set()):
+            cm.create_collection(CollectionSpec("history", scope_name="chat"))
+    except Exception:
+        pass
+
+
+def _history_key(customer: str) -> str:
+    return "history::" + (customer or "__all__").strip().lower().replace(" ", "_")
+
+
+def save_customer_chat_history(
+    customer: str,
+    history: list[dict],
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+) -> None:
+    """Persist per-customer NiceGUI/shared chat history in the `chat.history` CB collection."""
+    if not _CB_AVAILABLE or not history:
+        return
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        bkt = cluster.bucket(bucket)
+        _ensure_chat_history_col(bkt)
+        bkt.scope("chat").collection("history").upsert(_history_key(customer), {
+            "customer": customer or "",
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "messages": history,
+        })
+        cluster.close()
+    except Exception:
+        pass
+
+
+def load_customer_chat_history(
+    customer: str,
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+) -> list[dict]:
+    """Load per-customer shared chat history from the `chat.history` CB collection."""
+    if not _CB_AVAILABLE:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        bkt = cluster.bucket(bucket)
+        try:
+            doc = bkt.scope("chat").collection("history").get(_history_key(customer)).content_as[dict]
+            cluster.close()
+            return doc.get("messages", [])
+        except Exception:
+            cluster.close()
+            return []
+    except Exception:
+        return []
+
+
 def save_chat_session(
     session_id: str,
     turns: list[tuple],
@@ -393,39 +489,56 @@ def save_chat_session(
     cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
     scope: str, collection: str,
 ) -> None:
-    """Persist a full conversation session as a grouped doc for context-aware RAG recall.
+    """Persist a conversation session with ticket IDs and topic tags for staleness-aware recall.
 
-    Each turn is (question, answer, timestamp_iso).  The session is stored under
-    ``chat_cache::session::<session_id>`` with all turns embedded so future retrieval
-    can return the entire conversational thread, not just isolated Q&A pairs.
+    Each turn is (question, answer, timestamp_iso, ticket_ids) where ticket_ids is a
+    list[str] of ticket IDs that were in context for that turn (empty list for turns
+    with no retrieval, e.g. Batch mode).  Old 3-tuple turns are accepted for backward
+    compatibility.  Stored under ``chat_cache::session::<session_id>``.
     """
     if not _CB_AVAILABLE or not turns:
         return
     try:
-        doc = {
-            "type": "chat_session",
-            "session_id": session_id,
-            "organization": organization,
-            "turn_count": len(turns),
-            "turns": [
-                {"role": "user",      "content": q, "timestamp": ts}
-                for (q, a, ts) in turns
-            ] + [
-                {"role": "assistant", "content": a, "timestamp": ts}
-                for (q, a, ts) in turns
-            ],
-            # Interleaved order is more readable; rebuild it properly:
-            "started_at": turns[0][2] if turns else "",
-            "ended_at":   turns[-1][2] if turns else "",
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        # Build interleaved turns list
-        interleaved = []
-        for (q, a, ts) in turns:
-            interleaved.append({"role": "user",      "content": q, "timestamp": ts})
-            interleaved.append({"role": "assistant", "content": a, "timestamp": ts})
-        doc["turns"] = interleaved
+        # Collect all ticket IDs touched across the session (union, order-preserved)
+        _all_ticket_ids: list[str] = []
+        _seen_ids: set[str] = set()
+        interleaved: list[dict] = []
+        for turn in turns:
+            q, a, ts = turn[0], turn[1], turn[2]
+            t_ids: list[str] = list(turn[3]) if len(turn) > 3 else []
+            interleaved.append({"role": "user",      "content": q,  "timestamp": ts})
+            interleaved.append({"role": "assistant", "content": a,  "timestamp": ts,
+                                 "ticket_ids": t_ids})
+            for tid in t_ids:
+                if tid and tid not in _seen_ids:
+                    _all_ticket_ids.append(tid)
+                    _seen_ids.add(tid)
 
+        # Build topic tags: lower-case non-stopword words from questions (≥5 chars)
+        _stop = {"what", "which", "where", "there", "their", "these", "those", "about",
+                 "would", "could", "should", "please", "many", "have", "that", "with",
+                 "from", "this", "were", "show", "list", "give", "tell", "across"}
+        _tags: list[str] = []
+        for turn in turns:
+            for w in re.findall(r"[a-z][a-z0-9]{4,}", turn[0].lower()):
+                if w not in _stop and w not in _tags:
+                    _tags.append(w)
+        topic_tags = _tags[:30]
+
+        _now_epoch = int(time.time())
+        doc = {
+            "type":           "chat_session",
+            "session_id":     session_id,
+            "organization":   organization,
+            "turn_count":     len(turns),
+            "turns":          interleaved,
+            "ticket_ids":     _all_ticket_ids,    # union of all tickets touched
+            "topic_tags":     topic_tags,
+            "started_at":     turns[0][2] if turns else "",
+            "ended_at":       turns[-1][2] if turns else "",
+            "last_active_at": _now_epoch,          # epoch seconds — staleness anchor
+            "created_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
         chat_cache_set(
             f"chat_cache::session::{session_id}",
             doc,
@@ -434,6 +547,104 @@ def save_chat_session(
         )
     except Exception:
         pass
+
+
+def check_freshness(
+    ticket_ids: list[str],
+    since_epoch: int,
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+    scope: str, collection: str,
+) -> list[str]:
+    """Return ticket IDs where last_scraped_at > since_epoch.
+
+    Uses a single N1QL query so it scales to hundreds of IDs without per-doc
+    round-trips.  Returns an empty list when CB is unavailable or on error.
+    This is the staleness signal that prevents the LLM from reasoning about
+    stale ticket state carried over from a prior session.
+    """
+    if not _CB_AVAILABLE or not ticket_ids:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+        id_list  = ", ".join(json.dumps(str(tid)) for tid in ticket_ids[:500])
+        rows = list(cluster.query(
+            f"SELECT META(t).id AS doc_key, t.ticket_id, t.last_scraped_at "
+            f"FROM {keyspace} AS t "
+            f"WHERE t.ticket_id IN [{id_list}] "
+            f"AND t.last_scraped_at > $1",
+            QueryOptions(positional_parameters=[since_epoch], timeout=timedelta(seconds=15)),
+        ))
+        cluster.close()
+        stale: list[str] = []
+        for row in rows:
+            tid = str(row.get("ticket_id") or "").strip()
+            if tid and tid not in stale:
+                stale.append(tid)
+        return stale
+    except Exception:
+        return []
+
+
+def fetch_prior_session_context(
+    organization: str,
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+    scope: str, collection: str,
+    limit: int = 3,
+) -> str:
+    """Build a brief prior-session context block for system prompt injection.
+
+    Fetches the most recent sessions for the customer, runs check_freshness on
+    each session's ticket IDs, and flags which tickets have been updated since
+    that session ended.  Returns an empty string when there are no prior sessions
+    or CB is unavailable.
+
+    The block is intentionally short — it gives the model topic continuity and
+    staleness signals without re-injecting stale ticket content.
+    """
+    sessions = fetch_recent_sessions(
+        cb_url, bucket, username, password, use_tls, scope, collection,
+        limit=limit, organization=organization,
+    )
+    if not sessions:
+        return ""
+
+    lines: list[str] = ["## Prior Session Context"]
+    for sess in sessions:
+        _dt    = (sess.get("ended_at") or sess.get("created_at") or "")[:10]
+        _tc    = sess.get("turn_count", 0)
+        _tags  = ", ".join((sess.get("topic_tags") or [])[:8])
+        _tids  = sess.get("ticket_ids") or []
+        _since = sess.get("last_active_at") or 0
+
+        _stale: list[str] = []
+        if _tids and _since:
+            _stale = check_freshness(
+                _tids, _since,
+                cb_url, bucket, username, password, use_tls, scope, collection,
+            )
+
+        _line = f"Session {_dt} ({_tc} turns)"
+        if _tags:
+            _line += f" — topics: {_tags}"
+        if _tids:
+            _line += f" — {len(_tids)} tickets in scope"
+        if _stale:
+            _line += f" — ⚠ {len(_stale)} ticket(s) updated since session: {', '.join(_stale[:10])}"
+        lines.append(_line)
+
+        # Include a one-sentence distillation of the last assistant turn if available
+        _turns = sess.get("turns") or []
+        _last_a = next(
+            (t["content"][:200] for t in reversed(_turns) if t.get("role") == "assistant"),
+            None,
+        )
+        if _last_a:
+            lines.append(f"  Last answer: {_last_a}{'…' if len(_last_a) == 200 else ''}")
+
+    return "\n".join(lines)
 
 
 def fetch_recent_sessions(
@@ -572,10 +783,12 @@ def fetch_ticket_signals_from_cb(
     cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
     scope: str, collection: str,
 ) -> dict[str, dict]:
-    """Return {ticket_id: {status, solved}} for all stored tickets.
+    """Return {ticket_id: {status, solved, is_stub}} for all stored tickets.
 
     Used for change detection: if a ticket's status or solved date differs
     from the listing page, it is re-scraped even though the ID already exists.
+    is_stub=True when the stored record has no requester (detail page was never
+    successfully scraped) so it is re-scraped on the next incremental run.
     """
     if not _CB_AVAILABLE:
         return {}
@@ -585,7 +798,7 @@ def fetch_ticket_signals_from_cb(
         cluster.wait_until_ready(timedelta(seconds=15))
         keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
         rows = list(cluster.query(
-            f"SELECT META(t).id AS doc_id, t.status, t.solved "
+            f"SELECT META(t).id AS doc_id, t.status, t.solved, t.requester, t.`_deleted` "
             f"FROM {keyspace} AS t WHERE META(t).id LIKE 'ticket::%'",
             QueryOptions(timeout=timedelta(seconds=30)),
         ))
@@ -595,8 +808,10 @@ def fetch_ticket_signals_from_cb(
             tid = str(row.get("doc_id", "")).split("::")[-1]
             if tid:
                 signals[tid] = {
-                    "status": row.get("status"),
-                    "solved": row.get("solved"),
+                    "status":   row.get("status"),
+                    "solved":   row.get("solved"),
+                    "is_stub":  not row.get("requester") and not row.get("_deleted"),
+                    "_deleted": bool(row.get("_deleted")),
                 }
         return signals
     except Exception:
@@ -629,11 +844,17 @@ def _filter_changed_tickets(
             new_tickets.append(s)
             continue
         stored = stored_signals[tid]
+        # Skip permanently deleted tickets — never re-scrape them
+        if stored.get("_deleted"):
+            skipped += 1
+            continue
         listing_status = (s.get("status") or "").strip().lower()
         stored_status  = (stored.get("status") or "").strip().lower()
         listing_solved = (s.get("solved") or "").strip()
         stored_solved  = (stored.get("solved") or "").strip()
-        if listing_status != stored_status or listing_solved != stored_solved:
+        # Re-scrape stubs: CB record has no requester → detail page never succeeded
+        is_stub = stored.get("is_stub", False)
+        if listing_status != stored_status or listing_solved != stored_solved or is_stub:
             changed_tickets.append(s)
         else:
             skipped += 1
@@ -746,6 +967,16 @@ def _save_settings_file(profiles: dict) -> None:
     SETTINGS_FILE.write_text(json.dumps(profiles, indent=2))
 
 
+def _get_profile_cookie() -> str:
+    """Return the session cookie from the active saved profile, or empty string."""
+    try:
+        s = _load_settings_file()
+        active = s.get("__last__", "")
+        return s.get(active, {}).get("cookie", "") if active else ""
+    except Exception:
+        return ""
+
+
 # Module-level state — safe because NiceGUI runs as a single process.
 # ── Server-level persistent state ────────────────────────────────────────────
 # Survives browser refreshes and WebSocket reconnects.  Written by operations
@@ -783,6 +1014,19 @@ _browser_state: dict = {
 _browser_close_event:  threading.Event = threading.Event()
 _browser_closed_event: threading.Event = threading.Event()
 _browser_ready_event:  threading.Event = threading.Event()  # set when browser is open & navigated
+
+# Network API logger — captures XHR/fetch calls while user browses Supportal.
+_net_log_state: dict = {
+    "pw":      None,
+    "ctx":     None,
+    "entries": [],   # list of captured call dicts
+    "running": False,
+    "_loop":   None, # asyncio event loop for UI callbacks
+    "_ui_cb":  None, # async coroutine callback(entry) → None
+}
+_net_log_close_event:  threading.Event = threading.Event()
+_net_log_closed_event: threading.Event = threading.Event()
+_net_log_ready_event:  threading.Event = threading.Event()
 
 # Shared results — written by worker thread, read by UI download handlers.
 _results: list[dict] = []
@@ -1082,6 +1326,8 @@ def parse_ticket_detail(html: str, url: str) -> dict:
     status = priority = created = assignee = requester = organization = None
     ticket_group = tags_text = escalations_text = snapshots_text = None
     ticket_fields: dict = {}
+    cbses: list[str] = []
+    jira_issues: list[str] = []
     comments: list[dict] = []
 
     for box in soup.select("div.box"):
@@ -1159,6 +1405,29 @@ def parse_ticket_detail(html: str, url: str) -> dict:
                     if re.match(r"ESC-\d+", a.get_text(strip=True))]
             escalations_text = ", ".join(escs) if escs else None
 
+        # ── CBSEs ──────────────────────────────────────────────────────────────
+        elif box_title.strip().lower() in ("cbses", "cbse"):
+            raw_body = body.get_text(" ", strip=True)
+            # Collect from links first, fall back to text scan
+            found = [a.get_text(strip=True) for a in body.select("a")
+                     if re.search(r"CBSE-\d+", a.get_text(strip=True), re.IGNORECASE)]
+            if not found:
+                found = re.findall(r"CBSE-\d+", raw_body, re.IGNORECASE)
+            cbses = [c.upper() for c in found]
+
+        # ── JIRA Issues ────────────────────────────────────────────────────────
+        elif "jira" in box_title:
+            raw_body = body.get_text(" ", strip=True)
+            # Jira keys: PROJECT-NUMBER (e.g. MB-12345, CB-12345, JMSE-456)
+            found = [a.get_text(strip=True) for a in body.select("a")
+                     if re.match(r"[A-Z]+-\d+", a.get_text(strip=True))]
+            if not found:
+                found = re.findall(r"\b[A-Z]{2,}-\d+\b", raw_body)
+            # Exclude CBSEs that may appear in the Jira box by accident
+            jira_issues = [j for j in found
+                           if not j.upper().startswith("CBSE-")
+                           and not j.upper().startswith("ESC-")]
+
         # ── Snapshots ─────────────────────────────────────────────────────────
         elif "snapshot" in box_title:
             lines = [t.strip() for t in body.get_text("\n").splitlines() if t.strip()
@@ -1205,6 +1474,8 @@ def parse_ticket_detail(html: str, url: str) -> dict:
         "created":       created,
         "tags":          tags_text,
         "escalations":   escalations_text,
+        "cbses":         cbses if cbses else None,
+        "jira_issues":   jira_issues if jira_issues else None,
         "snapshots":     snapshots_text,
         "ticket_fields": ticket_fields if ticket_fields else None,
         "description":   description,
@@ -1891,8 +2162,11 @@ def scrape_with_cookie(
         url = f"{BASE_URL}/zendesk/ticket/{tid}"  # always use canonical URL
         try:
             resp = _worker_session().get(url, timeout=30, allow_redirects=True, verify=False)
-            resp.raise_for_status()
-            rec = parse_ticket_detail(resp.text, url)
+            if _is_deleted_ticket_page(resp.status_code, resp.text):
+                rec = {"ticket_id": tid, "url": url, "_deleted": True}
+            else:
+                resp.raise_for_status()
+                rec = parse_ticket_detail(resp.text, url)
         except Exception as exc:
             rec = {"ticket_id": tid, "url": url, "error": str(exc)}
         results[idx] = rec
@@ -2001,10 +2275,13 @@ def scrape_with_cookie_playwright(
                 except PWTimeoutError:
                     pass
                 html = page.content()
-                rec  = parse_ticket_detail(html, url)
-                for field in ("status", "priority", "subject", "created", "solved"):
-                    if not rec.get(field) and summary.get(field):
-                        rec[field] = summary[field]
+                if _is_deleted_ticket_page(200, html):
+                    rec = {**summary, "url": url, "_deleted": True}
+                else:
+                    rec = parse_ticket_detail(html, url)
+                    for field in ("status", "priority", "subject", "created", "solved"):
+                        if not rec.get(field) and summary.get(field):
+                            rec[field] = summary[field]
             except PWTimeoutError:
                 rec = {**summary, "url": url, "error": "timeout"}
             except Exception as exc:
@@ -2312,10 +2589,13 @@ def scrape_with_playwright(
                 except PWTimeoutError:
                     pass
                 html = page.content()
-                rec  = parse_ticket_detail(html, url)
-                for field in ("status", "priority", "subject", "created", "solved"):
-                    if not rec.get(field) and summary.get(field):
-                        rec[field] = summary[field]
+                if _is_deleted_ticket_page(200, html):
+                    rec = {**summary, "url": url, "_deleted": True}
+                else:
+                    rec = parse_ticket_detail(html, url)
+                    for field in ("status", "priority", "subject", "created", "solved"):
+                        if not rec.get(field) and summary.get(field):
+                            rec[field] = summary[field]
             except PWTimeoutError:
                 rec = {**summary, "url": url, "error": "timeout"}
             except Exception as exc:
@@ -2330,6 +2610,33 @@ def scrape_with_playwright(
     return results
 
 
+_DELETED_TICKET_PHRASES = (
+    "ticket has been deleted",
+    "ticket was deleted",
+    "this ticket no longer exists",
+    "has been permanently deleted",
+    "this record has been deleted",
+    "record not found",
+    "ticket not found",
+    "no longer available",
+)
+
+
+def _is_deleted_ticket_page(status_code: int, html: str) -> bool:
+    """Return True if the page indicates the ticket was deleted or does not exist."""
+    if not html:
+        return False
+    if status_code not in (200, 404):
+        return False
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True).lower()
+    if any(phrase in text for phrase in _DELETED_TICKET_PHRASES):
+        return True
+    # 404 pages with generic "not found" copy also count as deleted
+    if status_code == 404 and "not found" in text:
+        return True
+    return False
+
+
 def scrape_single_ticket_cookie(cookie: str, ticket_id: str) -> dict:
     """Fetch and parse a single ticket detail page using cookie auth."""
     session = requests.Session()
@@ -2340,6 +2647,8 @@ def scrape_single_ticket_cookie(cookie: str, ticket_id: str) -> dict:
     })
     url = f"{BASE_URL}/zendesk/ticket/{ticket_id}"
     resp = session.get(url, timeout=30, allow_redirects=True, verify=False)
+    if _is_deleted_ticket_page(resp.status_code, resp.text):
+        return {"ticket_id": ticket_id, "url": url, "_deleted": True}
     resp.raise_for_status()
     return parse_ticket_detail(resp.text, url)
 
@@ -2395,6 +2704,7 @@ def validate_and_recover_pipeline(
     use_playwright: bool,
     progress_cb: Callable[[str, float], None],
     cancel: threading.Event | None = None,
+    raw_tickets: list[dict] | None = None,
 ) -> tuple[int, int]:
     """
     Validate that every scored ticket exists in CB. For any that are missing
@@ -2405,6 +2715,41 @@ def validate_and_recover_pipeline(
         raise RuntimeError("couchbase SDK not installed")
 
     import datetime
+
+    # ── Report scraping failures from the raw ticket batch ───────────────
+    # Tickets whose subject is an HTTP error title were stored as-is in CB;
+    # log them here so the operator knows which URLs need a re-scrape.
+    _HTTP_ERR_SUBJECTS = frozenset({
+        "404 page not found", "403 forbidden", "401 unauthorized",
+        "500 internal server error", "502 bad gateway",
+        "503 service unavailable", "access denied",
+    })
+    if raw_tickets:
+        scrape_failures = [
+            t for t in raw_tickets
+            if (t.get("subject") or "").strip().lower() in _HTTP_ERR_SUBJECTS
+        ]
+        if scrape_failures:
+            progress_cb(
+                f"Scraping failures ({len(scrape_failures)} doc(s) returned HTTP error pages "
+                f"— stored with error title, need re-scrape):", 0.0,
+            )
+            for t in scrape_failures:
+                # Determine document type from whichever ID field is present
+                if t.get("ticket_id"):
+                    doc_type = "ticket"
+                    doc_id   = t["ticket_id"]
+                    url = f"{BASE_URL}/zendesk/ticket/{doc_id}"
+                elif t.get("snap_id") or t.get("snapshot_id"):
+                    doc_type = "snapshot"
+                    doc_id   = t.get("snap_id") or t.get("snapshot_id", "?")
+                    url = t.get("url") or f"{BASE_URL}/snapshot/{doc_id}"
+                else:
+                    doc_type = "unknown"
+                    doc_id   = "?"
+                    url = t.get("url", "")
+                subj = (t.get("subject") or "").strip()
+                progress_cb(f"  ✗ [{doc_type}] #{doc_id}  {subj}  →  {url}", 0.0)
 
     conn_str = _cb_conn_str(cb_url, use_tls)
     cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
@@ -2594,6 +2939,130 @@ def confirm_login_thread() -> None:
         raise TimeoutError("Browser did not close within 30 seconds.")
 
 
+# ─────────────────────────── Network API logger ───────────────────────────────
+
+def start_net_log_thread() -> None:
+    """
+    Open a headful Chromium window and capture every XHR/fetch call made to
+    supportal.couchbase.com into _net_log_state['entries'].
+
+    Uses a separate profile dir so it doesn't share cookies with the login
+    browser.  Blocks on _net_log_close_event — call stop_net_log_thread() to
+    shut down cleanly from another thread.
+    """
+    _net_log_close_event.clear()
+    _net_log_closed_event.clear()
+    _net_log_ready_event.clear()
+    _net_log_state["entries"] = []
+    _net_log_state["running"] = True
+
+    profile_dir = os.path.join(os.path.dirname(__file__), ".playwright_netlog")
+    os.makedirs(profile_dir, exist_ok=True)
+
+    pw  = sync_playwright().start()
+    ctx = pw.chromium.launch_persistent_context(
+        user_data_dir=profile_dir,
+        headless=False,
+        viewport={"width": 1280, "height": 900},
+        user_agent=UA,
+        ignore_https_errors=True,
+    )
+    _net_log_state["pw"]  = pw
+    _net_log_state["ctx"] = ctx
+    page = ctx.new_page() if not ctx.pages else ctx.pages[0]
+
+    def _handle_route(route):
+        # page.route() fires synchronously for each request while the page is
+        # alive — unlike requestfinished/response events which fire at browser
+        # shutdown after body buffers are released.  route.fetch() re-issues
+        # the request through Playwright's fetch infrastructure and returns a
+        # fully-buffered APIResponse whose .body() is always available.
+        request = route.request
+        url     = request.url
+
+        if "supportal.couchbase.com" not in url or request.resource_type not in ("xhr", "fetch"):
+            try:
+                route.continue_()
+            except Exception:
+                pass
+            return
+
+        resp_text  = ""
+        resp_error = ""
+        status     = 0
+        try:
+            api_resp  = route.fetch()
+            status    = api_resp.status
+            try:
+                resp_text = api_resp.body().decode("utf-8", errors="replace")
+            except Exception as e:
+                resp_error = str(e)
+            try:
+                route.fulfill(response=api_resp)
+            except Exception:
+                pass
+        except Exception as e:
+            resp_error = str(e)
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+        try:
+            req_body = request.post_data or ""
+        except Exception:
+            req_body = ""
+
+        entry = {
+            "ts":         int(time.time()),
+            "time":       time.strftime("%H:%M:%S"),
+            "method":     request.method,
+            "url":        url,
+            "status":     status,
+            "req_body":   req_body[:4000],
+            "resp_body":  resp_text[:50000],
+            "resp_size":  len(resp_text),
+            "resp_error": resp_error,
+        }
+        _net_log_state["entries"].append(entry)
+        cb = _net_log_state.get("_ui_cb")
+        lp = _net_log_state.get("_loop")
+        if cb and lp:
+            asyncio.run_coroutine_threadsafe(cb(entry), lp)
+
+    page.route("**/*", _handle_route)
+    try:
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
+    except Exception:
+        pass
+    _net_log_ready_event.set()
+    _net_log_close_event.wait()
+
+    try:
+        ctx.close()
+    finally:
+        pw.stop()
+    _net_log_state["pw"]      = None
+    _net_log_state["ctx"]     = None
+    _net_log_state["running"] = False
+    _net_log_closed_event.set()
+
+
+def stop_net_log_thread() -> None:
+    """Signal start_net_log_thread() to close the browser and wait for cleanup."""
+    _net_log_close_event.set()
+    _net_log_closed_event.wait(timeout=15)
+
+
+def save_net_log() -> str:
+    """Write captured entries to a timestamped JSON file. Returns the path."""
+    ts   = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(os.path.dirname(__file__), f"network_log_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(_net_log_state["entries"], f, indent=2)
+    return path
+
+
 # ─────────────────────────── Export helpers ───────────────────────────────────
 
 _FLAT_FIELDS = [
@@ -2601,7 +3070,7 @@ _FLAT_FIELDS = [
     "requester", "assignee", "organization",
     "created", "updated", "solved", "tags",
     "description", "ticket_information", "ticket_timeline",
-    "escalations", "snapshots", "comment_count", "error",
+    "escalations", "cbses", "jira_issues", "snapshots", "comment_count", "error",
     # enriched snapshot topology — serialised as JSON in CSV
     "snapshot_topology",
 ]
@@ -2779,7 +3248,8 @@ def main_page():
         "scores":           {},         # ticket_id -> score dict from Phase 3 LLM scoring
         "customer_name":    "",         # resolved customer name from last scrape/load
         "chat_session_id":  str(uuid.uuid4()),  # unique ID for current conversation session
-        "chat_session_turns": [],       # [(question, answer, ts)] for session storage
+        "chat_session_turns": [],       # [(question, answer, ts, ticket_ids)] for session storage
+        "prior_session_block": "",      # fetched once on first turn; injected into every system prompt
     }
 
     # ── Restore from server-level state (survives page refresh) ─────────────
@@ -3050,6 +3520,14 @@ def main_page():
                                     )
 
                                 state["results"] = data
+                                # Save old customer's history, then load new customer's
+                                _old_cust = state.get("customer_name", "")
+                                if _CB_AVAILABLE and state.get("chat_history") and _old_cust != customer:
+                                    await run.io_bound(
+                                        save_customer_chat_history, _old_cust, list(state["chat_history"]),
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
                                 state["customer_name"] = customer
                                 _SERVER_STATE["results"] = data
                                 _SERVER_STATE["customer_name"] = customer
@@ -3058,6 +3536,17 @@ def main_page():
                                 _results.clear()
                                 _results.extend(data)
                                 _set_customer_banner(customer or "All Customers")
+                                if _CB_AVAILABLE and _old_cust != customer:
+                                    _loaded_hist = await run.io_bound(
+                                        load_customer_chat_history, customer,
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
+                                    state["chat_history"] = _loaded_hist
+                                    state["chat_session_turns"] = []
+                                    state["chat_session_id"] = str(uuid.uuid4())
+                                    state["prior_session_block"] = ""
+                                    _render_chat()
 
                                 _refresh_table(data)
                                 btn_dl_json.set_enabled(True)
@@ -3237,7 +3726,9 @@ def main_page():
                                                 if _enrich_snap_col is not None:
                                                     def _snap_upsert_fn(doc, _col=_enrich_snap_col):
                                                         try:
-                                                            _col.upsert(f"snapshot::{doc['snap_id']}", doc)
+                                                            _d = doc.copy()
+                                                            _d["last_scraped_at"] = int(time.time())
+                                                            _col.upsert(f"snapshot::{doc['snap_id']}", _d)
                                                         except Exception:
                                                             pass
                                             enriched_n, enrich_errs = await run.io_bound(
@@ -3249,7 +3740,9 @@ def main_page():
                                                 4,
                                                 _snap_upsert_fn,
                                             )
-                                            _enrich_ok = enrich_errs < len([t for t in data if t.get("snapshots")]) or enriched_n > 0
+                                            _snap_count = len([t for t in data if t.get("snapshots")])
+                                            # ok = skipped (no snap tickets), partial success, or full success
+                                            _enrich_ok = _snap_count == 0 or enriched_n > 0 or enrich_errs < _snap_count
 
                                             # Re-save enriched tickets to Couchbase so that
                                             # snapshot_topology + snap_ids + snapshot_summary are
@@ -3385,6 +3878,7 @@ def main_page():
                                                 using_browser,
                                                 _make_step_prog("validate"),
                                                 _cancel,
+                                                data,
                                             )
                                             await _step_finish(
                                                 "validate",
@@ -3646,6 +4140,17 @@ def main_page():
                                 on_click=lambda: asyncio.ensure_future(_ch_save_cb()),
                             ).props("color=indigo outline")
                             btn_ch_save_cb.set_enabled(False)
+                            btn_ch_embed_cb = ui.button(
+                                "Embed Snapshots", icon="hub",
+                                on_click=lambda: asyncio.ensure_future(_ch_embed_cb()),
+                            ).props("color=teal outline").tooltip(
+                                "Generate vector embeddings for loaded snapshots and upsert them to Couchbase. "
+                                "Required for vector search / topology queries."
+                            )
+                            btn_ch_embed_cb.set_enabled(False)
+                            ch_auto_save_cb = ui.checkbox(
+                                "Auto-save to Couchbase after scrape", value=False,
+                            ).tooltip("Automatically persist scraped snapshots to Couchbase when the scrape completes")
                         ch_status = ui.label("Ready.").classes("text-sm text-gray-500 mt-1")
                         ch_progress = ui.linear_progress(value=0).classes("w-full mt-1")
                         ch_progress.set_visibility(False)
@@ -4067,6 +4572,95 @@ def main_page():
                                     btn_confirm = ui.button("Confirm Login", on_click=do_confirm_login, icon="check_circle")
                                     btn_confirm.props("disabled color=positive")
 
+                                # ── Network API Inspector ──────────────────────────────
+                                ui.separator().classes("mt-5")
+                                with ui.row().classes("items-center gap-2 mt-2"):
+                                    ui.icon("network_check").classes("text-purple-500")
+                                    ui.label("Network API Inspector").classes("text-sm font-semibold text-gray-700")
+                                ui.label(
+                                    "Opens a browser window — log in, then click through tickets and snapshots. "
+                                    "Every API call Supportal makes is captured here with its URL, "
+                                    "request body, and response. Save to JSON when done."
+                                ).classes("text-xs text-gray-400 mt-1 mb-2")
+
+                                with ui.row().classes("items-center gap-2"):
+                                    netlog_dot    = ui.icon("circle").classes("text-gray-400 text-sm")
+                                    netlog_status = ui.label("Not running").classes("text-sm text-gray-500")
+                                    netlog_count  = ui.badge("0 calls", color="purple").classes("ml-2")
+
+                                netlog_log = ui.log(max_lines=300).classes("w-full mt-2 font-mono text-xs")
+                                netlog_log.set_visibility(False)
+
+                                async def _do_start_netlog():
+                                    if _net_log_state["running"]:
+                                        return
+                                    btn_netlog_start.props("loading disabled")
+                                    netlog_dot.classes(replace="text-orange-400 text-sm")
+                                    netlog_status.set_text("Opening browser…")
+                                    netlog_log.clear()
+                                    netlog_log.set_visibility(True)
+                                    netlog_count.set_text("0 calls")
+
+                                    _net_log_state["_loop"] = asyncio.get_event_loop()
+
+                                    async def _on_entry(entry):
+                                        short_url = entry["url"].split("supportal.couchbase.com")[-1][:80]
+                                        netlog_log.push(
+                                            f"[{entry['time']}] {entry['method']:4} {short_url} → {entry['status']}"
+                                        )
+                                        netlog_count.set_text(f"{len(_net_log_state['entries'])} calls")
+
+                                    _net_log_state["_ui_cb"] = _on_entry
+
+                                    threading.Thread(target=start_net_log_thread, daemon=True).start()
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, _net_log_ready_event.wait
+                                    )
+                                    netlog_dot.classes(replace="text-green-500 text-sm")
+                                    netlog_status.set_text("Running — browse Supportal to capture calls")
+                                    btn_netlog_start.props(remove="loading disabled")
+                                    btn_netlog_stop.props(remove="disabled")
+                                    btn_netlog_save.props(remove="disabled")
+
+                                async def _do_stop_netlog():
+                                    btn_netlog_stop.props("loading disabled")
+                                    netlog_status.set_text("Stopping…")
+                                    await run.io_bound(stop_net_log_thread)
+                                    netlog_dot.classes(replace="text-gray-400 text-sm")
+                                    netlog_status.set_text(
+                                        f"Stopped — {len(_net_log_state['entries'])} calls captured"
+                                    )
+                                    btn_netlog_stop.props(remove="loading")
+                                    btn_netlog_stop.props("disabled")
+
+                                async def _do_save_netlog():
+                                    if not _net_log_state["entries"]:
+                                        ui.notify("No calls captured yet.", type="warning")
+                                        return
+                                    try:
+                                        path = await run.io_bound(save_net_log)
+                                        ui.notify(
+                                            f"Saved {len(_net_log_state['entries'])} calls → {os.path.basename(path)}",
+                                            type="positive",
+                                        )
+                                        netlog_status.set_text(f"Saved → {os.path.basename(path)}")
+                                    except Exception as exc:
+                                        ui.notify(f"Save error: {exc}", type="negative")
+
+                                with ui.row().classes("gap-3 mt-2"):
+                                    btn_netlog_start = ui.button(
+                                        "Start", icon="play_circle",
+                                        on_click=_do_start_netlog,
+                                    ).props("color=purple")
+                                    btn_netlog_stop = ui.button(
+                                        "Stop", icon="stop_circle",
+                                        on_click=_do_stop_netlog,
+                                    ).props("outline color=red disabled")
+                                    btn_netlog_save = ui.button(
+                                        "Save Log", icon="save",
+                                        on_click=_do_save_netlog,
+                                    ).props("outline color=green disabled")
+
                     with ui.tab_panel(cfg_cb):
                         with ui.row().classes("items-center justify-between w-full"):
                             ui.label("Load to Couchbase").classes("text-base font-semibold")
@@ -4081,6 +4675,7 @@ def main_page():
                             cb_scope_input      = ui.input("Scope",              placeholder="_default").classes("w-full")
                             cb_collection_input = ui.input("Collection",         placeholder="tickets").classes("w-full")
                             ch_snap_coll        = ui.input("Snapshot collection", placeholder="snapshots", value="snapshots").classes("w-full")
+                            cb_summary_coll     = ui.input("Summary collection",  placeholder="summary",   value="summary").classes("w-full")
 
                         with ui.row().classes("items-center gap-4 mt-2"):
                             cb_tls_toggle = ui.switch("TLS (couchbases://)", value=False)
@@ -4392,10 +4987,28 @@ def main_page():
                                 )
                                 state["results"] = tickets
                                 cb_cust = (cb_load_filter.value or "").strip() or "All Customers"
+                                _old_cust2 = state.get("customer_name", "")
+                                if _CB_AVAILABLE and state.get("chat_history") and _old_cust2 != cb_cust:
+                                    await run.io_bound(
+                                        save_customer_chat_history, _old_cust2, list(state["chat_history"]),
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
                                 state["customer_name"] = cb_cust
                                 _SERVER_STATE["results"] = tickets
                                 _SERVER_STATE["customer_name"] = cb_cust
                                 _set_customer_banner(cb_cust)
+                                if _CB_AVAILABLE and _old_cust2 != cb_cust:
+                                    _loaded_hist2 = await run.io_bound(
+                                        load_customer_chat_history, cb_cust,
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
+                                    state["chat_history"] = _loaded_hist2
+                                    state["chat_session_turns"] = []
+                                    state["chat_session_id"] = str(uuid.uuid4())
+                                    state["prior_session_block"] = ""
+                                    _render_chat()
 
                                 # Auto-extract scores if already present on the docs
                                 auto_scores = {
@@ -4570,6 +5183,87 @@ def main_page():
                             finally:
                                 btn_create_idx.set_enabled(True)
 
+                        async def _do_embed_snaps_from_cb():
+                            btn_embed_snaps.set_enabled(False)
+                            emb_status.set_text("Embedding snapshots from Couchbase …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_snaps(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_snaps(msg, pct), loop)
+
+                            try:
+                                ep, em, ek, eu, ed, _ = _get_embed_config()
+                                done, errs = await run.io_bound(
+                                    embed_snapshots_from_cb,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    ch_snap_coll.value.strip() or "snapshots",
+                                    ep, em, ek, eu, int(ed or 1024),
+                                    _prog,
+                                    int(embed_parallel_input.value or 1),
+                                )
+                                msg = f"Snapshot embed complete — {done} embedded, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"Snapshot embed error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_embed_snaps.set_enabled(True)
+
+                        async def _do_summarize():
+                            btn_summarize.set_enabled(False)
+                            emb_status.set_text("Summarizing tickets …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_sum(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_sum(msg, pct), loop)
+
+                            try:
+                                llm_p, llm_m, llm_k, llm_u = _get_llm_config()
+                                done, errs = await run.io_bound(
+                                    summarize_tickets_from_cb,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "supportal",
+                                    cb_summary_coll.value.strip() or "summary",
+                                    llm_p, llm_m, llm_k, llm_u,
+                                    _prog,
+                                    main_cust_input.value.strip(),
+                                    summarize_force_cb.value,  # force — overwrite existing if checked
+                                    1,      # max_workers — LLM calls are sequential by default
+                                )
+                                msg = f"Summarization complete — {done} written, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"Summarize error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_summarize.set_enabled(True)
+
                         async def _do_backfill():
                             btn_backfill.set_enabled(False)
                             emb_status.set_text("Backfilling analytics fields …")
@@ -4641,14 +5335,21 @@ def main_page():
                             ui.button("Probe LMStudio", icon="network_ping",
                                       on_click=_probe_lmstudio_concurrency).props("outline color=teal dense")
 
+                        with ui.row().classes("items-center gap-4 mt-2"):
+                            summarize_force_cb = ui.checkbox("Force re-summarize (overwrite existing)", value=False)
+
                         with ui.row().classes("gap-3 mt-2 flex-wrap"):
-                            btn_embed      = ui.button("Embed Tickets",              on_click=_do_embed,        icon="model_training").props("outline color=primary")
-                            btn_create_idx = ui.button("Create Vector Index",        on_click=_do_create_index, icon="manage_search").props("outline color=secondary")
-                            btn_backfill   = ui.button("Backfill Analytics Fields",  on_click=_do_backfill,     icon="auto_fix_high").props("outline color=brown")
-                            btn_stop_embed = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
+                            btn_embed       = ui.button("Embed Tickets",             on_click=_do_embed,                  icon="model_training").props("outline color=primary")
+                            btn_embed_snaps = ui.button("Embed All Snapshots",       on_click=_do_embed_snaps_from_cb,    icon="hub").props("outline color=indigo")
+                            btn_summarize   = ui.button("Summarize Tickets",         on_click=_do_summarize,              icon="summarize").props("outline color=teal")
+                            btn_create_idx  = ui.button("Create Vector Index",       on_click=_do_create_index,           icon="manage_search").props("outline color=secondary")
+                            btn_backfill    = ui.button("Backfill Analytics Fields", on_click=_do_backfill,               icon="auto_fix_high").props("outline color=brown")
+                            btn_stop_embed  = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
                             btn_stop_embed.set_enabled(False)
-                        btn_embed.set_enabled(False)
-                        btn_create_idx.set_enabled(False)
+                        btn_embed.set_enabled(_CB_AVAILABLE)
+                        btn_embed_snaps.set_enabled(_CB_AVAILABLE)
+                        btn_summarize.set_enabled(_CB_AVAILABLE)
+                        btn_create_idx.set_enabled(_CB_AVAILABLE)
 
                     with ui.tab_panel(cfg_chat_mem):
                         ui.label("Chat Memory & Cache").classes("text-base font-semibold")
@@ -5346,6 +6047,18 @@ def main_page():
                             on_click=lambda: asyncio.ensure_future(_run_preflight()),
                         ).props("color=indigo").classes("mt-4")
 
+                        with ui.row().classes("items-center gap-3 mt-3"):
+                            alias_status_lbl = ui.label("").classes("text-xs text-gray-500")
+                            ui.button(
+                                "Refresh App Aliases", icon="sync",
+                                on_click=lambda: asyncio.ensure_future(
+                                    _refresh_cluster_map(alias_status_lbl)
+                                ),
+                            ).props("color=teal outline size=sm").tooltip(
+                                "Query CB snapshots + tickets to build dynamic cluster→app name mappings. "
+                                "Improves search labelling for any customer, not just AmEx."
+                            )
+
             with ui.tab_panel(tab_chat):
                 with ui.column().classes("w-full gap-6"):
                     # ── Phase 2: Chat / RAG ──────────────────────────────────────────────
@@ -5356,12 +6069,20 @@ def main_page():
                         with ui.row().classes("items-center gap-2 mt-2 mb-1"):
                             ui.icon("info").classes("text-blue-400 text-sm")
                             ui.label("LLM provider is configured in the AI Models tab").classes("text-xs text-gray-500")
+                            ui.space()
+                            ui.button(
+                                "Open Chainlit Chat ↗",
+                                on_click=lambda: ui.run_javascript("window.open('http://localhost:8766','_blank')"),
+                            ).props("flat dense size=sm color=indigo").tooltip(
+                                "Open the professional Chainlit chat UI in a new tab.\n"
+                                "Start it first: python run_chainlit.py --port 8766"
+                            )
 
                         with ui.row().classes("items-center gap-4 mt-2 flex-wrap"):
                             with ui.column().classes("gap-1"):
                                 ui.label("Retrieval mode").classes("text-xs text-gray-500")
                                 chat_mode_select = ui.select(
-                                    ["Hybrid Search", "All Tickets", "Batch Map-Reduce"],
+                                    ["Hybrid Search", "Retrieve + Rerank", "All Tickets", "Batch Map-Reduce", "Agent"],
                                     value="Hybrid Search",
                                 ).classes("w-52")
                             top_k_input = ui.number("Top-K (vector search)", value=10, min=1, max=1600).classes("w-48")
@@ -5387,9 +6108,11 @@ def main_page():
 
                         def _update_chat_mode_visibility():
                             mode = chat_mode_select.value
-                            top_k_input.set_visibility(mode == "Hybrid Search")
+                            top_k_input.set_visibility(mode in ("Hybrid Search", "Retrieve + Rerank"))
                             batch_size_chat_input.set_visibility(mode == "Batch Map-Reduce")
                             batch_parallel_input.set_visibility(mode == "Batch Map-Reduce")
+                            compact_context_toggle.set_visibility(mode != "Agent")
+                            deep_reason_toggle.set_visibility(mode != "Agent")
 
                         chat_mode_select.on("update:model-value", lambda _: _update_chat_mode_visibility())
                         _update_chat_mode_visibility()
@@ -5400,11 +6123,8 @@ def main_page():
                         chat_status = ui.label("").classes("text-xs text-gray-400 mt-1 min-h-4")
 
                         # Live streaming display — visible only while Ollama/LMStudio generates
-                        with ui.row().classes("justify-start w-full mt-1") as _stream_row:
-                            _stream_label = ui.label("").classes(
-                                "bg-gray-100 text-gray-900 rounded-xl px-4 py-2 max-w-2xl "
-                                "text-sm whitespace-pre-wrap font-mono"
-                            )
+                        with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2") as _stream_row:
+                            _stream_label = ui.label("").classes("text-sm whitespace-pre-wrap font-mono")
                         _stream_row.set_visibility(False)
 
                         def _render_chat():
@@ -5412,22 +6132,88 @@ def main_page():
                             with chat_log:
                                 for msg in state["chat_history"]:
                                     if msg["role"] == "user":
-                                        with ui.row().classes("justify-end w-full"):
-                                            ui.label(msg["content"]).classes(
-                                                "bg-blue-600 text-white rounded-xl px-4 py-2 max-w-3xl text-sm whitespace-pre-wrap"
-                                            )
+                                        with ui.chat_message(name="You", sent=True).props("bg-color=blue-6 text-color=white"):
+                                            ui.label(msg["content"]).classes("text-sm whitespace-pre-wrap")
                                     elif msg["role"] == "assistant":
                                         _content = msg["content"]
-                                        with ui.row().classes("justify-start w-full items-start gap-1"):
-                                            with ui.column().classes("bg-gray-100 text-gray-900 rounded-xl px-4 py-2 max-w-3xl text-sm"):
-                                                ui.markdown(_content).classes("prose prose-sm max-w-none")
+                                        with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2"):
+                                            # Render text + artifact (echart/table) blocks interleaved
+                                            _last_pos = 0
+                                            _has_artifact = bool(_ARTIFACT_RE.search(_content))
+                                            for _am in _ARTIFACT_RE.finditer(_content):
+                                                _pre = _content[_last_pos:_am.start()].strip()
+                                                if _pre:
+                                                    ui.markdown(_pre).classes("prose prose-sm max-w-none")
+                                                _atype, _araw = _am.group(1), _am.group(2)
+                                                _last_pos = _am.end()
+                                                try:
+                                                    _ap = json.loads(_araw)
+                                                except Exception:
+                                                    ui.label(f"[{_atype} parse error]").classes("text-red-500 text-xs")
+                                                    continue
+                                                if _atype == "echart":
+                                                    _cuid = f"agchart-{abs(hash(_araw)):x}"
+                                                    _ctitle = ((_ap.get("title") or {}).get("text") or "chart").replace(" ", "_")
+                                                    with ui.element("div").classes(f"w-full {_cuid} mt-2"):
+                                                        ui.echart(_ap).classes("w-full").style("height:320px")
+                                                    ui.button(
+                                                        "PNG", icon="image",
+                                                        on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
+                                                            f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
+                                                            f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
+                                                            f"if(!inst)return;var img=inst.getDataURL({{type:'png',pixelRatio:2,backgroundColor:'#fff'}});"
+                                                            f"var a=document.createElement('a');a.href=img;a.download='{fn}.png';a.click();}})();"
+                                                        ),
+                                                    ).props("flat dense size=sm color=blue-grey").classes("mt-1").tooltip("Download PNG")
+                                                elif _atype == "table":
+                                                    import html as _hmod
+                                                    _tcols = _ap.get("columns") or []
+                                                    _trows = _ap.get("rows") or []
+                                                    _tname = _ap.get("title") or "table"
+                                                    if _tname:
+                                                        ui.label(_tname).classes("font-semibold text-sm mt-2 mb-1")
+                                                    if _ap.get("description"):
+                                                        ui.markdown(_ap["description"]).classes("prose prose-sm mb-1")
+                                                    _th = "".join(f'<th class="border border-gray-300 px-2 py-1 bg-gray-200 font-semibold whitespace-nowrap">{_hmod.escape(str(c))}</th>' for c in _tcols)
+                                                    _tb = "".join(
+                                                        "<tr>" + "".join(f'<td class="border border-gray-300 px-2 py-1 whitespace-nowrap">{_hmod.escape(str(cell))}</td>' for cell in row) + "</tr>"
+                                                        for row in _trows
+                                                    )
+                                                    ui.html(f'<div class="overflow-x-auto mt-1"><table class="border-collapse text-xs"><thead><tr>{_th}</tr></thead><tbody>{_tb}</tbody></table></div>')
+                                                    with ui.row().classes("gap-1 mt-1"):
+                                                        def _dl_csv(_c=_tcols, _r=_trows, _n=_tname):
+                                                            import csv as _cm, io as _im
+                                                            buf = _im.StringIO()
+                                                            w = _cm.writer(buf)
+                                                            w.writerow(_c)
+                                                            w.writerows(_r)
+                                                            ui.download(buf.getvalue().encode(), f"{_n}.csv", "text/csv")
+                                                        ui.button("CSV", icon="download", on_click=_dl_csv).props("flat dense size=sm color=green").tooltip("Download CSV")
+                                                        def _dl_xlsx(_c=_tcols, _r=_trows, _n=_tname):
+                                                            try:
+                                                                import openpyxl as _xl, io as _im
+                                                                wb = _xl.Workbook()
+                                                                ws = wb.active
+                                                                ws.title = _n[:31]
+                                                                ws.append(_c)
+                                                                for row in _r:
+                                                                    ws.append([str(c) for c in row])
+                                                                buf = _im.BytesIO()
+                                                                wb.save(buf)
+                                                                ui.download(buf.getvalue(), f"{_n}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                                                            except ImportError:
+                                                                ui.notify("Install openpyxl: pip install openpyxl", type="warning")
+                                                        ui.button("Excel", icon="table_view", on_click=_dl_xlsx).props("flat dense size=sm color=green").tooltip("Download Excel")
+                                            _post = _content[_last_pos:].strip()
+                                            if _post or not _has_artifact:
+                                                ui.markdown(_post or _content).classes("prose prose-sm max-w-none")
                                             # Copy button — writes raw markdown to clipboard
                                             ui.button(
                                                 icon="content_copy",
                                                 on_click=lambda e, txt=_content: ui.run_javascript(
                                                     f"navigator.clipboard.writeText({json.dumps(txt)})"
                                                 ),
-                                            ).props("flat round dense color=gray").classes("mt-1 opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
+                                            ).props("flat round dense color=gray").classes("mt-2 opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
                             # Scroll to bottom
                             ui.run_javascript(
                                 "var el = document.querySelector('.chat-log-scroll');"
@@ -5468,9 +6254,15 @@ def main_page():
                             def _worker():
                                 try:
                                     default = "http://localhost:1234" if provider == "lmstudio" else "http://localhost:11434"
+                                    # Long connect timeout for LMStudio on-demand model loading
+                                    # (model load on a 4070 Ti can take 30–90 s before first token)
+                                    _timeout = _openai_mod.Timeout(
+                                        timeout=600.0, connect=180.0
+                                    ) if provider == "lmstudio" else None
                                     client = _openai_mod.OpenAI(
                                         api_key=api_key or "ollama",
                                         base_url=_openai_base_url(base_url, default),
+                                        timeout=_timeout,
                                     )
                                     with client.chat.completions.create(
                                         model=model, messages=messages, max_tokens=4096, stream=True
@@ -5549,6 +6341,27 @@ def main_page():
                                         f"context: {ctx} tokens — VRAM: {vram_s}"
                                     )
 
+                            # Fetch prior session context once per session (first turn only).
+                            # Subsequent turns reuse the cached block to avoid extra CB round-trips.
+                            if (
+                                _CB_AVAILABLE
+                                and store_memory_toggle.value
+                                and not state["chat_session_turns"]   # first turn of this session
+                                and not state["prior_session_block"]
+                                and state.get("customer_name")
+                            ):
+                                _sc_col_p = (cache_collection_input.value.strip()
+                                             or cb_collection_input.value.strip() or "tickets")
+                                state["prior_session_block"] = await run.io_bound(
+                                    fetch_prior_session_context,
+                                    state["customer_name"],
+                                    cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(), cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    _sc_col_p,
+                                )
+
                             try:
                                 mode = chat_mode_select.value
 
@@ -5580,7 +6393,7 @@ def main_page():
                                     _render_chat()
                                     chat_status.set_text(f"Batch map-reduce complete — {len(state['results'])} tickets analysed.")
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now))
+                                    state["chat_session_turns"].append((question, answer, _ts_now, []))
 
                                 elif mode == "All Tickets":
                                     if not state["results"]:
@@ -5623,6 +6436,8 @@ def main_page():
                                         _mem_block = _build_memory_section(_memories)
                                         if _mem_block:
                                             system_msg = system_msg + "\n" + _mem_block
+                                    if state.get("prior_session_block"):
+                                        system_msg = system_msg + "\n" + state["prior_session_block"]
                                     # Window history to last 20 messages (10 turns)
                                     _hist_window = state["chat_history"][-(20):-1]
                                     messages = [{"role": "system", "content": system_msg}]
@@ -5665,7 +6480,247 @@ def main_page():
                                             chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
                                     # Record turn for session storage
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now))
+                                    _turn_tids = [str(t.get("ticket_id","")) for t in context_tickets if t.get("ticket_id")]
+                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
+
+                                elif mode == "Retrieve + Rerank":
+                                    _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
+                                    _cb_rr = (
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                    )
+                                    _top_k_rr = int(top_k_input.value or 60)
+
+                                    # Rewrite follow-up questions to be self-contained so
+                                    # "out of those, how many had CBSEs?" picks up the date
+                                    # range from the previous answer rather than fetching all time.
+                                    _orig_question = question
+                                    question = await run.io_bound(
+                                        contextualize_question,
+                                        question,
+                                        state["chat_history"][:-1],  # exclude current turn
+                                        provider, model, api_key, base_url,
+                                    )
+                                    if question != _orig_question:
+                                        chat_status.set_text(f"Contextualized: {question[:80]}…")
+
+                                    def _embed_fn_rr(text: str) -> list[float]:
+                                        return embed_text(text, _ep, _em, _eak, _ebu,
+                                                          dims=_edims, num_ctx=_enum_ctx)
+
+                                    chat_status.set_text("Stage 1 — retrieving candidates from Couchbase …")
+                                    rr_tickets, rr_notes = await run.io_bound(
+                                        search_tickets_retrieve_rerank,
+                                        question,   # rewritten — vector embedding
+                                        question,   # rewritten — N1QL date filter via build_structured_query
+                                        *_cb_rr,
+                                        _embed_fn_rr,
+                                        state["results"],
+                                        _top_k_rr,
+                                        500,
+                                        state.get("customer_name", ""),
+                                    )
+                                    if not rr_tickets:
+                                        answer = "No matching tickets found for your query."
+                                    else:
+                                        chat_status.set_text(
+                                            f"Stage 2 — reranking + answering over {len(rr_tickets)} candidates ({rr_notes}) …"
+                                        )
+                                        _today_dt  = datetime.datetime.now()
+                                        _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
+                                        _stats_block = build_dataset_stats(state["results"] or rr_tickets, _today_dt)
+                                        # Force compact when candidates are large
+                                        # to avoid blowing the model's context window.
+                                        _rr_compact = compact_context_toggle.value or len(rr_tickets) > 30
+                                        _context = build_rag_context(
+                                            rr_tickets, state["customer_name"],
+                                            compact=_rr_compact,
+                                        )
+                                        _rr_cust = state.get("customer_name", "")
+                                        _cust_rule = (
+                                            f"\nRULE R0 — You are answering about tickets for customer "
+                                            f"\"{_rr_cust}\". All retrieved tickets belong to "
+                                            f"this customer. Do NOT qualify answers with \"for this customer\" "
+                                            f"on every line — the scope is implicit."
+                                            if _rr_cust and _rr_cust.lower() != "all customers" else ""
+                                        )
+                                        _rerank_sys = (
+                                            SYSTEM_PROMPT_TEMPLATE.format(
+                                                today=_today_str, stats=_stats_block, context=_context,
+                                            ) +
+                                            "\n\n━━ RETRIEVE + RERANK RULES ━━" + _cust_rule + "\n"
+                                            "The tickets above were retrieved by a deterministic structured query "
+                                            "plus semantic vector search — they are your complete candidate set.\n"
+                                            "RULE R1 — Answer using ONLY tickets that directly match the question. "
+                                            "[Application: X] labels in ticket headers are authoritative.\n"
+                                            "RULE R2 — Do NOT include a ticket because it shares infrastructure or "
+                                            "patterns with matching tickets. Explicit label match only.\n"
+                                            "RULE R3 — If the question asks for a list, produce a markdown table of "
+                                            "ALL matching tickets from the context, not just a sample."
+                                            + (("\n" + state["prior_session_block"]) if state.get("prior_session_block") else "")
+                                        )
+                                        _rr_msgs = [
+                                            {"role": "system", "content": _rerank_sys},
+                                            {"role": "user",   "content": question},
+                                        ]
+                                        if use_streaming:
+                                            answer, n_tok, elapsed, rate = await _call_llm_streaming(
+                                                _rr_msgs, provider, model, api_key, base_url
+                                            )
+                                            chat_status.set_text(
+                                                f"Retrieve+Rerank: {len(rr_tickets)} candidates → "
+                                                f"{n_tok} tokens in {elapsed:.1f}s ({rate:.1f} tok/s) | {rr_notes}"
+                                            )
+                                        else:
+                                            answer = await run.io_bound(
+                                                call_llm, _rr_msgs, provider, model, api_key, base_url, 8192
+                                            )
+                                            chat_status.set_text(
+                                                f"Retrieve+Rerank: {len(rr_tickets)} candidates | {rr_notes}"
+                                            )
+                                    state["chat_history"].append({"role": "assistant", "content": answer})
+                                    _render_chat()
+                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                    _turn_tids = [str(t.get("ticket_id","")) for t in (rr_tickets or []) if t.get("ticket_id")]
+                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
+
+                                elif mode == "Agent":
+                                    if not _CB_AVAILABLE:
+                                        ui.notify("Couchbase is required for Agent mode.", type="warning")
+                                        return
+                                    _cb_agent = (
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                    )
+                                    _cust_agent = state.get("customer_name", "")
+                                    _today_str_agent = datetime.datetime.now().strftime("%Y-%m-%d (%A)")
+                                    _cust_scope = (
+                                        f" for customer \"{_cust_agent}\""
+                                        if _cust_agent and _cust_agent.lower() != "all customers"
+                                        else ""
+                                    )
+                                    _agent_sys = (
+                                        f"You are a Couchbase support ticket analyst. Today is {_today_str_agent}. "
+                                        f"You have access to tools that query a live Couchbase database containing "
+                                        f"Zendesk support tickets{_cust_scope}. "
+                                        "Use the available tools to answer questions accurately. "
+                                        "Always call tools to retrieve data — never guess at counts or ticket details.\n\n"
+                                        "TOOL GUIDANCE:\n"
+                                        "DATA SOURCE ROUTING — choose based on what the user is asking about:\n"
+                                        "  LOCAL (your Couchbase): list_organizations, query_tickets, count_tickets, get_ticket\n"
+                                        "    → 'what customers are you aware of?', 'what do you have locally?', 'which orgs have I scraped?'\n"
+                                        "  LIVE/GLOBAL (Supportal Analytics API): list_supportal_customers, query_supportal\n"
+                                        "    → 'how many customers get support today?', 'what's in Supportal globally?', "
+                                        "'how many clusters exist?', 'live snapshot data', 'version distribution across all customers'\n"
+                                        "When ambiguous, prefer LOCAL unless the user says 'today', 'live', 'Supportal', 'globally', or 'all customers'.\n"
+                                        "- count_tickets: for total/count questions\n"
+                                        "- query_tickets: to list or filter tickets (returns Last Scraped age per ticket)\n"
+                                        "- get_ticket: full detail on one ticket including cluster topology from the linked "
+                                        "snapshot (node count, CB version, services, buckets, RAM, auto-failover, bad/warn "
+                                        "health counts). Use this whenever the user asks about cluster configuration, "
+                                        "node count, topology, or infrastructure details for a specific ticket.\n"
+                                        "- check_data_freshness: ALWAYS call this when the user asks about 'current status', "
+                                        "'latest', 'live', 'today', or 'has this changed'. Pass the ticket_ids from a prior "
+                                        "query_tickets call. Report the age and include Supportal URLs for live verification.\n"
+                                        "- rescrape_ticket: refresh a single ticket from Supportal.\n"
+                                        "- rescrape_customer_tickets: bulk-refresh all stale tickets for a customer. "
+                                        "Call this when the user says 'rescrape all', 'refresh all tickets', 'update everything', "
+                                        "'get the latest for all tickets'. By default only rescrapes tickets older than 4 hours. "
+                                        "Use stale_hours=0 to force-refresh all regardless of age.\n"
+                                        "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true.\n"
+                                        "- generate_chart: MANDATORY when the user asks for any chart, graph, or "
+                                        "visualization. Call this tool — do NOT describe a chart in text or say 'here is "
+                                        "a bar chart:' followed by a text description. The tool renders a real interactive "
+                                        "chart in the UI. Supported types: bar, horizontal_bar, line, pie, donut. "
+                                        "Also call proactively when comparing counts across categories.\n"
+                                        "- generate_table: MANDATORY when the user asks for a table, spreadsheet, or "
+                                        "exportable data. Call this tool — do NOT render a markdown table. Always call "
+                                        "generate_table BEFORE your final summary text so the table appears above your "
+                                        "explanation. Produces real CSV and Excel download buttons."
+                                    )
+                                    if _cust_agent and _cust_agent.lower() != "all customers":
+                                        _agent_sys += (
+                                            f"\n\nSCOPING RULE: Customer is scoped to \"{_cust_agent}\". "
+                                            f"You MUST include customer=\"{_cust_agent}\" in every query_tickets and "
+                                            f"count_tickets call. Never ask the user for the customer name — it is already set.\n"
+                                            f"DISCOVERY EXCEPTIONS (cross-customer queries are allowed ONLY for):\n"
+                                            f"  1. list_organizations — always exempt, always runs across all customers.\n"
+                                            f"  2. Discovering what customers exist ('what orgs are in the system', "
+                                            f"'what other customers are there', 'update the customer list').\n"
+                                            f"  3. Getting a basic ticket count or summary for a specific other customer "
+                                            f"the user names explicitly.\n"
+                                            f"For all analysis, trends, ticket details, and comparisons: stay scoped to \"{_cust_agent}\"."
+                                        )
+                                    if state.get("prior_session_block"):
+                                        _agent_sys += "\n" + state["prior_session_block"]
+                                    _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
+                                    for _h in state["chat_history"][-(10):-1]:
+                                        if _h["role"] in ("user", "assistant"):
+                                            _agent_msgs.append(_h)
+                                    _agent_msgs.append({"role": "user", "content": question})
+                                    chat_status.set_text("Agent — planning tool calls …")
+                                    answer = await run.io_bound(
+                                        call_llm_with_tools,
+                                        _agent_msgs,
+                                        _AGENT_TOOLS,
+                                        *_cb_agent,
+                                        provider, model, api_key, base_url,
+                                        8192,
+                                        5,
+                                        _cust_agent,
+                                    )
+                                    # ── Chart enforcement ─────────────────────────────────────────
+                                    # Some models describe charts in text instead of calling
+                                    # generate_chart. Detect this and force one more tool-call round.
+                                    _CHART_KWS = ("chart", "graph", "bar chart", "pie chart",
+                                                  "line chart", "plot", "visuali")
+                                    _wants_chart = any(kw in question.lower() for kw in _CHART_KWS)
+                                    if _wants_chart and "```echart" not in (answer or ""):
+                                        chat_status.set_text("Agent — generating chart …")
+                                        _force_msgs = list(_agent_msgs) + [
+                                            {"role": "assistant", "content": answer or ""},
+                                            {"role": "user", "content": (
+                                                "You described the chart in text but did not call "
+                                                "generate_chart. Call generate_chart RIGHT NOW using "
+                                                "the exact numbers from your previous response. "
+                                                "Do not write any text — only make the tool call."
+                                            )},
+                                        ]
+                                        try:
+                                            _chart_ans = await run.io_bound(
+                                                call_llm_with_tools,
+                                                _force_msgs,
+                                                _AGENT_TOOLS,
+                                                *_cb_agent,
+                                                provider, model, api_key, base_url,
+                                                2048, 2, _cust_agent,
+                                            )
+                                            if _chart_ans and "```echart" in _chart_ans:
+                                                # Strip placeholder text from original answer then
+                                                # prepend the real chart artifact.
+                                                _clean = re.sub(
+                                                    r'\[.*?chart.*?(?:appear|here|above|generat).*?\]',
+                                                    '', answer or '', flags=re.IGNORECASE | re.DOTALL
+                                                ).strip()
+                                                answer = _chart_ans + ("\n\n" + _clean if _clean else "")
+                                        except Exception as _cef:
+                                            print(f"[chart enforcement] failed: {_cef}")
+                                    # ─────────────────────────────────────────────────────────────
+                                    state["chat_history"].append({"role": "assistant", "content": answer})
+                                    _render_chat()
+                                    chat_status.set_text("Agent mode complete.")
+                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                    state["chat_session_turns"].append((question, answer, _ts_now, []))
 
                                 else:  # Hybrid Search
                                     _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
@@ -5695,23 +6750,18 @@ def main_page():
                                     _emb_ttl_s    = _emb_ttl_days * 86400   # 0 = permanent
                                     _srch_ttl_s   = _srch_ttl_hrs * 3600    # 0 = permanent
 
-                                    # Conversational query rewriting: turn follow-up questions
-                                    # ("expand on MLE and safekey") into self-contained retrieval
-                                    # queries that embed well and pull the right tickets without
-                                    # needing to hard-code ticket IDs from the prior answer.
-                                    # Uses a cheap LLM call (max_tokens=120); falls back to the
-                                    # original question if the call fails or there is no history.
+                                    # Query rewriting: always strip output-format noise and
+                                    # resolve conversational references before embedding.
+                                    # Runs on every turn (first and follow-up) so the vector
+                                    # query is always retrieval-focused, not presentation-focused.
                                     _hist_for_rewrite = state["chat_history"][:-1]  # exclude current user msg
-                                    if _hist_for_rewrite:
-                                        chat_status.set_text("Rewriting query for retrieval …")
-                                        _retrieval_q = await run.io_bound(
-                                            rewrite_query_for_retrieval,
-                                            question,
-                                            _hist_for_rewrite,
-                                            provider, model, api_key, base_url,
-                                        )
-                                    else:
-                                        _retrieval_q = question
+                                    chat_status.set_text("Rewriting query for retrieval …")
+                                    _retrieval_q = await run.io_bound(
+                                        rewrite_query_for_retrieval,
+                                        question,
+                                        _hist_for_rewrite,
+                                        provider, model, api_key, base_url,
+                                    )
 
                                     # 1. Embed — always check cache; always store (TTL=0 = forever)
                                     _ekey = _chat_cache_key("embed", _retrieval_q, _ep, _em, str(_edims))
@@ -5768,12 +6818,13 @@ def main_page():
                                     chat_status.set_text("Hybrid retrieval: vector + structured search …")
                                     context_tickets, _retrieval_note = await run.io_bound(
                                         hybrid_retrieval,
-                                        _retrieval_q,   # augmented: includes prior ticket IDs
+                                        _retrieval_q,       # rewritten: vector embedding + expansion
                                         query_vec,
                                         *_ticket_cb,
                                         _top_k,
                                         state["results"],   # in-memory fallback
                                         _make_embed_fn(),   # for query expansion
+                                        _retrieval_q,       # rewritten: N1QL date filter (has prior-context dates)
                                     )
                                     chat_status.set_text(f"Hybrid retrieval: {_retrieval_note}")
                                     doc_keys = [str(t.get("ticket_id", "")) for t in context_tickets if t.get("ticket_id")]
@@ -5783,7 +6834,28 @@ def main_page():
                                         timeout=4000,
                                     )
 
-                                    # 4. Build messages with RAG context in system prompt
+                                    # 4a. Fetch snapshot topology for retrieved tickets
+                                    _snapshot_map: dict[str, dict] = {}
+                                    if context_tickets and _CB_AVAILABLE:
+                                        _cluster_uuids: list[str] = []
+                                        for _ct in context_tickets:
+                                            for _cu in _ticket_cluster_ids(_ct):
+                                                if _cu not in _cluster_uuids:
+                                                    _cluster_uuids.append(_cu)
+                                        if _cluster_uuids:
+                                            chat_status.set_text("Fetching cluster topology from snapshots …")
+                                            _snapshot_map = await run.io_bound(
+                                                fetch_snapshots_for_clusters,
+                                                _cluster_uuids[:30],
+                                                cb_url_input.value.strip(),
+                                                cb_bucket_input.value.strip(),
+                                                cb_user_input.value.strip(),
+                                                cb_pass_input.value,
+                                                cb_tls_toggle.value,
+                                                cb_scope_input.value.strip() or "_default",
+                                            )
+
+                                    # 4b. Build messages with RAG context in system prompt
                                     _today_dt  = datetime.datetime.now()
                                     _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
                                     _stats_block = build_dataset_stats(state["results"], _today_dt)
@@ -5792,7 +6864,8 @@ def main_page():
                                         (_agg_block + "\n" if _agg_block else "") +
                                         build_rag_context(context_tickets, state["customer_name"],
                                                           compact=compact_context_toggle.value,
-                                                          filter_note=_retrieval_note)
+                                                          filter_note=_retrieval_note,
+                                                          snapshot_map=_snapshot_map)
                                     )
                                     system_msg = SYSTEM_PROMPT_TEMPLATE.format(
                                         today=_today_str,
@@ -5812,6 +6885,8 @@ def main_page():
                                         _mem_block = _build_memory_section(_memories)
                                         if _mem_block:
                                             system_msg = system_msg + "\n" + _mem_block
+                                    if state.get("prior_session_block"):
+                                        system_msg = system_msg + "\n" + state["prior_session_block"]
                                     # Window history to last 20 messages (10 turns)
                                     _hist_window = state["chat_history"][-(20):-1]
                                     messages = [{"role": "system", "content": system_msg}]
@@ -5856,7 +6931,8 @@ def main_page():
                                             chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
                                     # Record turn for session storage
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now))
+                                    _turn_tids = [str(t.get("ticket_id","")) for t in context_tickets if t.get("ticket_id")]
+                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
 
                                     # 6. Write permanent memory — always store when toggle is on,
                                     #    include question_vector for future semantic retrieval
@@ -5888,6 +6964,15 @@ def main_page():
                                 _render_chat()
                             finally:
                                 btn_send.set_enabled(True)
+                                # Persist history if last exchange completed successfully
+                                if (_CB_AVAILABLE and state.get("chat_history")
+                                        and state["chat_history"][-1]["role"] == "assistant"):
+                                    asyncio.ensure_future(run.io_bound(
+                                        save_customer_chat_history,
+                                        state.get("customer_name", ""), list(state["chat_history"]),
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    ))
 
                         def _clear_chat():
                             # Persist the completed session before clearing
@@ -5906,6 +6991,7 @@ def main_page():
                             state["chat_history"].clear()
                             state["chat_session_turns"].clear()
                             state["chat_session_id"] = str(uuid.uuid4())
+                            state["prior_session_block"] = ""   # re-fetch on next session's first turn
                             _render_chat()
                             chat_status.set_text("")
 
@@ -6021,9 +7107,98 @@ def main_page():
                                 "Stop", icon="stop_circle",
                                 on_click=lambda: (_cancel.set(), btn_stop_score.set_enabled(False)),
                             ).props("outline color=red")
+                            async def _do_recover_clusters(client=None):
+                                _c2 = client or ui.context.client
+                                btn_recover_clusters.set_enabled(False)
+                                score_progress.set_value(0)
+                                score_status.set_text("Restoring cluster fields …")
+                                _loop2 = asyncio.get_event_loop()
+                                async def _upd_rc(msg: str, pct: float):
+                                    score_status.set_text(msg)
+                                    score_progress.set_value(pct)
+                                def _prog_rc(msg: str, pct: float):
+                                    asyncio.run_coroutine_threadsafe(_upd_rc(msg, pct), _loop2)
+                                try:
+                                    recovered, errs = await run.io_bound(
+                                        recover_score_cluster_fields_cb,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                        _prog_rc,
+                                    )
+                                    with _c2:
+                                        ui.notify(f"Cluster fields restored: {recovered} tickets, {errs} errors.", type="positive" if not errs else "warning")
+                                except Exception as exc:
+                                    with _c2:
+                                        ui.notify(f"Recovery failed: {exc}", type="negative")
+                                finally:
+                                    btn_recover_clusters.set_enabled(True)
+                            btn_recover_clusters = ui.button(
+                                "Restore Cluster Fields", icon="healing",
+                                on_click=lambda: asyncio.ensure_future(_do_recover_clusters(ui.context.client)),
+                            ).props("outline color=teal").tooltip("Restore score.cluster_names/cluster_ids wiped by a broken rescore run")
+
+                            async def _do_enrich_app_labels(client=None):
+                                _c3 = client or ui.context.client
+                                btn_enrich_app_labels.set_enabled(False)
+                                score_progress.set_value(0)
+                                score_status.set_text("Enriching app labels via Analytics API + LLM…")
+                                _loop3 = asyncio.get_event_loop()
+                                async def _upd_ea(msg: str, pct: float):
+                                    score_status.set_text(msg)
+                                    score_progress.set_value(pct)
+                                def _prog_ea(msg: str, pct: float):
+                                    asyncio.run_coroutine_threadsafe(_upd_ea(msg, pct), _loop3)
+                                _cust = state.get("customer_name", "")
+                                _cookie_ea = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                                llm_prov, llm_mod, llm_key, llm_base = _get_llm_config()
+                                try:
+                                    enriched_ea, errs_ea = await run.io_bound(
+                                        enrich_ticket_apps_via_analytics,
+                                        _cust,
+                                        _cookie_ea or None,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                        llm_prov, llm_mod, llm_key, llm_base,
+                                        _prog_ea,
+                                    )
+                                    with _c3:
+                                        ui.notify(
+                                            f"App label enrichment: {enriched_ea} labels written"
+                                            + (f", {errs_ea} errors" if errs_ea else " — done"),
+                                            type="positive" if not errs_ea else "warning",
+                                        )
+                                except Exception as exc:
+                                    with _c3:
+                                        ui.notify(f"Enrichment failed: {exc}", type="negative")
+                                finally:
+                                    btn_enrich_app_labels.set_enabled(True)
+                                    score_progress.set_value(0)
+
+                            btn_enrich_app_labels = ui.button(
+                                "Enrich App Labels", icon="label",
+                                on_click=lambda: asyncio.ensure_future(_do_enrich_app_labels(ui.context.client)),
+                            ).props("outline color=indigo").tooltip(
+                                "For tickets missing [Application: X] labels: query the Analytics API "
+                                "for linked snapshot cluster names, then use LLM to extract app names "
+                                "from ticket subjects (e.g. 'Enterprise Wallet', 'DQF', 'Griffin'). "
+                                "Requires a valid session cookie and LLM configured."
+                            )
+
                         btn_score.set_enabled(False)
                         btn_load_scores.set_enabled(False)
                         btn_rescore_all.set_enabled(_CB_AVAILABLE)
+                        btn_recover_clusters.set_enabled(_CB_AVAILABLE)
+                        btn_enrich_app_labels.set_enabled(_CB_AVAILABLE)
                         btn_stop_score.set_enabled(False)
 
                         ui.separator().classes("my-2")
@@ -6113,8 +7288,7 @@ def main_page():
                                 msg = f"Scored {len(scores)}/{len(state['results'])} tickets."
                                 score_status.set_text(msg)
                                 score_progress.set_value(1.0)
-                                with client:
-                                    ui.notify(msg, type="positive")
+                                _safe_notify(client, msg, type="positive")
                                 btn_render_charts.set_enabled(True)
 
                                 if score_autosave_toggle.value and scores:
@@ -6151,8 +7325,7 @@ def main_page():
                                         )
                             except Exception as exc:
                                 score_status.set_text(f"Error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                             finally:
                                 btn_score.set_enabled(True)
                                 btn_load_scores.set_enabled(True)
@@ -6195,14 +7368,12 @@ def main_page():
                                 msg = f"Loaded {len(loaded)} scores from Couchbase."
                                 score_status.set_text(msg)
                                 score_progress.set_value(1.0)
-                                with client:
-                                    ui.notify(msg, type="positive")
+                                _safe_notify(client, msg, type="positive")
                                 if loaded:
                                     btn_render_charts.set_enabled(True)
                             except Exception as exc:
                                 score_status.set_text(f"Error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                             finally:
                                 btn_load_scores.set_enabled(True)
                                 btn_rescore_all.set_enabled(True)
@@ -6249,22 +7420,25 @@ def main_page():
                                 msg = f"Bulk rescore complete — {scored} scored, {errs} errors."
                                 score_status.set_text(msg)
                                 score_progress.set_value(1.0)
-                                with client:
-                                    ui.notify(msg, type="positive" if errs == 0 else "warning")
+                                _safe_notify(client, msg, type="positive" if errs == 0 else "warning")
                                 if err_log:
-                                    with client:
-                                        with ui.dialog() as err_dialog, ui.card().classes("w-full max-w-2xl"):
-                                            ui.label(f"Rescore Errors ({len(err_log)})").classes("text-base font-semibold text-red-600")
-                                            ui.separator()
-                                            with ui.scroll_area().classes("w-full h-64"):
-                                                for e in err_log:
-                                                    ui.label(e).classes("text-xs font-mono text-red-700 break-all")
-                                            ui.button("Close", on_click=err_dialog.close).classes("mt-2")
-                                        err_dialog.open()
+                                    try:
+                                        from nicegui.client import Client as _NC
+                                        if client and client.id in _NC.instances:
+                                            with client:
+                                                with ui.dialog() as err_dialog, ui.card().classes("w-full max-w-2xl"):
+                                                    ui.label(f"Rescore Errors ({len(err_log)})").classes("text-base font-semibold text-red-600")
+                                                    ui.separator()
+                                                    with ui.scroll_area().classes("w-full h-64"):
+                                                        for e in err_log:
+                                                            ui.label(e).classes("text-xs font-mono text-red-700 break-all")
+                                                    ui.button("Close", on_click=err_dialog.close).classes("mt-2")
+                                                err_dialog.open()
+                                    except Exception:
+                                        pass
                             except Exception as exc:
                                 score_status.set_text(f"Bulk rescore error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                             finally:
                                 btn_rescore_all.set_enabled(True)
                                 btn_score.set_enabled(True)
@@ -6334,12 +7508,33 @@ def main_page():
                                 "Run JS diagnostics to check Highcharts availability"
                             )
 
+                        # ── Date range filter ──────────────────────────────────────────
+                        with ui.row().classes("gap-4 mt-2 flex-wrap items-end"):
+                            with ui.input("From", placeholder="YYYY-MM-DD").classes("w-36") as chart_date_from:
+                                with ui.menu().props("no-parent-event") as _date_from_menu:
+                                    with ui.date(mask="YYYY-MM-DD").bind_value(chart_date_from):
+                                        with ui.row().classes("justify-end"):
+                                            ui.button("Close", on_click=_date_from_menu.close).props("flat")
+                                with chart_date_from.add_slot("append"):
+                                    ui.icon("event").on("click", _date_from_menu.open).classes("cursor-pointer")
+                            with ui.input("To", placeholder="YYYY-MM-DD").classes("w-36") as chart_date_to:
+                                with ui.menu().props("no-parent-event") as _date_to_menu:
+                                    with ui.date(mask="YYYY-MM-DD").bind_value(chart_date_to):
+                                        with ui.row().classes("justify-end"):
+                                            ui.button("Close", on_click=_date_to_menu.close).props("flat")
+                                with chart_date_to.add_slot("append"):
+                                    ui.icon("event").on("click", _date_to_menu.open).classes("cursor-pointer")
+                            ui.button(
+                                "Clear dates", icon="clear",
+                                on_click=lambda: (chart_date_from.set_value(""), chart_date_to.set_value("")),
+                            ).props("flat color=grey-7 size=sm")
+
                         chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
                         charts_area  = ui.column().classes("w-full gap-4 mt-3")
 
-                        def _make_chart(container, cfg: dict):
+                        def _make_chart(container, cfg: dict, height: int = 380):
                             with container:
-                                ui.highchart(cfg).classes("w-full")
+                                ui.echart(cfg).classes("w-full").style(f"height:{height}px")
 
                         async def _render_charts(client=None):
                             cust_filter = (main_cust_input.value or "").strip()
@@ -6410,23 +7605,6 @@ def main_page():
                             _title_sz = f"{max(13, min(18, _fs + 2))}px"
                             _sub_sz   = f"{max(10, _fs - 1)}px"
 
-                            # Push global Highcharts text defaults for this render pass
-                            if client:
-                                try:
-                                    await client.run_javascript(
-                                        "Highcharts.setOptions({"
-                                        f"  chart:    {{style: {{fontSize: '{_fs_str}'}}}},"
-                                        f"  title:    {{style: {{fontSize: '{_title_sz}'}}}},"
-                                        f"  subtitle: {{style: {{fontSize: '{_sub_sz}'}}}},"
-                                        f"  xAxis:    {{labels: {{style: {{fontSize: '{_fs_str}'}}}}, title: {{style: {{fontSize: '{_fs_str}'}}}}}},"
-                                        f"  yAxis:    {{labels: {{style: {{fontSize: '{_fs_str}'}}}}, title: {{style: {{fontSize: '{_fs_str}'}}}}}},"
-                                        f"  legend:   {{itemStyle: {{fontSize: '{_fs_str}'}}}},"
-                                        f"  tooltip:  {{style: {{fontSize: '{_fs_str}'}}}}"
-                                        "});"
-                                    )
-                                except Exception:
-                                    pass
-
                             # Build org-name consolidation map for this ticket set
                             _oc = _load_settings_file().get("__org_consolidation__", {})
                             _org_map = build_org_name_map(
@@ -6466,88 +7644,108 @@ def main_page():
                                     f"Viewing: All Customers ({len(display_tickets)} tickets)"
                                 )
 
+                            # ── Date range filter ─────────────────────────────────────────
+                            _df = (chart_date_from.value or "").strip()[:10]
+                            _dt = (chart_date_to.value   or "").strip()[:10]
+                            if _df or _dt:
+                                _pre_filter = len(display_tickets)
+                                def _in_range(t):
+                                    raw = (t.get("created") or t.get("created_at") or "")[:10]
+                                    if not raw:
+                                        return True
+                                    if _df and raw < _df:
+                                        return False
+                                    if _dt and raw > _dt:
+                                        return False
+                                    return True
+                                display_tickets = [t for t in display_tickets if _in_range(t)]
+                                display_scores  = {
+                                    tid: sc for tid, sc in display_scores.items()
+                                    if any(str(t.get("ticket_id")) == tid for t in display_tickets)
+                                }
+                                _date_label = f"{_df or '…'} → {_dt or '…'}"
+                                chart_status.set_text(
+                                    f"Date filter: {_date_label} — {len(display_tickets)} of {_pre_filter} tickets"
+                                )
+
                             data = build_analytics_data(display_tickets, display_scores)
 
                             with charts_area:
                                 # ── Row 1: Stacked volume by origin over time ─────────────
                                 if data["month_keys"]:
-                                    ui.highchart({
-                                        "chart":       {"type": "column", "height": ch, "zoomType": "x"},
-                                        "title":       {"text": "Ticket Volume Over Time by Origin"},
-                                        "subtitle":    {"text": "Click and drag to zoom"},
-                                        "xAxis":       {"categories": data["month_keys"], "labels": {"rotation": -45, "style": {"fontSize": _fs_str}, "overflow": "allow"}},
-                                        "yAxis":       {"title": {"text": "Tickets"}, "stackLabels": {"enabled": True}},
-                                        "plotOptions": {"column": {"stacking": "normal"}},
-                                        "colors":      ["#1E88E5", "#FB8C00", "#6D4C41"],
+                                    ui.echart({
+                                        "title":    {"text": "Ticket Volume Over Time by Origin", "subtext": "Drag to zoom"},
+                                        "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                        "legend":   {"bottom": 0},
+                                        "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                        "grid":     {"bottom": 80},
+                                        "xAxis":    {"type": "category", "data": data["month_keys"], "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                        "yAxis":    {"type": "value", "name": "Tickets"},
+                                        "color":    ["#1E88E5", "#FB8C00", "#6D4C41"],
                                         "series": [
-                                            {"name": "Customer-Initiated",  "data": data["month_customer"]},
-                                            {"name": "Agent-Initiated",     "data": data["month_agent"]},
-                                            {"name": "Proactive/Automated", "data": data["month_proactive"]},
+                                            {"name": "Customer-Initiated",  "type": "bar", "stack": "total", "data": data["month_customer"]},
+                                            {"name": "Agent-Initiated",     "type": "bar", "stack": "total", "data": data["month_agent"]},
+                                            {"name": "Proactive/Automated", "type": "bar", "stack": "total", "data": data["month_proactive"]},
                                         ],
-                                    }).classes("w-full")
+                                    }).classes("w-full").style(f"height:{ch}px")
                                 else:
                                     ui.label("No parseable dates for frequency chart.").classes("text-sm text-gray-400")
 
                                 # ── Row 1b: Tickets per year ──────────────────────────────
                                 if data["year_keys"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":   {"type": "column", "height": ch_sm, "zoomType": "x"},
+                                        ui.echart({
                                             "title":   {"text": "Tickets per Year"},
-                                            "xAxis":   {"categories": data["year_keys"], "title": {"text": "Year"}},
-                                            "yAxis":   {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                            "colors":  ["#039BE5"],
-                                            "series":  [{"name": "Tickets", "data": data["year_values"]}],
-                                            "plotOptions": {"column": {"dataLabels": {"enabled": True}}},
-                                        }).classes("w-full")
+                                            "tooltip": {"trigger": "axis"},
+                                            "xAxis":   {"type": "category", "data": data["year_keys"], "name": "Year"},
+                                            "yAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                            "color":   ["#039BE5"],
+                                            "series":  [{"name": "Tickets", "type": "bar", "data": data["year_values"], "label": {"show": True, "position": "top"}}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Row 2: Priority + Status side by side ─────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "pie", "height": ch_sm},
-                                            "title":  {"text": "Priority Distribution"},
-                                            "colors": ["#43A047","#FB8C00","#E53935","#8E24AA"],
-                                            "series": [{"name": "Tickets", "data": list(zip(data["priority_labels"], data["priority_values"]))}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Priority Distribution"},
+                                            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                            "color":   ["#43A047","#FB8C00","#E53935","#8E24AA"],
+                                            "series":  [{"name": "Tickets", "type": "pie", "radius": "62%", "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["priority_labels"], data["priority_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "pie", "height": ch_sm},
-                                            "title":  {"text": "Status Breakdown"},
-                                            "plotOptions": {"pie": {"innerSize": "50%"}},
-                                            "series": [{"name": "Tickets", "data": list(zip(data["status_labels"], data["status_values"]))}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Status Breakdown"},
+                                            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                            "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["status_labels"], data["status_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Row 3: Comment distribution + Escalation rate ─────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                            "title":  {"text": "Comment Count Distribution"},
-                                            "xAxis":  {"categories": data["comment_labels"]},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "colors": ["#00ACC1"],
-                                            "series": [{"name": "Tickets", "data": data["comment_values"]}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Comment Count Distribution"},
+                                            "tooltip": {"trigger": "axis"},
+                                            "xAxis":   {"type": "category", "data": data["comment_labels"]},
+                                            "yAxis":   {"type": "value", "name": "Tickets"},
+                                            "color":   ["#00ACC1"],
+                                            "series":  [{"name": "Tickets", "type": "bar", "data": data["comment_values"]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "pie", "height": ch_sm},
-                                            "title":  {"text": "Escalation Rate"},
-                                            "plotOptions": {"pie": {"innerSize": "50%"}},
-                                            "colors": ["#E53935","#43A047"],
-                                            "series": [{"name": "Tickets", "data": list(zip(data["esc_labels"], data["esc_values"]))}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Escalation Rate"},
+                                            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                            "color":   ["#E53935","#43A047"],
+                                            "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["esc_labels"], data["esc_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Row 4: Ticket origin ──────────────────────────────────
                                 with ui.card().classes("w-full"):
-                                    ui.highchart({
-                                        "chart":  {"type": "pie", "height": ch_sm},
-                                        "title":  {"text": "Ticket Origin"},
-                                        "subtitle": {"text": "How the ticket was opened"},
-                                        "plotOptions": {"pie": {"innerSize": "50%", "dataLabels": {"enabled": True, "format": "<b>{point.name}</b>: {point.y} ({point.percentage:.1f}%)"}}},
-                                        "colors": ["#1E88E5", "#FB8C00", "#6D4C41"],
-                                        "series": [{"name": "Tickets", "data": list(zip(data["origin_labels"], data["origin_values"]))}],
-                                    }).classes("w-full")
+                                    ui.echart({
+                                        "title":   {"text": "Ticket Origin", "subtext": "How the ticket was opened"},
+                                        "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                        "color":   ["#1E88E5", "#FB8C00", "#6D4C41"],
+                                        "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"formatter": "{b}: {c} ({d}%)", "fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["origin_labels"], data["origin_values"])]}],
+                                    }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # Proactive diagnostic breakdown
                                 if data["origin_values"][2] > 0:  # Proactive/Automated count
@@ -6576,28 +7774,30 @@ def main_page():
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
                                         if data["version_labels"]:
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch, "zoomType": "x"},
-                                                "title":  {"text": "Tickets by Couchbase Version"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": data["version_labels"], "title": {"text": "Version"}, "labels": {"rotation": -45, "style": {"fontSize": _fs_str}, "overflow": "allow"}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#0277BD"],
-                                                "series": [{"name": "Tickets", "data": data["version_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Tickets by Couchbase Version", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis"},
+                                                "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                "grid":     {"bottom": 60},
+                                                "xAxis":    {"type": "category", "data": data["version_labels"], "name": "Version", "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                                "yAxis":    {"type": "value", "name": "Tickets"},
+                                                "color":    ["#0277BD"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["version_values"]}],
+                                            }).classes("w-full").style(f"height:{ch}px")
                                         else:
                                             ui.label("No version data found in ticket fields.").classes("text-sm text-gray-400 p-4")
                                     with ui.card().classes("flex-1"):
                                         if data["feature_labels"]:
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch, "zoomType": "y", "marginLeft": 160},
-                                                "title":  {"text": "Tickets by Feature Area"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": data["feature_labels"], "labels": {"style": {"fontSize": _fs_sm_str}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#00838F"],
-                                                "series": [{"name": "Tickets", "data": data["feature_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Tickets by Feature Area", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 170, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["feature_labels"], "axisLabel": {"overflow": "truncate", "width": 140, "fontSize": _fs_sm}},
+                                                "color":    ["#00838F"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["feature_values"]}],
+                                            }).classes("w-full").style(f"height:{ch}px")
                                         else:
                                             ui.label("No component/feature data found.").classes("text-sm text-gray-400 p-4")
 
@@ -6608,43 +7808,43 @@ def main_page():
                                     # Row 4: Stars + Temperature
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Experience Stars Distribution"},
-                                                "xAxis":  {"categories": ["★1","★2","★3","★4","★5"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#FDD835"],
-                                                "series": [{"name": "Tickets", "data": data["stars_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Experience Stars Distribution"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": ["★1","★2","★3","★4","★5"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#FDD835"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["stars_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "pie", "height": ch_sm},
-                                                "title":  {"text": "Temperature Distribution"},
-                                                "plotOptions": {"pie": {"innerSize": "50%"}},
-                                                "colors": ["#42A5F5","#FFA726","#EF5350"],
-                                                "series": [{"name": "Tickets", "data": list(zip(data["temp_labels"], data["temp_values"]))}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Temperature Distribution"},
+                                                "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                                "color":   ["#42A5F5","#FFA726","#EF5350"],
+                                                "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["temp_labels"], data["temp_values"])]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 5: Complexity + Dimension averages
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Complexity Score Distribution"},
-                                                "xAxis":  {"categories": ["1","2","3","4","5"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#8E24AA"],
-                                                "series": [{"name": "Tickets", "data": data["complexity_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Complexity Score Distribution"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": ["1","2","3","4","5"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#8E24AA"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["complexity_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 170},
-                                                "title":  {"text": "Avg Dimension Scores (1-5)"},
-                                                "xAxis":  {"categories": data["dim_categories"], "labels": {"style": {"fontSize": _fs_sm_str}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Avg Score"}, "max": 5},
-                                                "colors": ["#26A69A"],
-                                                "series": [{"name": "Avg Score", "data": data["dim_avg"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Avg Dimension Scores (1-5)"},
+                                                "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "grid":    {"left": 180},
+                                                "xAxis":   {"type": "value", "name": "Avg Score", "max": 5},
+                                                "yAxis":   {"type": "category", "data": data["dim_categories"], "axisLabel": {"overflow": "truncate", "width": 160, "fontSize": _fs_sm}},
+                                                "color":   ["#26A69A"],
+                                                "series":  [{"name": "Avg Score", "type": "bar", "data": data["dim_avg"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 6: Customer portfolio scatter
                                     cust_data = build_customer_analytics(display_tickets, display_scores)
@@ -6661,16 +7861,15 @@ def main_page():
                                         ]
                                         if bubble_pts:
                                             with ui.card().classes("w-full"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "bubble", "height": ch_bbl, "zoomType": "xy"},
-                                                    "title":  {"text": "Customer Portfolio: Volume vs Satisfaction"},
-                                                    "subtitle": {"text": "Bubble size = avg complexity · Hover for customer name"},
-                                                    "xAxis":  {"title": {"text": "Ticket Count"}},
-                                                    "yAxis":  {"title": {"text": "Avg Stars (1-5)"}, "min": 0, "max": 5},
-                                                    "tooltip": {"pointFormat": "<b>{point.name}</b><br>Tickets: {point.x}<br>Avg Stars: {point.y}<br>Avg Complexity: {point.z}"},
-                                                    "plotOptions": {"bubble": {"minSize": 8, "maxSize": 50, "dataLabels": {"enabled": False}}},
-                                                    "series": [{"name": "Customers", "data": bubble_pts, "color": "rgba(30,136,229,0.6)"}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":     {"text": "Customer Portfolio: Volume vs Satisfaction", "subtext": "Bubble size = avg complexity · Hover for customer name"},
+                                                    "tooltip":   {"trigger": "item", "formatter": "{b}<br/>Tickets: {c[0]}<br/>Avg Stars: {c[1]}<br/>Avg Complexity: {c[2]}"},
+                                                    "xAxis":     {"type": "value", "name": "Ticket Count"},
+                                                    "yAxis":     {"type": "value", "name": "Avg Stars (1-5)", "min": 0, "max": 5},
+                                                    "visualMap": {"show": False, "dimension": 2, "min": 3, "max": 50, "inRange": {"symbolSize": [8, 50]}},
+                                                    "color":     ["rgba(30,136,229,0.65)"],
+                                                    "series":    [{"name": "Customers", "type": "scatter", "data": [{"name": pt["name"], "value": [pt["x"], pt["y"], pt["z"]]} for pt in bubble_pts]}],
+                                                }).classes("w-full").style(f"height:{ch_bbl}px")
 
                                 # ── Cluster & Snapshot metrics ──────────────────────────
                                 ui.label("— Cluster & Snapshot Metrics —").classes("text-sm font-semibold text-gray-500 text-center w-full mt-2")
@@ -6678,47 +7877,40 @@ def main_page():
                                 with ui.row().classes("w-full gap-4"):
                                     # Snapshot count distribution
                                     with ui.card().classes("flex-1"):
-                                        ui.highchart({
-                                            "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                            "title":  {"text": "Snapshots per Ticket"},
-                                            "subtitle": {"text": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot"},
-                                            "xAxis":  {"categories": data["snap_bucket_labels"], "title": {"text": "Snapshot Count"}},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "colors": ["#00ACC1"],
-                                            "series": [{"name": "Tickets", "data": data["snap_bucket_values"]}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":   {"text": "Snapshots per Ticket", "subtext": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot"},
+                                            "tooltip": {"trigger": "axis"},
+                                            "xAxis":   {"type": "category", "data": data["snap_bucket_labels"], "name": "Snapshot Count"},
+                                            "yAxis":   {"type": "value", "name": "Tickets"},
+                                            "color":   ["#00ACC1"],
+                                            "series":  [{"name": "Tickets", "type": "bar", "data": data["snap_bucket_values"]}],
+                                        }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Cluster names (if any detected)
                                     if data["cluster_name_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 180},
-                                                "title":  {"text": "Top Cluster Names by Ticket Count"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": data["cluster_name_labels"], "labels": {"style": {"fontSize": _fs_sm_str}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#5E35B1"],
-                                                "tooltip": {"pointFormat": "<b>{point.name}</b><br/>Tickets: {point.y}"},
-                                                "series":  [{"name": "Tickets", "data": [
-                                                    {"y": v, "name": data["cluster_name_labels"][i]}
-                                                    for i, v in enumerate(data["cluster_name_values"])
-                                                ]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Top Cluster Names by Ticket Count", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 190, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["cluster_name_labels"], "axisLabel": {"overflow": "truncate", "width": 170, "fontSize": _fs_sm}},
+                                                "color":    ["#5E35B1"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["cluster_name_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                     elif data["cluster_id_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 100},
-                                                "title":  {"text": "Top Cluster IDs by Ticket Count"},
-                                                "subtitle": {"text": "Hover bar for full UUID · click and drag to zoom"},
-                                                "xAxis":  {"categories": data["cluster_id_labels"], "labels": {"style": {"fontSize": _fs_sm_str, "fontFamily": "monospace"}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#5E35B1"],
-                                                "tooltip": {"pointFormat": "<span style='font-family:monospace'>{point.name}</span><br/>Tickets: {point.y}"},
-                                                "series":  [{"name": "Tickets", "data": [
-                                                    {"y": v, "name": data["cluster_id_full"][i]}
-                                                    for i, v in enumerate(data["cluster_id_values"])
-                                                ]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 110, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["cluster_id_labels"], "axisLabel": {"fontFamily": "monospace", "overflow": "truncate", "width": 90, "fontSize": _fs_sm}},
+                                                "color":    ["#5E35B1"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
                                     else:
                                         with ui.card().classes("flex-1"):
                                             ui.label("No cluster names or IDs detected in ticket data.").classes("text-sm text-gray-400 p-4")
@@ -6726,41 +7918,38 @@ def main_page():
                                 # Cluster IDs (separate row, only if both names and IDs exist)
                                 if data["cluster_name_labels"] and data["cluster_id_labels"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":  {"type": "bar", "height": ch, "zoomType": "y", "marginLeft": 100},
-                                            "title":  {"text": "Top Cluster IDs by Ticket Count"},
-                                            "subtitle": {"text": "Hover bar for full UUID · click and drag to zoom"},
-                                            "xAxis":  {"categories": data["cluster_id_labels"], "labels": {"style": {"fontSize": _fs_sm_str, "fontFamily": "monospace"}, "overflow": "allow", "crop": False}},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "colors": ["#3949AB"],
-                                            "tooltip": {"pointFormat": "<span style='font-family:monospace'>{point.name}</span><br/>Tickets: {point.y}"},
-                                            "series":  [{"name": "Tickets", "data": [
-                                                {"y": v, "name": data["cluster_id_full"][i]}
-                                                for i, v in enumerate(data["cluster_id_values"])
-                                            ]}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                            "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                            "grid":     {"left": 110, "right": 60},
+                                            "xAxis":    {"type": "value", "name": "Tickets"},
+                                            "yAxis":    {"type": "category", "data": data["cluster_id_labels"], "axisLabel": {"fontFamily": "monospace", "overflow": "truncate", "width": 90, "fontSize": _fs_sm}},
+                                            "color":    ["#3949AB"],
+                                            "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
+                                        }).classes("w-full").style(f"height:{ch}px")
 
                                 # Unique clusters vs tickets per version
                                 if data["clusters_by_version_labels"]:
+                                    _cv_h = max(ch, len(data["clusters_by_version_labels"]) * 36 + 80)
                                     with ui.row().classes("w-full gap-4 items-center mt-2"):
                                         with ui.card().classes("px-6 py-3 text-center"):
                                             ui.label(str(data["unique_cluster_total"])).classes("text-3xl font-bold text-teal-600")
                                             ui.label("Unique Clusters Seen (all tickets)").classes("text-xs text-gray-500")
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":  {"type": "bar", "height": max(ch, len(data["clusters_by_version_labels"]) * 36 + 80), "zoomType": "y", "marginLeft": 90},
-                                            "title":  {"text": "Unique Clusters vs Tickets — by Version"},
-                                            "subtitle": {"text": f"{data['unique_cluster_total']} unique cluster UUIDs across all tickets · click and drag to zoom"},
-                                            "xAxis":  {"categories": data["clusters_by_version_labels"], "title": {"text": "Version"}, "labels": {"style": {"fontSize": _fs_str}, "overflow": "allow", "crop": False}},
-                                            "yAxis":  {"title": {"text": "Count"}, "allowDecimals": False},
-                                            "tooltip": {"shared": True},
-                                            "plotOptions": {"bar": {"grouping": True}},
-                                            "colors": ["#00897B", "#1E88E5"],
-                                            "series": [
-                                                {"name": "Unique Clusters", "data": data["clusters_by_version_values"]},
-                                                {"name": "Tickets",         "data": data["tickets_by_version_for_clusters"]},
+                                        ui.echart({
+                                            "title":   {"text": "Unique Clusters vs Tickets — by Version", "subtext": f"{data['unique_cluster_total']} unique cluster UUIDs · drag to zoom"},
+                                            "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "legend":  {"bottom": 0},
+                                            "grid":    {"left": 100, "bottom": 50},
+                                            "xAxis":   {"type": "value", "name": "Count", "minInterval": 1},
+                                            "yAxis":   {"type": "category", "data": data["clusters_by_version_labels"], "axisLabel": {"fontSize": _fs_sm}},
+                                            "color":   ["#00897B", "#1E88E5"],
+                                            "series":  [
+                                                {"name": "Unique Clusters", "type": "bar", "data": data["clusters_by_version_values"]},
+                                                {"name": "Tickets",         "type": "bar", "data": data["tickets_by_version_for_clusters"]},
                                             ],
-                                        }).classes("w-full")
+                                        }).classes("w-full").style(f"height:{_cv_h}px")
 
                                 # ── CBSE Document Analytics ──────────────────────────────────────
                                 if data["cbse_total"] > 0:
@@ -6780,26 +7969,27 @@ def main_page():
                                     with ui.row().classes("w-full gap-4"):
                                         if data["cbse_year_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                    "title":  {"text": "CBSEs Generated per Year"},
-                                                    "xAxis":  {"categories": data["cbse_year_labels"], "title": {"text": "Year"}},
-                                                    "yAxis":  {"title": {"text": "CBSE Count"}, "allowDecimals": False},
-                                                    "colors": ["#7B1FA2"],
-                                                    "series": [{"name": "CBSEs", "data": data["cbse_year_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "CBSEs Generated per Year"},
+                                                    "tooltip": {"trigger": "axis"},
+                                                    "xAxis":   {"type": "category", "data": data["cbse_year_labels"], "name": "Year"},
+                                                    "yAxis":   {"type": "value", "name": "CBSE Count", "minInterval": 1},
+                                                    "color":   ["#7B1FA2"],
+                                                    "series":  [{"name": "CBSEs", "type": "bar", "data": data["cbse_year_values"], "label": {"show": True, "position": "top"}}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         if data["cbse_month_keys"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "line", "height": ch_sm, "zoomType": "x"},
-                                                    "title":  {"text": "CBSEs Generated per Month"},
-                                                    "subtitle": {"text": "Click and drag to zoom"},
-                                                    "xAxis":  {"categories": data["cbse_month_keys"], "title": {"text": "Month"}, "labels": {"rotation": -45, "style": {"fontSize": _fs_str}, "overflow": "allow"}},
-                                                    "yAxis":  {"title": {"text": "CBSE Count"}, "allowDecimals": False},
-                                                    "colors": ["#5C6BC0"],
-                                                    "series": [{"name": "CBSEs", "data": data["cbse_month_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":    {"text": "CBSEs Generated per Month", "subtext": "Drag to zoom"},
+                                                    "tooltip":  {"trigger": "axis"},
+                                                    "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                    "grid":     {"bottom": 60},
+                                                    "xAxis":    {"type": "category", "data": data["cbse_month_keys"], "name": "Month", "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                                    "yAxis":    {"type": "value", "name": "CBSE Count", "minInterval": 1},
+                                                    "color":    ["#5C6BC0"],
+                                                    "series":   [{"name": "CBSEs", "type": "line", "smooth": True, "data": data["cbse_month_values"]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                 # ── Enriched topology charts (only when ≥1 ticket enriched) ──────
                                 if data["enriched_ticket_count"] > 0:
@@ -6813,96 +8003,85 @@ def main_page():
                                     # Row 1: Node count distribution + Bucket count distribution
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Node Count Distribution"},
-                                                "subtitle": {"text": "Cluster size across enriched tickets"},
-                                                "xAxis":  {"categories": data["node_dist_labels"], "title": {"text": "Nodes"}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#1E88E5"],
-                                                "series": [{"name": "Tickets", "data": data["node_dist_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Node Count Distribution", "subtext": "Cluster size across enriched tickets"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": data["node_dist_labels"], "name": "Nodes"},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#1E88E5"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["node_dist_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         if data["bucket_dist_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                    "title":  {"text": "Bucket Count per Cluster"},
-                                                    "subtitle": {"text": "Number of buckets configured"},
-                                                    "xAxis":  {"categories": data["bucket_dist_labels"], "title": {"text": "Buckets"}},
-                                                    "yAxis":  {"title": {"text": "Tickets"}},
-                                                    "colors": ["#43A047"],
-                                                    "series": [{"name": "Tickets", "data": data["bucket_dist_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "Bucket Count per Cluster", "subtext": "Number of buckets configured"},
+                                                    "tooltip": {"trigger": "axis"},
+                                                    "xAxis":   {"type": "category", "data": data["bucket_dist_labels"], "name": "Buckets"},
+                                                    "yAxis":   {"type": "value", "name": "Tickets"},
+                                                    "color":   ["#43A047"],
+                                                    "series":  [{"name": "Tickets", "type": "bar", "data": data["bucket_dist_values"]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 2: RAM per node tier + Auto-failover distribution
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "RAM per Node"},
-                                                "subtitle": {"text": "Memory tier across enriched clusters"},
-                                                "xAxis":  {"categories": data["ram_labels"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#FB8C00"],
-                                                "series": [{"name": "Tickets", "data": data["ram_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "RAM per Node", "subtext": "Memory tier across enriched clusters"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": data["ram_labels"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#FB8C00"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["ram_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": ch_sm, "zoomType": "x"},
-                                                "title":  {"text": "Auto-Failover Setting"},
-                                                "subtitle": {"text": "Configured threshold across enriched clusters"},
-                                                "xAxis":  {"categories": data["af_labels"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#E53935"],
-                                                "series": [{"name": "Tickets", "data": data["af_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Auto-Failover Setting", "subtext": "Configured threshold across enriched clusters"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": data["af_labels"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets"},
+                                                "color":   ["#E53935"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": data["af_values"]}],
+                                            }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 3: LDAP status + CB version from snapshot
                                     with ui.row().classes("w-full gap-4"):
                                         _ldap_total = sum(data["ldap_values"])
                                         if _ldap_total > 0:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "pie", "height": ch_sm},
-                                                    "title":  {"text": "LDAP Status"},
-                                                    "subtitle": {"text": "Across enriched clusters"},
-                                                    "colors": ["#43A047", "#E53935", "#9E9E9E"],
-                                                    "series": [{
-                                                        "name": "Tickets",
-                                                        "data": [
-                                                            {"name": l, "y": v}
-                                                            for l, v in zip(data["ldap_labels"], data["ldap_values"])
-                                                            if v > 0
-                                                        ],
-                                                    }],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "LDAP Status", "subtext": "Across enriched clusters"},
+                                                    "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                                    "color":   ["#43A047", "#E53935", "#9E9E9E"],
+                                                    "series":  [{"name": "Tickets", "type": "pie", "radius": "62%", "data": [{"name": l, "value": v} for l, v in zip(data["ldap_labels"], data["ldap_values"]) if v > 0]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                         if data["topo_version_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.highchart({
-                                                    "chart":  {"type": "bar", "height": ch_sm, "zoomType": "y", "marginLeft": 90},
-                                                    "title":  {"text": "CB Version Distribution"},
-                                                    "subtitle": {"text": "All tickets — ticket fields primary, snapshot fallback"},
-                                                    "xAxis":  {"categories": data["topo_version_labels"], "labels": {"style": {"fontSize": _fs_str}, "overflow": "allow", "crop": False}},
-                                                    "yAxis":  {"title": {"text": "Tickets"}},
-                                                    "colors": ["#8E24AA"],
-                                                    "series": [{"name": "Tickets", "data": data["topo_version_values"]}],
-                                                }).classes("w-full")
+                                                ui.echart({
+                                                    "title":   {"text": "CB Version Distribution", "subtext": "Ticket fields primary, snapshot fallback"},
+                                                    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                    "grid":    {"left": 100},
+                                                    "xAxis":   {"type": "value", "name": "Tickets"},
+                                                    "yAxis":   {"type": "category", "data": data["topo_version_labels"], "axisLabel": {"fontSize": _fs_sm}},
+                                                    "color":   ["#8E24AA"],
+                                                    "series":  [{"name": "Tickets", "type": "bar", "data": data["topo_version_values"]}],
+                                                }).classes("w-full").style(f"height:{ch_sm}px")
 
                                     # Row 4: Orchestrator hotspot (full width if data present)
                                     if data["orchestrator_labels"]:
                                         with ui.card().classes("w-full"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": ch, "zoomType": "y", "marginLeft": 180},
-                                                "title":  {"text": "Orchestrator Node Hotspot"},
-                                                "subtitle": {"text": "Top 10 nodes most often acting as orchestrator · click and drag to zoom"},
-                                                "xAxis":  {"categories": data["orchestrator_labels"], "labels": {"style": {"fontSize": _fs_sm_str, "fontFamily": "monospace"}, "overflow": "allow", "crop": False}},
-                                                "yAxis":  {"title": {"text": "Tickets"}},
-                                                "colors": ["#00ACC1"],
-                                                "series": [{"name": "Tickets", "data": data["orchestrator_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Orchestrator Node Hotspot", "subtext": "Top 10 nodes most often acting as orchestrator · drag to zoom"},
+                                                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
+                                                "grid":     {"left": 190, "right": 60},
+                                                "xAxis":    {"type": "value", "name": "Tickets"},
+                                                "yAxis":    {"type": "category", "data": data["orchestrator_labels"], "axisLabel": {"fontFamily": "monospace", "overflow": "truncate", "width": 170, "fontSize": _fs_sm}},
+                                                "color":    ["#00ACC1"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["orchestrator_values"]}],
+                                            }).classes("w-full").style(f"height:{ch}px")
 
                             cust_label = state.get("_main_chart_label", "All Customers")
                             chart_status.set_text(
@@ -6911,7 +8090,7 @@ def main_page():
                                 f"Customer: {cust_label}"
                             )
                             # Record how many charts belong to the main section
-                            js_count = "document.querySelectorAll('svg.highcharts-root').length"
+                            js_count = "(function(){var EC=window.echarts;if(!EC)return 0;var n=0;document.querySelectorAll('.nicegui-echart').forEach(function(el){if(EC.getInstanceByDom(el))n++;});return n;})()"
                             if client:
                                 try:
                                     state["_main_chart_count"] = await client.run_javascript(js_count)
@@ -7158,47 +8337,31 @@ def main_page():
                             btn_export_pdf.set_enabled(False)
                             chart_status.set_text("Collecting chart data …")
                             try:
-                                # ── Collect SVG + title text from every live Highcharts instance ──
+                                # ── Collect PNG data URLs from every live ECharts instance ──
                                 collect_js = """
                                 (function() {
-                                    var out = [], ser = new XMLSerializer();
-                                    var HC = window.Highcharts || window._Highcharts;
-                                    if (HC && HC.charts) {
-                                        for (var j = 0; j < HC.charts.length; j++) {
-                                            var c = HC.charts[j];
-                                            if (!c) continue;
-                                            var el = c.container && c.container.querySelector('svg');
-                                            if (!el) continue;
-                                            try {
-                                                out.push({
-                                                    svg:      ser.serializeToString(el),
-                                                    title:    (c.title    && c.title.textStr)    || '',
-                                                    subtitle: (c.subtitle && c.subtitle.textStr) || ''
-                                                });
-                                            } catch(e) {}
-                                        }
-                                    }
-                                    if (out.length === 0) {
-                                        var els = document.querySelectorAll('svg.highcharts-root');
-                                        for (var i = 0; i < els.length; i++) {
-                                            var tEl = els[i].querySelector('.highcharts-title');
-                                            var sEl = els[i].querySelector('.highcharts-subtitle');
-                                            try {
-                                                out.push({
-                                                    svg:      ser.serializeToString(els[i]),
-                                                    title:    tEl ? tEl.textContent.trim() : '',
-                                                    subtitle: sEl ? sEl.textContent.trim() : ''
-                                                });
-                                            } catch(e) {}
-                                        }
-                                    }
+                                    var out = [], EC = window.echarts;
+                                    if (!EC) return out;
+                                    document.querySelectorAll('.nicegui-echart').forEach(function(el) {
+                                        var inst = EC.getInstanceByDom(el);
+                                        if (!inst) return;
+                                        var opts  = inst.getOption();
+                                        var tArr  = opts.title || [];
+                                        var title = (tArr[0] && tArr[0].text)    || '';
+                                        var sub   = (tArr[0] && tArr[0].subtext) || '';
+                                        try {
+                                            var img = inst.getDataURL({type: 'png', pixelRatio: 2, backgroundColor: '#fff'});
+                                            out.push({img: img, title: title, subtitle: sub});
+                                        } catch(e) {}
+                                    });
                                     return out;
                                 })()
                                 """
-                                charts = await _cl.run_javascript(collect_js, timeout=15.0)
+                                charts = await _cl.run_javascript(collect_js, timeout=20.0)
                                 if not charts:
-                                    ui.notify("No charts found — generate charts first.",
-                                              type="warning")
+                                    with _cl:
+                                        ui.notify("No charts found — generate charts first.",
+                                                  type="warning")
                                     btn_export_pdf.set_enabled(True)
                                     return
 
@@ -7215,7 +8378,8 @@ def main_page():
                                 selected = (main_charts if _opts["main"] else []) + \
                                            (comp_charts if _opts["comp"] else [])
                                 if not selected:
-                                    ui.notify("No charts selected.", type="warning")
+                                    with _cl:
+                                        ui.notify("No charts selected.", type="warning")
                                     btn_export_pdf.set_enabled(True)
                                     return
 
@@ -7254,12 +8418,6 @@ def main_page():
                                     f"{'landscape' if _landscape else 'portrait'}; margin: 0.5in; }}"
                                 )
 
-                                def _fix_svg(svg: str) -> str:
-                                    svg = re.sub(r'(\d+(?:\.\d+)?)rem',
-                                                 lambda m: f"{float(m.group(1)) * 16:.1f}px", svg)
-                                    svg = re.sub(r'<foreignObject[\s\S]*?</foreignObject>', '', svg)
-                                    return svg
-
                                 def _section_page(title: str, desc: str) -> str:
                                     return (
                                         f'<div class="page section-page">'
@@ -7273,14 +8431,14 @@ def main_page():
                                 def _chart_page(ch: dict) -> str:
                                     title = (ch.get("title") or "").strip()
                                     desc  = _CHART_DESC.get(title, "")
-                                    svg   = _fix_svg(ch.get("svg", ""))
+                                    img   = ch.get("img", "")
                                     cap   = (
                                         f'<p class="caption">{_html.escape(desc)}</p>'
                                         if desc else ""
                                     )
                                     return (
                                         f'<div class="page chart-page">'
-                                        f'<div class="chart-wrap">{svg}</div>'
+                                        f'<div class="chart-wrap"><img src="{img}" alt="{_html.escape(title)}"></div>'
                                         f'{cap}</div>'
                                     )
 
@@ -7345,8 +8503,8 @@ def main_page():
 
   /* Chart */
   .chart-page{{justify-content:flex-start;padding-top:0.4in}}
-  .chart-wrap{{width:100%;flex:1}}
-  .chart-wrap svg{{width:100%!important;height:auto!important;max-height:80vh}}
+  .chart-wrap{{width:100%;flex:1;display:flex;align-items:center;justify-content:center}}
+  .chart-wrap img{{width:100%;height:auto;max-height:80vh;object-fit:contain}}
   .caption{{width:100%;margin-top:0.3rem;font-size:0.72rem;color:#555;
             line-height:1.5;border-top:1px solid #e0e0e0;padding-top:0.25rem;
             max-width:9in}}
@@ -7391,44 +8549,45 @@ def main_page():
                                 )
                             except Exception as exc:
                                 chart_status.set_text(f"Export error: {exc}")
-                                ui.notify(str(exc), type="negative")
+                                with _cl:
+                                    ui.notify(str(exc), type="negative")
                             finally:
                                 btn_export_pdf.set_enabled(True)
 
                         async def _diag_charts():
                             diag_js = """
                             (function() {
-                                var ser = new XMLSerializer();
-                                var domSvgs = document.querySelectorAll('svg.highcharts-root');
-                                var svgLen = 0, svgErr = null;
-                                if (domSvgs.length > 0) {
-                                    try {
-                                        var s = ser.serializeToString(domSvgs[0]);
-                                        svgLen = s ? s.length : 0;
-                                    } catch(e) { svgErr = e.toString(); }
-                                }
-                                var HC = window.Highcharts || window._Highcharts;
-                                var hcLen = (HC && HC.charts) ? HC.charts.length : -1;
-                                var live  = (HC && HC.charts) ? HC.charts.filter(function(c){ return !!c; }).length : 0;
+                                var EC = window.echarts;
+                                var containers = document.querySelectorAll('.nicegui-echart');
+                                var live = 0, dataUrlLen = 0, dataUrlErr = null;
+                                containers.forEach(function(el) {
+                                    var inst = EC && EC.getInstanceByDom(el);
+                                    if (!inst) return;
+                                    live++;
+                                    if (dataUrlLen === 0) {
+                                        try {
+                                            var d = inst.getDataURL({type:'png', pixelRatio:1, backgroundColor:'#fff'});
+                                            dataUrlLen = d ? d.length : 0;
+                                        } catch(e) { dataUrlErr = e.toString(); }
+                                    }
+                                });
                                 return {
-                                    domSvgCount:    domSvgs.length,
-                                    svgLen:         svgLen,
-                                    svgErr:         svgErr,
-                                    has_Highcharts: typeof window.Highcharts !== 'undefined',
-                                    hcChartsLen:    hcLen,
-                                    liveCharts:     live,
+                                    ecContainers: containers.length,
+                                    liveCharts:   live,
+                                    has_ECharts:  typeof EC !== 'undefined',
+                                    dataUrlLen:   dataUrlLen,
+                                    dataUrlErr:   dataUrlErr,
                                 };
                             })()
                             """
                             try:
                                 result = await ui.run_javascript(diag_js, timeout=10.0)
                                 msg = (
-                                    f"DOM svgs: {result.get('domSvgCount')} | "
-                                    f"svgLen: {result.get('svgLen')} | "
-                                    f"Highcharts global: {result.get('has_Highcharts')} | "
-                                    f"HC.charts[]: {result.get('hcChartsLen')} | "
-                                    f"live: {result.get('liveCharts')}"
-                                    + (f" | svgErr: {result.get('svgErr')}" if result.get('svgErr') else "")
+                                    f"EC containers: {result.get('ecContainers')} | "
+                                    f"live instances: {result.get('liveCharts')} | "
+                                    f"echarts global: {result.get('has_ECharts')} | "
+                                    f"dataUrl len: {result.get('dataUrlLen')}"
+                                    + (f" | err: {result.get('dataUrlErr')}" if result.get('dataUrlErr') else "")
                                 )
                                 chart_status.set_text(msg)
                                 ui.notify(msg, timeout=15000)
@@ -7558,7 +8717,7 @@ def main_page():
                         async def _do_radar():
                             selected = cust_select.value or []
                             if len(selected) < 2:
-                                ui.notify("Select at least 2 customers to compare.", type="warning")
+                                radar_status.set_text("Select at least 2 customers to compare.")
                                 return
 
                             btn_radar.set_enabled(False)
@@ -7617,43 +8776,34 @@ def main_page():
                             dim_keys  = ["avg_stars", "avg_complexity", "avg_resolution_quality",
                                          "avg_response_timeliness", "avg_communication_clarity"]
 
-                            series = []
+                            ec_series = []
                             for org in selected:
                                 v = cust_data.get(org)
                                 if not v or v["scored_count"] == 0:
                                     radar_status.set_text(f"No scored tickets for: {org}")
                                     continue
-                                series.append({
-                                    "name": org,
-                                    "data": [v[k] for k in dim_keys],
-                                    "pointPlacement": "on",
+                                ec_series.append({
+                                    "name":  org,
+                                    "value": [round(v[k], 2) for k in dim_keys],
                                 })
 
-                            if not series:
+                            if not ec_series:
                                 radar_status.set_text("No scored data for selected customers.")
                                 btn_radar.set_enabled(True)
                                 return
 
                             with radar_area:
-                                ui.highchart({
-                                    "chart":   {"polar": True, "type": "line", "height": 420},
+                                ui.echart({
                                     "title":   {"text": "Customer Dimension Comparison"},
-                                    "pane":    {"size": "75%"},
-                                    "xAxis":   {
-                                        "categories":        dims,
-                                        "tickmarkPlacement": "on",
-                                        "lineWidth":         0,
+                                    "tooltip": {"trigger": "item"},
+                                    "legend":  {"bottom": 0, "data": [s["name"] for s in ec_series]},
+                                    "radar":   {
+                                        "indicator": [{"name": d, "max": 5} for d in dims],
+                                        "shape": "polygon",
+                                        "splitNumber": 5,
                                     },
-                                    "yAxis":   {
-                                        "gridLineInterpolation": "polygon",
-                                        "lineWidth": 0,
-                                        "min": 0, "max": 5,
-                                        "tickInterval": 1,
-                                    },
-                                    "tooltip": {"shared": True, "pointFormat": "<b>{series.name}</b>: {point.y:.2f}<br/>"},
-                                    "legend":  {"enabled": True},
-                                    "series":  series,
-                                }).classes("w-full")
+                                    "series":  [{"type": "radar", "data": ec_series}],
+                                }).classes("w-full").style("height:420px")
 
                                 # Summary table below radar
                                 rows = []
@@ -7684,14 +8834,14 @@ def main_page():
 
                                 # ── Ticket count per customer ─────────────────────────────
                                 with ui.card().classes("w-full mt-4"):
-                                    ui.highchart({
-                                        "chart":  {"type": "column", "height": 280, "zoomType": "x"},
-                                        "title":  {"text": "Ticket Count by Customer"},
-                                        "xAxis":  {"categories": selected, "labels": {"rotation": -30, "style": {"fontSize": "11px"}, "overflow": "allow"}},
-                                        "yAxis":  {"title": {"text": "Tickets"}},
-                                        "series": [{"name": "Total Tickets", "color": "#1E88E5",
-                                                    "data": [cust_data.get(o, {}).get("ticket_count", 0) for o in selected]}],
-                                    }).classes("w-full")
+                                    ui.echart({
+                                        "title":   {"text": "Ticket Count by Customer"},
+                                        "tooltip": {"trigger": "axis"},
+                                        "xAxis":   {"type": "category", "data": selected, "axisLabel": {"rotate": 30, "fontSize": 11, "overflow": "truncate", "width": 100}},
+                                        "yAxis":   {"type": "value", "name": "Tickets"},
+                                        "color":   ["#1E88E5"],
+                                        "series":  [{"name": "Total Tickets", "type": "bar", "data": [cust_data.get(o, {}).get("ticket_count", 0) for o in selected]}],
+                                    }).classes("w-full").style("height:280px")
 
                                 # ── Priority breakdown per customer ───────────────────────
                                 from collections import Counter as _Counter
@@ -7710,18 +8860,20 @@ def main_page():
                                 }
                                 all_priorities = sorted({p for d in pri_counts.values() for p in d})
                                 with ui.card().classes("w-full mt-4"):
-                                    ui.highchart({
-                                        "chart":       {"type": "column", "height": 300, "zoomType": "x"},
-                                        "title":       {"text": "Priority Breakdown by Customer"},
-                                        "xAxis":       {"categories": selected, "labels": {"rotation": -30, "style": {"fontSize": "11px"}, "overflow": "allow"}},
-                                        "yAxis":       {"title": {"text": "Tickets"}, "stackLabels": {"enabled": True}},
-                                        "plotOptions": {"column": {"stacking": "normal"}},
-                                        "series": [
-                                            {"name": p, "data": [pri_counts[o].get(p, 0) for o in selected],
-                                             "color": _CMP_PRI_COLOR_MAP.get(p.lower(), "#9E9E9E")}
+                                    ui.echart({
+                                        "title":   {"text": "Priority Breakdown by Customer"},
+                                        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                        "legend":  {"bottom": 0},
+                                        "grid":    {"bottom": 50},
+                                        "xAxis":   {"type": "category", "data": selected, "axisLabel": {"rotate": 30, "fontSize": 11, "overflow": "truncate", "width": 100}},
+                                        "yAxis":   {"type": "value", "name": "Tickets"},
+                                        "series":  [
+                                            {"name": p, "type": "bar", "stack": "total",
+                                             "itemStyle": {"color": _CMP_PRI_COLOR_MAP.get(p.lower(), "#9E9E9E")},
+                                             "data": [pri_counts[o].get(p, 0) for o in selected]}
                                             for p in all_priorities
                                         ],
-                                    }).classes("w-full")
+                                    }).classes("w-full").style("height:300px")
 
                                 # ── Stars distribution per customer ───────────────────────
                                 if state["scores"]:
@@ -7736,19 +8888,20 @@ def main_page():
                                             idx = min(max(int(float(sc["stars"])), 1), 5) - 1
                                             star_by_org[org][idx] += 1
                                     with ui.card().classes("w-full mt-4"):
-                                        ui.highchart({
-                                            "chart":  {"type": "column", "height": 320, "zoomType": "x"},
-                                            "title":  {"text": "Experience Stars Distribution by Customer"},
-                                            "xAxis":  {"categories": ["★1", "★2", "★3", "★4", "★5"]},
-                                            "yAxis":  {"title": {"text": "Tickets"}},
-                                            "plotOptions": {"column": {"grouping": True}},
-                                            "series": [
-                                                {"name": org, "data": star_by_org[org]}
+                                        ui.echart({
+                                            "title":   {"text": "Experience Stars Distribution by Customer"},
+                                            "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "legend":  {"bottom": 0},
+                                            "grid":    {"bottom": 50},
+                                            "xAxis":   {"type": "category", "data": ["★1","★2","★3","★4","★5"]},
+                                            "yAxis":   {"type": "value", "name": "Tickets"},
+                                            "series":  [
+                                                {"name": org, "type": "bar", "data": star_by_org[org]}
                                                 for org in selected
                                             ],
-                                        }).classes("w-full")
+                                        }).classes("w-full").style("height:320px")
 
-                            radar_status.set_text(f"Comparing {len(series)} customers.")
+                            radar_status.set_text(f"Comparing {len(ec_series)} customers.")
                             state["_comparison_orgs"] = selected
                             btn_radar.set_enabled(True)
 
@@ -7789,8 +8942,7 @@ def main_page():
                         async def _do_profile(client=None):
                             org = (profile_org_select.value or "").strip()
                             if not org:
-                                with client:
-                                    ui.notify("Select a customer first.", type="warning")
+                                _safe_notify(client, "Select a customer first.", type="warning")
                                 return
                             btn_profile.set_enabled(False)
                             profile_status.set_text(f"Building profile for {org}…")
@@ -7871,79 +9023,82 @@ def main_page():
                                 with ui.row().classes("w-full gap-4"):
                                     if prof["year_keys"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": 240},
-                                                "title":  {"text": "Tickets per Year"},
-                                                "xAxis":  {"categories": prof["year_keys"]},
-                                                "yAxis":  {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                                "colors": ["#3949AB"],
-                                                "plotOptions": {"column": {"dataLabels": {"enabled": True}}},
-                                                "series": [{"name": "Tickets", "data": prof["year_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Tickets per Year"},
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis":   {"type": "category", "data": prof["year_keys"]},
+                                                "yAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                "color":   ["#3949AB"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": prof["year_values"], "label": {"show": True, "position": "top"}}],
+                                            }).classes("w-full").style("height:240px")
 
                                     if prof["month_keys"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "column", "height": 240, "zoomType": "x"},
-                                                "title":  {"text": "Tickets per Month"},
-                                                "subtitle": {"text": "Click and drag to zoom"},
-                                                "xAxis":  {"categories": prof["month_keys"], "labels": {"rotation": -45, "style": {"fontSize": "10px"}}},
-                                                "yAxis":  {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                                "colors": ["#1E88E5"],
-                                                "series": [{"name": "Tickets", "data": prof["month_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":    {"text": "Tickets per Month", "subtext": "Drag to zoom"},
+                                                "tooltip":  {"trigger": "axis"},
+                                                "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                "grid":     {"bottom": 50},
+                                                "xAxis":    {"type": "category", "data": prof["month_keys"], "axisLabel": {"rotate": 45, "fontSize": 10}},
+                                                "yAxis":    {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                "color":    ["#1E88E5"],
+                                                "series":   [{"name": "Tickets", "type": "bar", "data": prof["month_values"]}],
+                                            }).classes("w-full").style("height:240px")
 
                                 # ── Row 2: Priority per month (stacked) ───────────────────
                                 if prof["month_keys"] and prof["all_priorities"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":       {"type": "column", "height": 300, "zoomType": "x"},
-                                            "title":       {"text": "Ticket Priority per Month"},
-                                            "subtitle":    {"text": "Click and drag to zoom"},
-                                            "xAxis":       {"categories": prof["pri_month_keys"], "labels": {"rotation": -45, "style": {"fontSize": "10px"}}},
-                                            "yAxis":       {"title": {"text": "Tickets"}, "stackLabels": {"enabled": True}},
-                                            "plotOptions": {"column": {"stacking": "normal"}},
-                                            "series":      [
-                                                {"name": p, "data": prof["pri_by_month"][p], "color": _pri_color(p)}
+                                        ui.echart({
+                                            "title":    {"text": "Ticket Priority per Month", "subtext": "Drag to zoom"},
+                                            "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                            "legend":   {"bottom": 0},
+                                            "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                            "grid":     {"bottom": 80},
+                                            "xAxis":    {"type": "category", "data": prof["pri_month_keys"], "axisLabel": {"rotate": 45, "fontSize": 10}},
+                                            "yAxis":    {"type": "value", "name": "Tickets"},
+                                            "series":   [
+                                                {"name": p, "type": "bar", "stack": "total",
+                                                 "itemStyle": {"color": _pri_color(p)},
+                                                 "data": prof["pri_by_month"][p]}
                                                 for p in prof["all_priorities"]
                                             ],
-                                        }).classes("w-full")
+                                        }).classes("w-full").style("height:300px")
 
                                 # ── Row 3: Composition ────────────────────────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     if prof["feature_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "pie", "height": 280},
-                                                "title":  {"text": "Feature Area Breakdown"},
-                                                "plotOptions": {"pie": {"innerSize": "40%", "dataLabels": {"enabled": True, "format": "<b>{point.name}</b>: {point.percentage:.1f}%"}}},
-                                                "series":  [{"name": "Tickets", "data": list(zip(prof["feature_labels"], prof["feature_values"]))}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "Feature Area Breakdown"},
+                                                "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                                "series":  [{"name": "Tickets", "type": "pie", "radius": ["38%", "65%"], "label": {"formatter": "{b}: {d}%", "fontSize": 10}, "data": [{"name": l, "value": v} for l, v in zip(prof["feature_labels"], prof["feature_values"])]}],
+                                            }).classes("w-full").style("height:280px")
 
                                     if prof["version_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.highchart({
-                                                "chart":  {"type": "bar", "height": 280, "zoomType": "y", "marginLeft": 90},
-                                                "title":  {"text": "CB Version Distribution"},
-                                                "subtitle": {"text": "From ticket fields + snapshots"},
-                                                "xAxis":  {"categories": prof["version_labels"], "labels": {"style": {"fontSize": "10px"}}},
-                                                "yAxis":  {"title": {"text": "Tickets"}, "allowDecimals": False},
-                                                "colors": ["#0277BD"],
-                                                "series": [{"name": "Tickets", "data": prof["version_values"]}],
-                                            }).classes("w-full")
+                                            ui.echart({
+                                                "title":   {"text": "CB Version Distribution", "subtext": "From ticket fields + snapshots"},
+                                                "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                                "grid":    {"left": 100},
+                                                "xAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                "yAxis":   {"type": "category", "data": prof["version_labels"], "axisLabel": {"fontSize": 10}},
+                                                "color":   ["#0277BD"],
+                                                "series":  [{"name": "Tickets", "type": "bar", "data": prof["version_values"]}],
+                                            }).classes("w-full").style("height:280px")
 
                                 # ── Row 4: Satisfaction trend ─────────────────────────────
                                 if prof["stars_trend_keys"]:
                                     with ui.card().classes("w-full"):
-                                        ui.highchart({
-                                            "chart":  {"type": "line", "height": 240, "zoomType": "x"},
-                                            "title":  {"text": "Avg Satisfaction Stars per Month"},
-                                            "subtitle": {"text": "Based on AI-scored tickets · click and drag to zoom"},
-                                            "xAxis":  {"categories": prof["stars_trend_keys"], "labels": {"rotation": -45, "style": {"fontSize": "10px"}}},
-                                            "yAxis":  {"title": {"text": "Avg Stars"}, "min": 1, "max": 5, "tickInterval": 1},
-                                            "colors": ["#F9A825"],
-                                            "series": [{"name": "Avg Stars", "data": prof["stars_trend_values"], "marker": {"enabled": True}}],
-                                        }).classes("w-full")
+                                        ui.echart({
+                                            "title":    {"text": "Avg Satisfaction Stars per Month", "subtext": "AI-scored · drag to zoom"},
+                                            "tooltip":  {"trigger": "axis"},
+                                            "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                            "grid":     {"bottom": 50},
+                                            "xAxis":    {"type": "category", "data": prof["stars_trend_keys"], "axisLabel": {"rotate": 45, "fontSize": 10}},
+                                            "yAxis":    {"type": "value", "name": "Avg Stars", "min": 1, "max": 5, "minInterval": 1},
+                                            "color":    ["#F9A825"],
+                                            "series":   [{"name": "Avg Stars", "type": "line", "smooth": True, "symbol": "circle", "data": prof["stars_trend_values"]}],
+                                        }).classes("w-full").style("height:240px")
 
                                 # ── Cluster list (if any) ─────────────────────────────────
                                 if prof["cluster_list"]:
@@ -8135,8 +9290,9 @@ def main_page():
 
                                 # ── Time-series charts ────────────────────────────────────
                                 for spec in chart_specs:
+                                    _ch = spec.pop("_height", 280)
                                     with ui.card().classes("w-full"):
-                                        ui.highchart(spec).classes("w-full")
+                                        ui.echart(spec).classes("w-full").style(f"height:{_ch}px")
 
                                 # ── CB Version & Orchestrator change log ──────────────────
                                 version_changes = [
@@ -8546,6 +9702,7 @@ def main_page():
                             # Enable save whenever there are snapshots in memory
                             all_snaps = ch_snap_state.get("snapshots") or []
                             btn_ch_save_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
+                            btn_ch_embed_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
                             if new_snaps:
                                 ch_status.set_text(
                                     f"Scraped {len(new_snaps)} new snapshots "
@@ -8557,6 +9714,28 @@ def main_page():
                                     pass
                             elif all_snaps and not ch_status.text.startswith("Scrape error"):
                                 ch_status.set_text(f"{len(all_snaps)} snapshots in memory (no new).")
+
+                            if new_snaps and ch_auto_save_cb.value and _CB_AVAILABLE and cb_url_input.value.strip():
+                                ch_status.set_text(f"Auto-saving {len(new_snaps)} snapshots to Couchbase…")
+                                try:
+                                    _saved, _errs = await run.io_bound(
+                                        load_snapshots_to_couchbase,
+                                        new_snaps,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        ch_snap_coll.value.strip() or "snapshots",
+                                        lambda msg, pct: None,
+                                    )
+                                    ch_status.set_text(
+                                        f"Saved {_saved} snapshots ({_errs} errors). {len(all_snaps)} total in memory."
+                                    )
+                                except Exception as _ae:
+                                    ch_status.set_text(f"Auto-save error: {_ae}")
+
                             btn_ch_scrape.set_enabled(True)
                             ch_progress.set_visibility(False)
 
@@ -8564,8 +9743,7 @@ def main_page():
                             """Fetch snapshot listing + ticket IDs via analytics API (fast, no Playwright)."""
                             customer = (ch_cust_input.value or main_cust_input.value or "").strip()
                             if not customer:
-                                with client:
-                                    ui.notify("Enter a customer name or URL.", type="warning")
+                                _safe_notify(client, "Enter a customer name or URL.", type="warning")
                                 return
                             btn_ch_fetch_analytics.set_enabled(False)
                             ch_progress.set_visibility(True)
@@ -8616,8 +9794,7 @@ def main_page():
                                 ch_status.set_text(f"Analytics fetch error: {exc}")
                                 try:
                                     if client:
-                                        with client:
-                                            ui.notify(str(exc), type="negative")
+                                        _safe_notify(client, str(exc), type="negative")
                                     else:
                                         ui.notify(str(exc), type="negative")
                                 except Exception:
@@ -8640,6 +9817,7 @@ def main_page():
 
                             all_snaps = ch_snap_state.get("snapshots") or []
                             btn_ch_save_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
+                            btn_ch_embed_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
                             msg = (
                                 f"Analytics: {len(new_snaps)} new snapshots fetched "
                                 f"({len(all_snaps)} total). Topology not loaded — use Scrape for full detail."
@@ -8656,8 +9834,7 @@ def main_page():
                                 and s.get("snap_id")
                             ]
                             if not all_stubs:
-                                with client:
-                                    ui.notify("No analytics stubs to scrape — fetch via Analytics API first, or all snaps already have topology.", type="info")
+                                _safe_notify(client, "No analytics stubs to scrape — fetch via Analytics API first, or all snaps already have topology.", type="info")
                                 return
                             btn_ch_scrape_stubs.set_enabled(False)
                             ch_progress.set_visibility(True)
@@ -8697,8 +9874,7 @@ def main_page():
                                     + (f", capped at {max_snaps}" if max_snaps > 0 else "") + "."
                                 )
                                 if not stubs:
-                                    with client:
-                                        ui.notify(f"All {n_skipped} snapshots already complete in Couchbase.", type="info")
+                                    _safe_notify(client, f"All {n_skipped} snapshots already complete in Couchbase.", type="info")
                                     btn_ch_scrape_stubs.set_enabled(True)
                                     ch_progress.set_visibility(False)
                                     return
@@ -8722,8 +9898,7 @@ def main_page():
                                 import traceback as _tb
                                 _tb.print_exc()
                                 ch_status.set_text(f"Scrape error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                                 btn_ch_scrape_stubs.set_enabled(True)
                                 ch_progress.set_visibility(False)
                                 return
@@ -8742,11 +9917,33 @@ def main_page():
 
                             all_snaps = ch_snap_state.get("snapshots") or []
                             btn_ch_save_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
+                            btn_ch_embed_cb.set_enabled(bool(all_snaps) and _CB_AVAILABLE)
                             ch_status.set_text(
                                 f"Scraped topology for {len(scraped)} snapshots ({len(all_snaps)} total)."
                             )
-                            with client:
-                                ui.notify(f"Scraped {len(scraped)} snapshots.", type="positive")
+                            _safe_notify(client, f"Scraped {len(scraped)} snapshots.", type="positive")
+
+                            if scraped and ch_auto_save_cb.value and _CB_AVAILABLE and cb_url_input.value.strip():
+                                ch_status.set_text(f"Auto-saving {len(scraped)} snapshots to Couchbase…")
+                                try:
+                                    _saved, _errs = await run.io_bound(
+                                        load_snapshots_to_couchbase,
+                                        scraped,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        ch_snap_coll.value.strip() or "snapshots",
+                                        lambda msg, pct: None,
+                                    )
+                                    ch_status.set_text(
+                                        f"Saved {_saved} snapshots ({_errs} errors). {len(all_snaps)} total in memory."
+                                    )
+                                except Exception as _ae:
+                                    ch_status.set_text(f"Auto-save error: {_ae}")
+
                             btn_ch_scrape_stubs.set_enabled(True)
                             ch_progress.set_visibility(False)
 
@@ -8822,6 +10019,7 @@ def main_page():
                                     _prog,
                                 )
                                 ch_status.set_text(f"Saved {upserted} snapshots ({errors} errors).")
+                                btn_ch_embed_cb.set_enabled(bool(snaps) and _CB_AVAILABLE)
                                 try:
                                     ui.notify(f"Saved {upserted} snapshots.", type="positive")
                                 except Exception:
@@ -8834,6 +10032,62 @@ def main_page():
                                     pass
                             finally:
                                 btn_ch_save_cb.set_enabled(True)
+
+                        async def _ch_embed_cb():
+                            if not _CB_AVAILABLE:
+                                ui.notify("Couchbase SDK not available.", type="warning")
+                                return
+                            snaps = ch_snap_state.get("snapshots") or []
+                            if not snaps:
+                                ui.notify("No snapshots in memory — scrape or load first.", type="warning")
+                                return
+                            ep, em, ek, eu, ed, _enctx = _get_embed_config()
+                            if not ep or not em:
+                                ui.notify("Configure embedding model first (Configuration tab).", type="warning")
+                                return
+                            ch_status.set_text(f"Embedding {len(snaps)} snapshots …")
+                            btn_ch_embed_cb.set_enabled(False)
+                            ch_progress.set_visibility(True)
+                            ch_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            def _prog(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(
+                                    _ch_emb_upd(msg, pct), loop
+                                )
+
+                            async def _ch_emb_upd(msg: str, pct: float):
+                                ch_status.set_text(msg)
+                                ch_progress.set_value(pct)
+
+                            try:
+                                done, errs = await run.io_bound(
+                                    embed_all_snapshots,
+                                    snaps,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    ch_snap_coll.value.strip() or "snapshots",
+                                    ep, em, ek, eu, int(ed or 1024),
+                                    _prog,
+                                )
+                                ch_status.set_text(f"Embedded {done} snapshots ({errs} errors).")
+                                try:
+                                    ui.notify(f"Embedded {done} snapshots.", type="positive")
+                                except Exception:
+                                    pass
+                            except Exception as exc:
+                                ch_status.set_text(f"Embed error: {exc}")
+                                try:
+                                    ui.notify(str(exc), type="negative")
+                                except Exception:
+                                    pass
+                            finally:
+                                btn_ch_embed_cb.set_enabled(True)
+                                ch_progress.set_visibility(False)
 
                         async def _ch_render_timeline(client=None):
                             cid = ch_tl_cluster_select.value or ""
@@ -8866,30 +10120,34 @@ def main_page():
 
                             with ch_tl_area:
                                 # Bad + Warn over time
-                                ui.highchart({
-                                    "chart":  {"type": "line", "height": ch_h, "zoomType": "x"},
-                                    "title":  {"text": f"Issue Count Over Time — {cluster_label}"},
-                                    "subtitle": {"text": "Click and drag to zoom · bad=red, warn=orange"},
-                                    "xAxis":  {"categories": dates, "labels": {"rotation": -45}},
-                                    "yAxis":  {"title": {"text": "Issue Count"}, "allowDecimals": False, "min": 0},
-                                    "colors": ["#E53935", "#FB8C00"],
-                                    "series": [
-                                        {"name": "Bad",  "data": bad_vals,  "color": "#E53935"},
-                                        {"name": "Warn", "data": warn_vals, "color": "#FB8C00"},
+                                ui.echart({
+                                    "title":    {"text": f"Issue Count Over Time — {cluster_label}", "subtext": "bad=red, warn=orange · drag to zoom"},
+                                    "tooltip":  {"trigger": "axis"},
+                                    "legend":   {"bottom": 0},
+                                    "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                    "grid":     {"bottom": 70},
+                                    "xAxis":    {"type": "category", "data": dates, "axisLabel": {"rotate": 45}},
+                                    "yAxis":    {"type": "value", "name": "Issue Count", "minInterval": 1, "min": 0},
+                                    "color":    ["#E53935", "#FB8C00"],
+                                    "series":   [
+                                        {"name": "Bad",  "type": "line", "smooth": True, "data": bad_vals,  "itemStyle": {"color": "#E53935"}},
+                                        {"name": "Warn", "type": "line", "smooth": True, "data": warn_vals, "itemStyle": {"color": "#FB8C00"}},
                                     ],
-                                }).classes("w-full")
+                                }).classes("w-full").style(f"height:{ch_h}px")
 
                                 # Node count over time
                                 if any(n > 0 for n in node_vals):
-                                    ui.highchart({
-                                        "chart":  {"type": "line", "height": max(240, int(_win_h * 0.25)), "zoomType": "x"},
-                                        "title":  {"text": f"Node Count Over Time — {cluster_label}"},
-                                        "subtitle": {"text": f"min={ci.get('node_count_min')} · max={ci.get('node_count_max')}"},
-                                        "xAxis":  {"categories": dates, "labels": {"rotation": -45}},
-                                        "yAxis":  {"title": {"text": "Nodes"}, "allowDecimals": False, "min": 0},
-                                        "colors": ["#1E88E5"],
-                                        "series": [{"name": "Nodes", "data": node_vals}],
-                                    }).classes("w-full")
+                                    _nc_h = max(240, int(_win_h * 0.25))
+                                    ui.echart({
+                                        "title":    {"text": f"Node Count Over Time — {cluster_label}", "subtext": f"min={ci.get('node_count_min')} · max={ci.get('node_count_max')}"},
+                                        "tooltip":  {"trigger": "axis"},
+                                        "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
+                                        "grid":     {"bottom": 70},
+                                        "xAxis":    {"type": "category", "data": dates, "axisLabel": {"rotate": 45}},
+                                        "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1, "min": 0},
+                                        "color":    ["#1E88E5"],
+                                        "series":   [{"name": "Nodes", "type": "line", "smooth": True, "data": node_vals}],
+                                    }).classes("w-full").style(f"height:{_nc_h}px")
 
                                 # Version markers (show where version changed)
                                 version_changes = []
@@ -8975,18 +10233,20 @@ def main_page():
                                     labels = [c.get("cluster_name") or cid2[:12] for cid2, c in top20]
                                     bad_data  = [c.get("total_bad",  0) for _, c in top20]
                                     warn_data = [c.get("total_warn", 0) for _, c in top20]
-                                    ui.highchart({
-                                        "chart":  {"type": "bar", "height": max(ch_h, len(top20) * 28 + 80), "zoomType": "y"},
-                                        "title":  {"text": "Total Bad + Warn Issues by Cluster"},
-                                        "xAxis":  {"categories": labels},
-                                        "yAxis":  {"title": {"text": "Issue Count"}},
-                                        "plotOptions": {"bar": {"grouping": True}},
-                                        "colors": ["#E53935", "#FB8C00"],
-                                        "series": [
-                                            {"name": "Bad",  "data": bad_data},
-                                            {"name": "Warn", "data": warn_data},
+                                    _iss_h = max(ch_h, len(top20) * 28 + 80)
+                                    ui.echart({
+                                        "title":   {"text": "Total Bad + Warn Issues by Cluster"},
+                                        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                                        "legend":  {"bottom": 0},
+                                        "grid":    {"left": 140, "right": 20, "bottom": 40},
+                                        "xAxis":   {"type": "value", "name": "Issue Count"},
+                                        "yAxis":   {"type": "category", "data": labels, "axisLabel": {"overflow": "truncate", "width": 120}},
+                                        "color":   ["#E53935", "#FB8C00"],
+                                        "series":  [
+                                            {"name": "Bad",  "type": "bar", "data": bad_data},
+                                            {"name": "Warn", "type": "bar", "data": warn_data},
                                         ],
-                                    }).classes("w-full")
+                                    }).classes("w-full").style(f"height:{_iss_h}px")
 
                             ch_iss_status.set_text(
                                 f"Issue charts rendered for "
@@ -9231,7 +10491,7 @@ def main_page():
                           <q-td key="total_snapshots" :props="props" class="text-center">{{ props.row.total_snapshots }}</q-td>
                           <q-td key="total_tickets"   :props="props" class="text-center">{{ props.row.total_tickets }}</q-td>
                           <q-td key="last_scraped_at" :props="props">
-                            {{ props.row.last_scraped_at ? props.row.last_scraped_at.substring(0,16).replace('T',' ') : '—' }}
+                            {{ props.row.last_scraped_at ? (typeof props.row.last_scraped_at === 'number' ? new Date(props.row.last_scraped_at * 1000) : new Date(props.row.last_scraped_at)).toISOString().substring(0,16).replace('T',' ') : '—' }}
                           </q-td>
                           <q-td key="customer_url" :props="props">
                             <a v-if="props.row.customer_url" :href="props.row.customer_url" target="_blank"
@@ -9295,30 +10555,33 @@ def main_page():
             # Auth
             "cookie":        cookie_input.value,
             # Couchbase
-            "cb_url":        cb_url_input.value,
-            "cb_bucket":     cb_bucket_input.value,
-            "cb_user":       cb_user_input.value,
-            "cb_pass":       cb_pass_input.value,
-            "cb_tls":        cb_tls_toggle.value,
-            "cb_scope":      cb_scope_input.value,
-            "cb_collection": cb_collection_input.value,
+            "cb_url":          cb_url_input.value,
+            "cb_bucket":       cb_bucket_input.value,
+            "cb_user":         cb_user_input.value,
+            "cb_pass":         cb_pass_input.value,
+            "cb_tls":          cb_tls_toggle.value,
+            "cb_scope":        cb_scope_input.value,
+            "cb_collection":   cb_collection_input.value,
+            "ch_snap_coll":    ch_snap_coll.value,
+            "cb_summary_coll": cb_summary_coll.value,
             # Embedding
-            "emb_provider":      ai_emb_provider.value,
-            "emb_ollama_url":    emb_ollama_url_input.value,
+            "emb_provider":       ai_emb_provider.value,
+            "emb_ollama_url":     emb_ollama_url_input.value,
             "emb_ollama_model":   emb_ollama_model_input.value or "",
             "emb_ollama_dims":    emb_dims_input.value,
             "emb_ollama_num_ctx": emb_num_ctx_input.value,
-            "emb_lms_url":       emb_lms_url_input.value,
-            "emb_lms_model":     emb_lms_model_input.value or "",
-            "emb_lms_dims":      emb_lms_dims_input.value,
-            "emb_gemini_key":    emb_gemini_key_input.value,
-            "emb_gemini_model":  emb_gemini_model_input.value or "",
-            "emb_gemini_dims":   emb_gemini_dims_input.value,
-            "emb_mlx_model":     emb_mlx_model_input.value,
-            "emb_mlx_dims":      emb_mlx_dims_input.value,
-            "emb_openai_key":    emb_openai_key_input.value,
-            "emb_openai_model":  emb_openai_model_input.value or "",
-            "emb_openai_dims":   emb_openai_dims_input.value,
+            "emb_lms_url":        emb_lms_url_input.value,
+            "emb_lms_model":      emb_lms_model_input.value or "",
+            "emb_lms_dims":       emb_lms_dims_input.value,
+            "emb_gemini_key":     emb_gemini_key_input.value,
+            "emb_gemini_model":   emb_gemini_model_input.value or "",
+            "emb_gemini_dims":    emb_gemini_dims_input.value,
+            "emb_mlx_model":      emb_mlx_model_input.value,
+            "emb_mlx_dims":       emb_mlx_dims_input.value,
+            "emb_openai_key":     emb_openai_key_input.value,
+            "emb_openai_model":   emb_openai_model_input.value or "",
+            "emb_openai_dims":    emb_openai_dims_input.value,
+            "embed_parallel":     embed_parallel_input.value,
             # LLM (chat/scoring)
             "llm_provider":       ai_llm_provider.value,
             "claude_key":         claude_key_input.value,
@@ -9330,6 +10593,7 @@ def main_page():
             "openai_llm_model":   openai_llm_model_input.value or "",
             # Scoring
             "score_batch":        score_batch_input.value,
+            "score_parallel":     score_parallel_input.value,
             "score_ctx":          score_ctx_input.value,
             "score_no_think":     score_no_think_toggle.value,
             "score_autosave":     score_autosave_toggle.value,
@@ -9339,6 +10603,19 @@ def main_page():
             "pipeline_score":     pipeline_score_toggle.value,
             "pipeline_enrich":    pipeline_enrich_toggle.value,
             "pipeline_validate":  pipeline_validate_toggle.value,
+            "snap_auto_save_cb":  ch_auto_save_cb.value,
+            # CH scrape settings
+            "ch_max_pages":       ch_max_pages.value,
+            "ch_workers":         ch_workers.value,
+            "ch_max_snapshots":   ch_max_snapshots.value,
+            "ch_analytics_limit": ch_analytics_limit.value,
+            # Chat settings
+            "chat_mode":              chat_mode_select.value,
+            "top_k":                  top_k_input.value,
+            "batch_size_chat":        batch_size_chat_input.value,
+            "batch_parallel":         batch_parallel_input.value,
+            "compact_context":        compact_context_toggle.value,
+            "deep_reason":            deep_reason_toggle.value,
             # Chat cache / memory
             "cache_collection":   cache_collection_input.value,
             "embed_cache_ttl":    embed_cache_ttl.value,
@@ -9361,6 +10638,8 @@ def main_page():
         _set(cb_tls_toggle,       "cb_tls")
         _set(cb_scope_input,      "cb_scope")
         _set(cb_collection_input, "cb_collection")
+        _set(ch_snap_coll,        "ch_snap_coll")
+        _set(cb_summary_coll,     "cb_summary_coll")
 
         _set(emb_ollama_url_input,   "emb_ollama_url")
         if p.get("emb_ollama_model"):
@@ -9383,6 +10662,7 @@ def main_page():
         if p.get("emb_openai_model"):
             emb_openai_model_input.set_value(p["emb_openai_model"])
         _set(emb_openai_dims_input,  "emb_openai_dims")
+        _set(embed_parallel_input,   "embed_parallel")
         if p.get("emb_provider"):
             ai_emb_provider.set_value(p["emb_provider"])
 
@@ -9404,6 +10684,7 @@ def main_page():
             ai_llm_provider.set_value(p["llm_provider"])
 
         _set(score_batch_input,       "score_batch")
+        _set(score_parallel_input,    "score_parallel")
         _set(score_ctx_input,         "score_ctx")
         # If no saved value, auto-enable based on the currently saved model name
         if "score_no_think" in p:
@@ -9420,7 +10701,19 @@ def main_page():
         _set(pipeline_score_toggle,   "pipeline_score")
         _set(pipeline_enrich_toggle,  "pipeline_enrich")
         _set(pipeline_validate_toggle,"pipeline_validate")
-        _set(cache_collection_input, "cache_collection")
+        _set(ch_auto_save_cb,         "snap_auto_save_cb")
+        _set(ch_max_pages,            "ch_max_pages")
+        _set(ch_workers,              "ch_workers")
+        _set(ch_max_snapshots,        "ch_max_snapshots")
+        _set(ch_analytics_limit,      "ch_analytics_limit")
+        if p.get("chat_mode"):
+            chat_mode_select.set_value(p["chat_mode"])
+        _set(top_k_input,             "top_k")
+        _set(batch_size_chat_input,   "batch_size_chat")
+        _set(batch_parallel_input,    "batch_parallel")
+        _set(compact_context_toggle,  "compact_context")
+        _set(deep_reason_toggle,      "deep_reason")
+        _set(cache_collection_input,  "cache_collection")
         _set(embed_cache_ttl,        "embed_cache_ttl")
         _set(search_cache_ttl,       "search_cache_ttl")
         _set(store_memory_toggle,    "store_memory")
@@ -9436,6 +10729,29 @@ def main_page():
             cb_scope_input.value.strip() or "_default",
             cb_collection_input.value.strip() or "tickets",
         )
+
+    async def _refresh_cluster_map(status_label=None) -> str:
+        """Query CB snapshots + tickets to populate dynamic cluster↔app alias maps."""
+        args = _cb_args()
+        if not args:
+            msg = "CB not configured — aliases unchanged"
+            if status_label:
+                status_label.set_text(msg)
+            return msg
+        cb_url, bucket, cb_user, cb_pass, cb_tls, scope, _col = args
+        snap_col = ch_snap_coll.value.strip() or "snapshots"
+        if status_label:
+            status_label.set_text("Querying CB for cluster↔app mappings…")
+        n_snaps, n_tickets = await run.io_bound(
+            _load_cluster_app_map,
+            cb_url, bucket, cb_user, cb_pass, cb_tls, scope,
+            snap_col, _col,
+        )
+        total = len(_cluster_app_dynamic)
+        msg = f"Aliases refreshed — {total} cluster→app mappings ({n_snaps} from snaps, {n_tickets} from tickets)"
+        if status_label:
+            status_label.set_text(msg)
+        return msg
 
     async def _save_profile():
         profiles   = _load_settings_file()
@@ -9473,6 +10789,7 @@ def main_page():
                     local["__last__"] = name
                     _save_settings_file(local)
                     profile_status.set_text(f"Loaded \"{name}\" from Couchbase")
+                    asyncio.ensure_future(_refresh_cluster_map())
                     return
                 profile_status.set_text(f"\"{name}\" not in Couchbase — checking local…")
             except Exception as exc:
@@ -9486,6 +10803,7 @@ def main_page():
         profiles["__last__"] = name
         _save_settings_file(profiles)
         profile_status.set_text(f"Loaded \"{name}\"")
+        asyncio.ensure_future(_refresh_cluster_map())
 
     async def _delete_profile():
         profiles = _load_settings_file()
@@ -9508,13 +10826,15 @@ def main_page():
         else:
             profile_status.set_text(f"Profile \"{name}\" not found.")
 
-    # Auto-load the last-used profile on page open
+    # Auto-load the last-used profile on page open, then refresh cluster→app aliases
     _last = _load_settings_file().get("__last__")
     if _last:
         _saved = _load_settings_file().get(_last, {})
         if _saved:
             _apply_profile(_saved)
             profile_status.set_text(f"Auto-loaded \"{_last}\"")
+            # Fire alias refresh in background so it doesn't block page paint
+            asyncio.ensure_future(_refresh_cluster_map())
 
 
 # ─────────────────────────── Couchbase connection helper ─────────────────────
@@ -9743,10 +11063,12 @@ def load_tickets_from_cb(
     collection: str,
     customer_filter: str,
     progress_cb: Callable[[str, float], None],
+    summary_collection: str = "summary",
 ) -> list[dict]:
     """
     Query tickets from Couchbase via SQL++ and return them as a list of dicts,
     ready to populate state["results"].  Optionally filter by organization field.
+    Enriches each ticket with summary_text from the summary collection when available.
     """
     if not _CB_AVAILABLE:
         raise RuntimeError("couchbase SDK not installed")
@@ -9756,17 +11078,58 @@ def load_tickets_from_cb(
     cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
     cluster.wait_until_ready(timedelta(seconds=15))
 
+    _order = (
+        "CASE WHEN LOWER(t.status) IN [\"closed\",\"solved\"] THEN 1 ELSE 0 END ASC, "
+        "CASE LOWER(t.priority) "
+        "WHEN 'urgent' THEN 0 WHEN 'p1' THEN 0 "
+        "WHEN 'high'   THEN 1 WHEN 'p2' THEN 1 "
+        "WHEN 'normal' THEN 2 WHEN 'p3' THEN 2 WHEN 'medium' THEN 2 "
+        "WHEN 'low'    THEN 3 WHEN 'p4' THEN 3 "
+        "ELSE 4 END ASC, "
+        "t.created DESC"
+    )
     keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-    if customer_filter.strip():
-        query  = f"SELECT t.* FROM {keyspace} AS t WHERE LOWER(t.organization) LIKE $1"
-        opts   = QueryOptions(positional_parameters=[f"%{customer_filter.strip().lower()}%"])
+    _terms = [t.strip() for t in customer_filter.split(",") if t.strip()]
+    if _terms:
+        _clauses = " OR ".join(
+            f"LOWER(t.organization) LIKE ${i+1}" for i in range(len(_terms))
+        )
+        query = (f"SELECT t.* FROM {keyspace} AS t "
+                 f"WHERE t.ticket_id IS NOT MISSING "
+                 f"AND ({_clauses}) "
+                 f"ORDER BY {_order}")
+        opts  = QueryOptions(positional_parameters=[f"%{t.lower()}%" for t in _terms])
     else:
-        query  = f"SELECT t.* FROM {keyspace} AS t"
+        query  = (f"SELECT t.* FROM {keyspace} AS t "
+                  f"WHERE t.ticket_id IS NOT MISSING "
+                  f"ORDER BY {_order}")
         opts   = QueryOptions()
 
     progress_cb("Running query …", 0.1)
     result  = cluster.query(query, opts)
     tickets = [row for row in result.rows()]
+
+    # Enrich tickets with pre-computed summary_text from the summary collection.
+    if summary_collection and tickets:
+        progress_cb("Loading ticket summaries …", 0.95)
+        try:
+            sum_ks = f"`{bucket}`.`{scope}`.`{summary_collection}`"
+            sum_rows = list(cluster.query(
+                f"SELECT ticket_id, summary_text, health, resolution, cluster_name, cb_version "
+                f"FROM {sum_ks} WHERE type = 'ticket_summary' "
+                f"AND summary_text IS NOT NULL AND summary_text != ''",
+                QueryOptions(timeout=timedelta(seconds=60)),
+            ))
+            sum_map = {str(r["ticket_id"]): r for r in sum_rows if r.get("ticket_id")}
+            for t in tickets:
+                s = sum_map.get(str(t.get("ticket_id", "")))
+                if s:
+                    t["summary_text"]    = s.get("summary_text", "")
+                    t["summary_health"]  = s.get("health")
+                    t["summary_resolution"] = s.get("resolution")
+        except Exception as _sum_exc:
+            print(f"[load_tickets_from_cb] summary enrich skipped: {_sum_exc}")
+
     cluster.close()
     progress_cb(f"Loaded {len(tickets)} tickets.", 1.0)
     return tickets
@@ -9788,17 +11151,25 @@ def fetch_tickets_by_keys(
     """
     if not _CB_AVAILABLE or not doc_keys:
         return []
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-    # USE KEYS is bucket-level only; use META().id IN for scoped collections
-    placeholders = ", ".join(f"${i+1}" for i in range(len(doc_keys)))
-    query  = f"SELECT t.* FROM {keyspace} AS t WHERE META(t).id IN [{placeholders}]"
-    result = cluster.query(query, QueryOptions(positional_parameters=doc_keys))
-    tickets = [row for row in result.rows()]
-    cluster.close()
-    return tickets
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=15))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+        # USE KEYS is bucket-level only; use META().id IN for scoped collections
+        placeholders = ", ".join(f"${i+1}" for i in range(len(doc_keys)))
+        query  = f"SELECT t.* FROM {keyspace} AS t WHERE META(t).id IN [{placeholders}]"
+        result = cluster.query(query, QueryOptions(positional_parameters=doc_keys))
+        tickets = [row for row in result.rows()]
+        cluster.close()
+        _missing_req = [t.get("ticket_id") for t in tickets if not t.get("requester")]
+        if _missing_req:
+            print(f"[fetch_tickets_by_keys] {len(tickets)} returned, "
+                  f"missing requester on: {_missing_req}")
+        return tickets
+    except Exception as exc:
+        print(f"[fetch_tickets_by_keys] CB fetch failed ({len(doc_keys)} keys): {exc}")
+        return []
 
 
 def _make_snap_col(
@@ -9865,11 +11236,15 @@ def load_to_couchbase(
     upserted = 0
     errors = 0
 
+    _now = int(time.time())
     for i, ticket in enumerate(tickets, start=1):
         tid = ticket.get("ticket_id") or f"unknown_{i}"
         doc_key = f"ticket::{tid}"
         try:
-            col.upsert(doc_key, ticket)
+            doc = ticket.copy()
+            doc["last_scraped_at"] = _now
+            doc["type"] = "ticket"
+            col.upsert(doc_key, doc)
             upserted += 1
         except CouchbaseException as exc:
             errors += 1
@@ -9909,10 +11284,38 @@ def build_embed_text(ticket: dict) -> str:
     if ticket.get("subject"):
         parts.append(f"Subject: {ticket['subject']}")
         parts.append(f"Topic: {ticket['subject']}")
-    # Interaction summary — generated by the scoring LLM; semantically the richest
-    # field for retrieval.  Placed immediately after subject so it is weighted highly.
-    if ticket.get("interaction_summary"):
-        parts.append(f"Summary: {ticket['interaction_summary']}")
+
+    # Application alias injection: if the subject/description references a known cluster
+    # hostname but doesn't mention the application name, inject it so vector search on
+    # the app name ("MLE") finds this ticket.
+    _topo_for_alias = ticket.get("snapshot_topology") or {}
+    if isinstance(_topo_for_alias, str):
+        try:
+            _topo_for_alias = json.loads(_topo_for_alias)
+        except Exception:
+            _topo_for_alias = {}
+    _bn_for_alias = _topo_for_alias.get("bucket_names") or []
+    _bn_str = " ".join(_bn_for_alias) if isinstance(_bn_for_alias, list) else str(_bn_for_alias)
+    _text_for_alias = " ".join([
+        ticket.get("subject") or "", ticket.get("description") or "", _bn_str,
+    ]).lower()
+    _injected_apps: set[str] = set()
+    for _host, _app in _get_cluster_to_app().items():
+        if _host in _text_for_alias and _app not in _injected_apps:
+            if _app.lower() not in _text_for_alias:  # only inject if not already present
+                parts.append(f"Application: {_app.upper()}")
+                _injected_apps.add(_app)
+    # Phase 2a summary — full-thread LLM narrative; richest semantic signal.
+    # Placed first so it is weighted highest by the embedding model.
+    _summary_text = (ticket.get("summary_text") or "").strip()
+    if _summary_text:
+        parts.append(f"Summary: {_summary_text}")
+
+    # Interaction summary — scoring LLM by-product; used when no Phase 2a summary.
+    _t_score   = ticket.get("score") or {}
+    _t_summary = (ticket.get("interaction_summary") or _t_score.get("interaction_summary") or "").strip()
+    if _t_summary and not _summary_text:
+        parts.append(f"Summary: {_t_summary}")
     if ticket.get("status"):
         parts.append(f"Status: {ticket['status']}")
     if ticket.get("priority"):
@@ -9942,30 +11345,43 @@ def build_embed_text(ticket: dict) -> str:
     if tags:
         parts.append(f"Tags: {tags}")
 
-    # ── Key ticket fields (Component, SDK/SGW flags, etc.) ───────────────────
+    # ── CBSEs and Jira issues — formal escalation references ─────────────────
+    _cbses_e = ticket.get("cbses") or []
+    if _cbses_e:
+        _cbses_str_e = ", ".join(_cbses_e) if isinstance(_cbses_e, list) else str(_cbses_e)
+        parts.append(f"CBSEs: {_cbses_str_e}")
+    _jiras_e = ticket.get("jira_issues") or []
+    if _jiras_e:
+        _jiras_str_e = ", ".join(_jiras_e) if isinstance(_jiras_e, list) else str(_jiras_e)
+        parts.append(f"Jira Issues: {_jiras_str_e}")
+
+    # ── All ticket fields (Zendesk custom fields — include every key) ───────────
     tf = _parse_ticket_fields(ticket)
-    _FIELD_LABELS = [
-        ("Component",                   "Component"),
-        ("Couchbase_Server",            "Couchbase Server"),
-        ("Couchbase_Lite",              "Couchbase Lite"),
-        ("Couchbase_Analytics",         "Couchbase Analytics"),
-        ("Couchbase_Sync_Gateway",      "Couchbase Sync Gateway"),
-        ("Couchbase_Autonomous_Operator","Couchbase Autonomous Operator"),
-        ("Couchbase_Connector",         "Couchbase Connector"),
-        ("Couchbase_Edge_Server",       "Couchbase Edge Server"),
-        ("SDK_Related",                 "SDK Related"),
-        ("SGW_Related",                 "SGW Related"),
-        ("Customer_Environment",        "Customer Environment"),
-        ("Account_Tier",                "Account Tier"),
-        ("Deployment_Type",             "Deployment Type"),
-    ]
     tf_lines = []
-    for key, label in _FIELD_LABELS:
-        val = (tf.get(key) or "").strip()
-        if val:
-            tf_lines.append(f"  {label}: {val}")
+    for key, val in tf.items():
+        val_str = (str(val) or "").strip()
+        if val_str:
+            label = key.replace("_", " ").title()
+            tf_lines.append(f"  {label}: {val_str}")
     if tf_lines:
         parts.append("Ticket Fields:\n" + "\n".join(tf_lines))
+
+    # ── Escalations ──────────────────────────────────────────────────────────
+    _esc = ticket.get("escalations")
+    if _esc:
+        _esc_str = str(_esc)[:500]
+        parts.append(f"Escalations: {_esc_str}")
+
+    # ── Score cluster names and app labels ───────────────────────────────────
+    _score_e = ticket.get("score") or {}
+    _cluster_names_e = _score_e.get("cluster_names") or []
+    if _cluster_names_e:
+        _cn_str = ", ".join(_cluster_names_e) if isinstance(_cluster_names_e, list) else str(_cluster_names_e)
+        parts.append(f"Cluster Names: {_cn_str}")
+    _app_labels_e = _score_e.get("analytics_app_labels") or []
+    if _app_labels_e:
+        _al_str = ", ".join(_app_labels_e) if isinstance(_app_labels_e, list) else str(_app_labels_e)
+        parts.append(f"Application Labels: {_al_str}")
 
     # ── Snapshot topology (cluster state at time of snapshot) ─────────────────
     topo = ticket.get("snapshot_topology")
@@ -9986,6 +11402,11 @@ def build_embed_text(ticket: dict) -> str:
             topo_lines.append(f"  Nodes: {topo['total_nodes']}")
         if topo.get("bucket_count"):
             topo_lines.append(f"  Buckets: {topo['bucket_count']}")
+        _bn = topo.get("bucket_names") or []
+        if isinstance(_bn, list) and _bn:
+            topo_lines.append(f"  Bucket Names: {', '.join(_bn[:20])}")
+        elif isinstance(_bn, str) and _bn:
+            topo_lines.append(f"  Bucket Names: {_bn}")
         if topo.get("ram_per_node_mib"):
             topo_lines.append(f"  RAM per Node: {topo['ram_per_node_mib']} MiB")
         if topo.get("auto_failover_seconds") is not None:
@@ -10057,6 +11478,155 @@ def build_embed_text(ticket: dict) -> str:
     return assembled
 
 
+def build_snapshot_embed_text(snap: dict) -> str:
+    """
+    Build embedding text for a snapshot document so vector search can find
+    snapshots by cluster characteristics, health state, or application.
+
+    Enables queries like: "AmEx clusters running 7.6 with bad items",
+    "MLE clusters with more than 10 nodes", "clusters with high warn count".
+    """
+    parts: list[str] = []
+    if snap.get("organization"):
+        parts.append(f"Customer: {snap['organization']}")
+    if snap.get("cluster_name"):
+        parts.append(f"Cluster Name: {snap['cluster_name']}")
+        parts.append(f"Cluster: {snap['cluster_name']}")
+    if snap.get("cluster_uuid"):
+        parts.append(f"Cluster UUID: {snap['cluster_uuid']}")
+    if snap.get("cb_version"):
+        parts.append(f"Couchbase Version: {snap['cb_version']}")
+    if snap.get("date"):
+        parts.append(f"Snapshot Date: {snap['date']}")
+    _nodes = snap.get("total_nodes") or snap.get("node_count")
+    if _nodes:
+        parts.append(f"Total Nodes: {_nodes}")
+    if snap.get("ram_per_node_mib"):
+        parts.append(f"RAM per Node: {snap['ram_per_node_mib']} MiB")
+    svc_parts = []
+    for svc, key in [("KV/Data", "data_nodes"), ("Index", "index_nodes"),
+                     ("Query", "query_nodes"), ("Search", "fts_nodes"),
+                     ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
+        n = snap.get(key)
+        if n:
+            svc_parts.append(f"{svc}×{n}")
+    if svc_parts:
+        parts.append(f"Services: {', '.join(svc_parts)}")
+    _bn = snap.get("bucket_names") or []
+    if isinstance(_bn, list) and _bn:
+        parts.append(f"Bucket Names: {', '.join(_bn[:30])}")
+    elif isinstance(_bn, str) and _bn:
+        parts.append(f"Bucket Names: {_bn}")
+    _bad = snap.get("bad_items") or []
+    if isinstance(_bad, list) and _bad:
+        parts.append(f"Bad Items: {', '.join(str(b) for b in _bad[:20])}")
+    elif isinstance(_bad, str) and _bad:
+        parts.append(f"Bad Items: {_bad}")
+    _warn = snap.get("warn_items") or []
+    if isinstance(_warn, list) and _warn:
+        parts.append(f"Warning Items: {', '.join(str(w) for w in _warn[:20])}")
+    elif isinstance(_warn, str) and _warn:
+        parts.append(f"Warning Items: {_warn}")
+    if snap.get("bad_count"):
+        parts.append(f"Bad Count: {snap['bad_count']}")
+    if snap.get("warn_count"):
+        parts.append(f"Warning Count: {snap['warn_count']}")
+    _tids = snap.get("ticket_ids") or []
+    if _tids:
+        parts.append(f"Associated Tickets: {', '.join(str(t) for t in _tids[:10])}")
+    # App alias injection — same pattern as tickets
+    _alias_text = " ".join([
+        snap.get("cluster_name") or "",
+        " ".join(_bn[:30]) if isinstance(_bn, list) else (_bn or ""),
+    ]).lower()
+    for _host, _app in _get_cluster_to_app().items():
+        if _host in _alias_text and _app.lower() not in _alias_text:
+            parts.append(f"Application: {_app.upper()}")
+    return "\n".join(parts)
+
+
+def embed_all_snapshots(
+    snapshots: list[dict],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str,
+    embed_provider: str,
+    embed_model: str,
+    embed_api_key: str,
+    embed_base_url: str,
+    vector_dims: int,
+    progress_cb: Callable[[str, float], None],
+    cancel_event: threading.Event | None = None,
+    max_workers: int = 1,
+) -> tuple[int, int]:
+    """
+    For each snapshot: build embed text → call embedding provider → upsert back
+    to Couchbase with an added `embedding` field.  Returns (done, errors).
+    """
+    import concurrent.futures
+    from couchbase.subdocument import upsert as _SD_upsert
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    progress_cb("Connecting to Couchbase for snapshot embedding …", 0.0)
+    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    col = cluster.bucket(bucket).scope(scope).collection(snap_collection)
+
+    total = len(snapshots)
+    done_count = error_count = 0
+    lock = threading.Lock()
+
+    def _embed_one(snap: dict) -> tuple[str, list[float] | None, str | None]:
+        sid = snap.get("snap_id") or "unknown"
+        doc_key = f"snapshot::{sid}"
+        try:
+            text = build_snapshot_embed_text(snap)
+            vec  = embed_text(text, embed_provider, embed_model, embed_api_key,
+                              embed_base_url, vector_dims)
+            if vector_dims and len(vec) > vector_dims:
+                vec = vec[:vector_dims]
+                norm = sum(x * x for x in vec) ** 0.5
+                if norm > 0:
+                    vec = [x / norm for x in vec]
+            return doc_key, vec, None
+        except Exception as exc:
+            return doc_key, None, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futs = {pool.submit(_embed_one, s): s for s in snapshots}
+        for i, fut in enumerate(concurrent.futures.as_completed(futs)):
+            if cancel_event and cancel_event.is_set():
+                break
+            doc_key, vec, err = fut.result()
+            snap = futs[fut]
+            if vec:
+                try:
+                    col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
+                    with lock:
+                        done_count += 1
+                        if done_count % 10 == 0 or done_count == total:
+                            progress_cb(f"Embedded {done_count}/{total} snapshots …",
+                                        done_count / total)
+                except Exception as exc:
+                    with lock:
+                        error_count += 1
+                    print(f"[embed_snapshots] upsert error {doc_key}: {exc}")
+            else:
+                with lock:
+                    error_count += 1
+                print(f"[embed_snapshots] embed error {doc_key}: {err}")
+
+    cluster.close()
+    return done_count, error_count
+
+
 def embed_text_ollama(text: str, model: str, base_url: str,
                       num_ctx: int | None = None) -> list[float]:
     """
@@ -10112,7 +11682,7 @@ def _get_openai_client(api_key: str, base_url: str) -> "openai.OpenAI":
         _tls_openai.client_key = key
         _tls_openai.client = _openai_mod.OpenAI(
             api_key=api_key or "lmstudio",
-            base_url=base_url,
+            base_url=base_url or None,
         )
     return _tls_openai.client
 
@@ -10131,12 +11701,7 @@ def embed_text(
         return embed_text_ollama(text, model, base_url or "http://localhost:11434", num_ctx=num_ctx)
 
     elif provider == "lmstudio":
-        if not _OPENAI_AVAILABLE:
-            raise RuntimeError("openai package not installed: venv/bin/pip install openai")
-        client = _openai_mod.OpenAI(
-            api_key="lmstudio",
-            base_url=_openai_base_url(base_url, "http://localhost:1234"),
-        )
+        client = _get_openai_client("lmstudio", _openai_base_url(base_url, "http://localhost:1234"))
         resp = client.embeddings.create(model=model, input=text, encoding_format="float")
         return resp.data[0].embedding
 
@@ -10158,7 +11723,7 @@ def embed_text(
         kwargs: dict = {"model": model, "input": text, "encoding_format": "float"}
         if dims and dims > 0:
             kwargs["dimensions"] = dims
-        client = _openai_mod.OpenAI(api_key=api_key)
+        client = _get_openai_client(api_key, "")
         resp = client.embeddings.create(**kwargs)
         return resp.data[0].embedding
 
@@ -10327,6 +11892,7 @@ def save_tickets_to_cb(
     total = len(tickets)
     saved = errors = 0
 
+    _now = int(time.time())
     for i, ticket in enumerate(tickets, 1):
         if cancel_event and cancel_event.is_set():
             progress_cb(f"Cancelled — {saved}/{total} saved.", i / total)
@@ -10334,10 +11900,27 @@ def save_tickets_to_cb(
         tid     = ticket.get("ticket_id") or f"unknown_{i}"
         doc_key = f"ticket::{tid}"
         try:
+            if ticket.get("_deleted"):
+                # Store a minimal deletion marker; merge with existing if present
+                try:
+                    existing = col.get(doc_key).content_as[dict]
+                    existing["_deleted"] = True
+                    existing["last_scraped_at"] = _now
+                    col.upsert(doc_key, existing)
+                except Exception:
+                    col.upsert(doc_key, {
+                        "ticket_id": tid, "_deleted": True,
+                        "type": "ticket", "last_scraped_at": _now,
+                    })
+                saved += 1
+                progress_cb(f"  ✗ Ticket #{tid} is deleted on Supportal — marked, will skip future scrapes.", i / total)
+                continue
             doc = ticket.copy()
-            doc["cb_version"]    = extract_ticket_version(ticket)
-            doc["feature_area"]  = classify_ticket_feature(ticket)
-            doc["ticket_origin"] = classify_ticket_origin(ticket)
+            doc["cb_version"]      = extract_ticket_version(ticket)
+            doc["feature_area"]    = classify_ticket_feature(ticket)
+            doc["ticket_origin"]   = classify_ticket_origin(ticket)
+            doc["last_scraped_at"] = _now
+            doc["type"]            = "ticket"
             col.upsert(doc_key, doc)
             saved += 1
         except Exception as exc:
@@ -10348,6 +11931,179 @@ def save_tickets_to_cb(
 
     cluster.close()
     return saved, errors
+
+
+def run_ticket_pipeline(
+    customer: str,
+    auth: dict,
+    cb_config: CbConfig,
+    options: dict | None = None,
+    progress_cb: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """
+    Scrape tickets for *customer* and save them to Couchbase in one call.
+
+    auth dict keys:
+      mode    – "cookie" | "browser"
+      cookie  – session cookie string (required when mode=="cookie")
+
+    options dict keys (all optional):
+      max_pages   – int, 0 = all listing pages
+      max_tickets – int, 0 = no limit
+      scrape_mode – "all" | "changed"  (default "all")
+
+    Returns:
+      {
+        "tickets": list[dict],   # scraped ticket docs
+        "saved":   int,          # docs upserted to CB
+        "errors":  int,          # upsert errors
+        "skipped": int,          # tickets skipped by change detection
+      }
+
+    Callable from CLI, tests, or MCP tools without a NiceGUI context.
+    """
+    opts = options or {}
+    _prog = progress_cb or (lambda msg, pct: None)
+
+    max_pages   = int(opts.get("max_pages",   0))
+    max_tickets = int(opts.get("max_tickets", 0))
+    scrape_mode = opts.get("scrape_mode", "all")
+
+    # Change detection
+    skip_ids: set | None       = None
+    change_signals: dict | None = None
+    n_skipped = 0
+
+    if scrape_mode == "changed" and _CB_AVAILABLE:
+        _prog("Change detection: fetching stored ticket signals from Couchbase…", 0.0)
+        change_signals = fetch_ticket_signals_from_cb(
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.ticket_collection,
+        )
+
+    # Scrape
+    _prog("Scraping tickets…", 0.05)
+    mode     = auth.get("mode", "cookie")
+    cookie   = auth.get("cookie", "")
+
+    if mode == "browser":
+        tickets = scrape_with_playwright(
+            customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
+        )
+    else:
+        tickets = scrape_with_cookie_playwright(
+            cookie, customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
+        )
+
+    _prog(f"Scraped {len(tickets)} tickets. Saving to Couchbase…", 0.7)
+
+    # Persist
+    saved = errors = 0
+    if _CB_AVAILABLE and cb_config.url:
+        saved, errors = save_tickets_to_cb(
+            tickets,
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.ticket_collection,
+            _prog, cancel_event,
+        )
+
+    _prog(f"Done — {len(tickets)} scraped, {saved} saved, {errors} errors.", 1.0)
+    return {"tickets": tickets, "saved": saved, "errors": errors, "skipped": n_skipped}
+
+
+def run_snapshot_pipeline(
+    customer: str,
+    auth: dict,
+    cb_config: CbConfig,
+    options: dict | None = None,
+    progress_cb: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    embed_config: dict | None = None,
+) -> dict:
+    """
+    Scrape snapshots for *customer* and save them to Couchbase in one call.
+
+    auth dict keys:
+      cookie – session cookie string
+
+    options dict keys (all optional):
+      max_pages     – int, 0 = all listing pages
+      max_snapshots – int, 0 = no limit
+      workers       – int (default 4), concurrent topology fetches
+
+    embed_config dict keys (all optional — omit to skip embedding):
+      provider, model, api_key, base_url, dims, max_workers
+
+    Returns:
+      {"snapshots": list[dict], "saved": int, "errors": int, "skipped": int,
+       "embedded": int, "embed_errors": int}
+    """
+    opts     = options or {}
+    _prog    = progress_cb or (lambda msg, pct: None)
+    cookie   = auth.get("cookie", "")
+    max_pages = int(opts.get("max_pages",     0))
+    max_snaps = int(opts.get("max_snapshots", 0))
+    workers   = int(opts.get("workers",       4))
+
+    # Skip IDs already complete in CB
+    skip_ids: set = set()
+    n_skipped = 0
+    if _CB_AVAILABLE and cb_config.url:
+        _prog("Checking Couchbase for already-complete snapshots…", 0.0)
+        signals = fetch_snapshot_signals_from_cb(
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
+        )
+        skip_ids = {sid for sid, sig in signals.items() if sig.get("complete")}
+        n_skipped = len(skip_ids)
+
+    _prog("Scraping snapshots…", 0.05)
+    snapshots = scrape_snapshots_for_customer(
+        customer, cookie or None, max_pages, workers, _prog, skip_ids, max_snaps,
+    )
+
+    _prog(f"Scraped {len(snapshots)} snapshots. Saving to Couchbase…", 0.8)
+
+    saved = errors = 0
+    if _CB_AVAILABLE and cb_config.url:
+        saved, errors = load_snapshots_to_couchbase(
+            snapshots,
+            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+            cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
+            _prog,
+        )
+
+    embedded = embed_errors = 0
+    if embed_config and snapshots and _CB_AVAILABLE and cb_config.url:
+        ecfg = embed_config
+        _prog(f"Embedding {len(snapshots)} snapshots …", 0.85)
+        try:
+            embedded, embed_errors = embed_all_snapshots(
+                snapshots,
+                cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
+                cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
+                embed_provider   = ecfg.get("provider", ""),
+                embed_model      = ecfg.get("model", ""),
+                embed_api_key    = ecfg.get("api_key", ""),
+                embed_base_url   = ecfg.get("base_url", ""),
+                vector_dims      = int(ecfg.get("dims", 1024)),
+                progress_cb      = _prog,
+                cancel_event     = cancel_event,
+                max_workers      = int(ecfg.get("max_workers", 1)),
+            )
+        except Exception as exc:
+            _prog(f"Snapshot embedding error: {exc}", 0.95)
+
+    _prog(
+        f"Done — {len(snapshots)} scraped, {saved} saved, {errors} errors"
+        + (f", {embedded} embedded" if embed_config else "") + ".",
+        1.0,
+    )
+    return {
+        "snapshots": snapshots, "saved": saved, "errors": errors, "skipped": n_skipped,
+        "embedded": embedded, "embed_errors": embed_errors,
+    }
 
 
 def embed_all_tickets(
@@ -10379,6 +12135,7 @@ def embed_all_tickets(
     """
     import concurrent.futures
     import traceback as _tb
+    from couchbase.subdocument import upsert as _SD_upsert
 
     if not _CB_AVAILABLE:
         raise RuntimeError("couchbase SDK not installed — run: venv/bin/pip install couchbase")
@@ -10457,19 +12214,10 @@ def embed_all_tickets(
                     error_count += 1
                     if not first_error:
                         first_error.append(err)
-                        progress_cb(f"Error on ticket {tid}: {err.splitlines()[0]}", done_count / total)
-                        cluster.close()
-                        raise RuntimeError(
-                            f"Embedding failed on ticket {tid}:\n{err}"
-                        )
+                    progress_cb(f"Skipped ticket {tid}: {err.splitlines()[0]}", done_count / total)
                 continue
 
-            doc = ticket.copy()
-            doc["embedding"]     = vec
-            doc["cb_version"]    = extract_ticket_version(ticket)
-            doc["feature_area"]  = classify_ticket_feature(ticket)
-            doc["ticket_origin"] = classify_ticket_origin(ticket)
-            col.upsert(doc_key, doc)
+            col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
 
             with lock:
                 done_count += 1
@@ -10514,65 +12262,117 @@ def create_vector_index(
             "fields": [{"analyzer": "standard", "index": True, "name": name, "store": True, "type": "text"}],
         }
 
-    type_key  = f"{scope}.{collection}"
+    # In scope.collection.type_field mode, CB FTS keys docs by
+    # "{scope}.{collection}" when they have no `type` field — matching the
+    # existing production index.  No document stamping required.
+    snap_collection = "snapshots"
+    ticket_type_key  = f"{scope}.{collection}"
+    snap_type_key    = f"{scope}.{snap_collection}"
+
+    def _vec_field() -> dict:
+        return {
+            "dynamic": False,
+            "enabled": True,
+            "fields": [{"dims": vector_dims, "index": True, "name": "embedding",
+                        "similarity": "dot_product", "type": "vector"}],
+        }
+
+    def _nested(children: dict) -> dict:
+        """Nested object mapping (for arrays-of-objects or sub-documents)."""
+        return {"dynamic": False, "enabled": True, "properties": children}
 
     index_def = {
         "type":       "fulltext-index",
         "name":       f"{bucket}.{scope}.{index_name}",
         "sourceType": "gocbcore",
         "sourceName": bucket,
-        "sourceUUID": "",
         "sourceParams": {},
-        "planParams": {"maxPartitionsPerPIndex": 512, "indexPartitions": 1},
+        "planParams": {"maxPartitionsPerPIndex": 1024, "indexPartitions": 1},
         "params": {
             "doc_config": {
                 "docid_prefix_delim": "",
-                "docid_regexp": "",
-                "mode": "scope.collection.type_field",
-                "type_field": "type",
+                "docid_regexp":       "",
+                "mode":               "scope.collection.type_field",
+                "type_field":         "type",
             },
             "mapping": {
                 "analysis": {},
-                "default_analyzer": "standard",
+                "default_analyzer":        "standard",
                 "default_datetime_parser": "dateTimeOptional",
-                "default_field": "_all",
-                "default_mapping": {"dynamic": False, "enabled": False},
-                "default_type": "_default",
-                "docvalues_dynamic": False,
-                "index_dynamic": False,
-                "store_dynamic": False,
-                "type_field": "_type",
+                "default_field":           "_all",
+                "default_mapping":         {"dynamic": False, "enabled": False},
+                "default_type":            "_default",
+                "docvalues_dynamic":       False,
+                "index_dynamic":           False,
+                "store_dynamic":           False,
+                "type_field":              "_type",
                 "types": {
-                    type_key: {
+                    # ── Tickets ──────────────────────────────────────────────
+                    ticket_type_key: {
                         "dynamic": False,
                         "enabled": True,
                         "properties": {
-                            "embedding": {
-                                "dynamic": False,
-                                "enabled": True,
-                                "fields": [{
-                                    "dims":       vector_dims,
-                                    "index":      True,
-                                    "name":       "embedding",
-                                    "similarity": "dot_product",
-                                    "type":       "vector",
-                                }],
-                            },
+                            "embedding":   _vec_field(),
                             "subject":     _text_field("subject"),
+                            "description": _text_field("description"),
+                            # comments is an array of objects — must map the
+                            # nested .body field so BM25 indexes comment text.
+                            "comments":    _nested({"body": _text_field("body")}),
+                            "tags":        _text_field("tags"),
                             "status":      _text_field("status"),
                             "priority":    _text_field("priority"),
                             "requester":   _text_field("requester"),
                             "assignee":    _text_field("assignee"),
                             "created":     _text_field("created"),
-                            "description": _text_field("description"),
-                            "comments":    _text_field("comments"),
+                            # Embedded snapshot topology — cluster hostname and
+                            # bucket names let BM25 find tickets by cluster.
+                            "snapshot_topology": _nested({
+                                "cluster_name": _text_field("cluster_name"),
+                                "bucket_names": _text_field("bucket_names"),
+                            }),
+                            # Scoring system pre-computes cluster names that
+                            # span multiple snapshots — richer than topo alone.
+                            "score": _nested({
+                                "cluster_names": _text_field("cluster_names"),
+                            }),
+                            # CBSE and Jira issue numbers for BM25 lookups.
+                            "cbses":       _text_field("cbses"),
+                            "jira_issues": _text_field("jira_issues"),
                         },
-                    }
+                    },
+                    # ── Snapshots ─────────────────────────────────────────────
+                    # Vector enables semantic topology queries ("clusters with
+                    # memory pressure", "clusters running 7.6 with XDCR issues").
+                    # Numeric topology filters (node count, RAM) stay in SQL++
+                    # via snapshot_topology_search — FTS doesn't do numeric range.
+                    snap_type_key: {
+                        "dynamic": False,
+                        "enabled": True,
+                        "properties": {
+                            "embedding":    _vec_field(),
+                            "cluster_name": _text_field("cluster_name"),
+                            "organization": _text_field("organization"),
+                            "cb_version":   _text_field("cb_version"),
+                            "bad_items":    _text_field("bad_items"),
+                            "warn_items":   _text_field("warn_items"),
+                        },
+                    },
                 },
             },
             "store": {"indexType": "scorch", "segmentVersion": 16},
         },
     }
+
+    # Delete any stale index at every possible registration level — CB rejects
+    # PUT if the existing index was registered under a different bucket/scope.
+    _auth    = (username, password)
+    _base    = f"{api_scheme}://{host}:{port}"
+    for _del_url in [
+        f"{_base}/api/index/{index_name}",                                        # global
+        f"{_base}/api/bucket/{bucket}/index/{index_name}",                        # bucket
+        f"{_base}/api/bucket/{bucket}/scope/{scope}/index/{index_name}",          # scope
+    ]:
+        requests.delete(_del_url, auth=_auth, verify=False, timeout=10)
 
     resp = requests.put(
         api_url,
@@ -10581,7 +12381,13 @@ def create_vector_index(
         verify=False,
         timeout=30,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(
+            f"FTS index PUT failed {resp.status_code}: {resp.text}"
+        )
+
+    # No document stamping needed: type key is "{scope}.{collection}" which CB
+    # FTS assigns automatically to all docs that lack a `type` field.
 
 
 def vector_search_cb(
@@ -10610,9 +12416,12 @@ def vector_search_cb(
     cluster.wait_until_ready(timedelta(seconds=15))
     scope_obj  = cluster.bucket(bucket).scope(scope)
 
+    # num_candidates drives FTS scan depth; cap at 200 to avoid overwhelming
+    # a local CB instance when top_k is large (e.g. 150 → 450 is too heavy).
+    _num_candidates = min(top_k * 3, 200)
     search_req = SearchRequest.create(
         VectorSearch.from_vector_query(
-            VectorQuery("embedding", query_vec, num_candidates=top_k * 3)
+            VectorQuery("embedding", query_vec, num_candidates=_num_candidates)
         )
     )
 
@@ -10643,6 +12452,94 @@ def vector_search_cb(
     ) from last_exc
 
 
+def _snap_keys_to_ticket_keys(
+    snap_keys: list[str],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str = "snapshots",
+) -> list[str]:
+    """Resolve snapshot doc keys → ticket doc keys via snapshot.ticket_ids.
+
+    Used when vector search returns snapshot:: keys (from the hybrid FTS index)
+    so they can be cross-referenced into the ticket retrieval pipeline.
+    Returns deduplicated ticket keys in 'ticket::<id>' format.
+    """
+    if not _CB_AVAILABLE or not snap_keys:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        ks           = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        placeholders = ", ".join(f"${i+1}" for i in range(len(snap_keys)))
+        q    = f"SELECT s.ticket_ids FROM {ks} s WHERE META(s).id IN [{placeholders}]"
+        rows = list(cluster.query(q, QueryOptions(positional_parameters=snap_keys)))
+        cluster.close()
+        seen: set[str] = set()
+        result: list[str] = []
+        for row in rows:
+            for tid in (row.get("ticket_ids") or []):
+                key = f"ticket::{tid}"
+                if key not in seen:
+                    seen.add(key)
+                    result.append(key)
+        return result
+    except Exception as exc:
+        print(f"[_snap_keys_to_ticket_keys] {exc}")
+        return []
+
+
+def fts_keyword_search_cb(
+    keywords: list[str],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    top_k: int = 50,
+) -> list[str]:
+    """FTS text search (BM25) against the hybrid FTS index.
+
+    Uses OR semantics: any ticket matching ANY keyword is a candidate.
+    The FTS index handles tokenisation, stemming, and BM25 scoring.
+    This is the correct place for keyword matching — not N1QL LIKE scans.
+
+    Returns doc keys in 'ticket::<id>' format, ranked by FTS score.
+    """
+    if not _CB_AVAILABLE or not keywords:
+        return []
+    try:
+        conn_str   = _cb_conn_str(cb_url, use_tls)
+        cluster    = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        scope_obj  = cluster.bucket(bucket).scope(scope)
+        index_name = f"{collection}_vector_idx"
+
+        kw_list = keywords[:8]
+        if len(kw_list) == 1:
+            fts_q = MatchQuery(kw_list[0])
+        else:
+            fts_q = DisjunctionQuery(*[MatchQuery(kw) for kw in kw_list])
+
+        result = scope_obj.search(
+            index_name,
+            SearchRequest.create(fts_q),
+            SearchOptions(limit=top_k),
+        )
+        ids = [row.id for row in result.rows()]
+        cluster.close()
+        return ids
+    except Exception as exc:
+        print(f"[fts_keyword_search_cb] {exc}")
+        return []
+
+
 def _extract_ticket_ids(text: str) -> set[str]:
     """Extract ticket IDs from free text.
 
@@ -10671,41 +12568,56 @@ def rewrite_query_for_retrieval(
     api_key: str,
     base_url: str,
 ) -> str:
-    """Rewrite a conversational follow-up question into a self-contained retrieval query.
+    """Rewrite any question into a focused, self-contained retrieval query.
 
-    Uses a cheap LLM call (max_tokens=120) to expand contextual pronouns and references
-    ("expand on that", "tell me more about MLE and safekey") into a fully standalone
-    query string that embeds well for dense vector retrieval.
+    Always runs — even on the first turn — so that verbose natural-language
+    questions ("give me a summary in a table with timeline, cluster name,
+    impact...") are distilled to retrieval-focused text ("MLE tickets 2026
+    authentication failure") before embedding.  This prevents output-format
+    noise from diluting the vector signal.
 
-    Returns the original question unchanged if:
-    - there is no chat history (first turn — nothing to resolve)
-    - the LLM call fails for any reason
+    On follow-up turns the chat history is included so pronouns and references
+    ("expand on that", "what about safekey?") are resolved to concrete terms.
+
+    Returns the original question unchanged if the LLM call fails.
     """
-    # No prior turns — nothing to reformulate
-    if not chat_history:
-        return question
-
     # Build a compact history block: last 3 turns (6 messages max), text only
     _turns: list[str] = []
-    for msg in chat_history[-6:]:
+    for msg in (chat_history or [])[-6:]:
         role = msg.get("role", "")
         if role == "user":
             _turns.append(f"User: {msg['content']}")
         elif role == "assistant":
-            # Truncate long answers to keep the prompt short
-            _turns.append(f"Assistant: {msg['content'][:600]}")
-    history_block = "\n".join(_turns)
+            _turns.append(f"Assistant: {msg['content'][:400]}")
+    history_block = ("\nConversation so far:\n" + "\n".join(_turns)) if _turns else ""
 
+    _today = datetime.date.today()
+    _today_str = _today.isoformat()
+    _yr = _today.year
+    _lookback = (_today - datetime.timedelta(days=90)).isoformat()
     _prompt = (
-        "You are a query rewriter for a support-ticket search system.\n"
-        "Given the conversation so far and the user's latest message, "
-        "rewrite the latest message as a single self-contained search query "
-        "that captures all necessary context (topics, applications, error types, priorities, "
-        "ticket IDs, date ranges) needed to retrieve relevant support tickets.\n"
-        "Output ONLY the rewritten query — no explanation, no prefix, no quotes.\n\n"
-        f"Conversation:\n{history_block}\n\n"
-        f"Latest message: {question}\n\n"
-        "Rewritten query:"
+        f"You are a query rewriter for a support-ticket retrieval system.\n"
+        f"Today's date is {_today_str}.\n"
+        f"Your job: extract ONLY the search intent from the user's message — "
+        f"what topics, applications, error types, priorities, ticket IDs, or "
+        f"time ranges to find — and output a concise retrieval query.\n"
+        f"STRIP all output-format instructions (tables, timelines, summaries, "
+        f"columns, 'please', 'give me', 'in a table', etc.) — those are for the "
+        f"answer formatter, not the retriever.\n"
+        f"DATE RESOLUTION (critical): Convert every relative or ambiguous date "
+        f"reference to explicit ISO-8601 dates (YYYY-MM-DD). Examples:\n"
+        f"  'this year' -> 'from {_yr}-01-01'\n"
+        f"  'since January' -> 'from {_yr}-01-01'\n"
+        f"  'last quarter' -> compute the previous calendar quarter start/end\n"
+        f"  'recent' / 'lately' -> from {_lookback}\n"
+        f"  'last month' -> from first day of the previous calendar month\n"
+        f"  'in 2025' -> 'from 2025-01-01 to 2025-12-31'\n"
+        f"Always include the resolved date range in the output query as "
+        f"'from YYYY-MM-DD' or 'from YYYY-MM-DD to YYYY-MM-DD'.\n"
+        f"Output ONLY the rewritten query — no explanation, no prefix, no quotes.\n"
+        f"{history_block}\n\n"
+        f"User message: {question}\n\n"
+        f"Retrieval query:"
     )
     try:
         result = call_llm(
@@ -10714,12 +12626,145 @@ def rewrite_query_for_retrieval(
             max_tokens=120,
         )
         rewritten = result.strip().strip('"').strip("'")
-        # Sanity check: if the model returned something clearly bad, fall back
-        if rewritten and len(rewritten) > 10 and rewritten.lower() != question.lower():
+        if rewritten and len(rewritten) > 5:
             return rewritten
     except Exception:
         pass
     return question
+
+
+# ── Dynamic cluster↔application alias maps ────────────────────────────────────
+# These maps are populated at runtime by querying CB snapshots/tickets.
+# _cluster_app_dynamic  : cluster_name (hostname) → app/org label (lowercase)
+# _app_cluster_dynamic  : app/org label → [cluster_name, ...] list
+# Both dicts start empty and are filled by _load_cluster_app_map().
+# _get_cluster_to_app() / _get_app_cluster_aliases() merge dynamic data with
+# the static seed dict so existing AmEx entries remain until CB is queried.
+_cluster_app_dynamic: dict[str, str] = {}
+_app_cluster_dynamic: dict[str, list[str]] = {}
+
+# Static seed — known AmEx mappings kept as a fallback / bootstrap until CB
+# data is loaded. Multi-word aliases that share hosts are intentionally kept
+# separate so both "mle" and "merchant list" expand to the same hosts.
+_APP_CLUSTER_ALIASES_SEED: dict[str, list[str]] = {
+    "mle":              ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129", "peuse1cbecpsd000069"],
+    "merchant list":    ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129", "peuse1cbecpsd000069"],
+    "merchant":         ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129"],
+    "safekey":          ["peusw1cbecpsd000102", "peuse1cbecpsd000103"],
+    "griffin":          ["peusw1cbecpsd2000303"],
+    "digital payments": ["peusw1cbecpsd2000086", "peuse1cbecpsd2000081"],
+}
+
+
+def _get_cluster_to_app() -> dict[str, str]:
+    """Merge static seed + dynamic CB data → cluster_name → app label."""
+    merged: dict[str, str] = {
+        host: app
+        for app, hosts in _APP_CLUSTER_ALIASES_SEED.items()
+        for host in hosts
+        if app not in ("merchant list", "merchant")
+    }
+    merged.update(_cluster_app_dynamic)
+    return merged
+
+
+def _get_app_cluster_aliases() -> dict[str, list[str]]:
+    """Merge static seed + dynamic CB data → app label → [cluster_names]."""
+    merged: dict[str, list[str]] = dict(_APP_CLUSTER_ALIASES_SEED)
+    for app, hosts in _app_cluster_dynamic.items():
+        if app in merged:
+            existing = merged[app]
+            for h in hosts:
+                if h not in existing:
+                    existing.append(h)
+        else:
+            merged[app] = list(hosts)
+    return merged
+
+
+def _load_cluster_app_map(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, snap_collection: str,
+    ticket_collection: str = "tickets",
+) -> tuple[int, int]:
+    """
+    Query CB to build dynamic cluster→app maps from snapshot organization labels
+    and ticket score.cluster_names + organization fields.  Updates the module-level
+    _cluster_app_dynamic / _app_cluster_dynamic dicts in place.
+    Returns (n_from_snaps, n_from_tickets).
+    """
+    if not _CB_AVAILABLE:
+        return (0, 0)
+    try:
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions, QueryOptions
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.exceptions import CouchbaseException
+        scheme = "couchbases" if use_tls else "couchbase"
+        cluster = Cluster(
+            f"{scheme}://{cb_url}",
+            ClusterOptions(PasswordAuthenticator(username, password)),
+        )
+        cluster.wait_until_ready(datetime.timedelta(seconds=10))
+        ks_snaps   = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        ks_tickets = f"`{bucket}`.`{scope}`.`{ticket_collection}`"
+
+        snap_n = 0
+        try:
+            q = (
+                f"SELECT DISTINCT cluster_name, organization "
+                f"FROM {ks_snaps} "
+                f"WHERE cluster_name IS NOT MISSING AND organization IS NOT MISSING "
+                f"LIMIT 2000"
+            )
+            rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
+            for row in rows:
+                cname = (row.get("cluster_name") or "").strip().lower()
+                org   = (row.get("organization") or "").strip().lower()
+                if not cname or not org:
+                    continue
+                _cluster_app_dynamic[cname] = org
+                if org not in _app_cluster_dynamic:
+                    _app_cluster_dynamic[org] = []
+                if cname not in _app_cluster_dynamic[org]:
+                    _app_cluster_dynamic[org].append(cname)
+                snap_n += 1
+        except Exception:
+            pass
+
+        ticket_n = 0
+        try:
+            q = (
+                f"SELECT organization, score.cluster_names AS cnames "
+                f"FROM {ks_tickets} "
+                f"WHERE organization IS NOT MISSING "
+                f"  AND score.cluster_names IS NOT MISSING "
+                f"LIMIT 5000"
+            )
+            rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
+            for row in rows:
+                org    = (row.get("organization") or "").strip().lower()
+                cnames = row.get("cnames") or []
+                if not org or not isinstance(cnames, list):
+                    continue
+                for cname in cnames:
+                    cname = (cname or "").strip().lower()
+                    if not cname:
+                        continue
+                    if cname not in _cluster_app_dynamic:
+                        _cluster_app_dynamic[cname] = org
+                        ticket_n += 1
+                    if org not in _app_cluster_dynamic:
+                        _app_cluster_dynamic[org] = []
+                    if cname not in _app_cluster_dynamic[org]:
+                        _app_cluster_dynamic[org].append(cname)
+        except Exception:
+            pass
+
+        cluster.close()
+        return (snap_n, ticket_n)
+    except Exception:
+        return (0, 0)
 
 
 _KEYWORD_STOPWORDS = frozenset({
@@ -10738,17 +12783,38 @@ _KEYWORD_STOPWORDS = frozenset({
     "once", "here", "there",
     # task / request words
     "tell", "get", "show", "give", "find", "list", "please", "hi", "hello",
-    "can", "could", "would", "also", "also", "now", "like",
+    "can", "could", "would", "also", "now", "like", "want", "need",
+    "help", "look", "using", "used", "use",
+    # output / format words — these describe what the user wants returned,
+    # NOT what to search for; they pollute keyword search with zero matches
+    "summary", "summarize", "summarise", "table", "timeline", "review",
+    "happened", "able", "create", "sort", "impact", "details", "detail",
+    "info", "information", "explain", "description", "describe", "reason",
+    "note", "notes", "result", "results", "output", "format", "report",
+    "chart", "graph", "compare", "comparison", "analysis", "analyze",
+    # schema / metadata words — not product names
+    "cluster", "clusters", "name", "status", "id", "date", "time",
+    "customer", "org", "organization", "account",
     # ticket domain noise
     "ticket", "tickets", "issue", "issues", "problem", "problems", "case",
     "cases", "related", "recent", "latest", "last", "first", "top", "next",
-    "new", "old", "many", "number", "count", "how", "see",
+    "new", "old", "many", "number", "count", "see", "per", "each",
     # time words (handled structurally)
     "month", "months", "week", "weeks", "day", "days", "year", "years",
     "past", "quarter", "today", "yesterday", "ago",
     # priority / status (handled structurally)
     "open", "closed", "solved", "pending", "hold", "high", "low",
     "priority", "p1", "p2", "p3", "p4",
+    # common English verbs / adjectives that pollute LIKE keyword search
+    # (not product names — these match every ticket's description text)
+    "involved", "involving", "involve", "involves",
+    "affected", "affecting", "affects", "affect",
+    "occurred", "occurring", "occur", "occurs",
+    "failed", "failing", "fails", "fail",
+    "caused", "causing", "causes", "cause",
+    "seen", "see", "far", "across", "along",
+    "means", "mean", "take", "taken", "took",
+    "since", "until", "while", "whereby",
 })
 
 
@@ -10762,23 +12828,31 @@ def build_structured_query(question: str) -> dict:
       date_to    : str | None  — ISO-8601 upper bound
       cluster_ids: list[str]   — explicit cluster identifiers mentioned
       statuses   : list[str]   — open / closed / pending / solved
-      keywords   : list[str]   — application/product names for subject/description LIKE search
-      limit      : int         — explicit N from "last N" / "top N" (0 = use default)
+      keywords      : list[str]   — all extracted terms (full set, for vector/context)
+      struct_keywords: list[str]  — alias/tech terms only; passed to FTS text search
+                                    and Stage-6 post-filter (never used in N1QL LIKE)
+      limit         : int         — explicit N from "last N" / "top N" (0 = use default)
 
-    These constraints are used for N1QL retrieval ONLY — the LLM still receives
-    the full monthly index and TODAY for its own temporal reasoning.
+    Keyword matching uses the FTS hybrid index (BM25) via fts_keyword_search_cb,
+    not N1QL LIKE scans. Structured search handles only: ticket IDs, priorities,
+    date ranges, and statuses.
     """
     q = question.lower()
     today = datetime.datetime.now()
     result: dict = {
-        "ticket_ids":  [],
-        "priorities":  [],
-        "date_from":   None,
-        "date_to":     None,
-        "cluster_ids": [],
-        "statuses":    [],
-        "keywords":    [],
-        "limit":       0,
+        "ticket_ids":            [],
+        "priorities":            [],
+        "date_from":             None,
+        "date_to":               None,
+        "cluster_ids":           [],
+        "statuses":              [],
+        "keywords":              [],
+        "limit":                 0,
+        # Topology filters — trigger snapshot_topology_search leg
+        "topology_min_nodes":    None,   # total node count lower bound
+        "topology_max_nodes":    None,   # total node count upper bound
+        "topology_min_data":     None,   # data-node lower bound
+        "topology_services":     [],     # ["fts","eventing","analytics","index","query"]
     }
 
     # ── Ticket IDs ────────────────────────────────────────────────────────
@@ -10793,19 +12867,39 @@ def build_structured_query(question: str) -> dict:
     # ── Date range — relative phrases → absolute cutoff ──────────────────
     # Note: we compute these for *retrieval* (querying the right docs from CB).
     # The LLM independently uses the monthly index for its answer.
+
+    # Written-number → digit normalisation so "last two months" works like "last 2 months"
+    _WORD_TO_NUM = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12,
+    }
+    def _n_unit(unit: str) -> int | None:
+        """Return number of days for the first 'last/past N <unit>' phrase found, written or digit."""
+        # Digit form: "last 3 months"
+        dm = re.search(rf"\b(?:last|past)\s+(\d+)\s+{unit}s?\b", q)
+        if dm:
+            return int(dm.group(1))
+        # Written form: "last two months"
+        wm = re.search(rf"\b(?:last|past)\s+({'|'.join(_WORD_TO_NUM)})\s+{unit}s?\b", q)
+        if wm:
+            return _WORD_TO_NUM[wm.group(1)]
+        return None
+
+    _n_d = _n_unit("day")
+    _n_w = _n_unit("week")
+    _n_m = _n_unit("month")
+    _n_y = _n_unit("year")
+
     # Generic "last N days/weeks/months/years" — checked before hardcoded aliases
-    _n_days   = re.search(r"\b(?:last|past)\s+(\d+)\s+days?\b", q)
-    _n_weeks  = re.search(r"\b(?:last|past)\s+(\d+)\s+weeks?\b", q)
-    _n_months = re.search(r"\b(?:last|past)\s+(\d+)\s+months?\b", q)
-    _n_years  = re.search(r"\b(?:last|past)\s+(\d+)\s+years?\b", q)
-    if _n_days:
-        result["date_from"] = (today - datetime.timedelta(days=int(_n_days.group(1)))).strftime("%Y-%m-%d")
-    elif _n_weeks:
-        result["date_from"] = (today - datetime.timedelta(weeks=int(_n_weeks.group(1)))).strftime("%Y-%m-%d")
-    elif _n_months:
-        result["date_from"] = (today - datetime.timedelta(days=int(_n_months.group(1)) * 30)).strftime("%Y-%m-%d")
-    elif _n_years:
-        result["date_from"] = (today - datetime.timedelta(days=int(_n_years.group(1)) * 365)).strftime("%Y-%m-%d")
+    if _n_d is not None:
+        result["date_from"] = (today - datetime.timedelta(days=_n_d)).strftime("%Y-%m-%d")
+    elif _n_w is not None:
+        result["date_from"] = (today - datetime.timedelta(weeks=_n_w)).strftime("%Y-%m-%d")
+    elif _n_m is not None:
+        result["date_from"] = (today - datetime.timedelta(days=_n_m * 30)).strftime("%Y-%m-%d")
+    elif _n_y is not None:
+        result["date_from"] = (today - datetime.timedelta(days=_n_y * 365)).strftime("%Y-%m-%d")
     elif any(k in q for k in ("last week", "past week", "7 day", "past 7")):
         result["date_from"] = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
     elif any(k in q for k in ("last month", "past month", "30 day", "this month", "past 30")):
@@ -10815,27 +12909,40 @@ def build_structured_query(question: str) -> dict:
         result["date_from"] = (today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     elif any(k in q for k in ("last year", "past year", "12 month", "365 day")):
         result["date_from"] = (today - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+    elif any(k in q for k in ("this year", "year to date", "ytd", "so far this year", "current year")):
+        result["date_from"] = f"{today.year}-01-01"
+    elif re.search(r"\brecent\b", q):
+        # "recent" without an explicit time qualifier → last 90 days
+        result["date_from"] = (today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     else:
-        # Explicit year — e.g. "in 2025" / "during 2024"
-        ym = re.search(r"\b(20\d{2})\b", q)
-        if ym:
-            yr = int(ym.group(1))
-            result["date_from"] = f"{yr}-01-01"
-            result["date_to"]   = f"{yr}-12-31"
-        # Explicit month+year — e.g. "March 2026" / "2026-03"
-        month_names = {"january": 1, "february": 2, "march": 3, "april": 4,
-                       "may": 5, "june": 6, "july": 7, "august": 8,
-                       "september": 9, "october": 10, "november": 11, "december": 12}
-        for name, num in month_names.items():
-            if name in q:
-                yr_m = re.search(r"\b(20\d{2})\b", q)
-                if yr_m:
-                    yr = int(yr_m.group(1))
-                    last_day = (datetime.datetime(yr, num, 1)
-                                + datetime.timedelta(days=32)).replace(day=1)
-                    result["date_from"] = f"{yr}-{num:02d}-01"
-                    result["date_to"]   = (last_day - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                break
+        # Explicit ISO date injected by query rewriter — e.g. "since 2026-01-01"
+        iso_dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", q)
+        if iso_dates:
+            iso_dates_sorted = sorted(iso_dates)
+            result["date_from"] = iso_dates_sorted[0]
+            if len(iso_dates_sorted) > 1:
+                result["date_to"] = iso_dates_sorted[-1]
+        else:
+            # Explicit year — e.g. "in 2025" / "during 2024"
+            ym = re.search(r"\b(20\d{2})\b", q)
+            if ym:
+                yr = int(ym.group(1))
+                result["date_from"] = f"{yr}-01-01"
+                result["date_to"]   = f"{yr}-12-31"
+            # Explicit month+year — e.g. "March 2026" / "2026-03"
+            month_names = {"january": 1, "february": 2, "march": 3, "april": 4,
+                           "may": 5, "june": 6, "july": 7, "august": 8,
+                           "september": 9, "october": 10, "november": 11, "december": 12}
+            for name, num in month_names.items():
+                if name in q:
+                    yr_m = re.search(r"\b(20\d{2})\b", q)
+                    if yr_m:
+                        yr = int(yr_m.group(1))
+                        last_day = (datetime.datetime(yr, num, 1)
+                                    + datetime.timedelta(days=32)).replace(day=1)
+                        result["date_from"] = f"{yr}-{num:02d}-01"
+                        result["date_to"]   = (last_day - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                    break
 
     # ── Status ────────────────────────────────────────────────────────────
     status_map = {"open": "open", "closed": "closed", "solved": "solved",
@@ -10851,6 +12958,14 @@ def build_structured_query(question: str) -> dict:
     # Strip punctuation, tokenise, remove stop words and already-structured
     # terms (IDs, priorities, dates, statuses). What remains are likely
     # application/product names (safekey, xdcr, mle, orchestration, etc.)
+    # Min length is 4 for generic terms; exact alias-key or known tech acronym
+    # matches bypass the length check so short names like "mle", "fts", "kv" work.
+    _aca = _get_app_cluster_aliases()  # dynamic + seed merged
+    _alias_key_set = set(_aca.keys())
+    _TECH_ACRONYMS = frozenset({
+        "mle", "fts", "kv", "xdcr", "cbas", "n1ql", "sdk", "ssl",
+        "tls", "ldap", "rbac", "cbse", "cbm", "dcp", "gsi", "eventing",
+    })
     _tokens = re.sub(r"[^\w\s]", " ", q).split()
     _used = set(result["ticket_ids"]) | {p.lower() for p in result["priorities"]} | \
             {s.lower() for s in result["statuses"]}
@@ -10858,12 +12973,95 @@ def build_structured_query(question: str) -> dict:
         t for t in _tokens
         if t not in _KEYWORD_STOPWORDS
         and t not in _used
-        and len(t) >= 3
         and not t.isdigit()
+        and (
+            t in _alias_key_set    # exact app alias: "mle", "safekey", etc.
+            or t in _TECH_ACRONYMS  # known short technical acronym
+            or len(t) >= 4          # everything else needs 4+ chars
+        )
     ]
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order: check membership BEFORE adding
     _seen: set[str] = set()
-    result["keywords"] = [k for k in _keywords if not (_seen.add(k) or k in _seen)]  # type: ignore[func-returns-value]
+    _deduped = [k for k in _keywords if not (k in _seen or _seen.add(k))]  # type: ignore[func-returns-value]
+
+    # Application alias expansion: "mle" → also include known cluster hostnames
+    # so tickets titled "peuse1cbecpsd2000083 warmup" are found even without "mle" in subject.
+    _alias_hosts: list[str] = []
+    for kw in _deduped:
+        for alias, hosts in _aca.items():
+            if kw == alias or alias.startswith(kw) or kw in alias:
+                for h in hosts:
+                    if h not in _alias_hosts and h not in _deduped:
+                        _alias_hosts.append(h)
+    result["keywords"] = _deduped + _alias_hosts
+    # struct_keywords = alias app names + tech acronyms + expanded hostnames +
+    # any token that is a known cluster hostname (from cluster→app map) or that
+    # looks like a hostname pattern (long alphanumeric, e.g. peusw1cbecpsd2000129).
+    # General English words are excluded to avoid noisy LIKE conditions.
+    _known_hostnames = set(_get_cluster_to_app().keys())
+    # Hostname heuristic: 12+ char alphanumeric-with-digits token — catches cluster
+    # names typed verbatim that aren't in the alias map yet (dynamic map lag).
+    _HOSTNAME_RE = re.compile(r"^[a-z][a-z0-9]{11,}$")
+    # Normalize tech-acronym plurals: "cbses" → "cbse", "sdks" → "sdk".
+    # This ensures the LIKE condition and grounding check use the base form.
+    def _base_tech(tok: str) -> str:
+        if tok in _TECH_ACRONYMS:
+            return tok
+        stripped = tok.rstrip("s")
+        if stripped in _TECH_ACRONYMS:
+            return stripped
+        return tok
+
+    _struct_raw = [
+        _base_tech(k) for k in _deduped
+        if k in _alias_key_set
+        or k in _TECH_ACRONYMS
+        or k.rstrip("s") in _TECH_ACRONYMS
+        or k in _known_hostnames
+        or _HOSTNAME_RE.match(k)
+    ]
+    # Deduplicate after normalization (e.g. "cbse" + "cbses" → ["cbse"])
+    _sk_seen: set[str] = set()
+    result["struct_keywords"] = [
+        k for k in _struct_raw + _alias_hosts
+        if not (k in _sk_seen or _sk_seen.add(k))  # type: ignore[func-returns-value]
+    ]
+
+    # ── Topology filters — node counts and service presence ───────────────
+    # Patterns: "more than 9 nodes", "> 9 nodes", "9+ nodes", "at least 9 nodes"
+    _topo_gt = re.search(
+        r"\b(?:more than|greater than|over|>\s*)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    _topo_ge = re.search(
+        r"\b(?:at least|minimum of?|min\s+)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    _topo_plus = re.search(r"\b(\d+)\+\s*nodes?\b", q)
+    _topo_lt = re.search(
+        r"\b(?:fewer than|less than|under|<\s*)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    _topo_le = re.search(
+        r"\b(?:at most|maximum of?|max\s+)(\d+)\s+(?:total\s+)?nodes?\b", q)
+    if _topo_gt:
+        result["topology_min_nodes"] = int(_topo_gt.group(1)) + 1
+    elif _topo_ge:
+        result["topology_min_nodes"] = int(_topo_ge.group(1))
+    elif _topo_plus:
+        result["topology_min_nodes"] = int(_topo_plus.group(1))
+    if _topo_lt:
+        result["topology_max_nodes"] = int(_topo_lt.group(1)) - 1
+    elif _topo_le:
+        result["topology_max_nodes"] = int(_topo_le.group(1))
+    # Data-node specific: "more than 5 data nodes"
+    _data_gt = re.search(
+        r"\b(?:more than|greater than|over|>\s*)(\d+)\s+data\s+nodes?\b", q)
+    if _data_gt:
+        result["topology_min_data"] = int(_data_gt.group(1)) + 1
+    # Services mentioned
+    _SVC_MAP = {
+        "fts": "fts", "full text search": "fts", "full-text": "fts",
+        "eventing": "eventing", "analytics": "analytics",
+        "index": "index", "query": "query",
+    }
+    result["topology_services"] = list({
+        v for k, v in _SVC_MAP.items() if k in q
+    })
 
     return result
 
@@ -10888,11 +13086,10 @@ def structured_search_cb(
     date_from  = filters.get("date_from")
     date_to    = filters.get("date_to")
     statuses   = filters.get("statuses") or []
-    keywords   = filters.get("keywords") or []
     limit      = filters.get("limit") or default_limit
 
     # Nothing useful to query — skip
-    if not any([ticket_ids, priorities, date_from, statuses, keywords]):
+    if not any([ticket_ids, priorities, date_from, statuses]):
         return []
 
     try:
@@ -10901,7 +13098,7 @@ def structured_search_cb(
         cluster.wait_until_ready(timedelta(seconds=10))
         keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
 
-        where_parts: list[str] = []
+        where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]  # enables partial index use
         params: list = []
 
         if ticket_ids:
@@ -10919,10 +13116,10 @@ def structured_search_cb(
 
         if date_from:
             params.append(date_from)
-            where_parts.append(f"t.created_at >= ${len(params)}")
+            where_parts.append(f"t.created >= ${len(params)}")
         if date_to:
             params.append(date_to)
-            where_parts.append(f"t.created_at <= ${len(params)}")
+            where_parts.append(f"t.created <= ${len(params)}")
 
         if statuses:
             s_idx = len(params) + 1
@@ -10930,21 +13127,11 @@ def structured_search_cb(
             where_parts.append(f"LOWER(TOSTRING(t.status)) IN [{placeholders}]")
             params.extend(statuses)
 
-        if keywords:
-            # Each keyword: subject OR description OR tags must contain it (AND across keywords)
-            for kw in keywords[:5]:   # cap at 5 to keep the query manageable
-                kw_lower = kw.lower()
-                where_parts.append(
-                    f"(LOWER(TOSTRING(t.subject)) LIKE '%{kw_lower}%' "
-                    f"OR LOWER(TOSTRING(t.description)) LIKE '%{kw_lower}%' "
-                    f"OR LOWER(TOSTRING(t.tags)) LIKE '%{kw_lower}%')"
-                )
-
         where_clause = " AND ".join(where_parts)
         n1ql = (
             f"SELECT META(t).id AS doc_key FROM {keyspace} AS t "
             f"WHERE {where_clause} "
-            f"ORDER BY t.created_at DESC "
+            f"ORDER BY t.created DESC "
             f"LIMIT {min(limit * 3, 200)}"   # fetch extra for RRF to re-rank
         )
 
@@ -10957,6 +13144,416 @@ def structured_search_cb(
     except Exception as exc:
         print(f"[structured_search_cb] {exc}")
         return []
+
+
+def tool_query_tickets(
+    filters: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    limit: int = 500,
+) -> list[dict]:
+    """
+    Stage-1 structured retrieval for retrieve-then-rerank pipeline.
+    Returns full ticket docs — no top_k cap, up to `limit` results.
+    Expands app alias keywords to cluster hostnames dynamically via
+    _get_app_cluster_aliases(). Unlike structured_search_cb, returns docs
+    not keys and includes keyword/hostname LIKE conditions.
+    """
+    if not _CB_AVAILABLE:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+
+        where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]
+        params: list = []
+
+        organization = (filters.get("organization") or "").strip()
+        if organization:
+            params.append(f"%{organization.lower()}%")
+            where_parts.append(f"LOWER(TOSTRING(t.organization)) LIKE ${len(params)}")
+
+        ticket_ids = filters.get("ticket_ids") or []
+        if ticket_ids:
+            phs = ", ".join(f"${i + 1}" for i, _ in enumerate(ticket_ids))
+            where_parts.append(f"t.ticket_id IN [{phs}]")
+            params.extend(ticket_ids)
+
+        date_from = filters.get("date_from")
+        date_to   = filters.get("date_to")
+        if date_from:
+            params.append(date_from)
+            _df_idx = len(params)
+            # Fallback: tickets with null created compare scraped-at epoch as ISO string
+            where_parts.append(
+                f"(t.created >= ${_df_idx}"
+                f" OR (t.created IS NULL"
+                f" AND MILLIS_TO_STR(t.last_scraped_at * 1000) >= ${_df_idx}))"
+            )
+        if date_to:
+            params.append(date_to + "T23:59:59Z")
+            _dt_idx = len(params)
+            where_parts.append(
+                f"(t.created <= ${_dt_idx}"
+                f" OR (t.created IS NULL"
+                f" AND MILLIS_TO_STR(t.last_scraped_at * 1000) <= ${_dt_idx}))"
+            )
+
+        priorities = filters.get("priorities") or []
+        if priorities:
+            p_idx = len(params) + 1
+            phs   = ", ".join(f"${p_idx + i}" for i, _ in enumerate(priorities))
+            where_parts.append(f"UPPER(TOSTRING(t.priority)) IN [{phs}]")
+            params.extend(priorities)
+
+        statuses = filters.get("statuses") or []
+        if statuses:
+            s_idx = len(params) + 1
+            phs   = ", ".join(f"${s_idx + i}" for i, _ in enumerate(statuses))
+            where_parts.append(f"LOWER(TOSTRING(t.status)) IN [{phs}]")
+            params.extend(statuses)
+
+        # When "cbse" or "jira" appear in struct_keywords, filter directly on
+        # the array fields — never rely on LIKE text matching for these since
+        # many tickets mention CBSE/Jira in prose without having formal links.
+        struct_kws = filters.get("struct_keywords") or []
+        _array_kws: set[str] = set()
+        if "cbse" in struct_kws:
+            where_parts.append("ARRAY_LENGTH(t.`cbses`) > 0")
+            _array_kws.add("cbse")
+        if "jira" in struct_kws:
+            where_parts.append("ARRAY_LENGTH(t.`jira_issues`) > 0")
+            _array_kws.add("jira")
+        # Remaining keywords (excluding array-handled ones) go through LIKE conditions.
+        _text_kws = [kw for kw in struct_kws if kw not in _array_kws]
+
+        # Keyword + hostname LIKE conditions built from struct_keywords.
+        # struct_keywords contains app names ("mle") AND expanded hostnames
+        # ("peuse1cbecpsd2000083") — each generates OR conditions across
+        # subject, description, and score.cluster_names.
+        if _text_kws:
+            kw_ors: list[str] = []
+            for kw in _text_kws:
+                params.append(f"%{kw.lower()}%")
+                idx = len(params)
+                kw_ors.append(
+                    f"(LOWER(t.subject) LIKE ${idx}"
+                    f" OR LOWER(t.description) LIKE ${idx}"
+                    f" OR ANY c IN t.`score`.`cluster_names`"
+                    f"   SATISFIES LOWER(c) LIKE ${idx} END"
+                    f" OR ANY cb IN t.`cbses`"
+                    f"   SATISFIES LOWER(cb) LIKE ${idx} END"
+                    f" OR ANY ji IN t.`jira_issues`"
+                    f"   SATISFIES LOWER(ji) LIKE ${idx} END)"
+                )
+            where_parts.append(f"({' OR '.join(kw_ors)})")
+
+        where_clause = " AND ".join(where_parts)
+        n1ql = (
+            f"SELECT t.* FROM {keyspace} AS t "
+            f"WHERE {where_clause} "
+            f"ORDER BY IFNULL(t.created, MILLIS_TO_STR(t.last_scraped_at * 1000)) DESC "
+            f"LIMIT {int(limit)}"
+        )
+        rows = list(cluster.query(
+            n1ql,
+            QueryOptions(positional_parameters=params, timeout=timedelta(seconds=30)),
+        ))
+        cluster.close()
+        return [dict(r) for r in rows if r.get("ticket_id")]
+    except Exception as exc:
+        print(f"[tool_query_tickets] {exc}")
+        return []
+
+
+def search_tickets_retrieve_rerank(
+    question: str,
+    original_question: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    embed_fn,
+    in_memory_tickets: list[dict],
+    top_k_vec: int = 60,
+    query_limit: int = 500,
+    customer_name: str = "",
+) -> tuple[list[dict], str]:
+    """
+    Two-stage retrieval pipeline:
+    Stage 1a — tool_query_tickets: complete structured set, no top_k cap
+    Stage 1b — vector_search_cb: semantic supplement for tickets not in Stage 1a
+    Stage 1c — K/V fetch full docs for vector-only hits
+    Returns (all_candidate_tickets, notes_string).
+    The caller is responsible for the Stage 2 LLM rerank + answer pass.
+    """
+    notes: list[str] = []
+    filters = build_structured_query(original_question or question)
+
+    # Scope retrieval to the loaded customer so cross-customer tickets never
+    # appear in the candidate set. Skip the "All Customers" sentinel — that
+    # value means no filter was set and all customers should be searched.
+    _cust_for_filter = customer_name.strip()
+    if _cust_for_filter and _cust_for_filter.lower() != "all customers":
+        filters["organization"] = _cust_for_filter
+
+    # Stage 1a: deterministic structured retrieval
+    struct_tickets: list[dict] = []
+    if _CB_AVAILABLE and cb_url:
+        struct_tickets = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=query_limit,
+        )
+        notes.append(f"struct:{len(struct_tickets)}")
+    struct_ids = {str(t.get("ticket_id", "")) for t in struct_tickets}
+
+    # Stage 1b: semantic vector supplement
+    vec_tickets: list[dict] = []
+    if embed_fn and _CB_AVAILABLE and cb_url:
+        try:
+            query_vec = embed_fn(question)
+            if query_vec:
+                all_vec_keys = vector_search_cb(
+                    query_vec, cb_url, bucket, username, password,
+                    use_tls, scope, collection, top_k_vec,
+                )
+                new_vec_keys = [k for k in all_vec_keys
+                                if k.split("::")[-1] not in struct_ids]
+                if new_vec_keys:
+                    vec_tickets = fetch_tickets_by_keys(
+                        new_vec_keys, cb_url, bucket, username,
+                        password, use_tls, scope, collection,
+                    )
+                    # Drop vector hits that belong to a different customer.
+                    # Use bidirectional substring: handles cases where the typed
+                    # customer name is shorter OR longer than the stored org value.
+                    if _cust_for_filter and _cust_for_filter.lower() != "all customers":
+                        _org_lc = _cust_for_filter.lower()
+                        vec_tickets = [
+                            t for t in vec_tickets
+                            if _org_lc in (t.get("organization") or "").lower()
+                            or (t.get("organization") or "").lower() in _org_lc
+                        ]
+                notes.append(f"vec_new:{len(vec_tickets)}")
+        except Exception as exc:
+            notes.append(f"vec_err:{exc}")
+
+    # Union: struct first (date-ordered), then vector supplement
+    all_tickets = struct_tickets + [
+        t for t in vec_tickets
+        if str(t.get("ticket_id", "")) not in struct_ids
+    ]
+
+    # Fallback to in-memory prefilter when CB is unavailable
+    if not all_tickets and in_memory_tickets:
+        all_tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
+        notes.append(f"mem:{pf_note}")
+
+    # Date post-filter: apply date_from / date_to to the full combined set so
+    # the vector leg respects the same temporal constraint as the N1QL leg.
+    # Tickets with no parseable date are kept (don't penalise missing data).
+    _date_from = filters.get("date_from")
+    _date_to   = filters.get("date_to")
+    if _date_from or _date_to:
+        _pre_date = len(all_tickets)
+        def _in_date_range(t: dict) -> bool:
+            d = _ticket_date(t)[:10]
+            if not d:
+                return True
+            if _date_from and d < _date_from:
+                return False
+            if _date_to and d > _date_to:
+                return False
+            return True
+        all_tickets = [t for t in all_tickets if _in_date_range(t)]
+        if len(all_tickets) < _pre_date:
+            notes.append(f"date_filter:{_pre_date}→{len(all_tickets)}")
+
+    # Tech-keyword grounding: when struct_keywords are pure technical terms (not
+    # app aliases) and Stage 1a returned 0 N1QL hits, validate that each vector
+    # candidate actually contains at least one keyword in its text fields.
+    # Without this, vector-only noise is passed to Stage 2 and the LLM gives
+    # inconsistent answers about whether unrelated tickets "match" the keyword.
+    _skws = filters.get("struct_keywords") or []
+    _known_apps = set(_get_app_cluster_aliases().keys())
+    _pure_tech_kws = [k for k in _skws if k not in _known_apps]
+    if _pure_tech_kws and not struct_tickets:
+        def _ticket_mentions_kw(t: dict) -> bool:
+            _comments_raw = t.get("comments") or []
+            _comments_str = " ".join(
+                str(c.get("body") or c.get("content") or c)
+                for c in (_comments_raw if isinstance(_comments_raw, list) else [])
+            )[:800]
+            # interaction_summary may be at top level (in-memory) or nested
+            # inside score (CB-loaded) — check both
+            _score = t.get("score") or {}
+            _summary = (
+                str(t.get("interaction_summary") or "")
+                or str(_score.get("interaction_summary") or "")
+            )
+            haystack = " ".join([
+                str(t.get("subject") or ""),
+                str(t.get("description") or ""),
+                str(t.get("tags") or ""),
+                _comments_str,
+                _summary,
+            ]).lower()
+            return any(kw.lower() in haystack for kw in _pure_tech_kws)
+        grounded = [t for t in all_tickets if _ticket_mentions_kw(t)]
+        if grounded:
+            all_tickets = grounded
+            notes.append(f"grounded:{len(all_tickets)}")
+        elif all_tickets:
+            # Candidates exist but none mention the keyword in their text.
+            # Rather than returning empty (which produces "No matching tickets
+            # found"), pass the candidates through so the LLM can explicitly
+            # answer "none of these N tickets mention <keyword>" — much more
+            # informative than a retrieval-failure message.
+            notes.append(f"grounded:0,candidates:{len(all_tickets)}")
+        else:
+            notes.append("grounded:0→empty")
+            return [], " | ".join(notes)
+
+    # Safety cap: never send more than 150 candidates to Stage 2 LLM.
+    # Struct results are already date-DESC ordered; keep the most recent N.
+    _MAX_CANDIDATES = 150
+    if len(all_tickets) > _MAX_CANDIDATES:
+        notes.append(f"capped:{len(all_tickets)}→{_MAX_CANDIDATES}")
+        all_tickets = all_tickets[:_MAX_CANDIDATES]
+
+    notes.append(f"total:{len(all_tickets)}")
+    return all_tickets, " | ".join(notes)
+
+
+def snapshot_topology_search(
+    topology_filters: dict,
+    date_from: str | None,
+    date_to: str | None,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, ticket_collection: str,
+    snap_collection: str = "snapshots",
+    default_limit: int = 200,
+) -> list[str]:
+    """Two-step topology-aware ticket retrieval.
+
+    Step 1: query the snapshots collection for clusters matching topology
+            criteria (node count, data nodes, services).
+    Step 2: collect ticket IDs from those snapshots, optionally filtered
+            by date from the tickets collection.
+
+    Returns ticket doc keys in 'ticket::<id>' format for RRF merging.
+    No cross-collection JOIN index required.
+    """
+    if not _CB_AVAILABLE:
+        return []
+    min_nodes = topology_filters.get("topology_min_nodes")
+    max_nodes = topology_filters.get("topology_max_nodes")
+    min_data  = topology_filters.get("topology_min_data")
+    services  = topology_filters.get("topology_services") or []
+    if not any([min_nodes, max_nodes, min_data, services]):
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cl       = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        ks_snap = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        ks_tick = f"`{bucket}`.`{scope}`.`{ticket_collection}`"
+
+        snap_where = ["ticket_ids IS NOT MISSING AND ARRAY_LENGTH(ticket_ids) > 0"]
+        if min_nodes is not None:
+            snap_where.append(f"node_count >= {min_nodes}")
+        if max_nodes is not None:
+            snap_where.append(f"node_count <= {max_nodes}")
+        if min_data is not None:
+            snap_where.append(f"topology.data_nodes >= {min_data}")
+        for svc in services:
+            snap_where.append(f"topology.{svc}_nodes > 0")
+
+        snap_q = (
+            f"SELECT cluster_uuid, cluster_name, node_count, ticket_ids "
+            f"FROM {ks_snap} WHERE {' AND '.join(snap_where)} LIMIT 500"
+        )
+        snap_rows = list(cl.query(snap_q, QueryOptions(timeout=timedelta(seconds=20))))
+        if not snap_rows:
+            cl.close()
+            return []
+
+        # Collect ticket IDs (deduplicated)
+        all_tids: list[str] = []
+        seen_tids: set[str] = set()
+        for row in snap_rows:
+            for tid in (row.get("ticket_ids") or []):
+                s = str(tid)
+                if s not in seen_tids:
+                    all_tids.append(s)
+                    seen_tids.add(s)
+        if not all_tids:
+            cl.close()
+            return []
+
+        # If a date range is required, filter tickets by date from the ticket collection
+        if date_from or date_to:
+            placeholders = ", ".join(f'"{t}"' for t in all_tids[:500])
+            tick_where   = [f"t.ticket_id IN [{placeholders}]"]
+            if date_from:
+                tick_where.append(f"t.created >= '{date_from}'")
+            if date_to:
+                tick_where.append(f"t.created <= '{date_to}'")
+            tick_q = (
+                f"SELECT META(t).id AS doc_key FROM {ks_tick} AS t "
+                f"WHERE {' AND '.join(tick_where)} "
+                f"ORDER BY t.created DESC LIMIT {default_limit}"
+            )
+            tick_rows = list(cl.query(tick_q, QueryOptions(timeout=timedelta(seconds=20))))
+            cl.close()
+            return [r["doc_key"] for r in tick_rows if r.get("doc_key")]
+
+        cl.close()
+        return [f"ticket::{tid}" for tid in all_tids[:default_limit]]
+    except Exception as exc:
+        print(f"[snapshot_topology_search] {exc}")
+        return []
+
+
+def fetch_snapshots_for_clusters(
+    cluster_uuids: list[str],
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+    snap_collection: str = "snapshots",
+) -> dict[str, dict]:
+    """Fetch the latest snapshot document for each cluster UUID.
+
+    Returns {cluster_uuid: snapshot_dict} with these topology fields:
+    cluster_name, node_count, cb_version, date, data_nodes, index_nodes,
+    query_nodes, fts_nodes, eventing_nodes, analytics_nodes,
+    warn_items, bad_items, cluster_hostname.
+    """
+    if not cluster_uuids or not _CB_AVAILABLE:
+        return {}
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cl       = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        ks   = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+        uids = ", ".join(f'"{u}"' for u in cluster_uuids[:50])
+        q    = (
+            f"SELECT s.cluster_uuid, s.cluster_name, s.node_count, s.cb_version, s.date, "
+            f"s.topology.data_nodes, s.topology.index_nodes, s.topology.query_nodes, "
+            f"s.topology.fts_nodes, s.topology.eventing_nodes, s.topology.analytics_nodes, "
+            f"s.topology.warn_items, s.topology.bad_items, s.topology.cluster_hostname "
+            f"FROM {ks} s WHERE s.cluster_uuid IN [{uids}] ORDER BY s.date DESC"
+        )
+        rows = list(cl.query(q, QueryOptions(timeout=timedelta(seconds=15))))
+        cl.close()
+        result: dict[str, dict] = {}
+        for row in rows:
+            uid = row.get("cluster_uuid")
+            if uid and uid not in result:   # keep latest (first due to ORDER BY date DESC)
+                result[uid] = row
+        return result
+    except Exception as exc:
+        print(f"[fetch_snapshots_for_clusters] {exc}")
+        return {}
 
 
 def reciprocal_rank_fusion(
@@ -10987,6 +13584,7 @@ def hybrid_retrieval(
     top_k: int = 10,
     in_memory_tickets: list[dict] | None = None,
     embed_fn: "Callable[[str], list[float]] | None" = None,
+    original_question: str | None = None,
 ) -> tuple[list[dict], str]:
     """Run dense vector search + structured N1QL in parallel, merge with RRF,
     and optionally expand the query using resolved ticket content.
@@ -11011,7 +13609,10 @@ def hybrid_retrieval(
     """
     import concurrent.futures
 
-    filters = build_structured_query(question)
+    # Structured filters always built from the original question so product names
+    # (e.g. "safekey", "mle") are never stripped by the query rewriter.
+    # The rewritten question is used only for the vector embedding (query_vec).
+    filters = build_structured_query(original_question or question)
     cb_args = (cb_url, bucket, username, password, use_tls, scope, collection)
     vector_ids:    list[str] = []
     struct_ids:    list[str] = []
@@ -11022,7 +13623,7 @@ def hybrid_retrieval(
         if in_memory_tickets:
             tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
             # Apply keyword filters in-memory when CB is unavailable
-            kws = filters.get("keywords") or []
+            kws = filters.get("struct_keywords") or filters.get("keywords") or []
             if kws:
                 def _kw_match(t: dict) -> bool:
                     haystack = " ".join([
@@ -11030,7 +13631,7 @@ def hybrid_retrieval(
                         str(t.get("description") or ""),
                         str(t.get("tags") or ""),
                     ]).lower()
-                    return all(kw.lower() in haystack for kw in kws)
+                    return any(kw.lower() in haystack for kw in kws)
                 tickets = [t for t in tickets if _kw_match(t)] or tickets  # fall back to unfiltered if nothing matches
             return tickets[:top_k], f"in-memory fallback ({pf_note})"
         return [], "CB unavailable, no in-memory tickets"
@@ -11050,10 +13651,64 @@ def hybrid_retrieval(
 
         if f_vec:
             try:
-                vector_ids = f_vec.result(timeout=30)
+                _raw_vec = f_vec.result(timeout=30)
+                # Separate ticket and snapshot keys — the hybrid FTS index covers
+                # both collections.  Snapshot hits are cross-referenced to their
+                # associated ticket IDs and fed into the expansion leg.
+                _snap_from_vec   = [k for k in _raw_vec if k.startswith("snapshot::")]
+                vector_ids       = [k for k in _raw_vec if not k.startswith("snapshot::")]
                 notes.append(f"{len(vector_ids)} vector")
+                if _snap_from_vec:
+                    _xref = _snap_keys_to_ticket_keys(_snap_from_vec, *cb_args)
+                    expansion_ids.extend(k for k in _xref if k not in expansion_ids)
+                    notes.append(f"{len(_xref)} snap-vec→ticket")
             except Exception as e:
                 notes.append(f"vector err: {e}")
+
+    # ── Stage 2b: FTS keyword text search (BM25) ─────────────────────────
+    # supportal_vector_idx is a true hybrid index: embedding (vector, 1024
+    # dims, dot_product) + text fields (subject, description, comments,
+    # assignee, priority, requester, status) — all with standard analyzer.
+    # MatchQuery/DisjunctionQuery hit the text fields directly; BM25 ranking
+    # surfaces tickets by exact term match (e.g. "mle", hostname tokens).
+    # Only struct_keywords (alias/tech) are sent so question-structure words
+    # ("reported", "relate") never enter the FTS query.
+    keyword_ids: list[str] = []
+    _skw = filters.get("struct_keywords") or []
+    if _skw and _CB_AVAILABLE:
+        try:
+            _raw_kw = fts_keyword_search_cb(_skw, *cb_args, top_k * 3)
+            _snap_from_kw = [k for k in _raw_kw if k.startswith("snapshot::")]
+            keyword_ids   = [k for k in _raw_kw if not k.startswith("snapshot::")]
+            notes.append(f"{len(keyword_ids)} fts-keyword")
+            if _snap_from_kw:
+                _xref = _snap_keys_to_ticket_keys(_snap_from_kw, *cb_args)
+                expansion_ids.extend(k for k in _xref if k not in expansion_ids)
+                notes.append(f"{len(_xref)} snap-kw→ticket")
+        except Exception as e:
+            notes.append(f"fts-keyword err: {e}")
+
+    # ── Stage 2c: snapshot topology search ───────────────────────────────
+    # When the question contains topology constraints ("more than 9 nodes",
+    # "with eventing service"), query the snapshots collection for matching
+    # clusters, then cross-reference their ticket_ids — filtered by date.
+    # This leg is the only way to answer "how many clusters > 9 nodes had
+    # issues in 2026" correctly; vector + keyword search cannot do it.
+    topology_ids: list[str] = []
+    _snap_col = "snapshots"   # collection name in same scope
+    if any([filters.get("topology_min_nodes"), filters.get("topology_max_nodes"),
+            filters.get("topology_min_data"), filters.get("topology_services")]):
+        try:
+            topology_ids = snapshot_topology_search(
+                filters,
+                filters.get("date_from"), filters.get("date_to"),
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                snap_collection=_snap_col,
+            )
+            if topology_ids:
+                notes.append(f"{len(topology_ids)} topology-snapshot")
+        except Exception as e:
+            notes.append(f"topology err: {e}")
 
     # ── Stage 3: query expansion via ticket content ───────────────────────
     # When the user asks about a specific ticket (e.g. "summary of 76403"),
@@ -11094,28 +13749,65 @@ def hybrid_retrieval(
                 notes.append(f"expansion err: {e}")
 
     # ── Stage 4: RRF merge ────────────────────────────────────────────────
-    all_lists = [lst for lst in (struct_ids, vector_ids, expansion_ids) if lst]
+    all_lists = [lst for lst in (struct_ids, vector_ids, keyword_ids, topology_ids, expansion_ids) if lst]
     if not all_lists:
         if in_memory_tickets:
             tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
             return tickets[:top_k], f"in-memory fallback ({pf_note})"
         return [], "no results"
 
-    merged_ids = reciprocal_rank_fusion(*all_lists)[:top_k * 2]  # over-fetch before keyword filter
-    notes.append(f"{len(merged_ids)} after RRF")
+    _rrf_ordered = reciprocal_rank_fusion(*all_lists)
+    _rrf_cap     = top_k * 2
+    _rrf_set     = set(_rrf_ordered[:_rrf_cap])
+    # Structured results matched explicit user filters — guarantee they survive the
+    # final [:top_k] slice even if the RRF vector signal didn't rank them high enough.
+    # Cap struct_forced at top_k so a broad query can't flood the LLM context.
+    _struct_forced = [k for k in struct_ids if k not in _rrf_set][:top_k]
+    _sf_set = set(_struct_forced)
+    # BM25 keyword hits get the same guarantee: if a ticket passed FTS relevance
+    # testing for the query terms but didn't rank in the RRF top-N (because a
+    # broad date filter produces ~150 struct_ids that dilute RRF scores), force
+    # it in.  This is the main path for tickets like "Moving of partitioned
+    # index : peuse1cbecpsd2000083" — FTS matches the hostname; struct rank is
+    # too low for the RRF top-20 cut.
+    _kw_forced = [k for k in keyword_ids if k not in _rrf_set and k not in _sf_set][:top_k]
+    _kf_set = set(_kw_forced)
+    # struct_forced first → keyword_forced second → RRF-ranked fills remaining
+    merged_ids = (
+        _struct_forced
+        + _kw_forced
+        + [k for k in _rrf_ordered[:_rrf_cap] if k not in _sf_set and k not in _kf_set]
+    )
+    notes.append(f"{len(merged_ids)} after RRF (sf={len(_struct_forced)} kf={len(_kw_forced)})")
 
     # ── Stage 5: resolve keys → full ticket dicts ────────────────────────
+    # Always prefer CB when available — in-memory tickets may have stale or
+    # incomplete fields (e.g. requester=None from an older scrape).
+    # Memory is used only as a fast fallback when CB is unavailable.
     resolved: list[dict] = []
-    if in_memory_tickets:
+    if _CB_AVAILABLE:
+        resolved = fetch_tickets_by_keys(merged_ids, *cb_args)
+        if resolved:
+            notes.append(f"cb:{len(resolved)}")
+        else:
+            notes.append("cb:0(failed?)")
+        # Fill in any not found in CB from memory
+        if in_memory_tickets:
+            _cb_ids = {str(t.get("ticket_id", "")) for t in resolved}
+            mem_map = {str(t.get("ticket_id", "")): t for t in in_memory_tickets}
+            _mem_filled = 0
+            for k in merged_ids:
+                tid = k.split("::")[-1]
+                if tid not in _cb_ids and tid in mem_map:
+                    resolved.append(mem_map[tid])
+                    _mem_filled += 1
+            if _mem_filled:
+                notes.append(f"mem-fill:{_mem_filled}")
+    elif in_memory_tickets:
         mem_map = {str(t.get("ticket_id", "")): t for t in in_memory_tickets}
         resolved = [mem_map[k.split("::")[-1]] for k in merged_ids
                     if k.split("::")[-1] in mem_map]
-
-    missing = [k for k in merged_ids
-               if k.split("::")[-1] not in {str(t.get("ticket_id", "")) for t in resolved}]
-    if missing:
-        cb_fetched = fetch_tickets_by_keys(missing, *cb_args)
-        resolved.extend(cb_fetched)
+        notes.append(f"mem-only:{len(resolved)}")
 
     # Preserve RRF order
     order = {k.split("::")[-1]: i for i, k in enumerate(merged_ids)}
@@ -11123,23 +13815,92 @@ def hybrid_retrieval(
 
     # ── Stage 6: post-RRF keyword filter ─────────────────────────────────
     # When the query has keyword filters (e.g. "safekey"), remove tickets
-    # whose subject/description/tags don't actually contain the keyword.
-    # This prevents vector-similar-but-unrelated tickets from leaking through.
-    # Only applied when ALL keywords are non-trivial (≥4 chars) to avoid
+    # whose text doesn't contain ANY of the keywords.
+    # Uses ANY (not ALL) so multi-keyword questions still return results.
+    # Only applied when keywords are non-trivial (≥3 chars) to avoid
     # over-filtering on short stop-word-like terms.
-    kws = [k for k in (filters.get("keywords") or []) if len(k) >= 4]
+    kws = [k for k in (filters.get("struct_keywords") or filters.get("keywords") or []) if len(k) >= 3]
+    # Tickets that came from the FTS BM25 leg already passed relevance testing
+    # for these exact keywords — trust them and skip the text scan.
+    _kw_trusted = set(keyword_ids)
     if kws and not filters.get("ticket_ids"):  # skip if pinned by explicit ID
+        _c2a_s6 = _get_cluster_to_app()   # resolve once outside the per-ticket closure
+        _known_apps_s6 = set(_get_app_cluster_aliases().keys())  # all known app names
+        # Which app aliases appear in the query keywords?
+        _queried_apps_s6 = {kw.lower() for kw in kws if kw.lower() in _known_apps_s6}
         def _kw_match(t: dict) -> bool:
+            # ── Cluster-authoritative exclusion (runs before FTS trust bypass) ──
+            # When the query names a known app (e.g. "safekey"), a ticket whose
+            # cluster(s) ALL resolve to a DIFFERENT known app is a cross-app false
+            # positive — exclude it even if FTS found a keyword hit in its text.
+            if _queried_apps_s6:
+                _t_cids = _ticket_cluster_ids(t)
+                _t_apps = {_c2a_s6.get(cid, "") for cid in _t_cids} - {""}
+                # Only exclude when: ticket has clusters that map to known apps
+                # AND none of those apps match the queried app(s).
+                if _t_apps and not (_t_apps & _queried_apps_s6):
+                    return False
+
+            # FTS BM25 already validated this ticket for the query keywords
+            _key = f"ticket::{t.get('ticket_id', '')}"
+            if _key in _kw_trusted:
+                return True
+            # Build haystack from all text-bearing fields including comments
+            _comments_raw = t.get("comments") or []
+            if isinstance(_comments_raw, list):
+                _comments_str = " ".join(
+                    str(c.get("body") or c.get("content") or c)
+                    for c in _comments_raw
+                )[:1000]
+            else:
+                _comments_str = str(_comments_raw)[:1000]
             haystack = " ".join([
                 str(t.get("subject") or ""),
                 str(t.get("description") or ""),
                 str(t.get("tags") or ""),
+                _comments_str,
             ]).lower()
-            return all(kw.lower() in haystack for kw in kws)
+            # 1. Direct text match
+            if any(kw.lower() in haystack for kw in kws):
+                return True
+            # 2. Structured cluster→app match (cluster_name / UUID from snapshot_topology)
+            _ticket_apps = {
+                _c2a_s6.get(cid, "")
+                for cid in _ticket_cluster_ids(t)
+            } - {""}
+            if any(kw.lower() in _ticket_apps for kw in kws):
+                return True
+            # 3. Hostname text-scan: any known host appears in subject/desc/comments
+            #    and that host's app matches a queried keyword
+            for host, app in _c2a_s6.items():
+                if host in haystack and any(kw.lower() == app for kw in kws):
+                    return True
+            return False
         filtered = [t for t in resolved if _kw_match(t)]
         if filtered:   # only apply if something survives — never return empty
             resolved = filtered
             notes.append(f"keyword-filtered to {len(resolved)}")
+
+    # ── Stage 7: date post-filter ─────────────────────────────────────────
+    # Apply date range to ALL retrieved tickets including vector hits so that
+    # "in 2026" / "last month" constrains the final answer even when the
+    # structured search returned nothing (keyword-driven fallback path).
+    _date_from = filters.get("date_from")
+    _date_to   = filters.get("date_to")
+    if _date_from or _date_to:
+        def _in_date_range(t: dict) -> bool:
+            _cd = str(t.get("created") or "")[:10]
+            if not _cd:
+                return True   # don't drop tickets with no date field
+            if _date_from and _cd < _date_from:
+                return False
+            if _date_to and _cd > _date_to:
+                return False
+            return True
+        date_filtered = [t for t in resolved if _in_date_range(t)]
+        if date_filtered:   # never return empty just because of strict date
+            resolved = date_filtered
+            notes.append(f"date-filtered to {len(resolved)}")
 
     return resolved[:top_k], " | ".join(notes)
 
@@ -11173,18 +13934,33 @@ def chat_batch_map_reduce(
     lock = threading.Lock()
     completed = [0]
 
+    _BATCH_NO_MATCH = "NO_MATCH"
+    _batch_instruction = (
+        "\n\n━━ BATCH MODE RULES ━━\n"
+        "You are processing ONE slice of a larger dataset. Most slices will not contain "
+        "tickets matching the question — that is normal and expected.\n"
+        "RULE B1 — If NO tickets in this slice match the question, respond with exactly the "
+        "two words: NO_MATCH — nothing else.\n"
+        "RULE B2 — Only include a ticket if it DIRECTLY matches. Do NOT include tickets "
+        "because they share infrastructure, patterns, or implied relationships with matching "
+        "tickets. [Application: X] labels are authoritative — do not override them.\n"
+        "RULE B3 — Never infer that a ticket belongs to an application unless its header "
+        "explicitly shows [Application: THAT_APP] or its subject/description names it directly."
+    )
+
     def _run_batch(idx: int, batch: list[dict]) -> tuple[int, str]:
         context = build_rag_context(batch, "", compact=compact)
         system  = SYSTEM_PROMPT_TEMPLATE.format(today=_today_str, stats=_stats_block, context=context)
+        system += _batch_instruction
         msgs    = [
             {"role": "system", "content": system},
             {"role": "user",   "content": question},
         ]
         try:
             ans = call_llm(msgs, provider, model, api_key, base_url, max_tokens=4096)
-            return idx, f"[Batch {idx + 1}]\n{ans}"
+            return idx, ans.strip()
         except Exception as exc:
-            return idx, f"[Batch {idx + 1}] Error: {exc}"
+            return idx, f"ERROR: {exc}"
 
     effective = max(1, min(max_workers, len(batches)))
     progress_cb(
@@ -11205,15 +13981,57 @@ def chat_batch_map_reduce(
 
     # Restore original order before synthesis
     partial_answers.sort(key=lambda x: x[0])
-    ordered = [ans for _, ans in partial_answers]
+
+    # Filter out batches that found nothing — they are not contradictions,
+    # just slices that didn't contain matching tickets.
+    # Local models rarely respond with the exact sentinel, so detect emptiness
+    # by: (a) exact/near sentinel match, or (b) no ticket ID (#NNNNN) in a
+    # short response, or (c) contains common "nothing found" phrases.
+    _NO_RESULT_PHRASES = (
+        "no_match", "no match", "no tickets", "no matching tickets",
+        "no relevant", "no results", "none found", "not found",
+        "no ticket", "no support ticket",
+    )
+
+    def _is_empty_batch(ans: str) -> bool:
+        if ans.startswith("ERROR:"):
+            return True
+        _lower = ans.strip().lower()
+        # Exact sentinel (or with trailing punctuation)
+        if _lower.rstrip(".,! ") == "no_match":
+            return True
+        # Short response with no ticket ID reference → almost certainly empty
+        if len(_lower) < 120 and "#" not in ans:
+            return True
+        # Contains a clear "nothing found" phrase and no ticket ID
+        if "#" not in ans and any(p in _lower for p in _NO_RESULT_PHRASES):
+            return True
+        return False
+
+    matching = [(idx, ans) for idx, ans in partial_answers if not _is_empty_batch(ans)]
+    n_empty = len(partial_answers) - len(matching)
+    ordered = [f"[Batch {idx + 1}]\n{ans}" for idx, ans in matching]
+
+    if not ordered:
+        return "No matching tickets found across all batches."
 
     # Final synthesis pass
-    progress_cb(f"Synthesising {len(ordered)} batch answers …")
+    progress_cb(f"Synthesising {len(ordered)} batch answer(s) ({n_empty} empty batches excluded) …")
     combined = "\n\n".join(ordered)
     synthesis_system = (
-        "You are a support analyst. You have been given partial answers from multiple "
-        "batches of support tickets. Synthesise them into a single, coherent, concise answer. "
-        "Remove duplicates. Cite ticket IDs where relevant."
+        "You are a senior Couchbase support analyst performing the final synthesis step of a "
+        "map-reduce analysis. You have been given partial answers from batches that found "
+        "MATCHING tickets — batches that found no matches were already excluded.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Batches that found no results are NOT contradictions — they simply did not contain "
+        "matching tickets. Treat all provided partial answers as additive evidence.\n"
+        "2. Synthesise into a single coherent answer. Remove exact duplicates but preserve "
+        "all unique ticket IDs.\n"
+        "3. Never include a ticket from one application in results for a different application. "
+        "[Application: X] labels are authoritative.\n"
+        "4. Do NOT infer relationships between tickets based on infrastructure patterns. "
+        "Only report tickets explicitly identified as matching in the partial answers.\n"
+        "5. Cite ticket IDs wherever relevant. Use markdown tables for ticket lists."
     )
     synthesis_msgs = [
         {"role": "system",  "content": synthesis_system},
@@ -11224,7 +14042,7 @@ def chat_batch_map_reduce(
 
 def _ticket_date(t: dict) -> str:
     """Return the best available ISO date string for a ticket (empty string if none)."""
-    return (t.get("created_at") or t.get("created") or t.get("date") or "").strip()
+    return (t.get("created") or t.get("created_at") or t.get("date") or "").strip()
 
 
 def _parse_ticket_date(t: dict):
@@ -11241,21 +14059,57 @@ def _parse_ticket_date(t: dict):
 
 
 def _ticket_cluster_ids(t: dict) -> list[str]:
-    """Extract cluster IDs from a ticket (snap_ids, snapshot_topology, or ticket_fields)."""
+    """Extract cluster hostnames/IDs from a ticket.
+
+    Returns cluster_name (hostname) first so callers can look up _get_cluster_to_app().
+    Falls back to UUID and snap_id prefix for completeness.
+    """
     ids: list[str] = []
-    for sid in t.get("snap_ids") or []:
-        cid = sid.split("::")[0]
-        if cid and cid not in ids:
-            ids.append(cid)
     topo = t.get("snapshot_topology") or {}
     if isinstance(topo, str):
         try:
             topo = json.loads(topo)
         except Exception:
             topo = {}
-    cid = (topo.get("cluster_uuid") or topo.get("cluster_name") or "").strip()
-    if cid and cid not in ids:
-        ids.append(cid)
+    # cluster_name is the short hostname (e.g. "peuse1cbecpsd2000083") — used by _CLUSTER_TO_APP
+    _cname = (topo.get("cluster_name") or "").strip()
+    if _cname and _cname not in ids:
+        ids.append(_cname)
+    # UUID from topology
+    _cuuid = (topo.get("cluster_uuid") or "").strip()
+    if _cuuid and _cuuid not in ids:
+        ids.append(_cuuid)
+    # snap_ids prefix (UUID format — lower priority, kept for compatibility)
+    for sid in t.get("snap_ids") or []:
+        cid = sid.split("::")[0]
+        if cid and cid not in ids:
+            ids.append(cid)
+    # score.cluster_names: pre-computed cluster hostnames from the scoring step;
+    # more reliable than snapshot_topology when a ticket spans multiple clusters.
+    _score = t.get("score") or {}
+    for cname in (_score.get("cluster_names") or []):
+        cname = (cname or "").strip()
+        if cname and cname not in ids:
+            ids.append(cname)
+    # Text-scan supplement: always check subject/description/comments for known hostnames.
+    # Not a fallback — runs even when topology fields already populated, so a ticket
+    # titled "Cluster peuse1cbecpsd2000083 indexes in warmup" gets labelled MLE even
+    # if snapshot_topology references a different cluster.
+    _comments_raw = t.get("comments") or []
+    if isinstance(_comments_raw, list):
+        _comments_text = " ".join(
+            str(c.get("body") or c.get("content") or c) for c in _comments_raw
+        )[:2000]
+    else:
+        _comments_text = str(_comments_raw)[:2000]
+    _text = " ".join([
+        (t.get("subject") or ""),
+        (t.get("description") or "")[:500],
+        _comments_text,
+    ]).lower()
+    for host in _get_cluster_to_app():
+        if host in _text and host not in ids:
+            ids.append(host)
     return ids
 
 
@@ -11319,6 +14173,7 @@ def build_dataset_stats(tickets: list[dict], today_dt: datetime.datetime) -> str
 
     window_7  = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 7))
     window_30 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 30))
+    window_60 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 60))
     window_90 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 90))
 
     # ── 10 most recent tickets ────────────────────────────────────────────
@@ -11355,9 +14210,11 @@ def build_dataset_stats(tickets: list[dict], today_dt: datetime.datetime) -> str
         f"STATUS:           {status_str}",
         f"UNIQUE CLUSTERS:  {len(all_cluster_ids)}",
         "",
-        "### Rolling Window Counts (computed from TODAY — use these for 'last N days/weeks/month' questions)",
+        "### Rolling Window Counts (computed from TODAY — use these for 'last N days/weeks/months' questions)",
+        "# 'Last week' = 7 days. 'Last month' = 30 days. 'Last 2 months' = 60 days. 'Last quarter' = 90 days.",
         f"  Last  7 days:  {window_7} tickets",
         f"  Last 30 days:  {window_30} tickets",
+        f"  Last 60 days:  {window_60} tickets",
         f"  Last 90 days:  {window_90} tickets",
         "",
         "### Most Recent Ticket Per Priority",
@@ -11467,7 +14324,7 @@ def compute_aggregations(question: str, tickets: list[dict]) -> str:
             if not created:
                 continue
             # Use solved/closed date if present, else today (still open)
-            closed_raw = (t.get("solved_at") or t.get("closed_at") or t.get("updated_at") or "").strip()
+            closed_raw = (t.get("solved") or t.get("solved_at") or t.get("closed_at") or t.get("updated") or "").strip()
             closed = None
             if closed_raw:
                 closed = _parse_ticket_date({"created": closed_raw})
@@ -11505,6 +14362,7 @@ def build_rag_context(
     customer_name: str = "",
     compact: bool = False,
     filter_note: str = "",
+    snapshot_map: "dict[str, dict] | None" = None,
 ) -> str:
     """
     Format a list of ticket dicts as a context block for the LLM system prompt.
@@ -11514,6 +14372,8 @@ def build_rag_context(
     - ≤5 tickets    → deep-dive: full description, all comments, ticket_fields, tags
     - >5 tickets    → standard: description capped at 1 500 chars, 8 comments × 600 chars
     filter_note is shown in the header so the LLM knows what retrieval produced this set.
+    snapshot_map: {cluster_uuid: snapshot_doc} — when provided, topology is appended
+    after each ticket's cluster line so the LLM can answer topology questions.
     """
     header = "### Retrieved Ticket Context"
     if customer_name:
@@ -11525,28 +14385,179 @@ def build_rag_context(
     lines = [header + "\n"]
 
     deep = (not compact) and len(tickets) <= 5
+    _c2a = _get_cluster_to_app()   # resolve once per call, not per ticket
 
     for t in tickets:
         tid = t.get("ticket_id", "?")
         cluster_ids = _ticket_cluster_ids(t)
-        cluster_str = ", ".join(cluster_ids[:5]) if cluster_ids else "—"
+        # Append app name when known, e.g. "peuse1cbecpsd2000083 (MLE)"
+        _cluster_parts = []
+        for _cid in cluster_ids[:5]:
+            _app = _c2a.get(_cid, "")
+            _cluster_parts.append(f"{_cid} ({_app.upper()})" if _app else _cid)
+        cluster_str = ", ".join(_cluster_parts) if _cluster_parts else "—"
+
+        # ── Compute resolution date and time-taken (shared by compact + standard) ──
+        _created_str  = _ticket_date(t)[:10]                           # may be empty
+        _solved_raw   = (t.get("solved") or t.get("solved_at")
+                         or t.get("closed_at") or "").strip()
+        _resolved_str = _solved_raw[:10] if _solved_raw else ""
+        # Fall back to updated when ticket is closed but no explicit solved date
+        if not _resolved_str and t.get("status", "").lower() in ("closed", "solved"):
+            _resolved_str = (t.get("updated") or "").strip()[:10]
+        # Time-taken in days (only when both dates available)
+        _days_str = ""
+        if _created_str and _resolved_str:
+            try:
+                _c = datetime.datetime.strptime(_created_str, "%Y-%m-%d")
+                _r = datetime.datetime.strptime(_resolved_str, "%Y-%m-%d")
+                _days_str = f"{max(0, (_r - _c).days)}d"
+            except Exception:
+                pass
+
+        # ── Application label (shared by compact + standard) ─────────────────
+        # Derive from cluster→app map so hostname-only subjects get labelled too
+        _app_labels = list({
+            _c2a[_cid].upper()
+            for _cid in cluster_ids
+            if _c2a.get(_cid)
+        })
+        # Fallback: analytics-enriched labels stored on the ticket document
+        if not _app_labels:
+            _score_t = t.get("score") or {}
+            _analytics_labels = _score_t.get("analytics_app_labels") or []
+            if _analytics_labels:
+                _app_labels = [str(lbl).upper() for lbl in _analytics_labels]
+        _app_str = ", ".join(sorted(_app_labels)) if _app_labels else ""
 
         if compact:
             desc = (t.get("description") or "")[:200].replace("\n", " ")
-            lines.append(
+            _app_tag = f"[Application: {_app_str}]" if _app_str else "[Application: ?]"
+            _score_c   = t.get("score") or {}
+            _summary_c = (
+                t.get("summary_text")
+                or t.get("interaction_summary")
+                or _score_c.get("interaction_summary")
+                or ""
+            ).strip()
+            _compact_line = (
                 f"#{tid} [{(t.get('priority') or '?').upper()}|{t.get('status','?')}] "
-                f"created:{_ticket_date(t)[:10]} assignee:{t.get('assignee','?')} "
-                f"clusters:{cluster_str} — {t.get('subject','N/A')} — {desc}"
+                f"{_app_tag} requester:{t.get('requester','?')} "
+                f"created:{_created_str or '?'} resolved:{_resolved_str or '?'} "
+                f"time:{_days_str or '?'} assignee:{t.get('assignee','?')} "
+                f"clusters:{cluster_str} — {t.get('subject','N/A')}"
             )
+            # Append compact topology note when snapshot_topology is available
+            _topo_c = t.get("snapshot_topology") or {}
+            if isinstance(_topo_c, str):
+                try:
+                    _topo_c = json.loads(_topo_c)
+                except Exception:
+                    _topo_c = {}
+            if _topo_c and (_topo_c.get("total_nodes") or _topo_c.get("data_nodes") or _topo_c.get("cb_version")):
+                _tv   = _topo_c.get("cb_version") or ""
+                _tn   = _topo_c.get("total_nodes") or _topo_c.get("node_count") or "?"
+                _tbc  = _topo_c.get("bad_count") or len(_topo_c.get("bad_items") or [])
+                _twc  = _topo_c.get("warn_count") or len(_topo_c.get("warn_items") or [])
+                _tram = _topo_c.get("ram_per_node_mib")
+                _tcpu = _topo_c.get("cpus_per_node")
+                _snap_note = f" [Snap: {_tn}nodes CB={(_tv or '?')[:12]} bad={_tbc} warn={_twc}"
+                if _tram:
+                    _snap_note += f" RAM/node={round(int(_tram)/1024)}GB"
+                if _tcpu:
+                    _snap_note += f" CPU/node={_tcpu}"
+                _snap_note += "]"
+                _compact_line += _snap_note
+            _cbses_c = t.get("cbses") or []
+            _jiras_c = t.get("jira_issues") or []
+            if _cbses_c:
+                _compact_line += f" | CBSEs: {', '.join(_cbses_c) if isinstance(_cbses_c, list) else _cbses_c}"
+            if _jiras_c:
+                _compact_line += f" | Jira: {', '.join(_jiras_c) if isinstance(_jiras_c, list) else _jiras_c}"
+            if _summary_c:
+                _compact_line += f" | Summary: {_summary_c[:300].replace(chr(10), ' ')}"
+            elif desc:
+                _compact_line += f" — {desc}"
+            lines.append(_compact_line)
             continue
 
-        # ── Header fields (all modes) ─────────────────────────────────────────
-        lines.append(f"**Ticket #{tid}** — {t.get('subject', 'N/A')}")
+        # ── Header fields (standard / deep modes) ────────────────────────────
+        _subj_line = f"**Ticket #{tid}** — {t.get('subject', 'N/A')}"
+        if _app_str:
+            _subj_line += f"  [Application: {_app_str}]"
+        lines.append(_subj_line)
         lines.append(
             f"Priority: {(t.get('priority') or '?').upper()} | Status: {t.get('status','?')} "
-            f"| Created: {_ticket_date(t)[:10]} | Assignee: {t.get('assignee','?')}"
+            f"| Created: {_created_str or '?'} | Resolved: {_resolved_str or '?'} "
+            f"| Time-taken: {_days_str or '?'} | Assignee: {t.get('assignee','?')}"
         )
         lines.append(f"Requester: {t.get('requester','?')} | Clusters: {cluster_str}")
+
+        # ── Snapshot topology (when available) ────────────────────────────────
+        # Primary: external snapshot_map (fetched from snapshots collection).
+        # Fallback: snapshot_topology stored directly on the ticket doc — populated
+        # by the Enrich pipeline step and authoritative for the linked snapshot.
+        def _render_topo_snap(snap: dict, label: str = "Snapshot") -> None:
+            _topo = snap.get("topology") or {}
+            def _f(key: str):
+                return snap.get(key) or _topo.get(key)
+            _svc_parts = []
+            for _svc in ("data", "index", "query", "fts", "eventing", "analytics"):
+                _n = _f(f"{_svc}_nodes") or 0
+                if _n:
+                    _svc_parts.append(f"{_n} {_svc}")
+            _nodes   = _f("total_nodes") or _f("node_count") or "?"
+            _vers    = _f("cb_version") or ""
+            _buckets = _f("bucket_names") or []
+            _ram_mib = _f("ram_per_node_mib")
+            _cpus    = _f("cpus_per_node")
+            _groups  = _f("server_groups") or []
+            _afo     = _f("auto_failover_seconds")
+            _topo_line = (
+                f"  {label} [{(snap.get('date') or '?')[:10]}]: "
+                f"Cluster={snap.get('cluster_name') or '?'} | "
+                f"Nodes={_nodes} ({', '.join(_svc_parts) if _svc_parts else '?'}) | "
+                f"CB={_vers or '?'}"
+            )
+            if _ram_mib:
+                _topo_line += f" | RAM/node={round(int(_ram_mib)/1024)}GB"
+            if _cpus:
+                _topo_line += f" | CPU/node={_cpus}"
+            if _groups:
+                _topo_line += f" | ServerGroups={len(_groups)}({','.join(str(g) for g in _groups[:4])})"
+            if _afo:
+                _topo_line += f" | AutoFailover={_afo}s"
+            _warns = _f("warn_items") or []
+            _bads  = _f("bad_items")  or []
+            if _bads:
+                _topo_line += f" | Issues({len(_bads)}): {', '.join(str(b) for b in _bads[:5])}"
+            if _warns:
+                _topo_line += f" | Warnings({len(_warns)}): {', '.join(str(w) for w in _warns[:5])}"
+            if _buckets:
+                _topo_line += f" | Buckets: {', '.join(str(b) for b in _buckets[:6])}"
+            lines.append(_topo_line)
+
+        _topo_rendered = False
+        if snapshot_map and cluster_ids:
+            for _cid in cluster_ids[:3]:
+                _snap = snapshot_map.get(_cid)
+                if _snap and (_snap.get("node_count") or _snap.get("cb_version")):
+                    _render_topo_snap(_snap)
+                    _topo_rendered = True
+
+        # Fallback: use snapshot_topology stored on the ticket itself
+        if not _topo_rendered:
+            _topo_inline = t.get("snapshot_topology") or {}
+            if isinstance(_topo_inline, str):
+                try:
+                    _topo_inline = json.loads(_topo_inline)
+                except Exception:
+                    _topo_inline = {}
+            if _topo_inline and (
+                _topo_inline.get("total_nodes") or _topo_inline.get("node_count")
+                or _topo_inline.get("data_nodes") or _topo_inline.get("cb_version")
+            ):
+                _render_topo_snap(_topo_inline, label="Cluster Snapshot")
 
         # ── Tags ──────────────────────────────────────────────────────────────
         if t.get("tags"):
@@ -11559,18 +14570,39 @@ def build_rag_context(
             if tf_pairs:
                 lines.append("Fields: " + " | ".join(tf_pairs[:20 if deep else 8]))
 
-        # ── Escalations / snapshots ───────────────────────────────────────────
-        if deep:
-            if t.get("escalations"):
-                lines.append(f"Escalations: {str(t['escalations'])[:500]}")
-            if t.get("snapshots"):
-                lines.append(f"Snapshots: {str(t['snapshots'])[:500]}")
+        # ── Escalations / CBSEs / Jira / snapshots ────────────────────────────
+        if t.get("escalations"):
+            lines.append(f"Escalations: {str(t['escalations'])[:500]}")
+        _cbses_r = t.get("cbses")
+        if _cbses_r:
+            _cbses_str = ", ".join(_cbses_r) if isinstance(_cbses_r, list) else str(_cbses_r)
+            lines.append(f"CBSEs: {_cbses_str}")
+        _jira_r = t.get("jira_issues")
+        if _jira_r:
+            _jira_str_r = ", ".join(_jira_r) if isinstance(_jira_r, list) else str(_jira_r)
+            lines.append(f"Jira Issues: {_jira_str_r}")
+        if deep and t.get("snapshots"):
+            lines.append(f"Snapshots: {str(t['snapshots'])[:500]}")
 
-        # ── Description ───────────────────────────────────────────────────────
+        # ── AI summary (preferred) or raw description ────────────────────────
+        # Prefer Phase 2a summary_text (full-thread LLM narrative) over the
+        # older interaction_summary (scoring by-product, closure-message only).
+        _score_s  = t.get("score") or {}
+        _summary  = (
+            t.get("summary_text")
+            or t.get("interaction_summary")
+            or _score_s.get("interaction_summary")
+            or ""
+        ).strip()
+        if _summary:
+            lines.append(f"Summary: {_summary}")
         if t.get("description"):
             desc_limit = None if deep else 1_500
             desc = t["description"] if deep else t["description"][:1_500]
-            lines.append(f"Description:\n{desc}")
+            # In standard mode show description only when no summary exists,
+            # or always in deep-dive mode for full fidelity.
+            if deep or not _summary:
+                lines.append(f"Description:\n{desc}")
 
         # ── Comments ─────────────────────────────────────────────────────────
         comments_raw = t.get("comments")
@@ -11605,17 +14637,37 @@ Open every response with a single sentence that directly answers the question.
 Example: "There were 4 high-priority tickets in the last month."
 Never start with a preamble, caveat, or "Based on the data…".
 
-RULE 2 — SCALE DETAIL TO QUESTION TYPE.
+RULE 2 — USE MARKDOWN TABLES for ANY response listing 2 or more tickets.
+Always render a properly formatted markdown table — never use bullet lists when a table fits.
+Standard columns: Ticket # | Subject | Priority | Status | Created | Resolved | Days | Notes
+Add columns as relevant (e.g., Cluster, Org, Assignee, Reporter). Omit columns where ALL values would be "?".
+The "Created", "Resolved", and "Days" columns come directly from the ticket context header lines:
+  Created = the "Created:" field   Resolved = the "Resolved:" field   Days = the "Time-taken:" field
+The "Reporter" (also called Requester or Submitter) comes from the "Requester:" line in the ticket context.
+  "Requester:", "Reporter:", and "Submitted by:" all refer to the same person — the one who opened the ticket.
+  When the user asks for reporter, submitter, or who raised the ticket, use the "Requester:" field value.
+Use "?" only when a field is genuinely absent — never say "Date Unavailable" or "N/A".
+Example:
+| Ticket # | Subject | Priority | Status | Created | Resolved | Days | Notes |
+|---|---|---|---|---|---|---|---|
+| #12345 | SDK crash on connect | P1 | Open | 2026-04-10 | ? | ? | Memory leak suspected |
+| #12346 | Rebalance hung | P2 | Closed | 2026-03-01 | 2026-03-15 | 14 | Fixed via rebalance retry |
+
+RULE 3 — APPLICATION MEMBERSHIP.
+Each ticket header may include [Application: NAME] derived from its cluster IDs.
+A ticket IS an MLE ticket, SafeKey ticket, etc. if its header shows [Application: MLE] or [Application: SAFEKEY],
+even when the application name does not appear in the subject line.
+Always count and include ALL tickets for an application regardless of whether the name appears in the subject.
+
+RULE 4 — SCALE DETAIL TO QUESTION TYPE.
 
 ▸ COUNT / SIMPLE FACTUAL ("how many", "when was", "who is")
-  Direct answer sentence, then a compact table or bulleted list if there are items:
-  • #NNNNN | Priority | Status | One-line description | Outcome/Impact
+  Direct answer sentence, then a markdown table if any items exist.
   Nothing more unless the user asks to expand.
 
 ▸ LIST / SURVEY ("show me", "what are the recent", "list all P1s")
-  Direct answer sentence stating the count, then one entry per ticket:
-  • #NNNNN — Subject — Priority/Status — created YYYY-MM-DD — one sentence outcome
-  Keep each entry to a single line. No sub-bullets unless asked.
+  Direct answer sentence stating the count, then a markdown table with ALL retrieved tickets.
+  NEVER use bullet points for ticket lists — always use the markdown table format from RULE 2.
 
 ▸ SPECIFIC TICKET DEEP-DIVE ("tell me about #NNNNN", "summarise ticket X",
   "expand on MLE", "what happened with SafeKey")
@@ -11630,7 +14682,7 @@ RULE 2 — SCALE DETAIL TO QUESTION TYPE.
 ▸ AGGREGATION / TREND / COMPARISON ("frequency of", "top issues", "compare clusters")
   Direct answer sentence, then:
   - Summary paragraph (2–4 sentences on the dominant pattern)
-  - Bullet list of top findings with ticket count evidence
+  - Markdown table of top findings (issue | ticket count | example ticket IDs)
   - One sentence on recommended focus area
 
 ━━ DATA RULES ━━
@@ -11979,6 +15031,77 @@ def _build_memory_section(memories: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# Follow-up pronouns and phrases that indicate the question depends on prior context.
+# If any of these appear at the start or as a dominant pattern the rewriter fires.
+_FOLLOWUP_TRIGGERS = re.compile(
+    r"\b(of (those|them|the(se|m)?|those issues|those tickets|the issues?|the tickets?)"
+    r"|out of|from those|from them|among those|among them"
+    r"|how many (of|were|had|have|did|do)"
+    r"|which (of|ones|tickets?|issues?)"
+    r"|what (about|were|was|is|are) (those|them|the)"
+    r"|same (tickets?|issues?|period|year|month)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def contextualize_question(
+    question: str,
+    chat_history: list[dict],
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+) -> str:
+    """Rewrite a follow-up question to be self-contained using recent conversation history.
+
+    For example:
+      History: "how many tickets in 2026?" → "31 tickets in 2026..."
+      Question: "out of those, how many had CBSEs?"
+      → "Out of the 31 tickets opened in 2026, how many had CBSEs or Jira issue references?"
+
+    Only fires when the question contains pronouns or phrases that reference prior context.
+    Returns the original question unchanged if the model is not configured or no history exists.
+    """
+    if not provider or not model or not chat_history:
+        return question
+    if not _FOLLOWUP_TRIGGERS.search(question):
+        return question
+
+    # Use last 4 messages (2 turns) — enough context without token bloat
+    recent = [m for m in chat_history[-4:] if m.get("role") in ("user", "assistant")]
+    if not recent:
+        return question
+
+    history_text = "\n".join(
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: "
+        f"{(m.get('content') or '')[:600]}"
+        for m in recent
+    )
+    prompt = (
+        "Given the conversation excerpt below, rewrite the LAST USER QUESTION so it is "
+        "fully self-contained: replace pronouns and vague references ('those', 'them', "
+        "'the issues opened', 'out of those', etc.) with the explicit date ranges, "
+        "application names, ticket IDs, or other context they refer to. "
+        "If the question is already unambiguous, return it unchanged. "
+        "Return ONLY the rewritten question — no explanation, no quotes, no preamble.\n\n"
+        f"Conversation:\n{history_text}\n\n"
+        f"Last user question: {question}"
+    )
+    try:
+        rewritten = call_llm(
+            [{"role": "user", "content": prompt}],
+            provider, model, api_key, base_url,
+            max_tokens=150,
+        ).strip().strip('"\'')
+        if rewritten and rewritten.lower() != question.lower():
+            print(f"[contextualize] '{question}' → '{rewritten}'")
+            return rewritten
+    except Exception as exc:
+        print(f"[contextualize] failed: {exc}")
+    return question
+
+
 def call_llm(
     messages: list[dict],
     provider: str,
@@ -12051,9 +15174,13 @@ def call_llm(
             resp.raise_for_status()
             return resp.json()["message"]["content"]
 
-        client = _get_openai_client(
-            api_key or "lmstudio",
-            _openai_base_url(base_url, default),
+        _timeout = _openai_mod.Timeout(
+            timeout=600.0, connect=180.0
+        ) if provider == "lmstudio" else None
+        client = _openai_mod.OpenAI(
+            api_key=api_key or "lmstudio",
+            base_url=_openai_base_url(base_url, default),
+            timeout=_timeout,
         )
         kwargs: dict = {"model": model, "messages": messages, "max_tokens": max_tokens}
         # num_ctx is an Ollama-specific option; LM Studio context length is fixed at
@@ -12087,6 +15214,1384 @@ def call_llm(
 
     else:
         raise ValueError(f"Unknown LLM provider: {provider!r}")
+
+
+# ──────────────────────────── Phase 2b: Agent Tool Calling ───────────────────
+
+_AGENT_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_tickets",
+            "description": (
+                "Query support tickets from Couchbase using structured filters. "
+                "Returns a markdown table of matching tickets with key fields. "
+                "Use this to find, list, or analyze tickets matching specific criteria."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name (partial match, case-insensitive).",
+                    },
+                    "cbse_only": {
+                        "type": "boolean",
+                        "description": "If true, only return tickets that have formal CBSE bug links.",
+                    },
+                    "jira_only": {
+                        "type": "boolean",
+                        "description": "If true, only return tickets that have formal Jira issue links.",
+                    },
+                    "cbse_id": {
+                        "type": "string",
+                        "description": "Specific CBSE ID to search for (e.g. 'MB-12345'). Partial match.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["P1", "P2", "P3", "P4", "URGENT", "HIGH", "NORMAL", "LOW"],
+                        "description": "Filter by ticket priority.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "pending", "solved", "closed", "hold"],
+                        "description": "Filter by ticket status.",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "ISO date lower bound for ticket creation (e.g. '2024-01-01').",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "ISO date upper bound for ticket creation (e.g. '2024-12-31').",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Text keyword to search in subject, description, and cluster names.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of tickets to return (default 50, max 200).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_tickets",
+            "description": (
+                "Count support tickets matching the given filters. "
+                "Returns just the count. Prefer this over query_tickets when you "
+                "only need a total, not individual ticket details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {"type": "string", "description": "Customer name (partial match)."},
+                    "cbse_only": {"type": "boolean", "description": "Only tickets with formal CBSE links."},
+                    "jira_only": {"type": "boolean", "description": "Only tickets with formal Jira links."},
+                    "priority": {
+                        "type": "string",
+                        "enum": ["P1", "P2", "P3", "P4", "URGENT", "HIGH", "NORMAL", "LOW"],
+                        "description": "Filter by priority.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "pending", "solved", "closed", "hold"],
+                        "description": "Filter by status.",
+                    },
+                    "date_from": {"type": "string", "description": "ISO date lower bound."},
+                    "date_to": {"type": "string", "description": "ISO date upper bound."},
+                    "keyword": {"type": "string", "description": "Text keyword to match in subject/description."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_ticket",
+            "description": (
+                "Fetch full details for a single support ticket by its numeric ticket ID. "
+                "Returns description, comments, CBSEs, Jira issues, AI summary, data freshness, "
+                "and cluster topology from the linked snapshot — including node count, CB version, "
+                "service layout, bucket names, RAM per node, auto-failover setting, and health "
+                "(bad/warn item counts). Use this when the user asks about cluster configuration, "
+                "node count, topology, or any infrastructure details for a specific ticket."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "The numeric ticket ID (e.g. '123456').",
+                    }
+                },
+                "required": ["ticket_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_data_freshness",
+            "description": (
+                "Check how recently ticket data was scraped from Supportal. "
+                "Use this whenever the user asks about 'current', 'live', 'latest', "
+                "or 'today's' status. Returns last_scraped_at age in hours and the "
+                "Supportal Analytics URL for manual live verification."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Ticket IDs to check freshness for (from a prior query_tickets call).",
+                    },
+                },
+                "required": ["ticket_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rescrape_customer_tickets",
+            "description": (
+                "Bulk re-scrape tickets for a customer from Supportal and update Couchbase. "
+                "Use when the user asks to refresh all tickets, update stale data, or rescrape "
+                "a customer's full ticket history. By default only scrapes tickets older than 4 hours. "
+                "Runs sequentially with a short delay between requests to avoid rate-limiting. "
+                "Returns a summary of how many succeeded, failed, or were skipped."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer": {
+                        "type": "string",
+                        "description": "Customer/organization name to rescrape. Defaults to the currently scoped customer.",
+                    },
+                    "stale_hours": {
+                        "type": "number",
+                        "description": "Only rescrape tickets not updated within this many hours (default 4). Set to 0 to force-rescrape all.",
+                    },
+                    "max_tickets": {
+                        "type": "integer",
+                        "description": "Safety cap on how many tickets to rescrape in one call (default 50, max 200).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "pending", "solved", "closed", "hold"],
+                        "description": "Only rescrape tickets with this status. Leave blank for all statuses.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rescrape_ticket",
+            "description": (
+                "Re-fetch a ticket directly from Supportal Analytics and update Couchbase "
+                "with the latest status, priority, comments, and metadata. Use this when "
+                "the user wants to verify or refresh a specific ticket's current state. "
+                "Requires a valid session cookie saved in the app profile."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "The numeric ticket ID to re-scrape.",
+                    },
+                },
+                "required": ["ticket_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_chart",
+            "description": (
+                "Renders a real interactive chart in the chat UI. "
+                "MUST be called whenever the user asks for a chart, graph, bar chart, "
+                "pie chart, or any visualization — never substitute with text. "
+                "Supported types: bar, horizontal_bar, line, pie, donut. "
+                "For multi-series data pass series instead of labels+values."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chart_type": {
+                        "type": "string",
+                        "enum": ["bar", "horizontal_bar", "line", "pie", "donut"],
+                        "description": "Chart type.",
+                    },
+                    "title": {"type": "string", "description": "Chart title."},
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Category labels (x-axis for bar/line, slice names for pie).",
+                    },
+                    "values": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Numeric values — one per label. Use for single-series charts.",
+                    },
+                    "series": {
+                        "type": "array",
+                        "description": "Multi-series data. Each item: {name, data: [numbers]}.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "data": {"type": "array", "items": {"type": "number"}},
+                            },
+                        },
+                    },
+                    "x_label": {"type": "string", "description": "X-axis label (bar/line only)."},
+                    "y_label": {"type": "string", "description": "Y-axis label (bar/line only)."},
+                },
+                "required": ["chart_type", "title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_supportal_customers",
+            "description": (
+                "[LIVE / GLOBAL — hits Supportal Analytics API, not local Couchbase] "
+                "Returns every customer Supportal is aware of globally, with snapshot and "
+                "linked ticket counts. Use for questions like: 'how many customers get support?', "
+                "'what customers are in Supportal?', 'show me all customers globally', "
+                "'how many orgs does Couchbase support?'. "
+                "Do NOT use for questions about locally scraped data — use list_organizations for that. "
+                "Requires a valid session cookie in the saved profile."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["name", "snapshots", "tickets"],
+                        "description": "Sort order: alphabetical by name, by snapshot count, or by linked ticket count. Default: name.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max customers to return (default 200).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_supportal",
+            "description": (
+                "[LIVE / GLOBAL — hits Supportal Analytics API, not local Couchbase] "
+                "Run a SQL++ query against the live Supportal Analytics API. "
+                "Use for global/live questions not covered by other tools: snapshot details, "
+                "cluster configurations, version distributions, ticket-to-cluster mappings, "
+                "counts of customers/clusters/snapshots as seen by Supportal today. "
+                "Do NOT use for locally scraped ticket data — use query_tickets/count_tickets for that.\n\n"
+                "SCHEMA (scope: v1):\n"
+                "  customer   — name (string). Key: Customer::{id}\n"
+                "  cluster    — ui_name (string), customer (string, customer id). Key: Cluster::{uuid}\n"
+                "  snapshot   — timestamp (ISO string), uuid (cluster uuid), zendesk (array of int ticket IDs). Key: Snapshot::{id}\n\n"
+                "JOIN PATTERNS:\n"
+                "  cluster→customer:  JOIN customer cu ON META(cu).id = (\"Customer::\" || cl.customer)\n"
+                "  snapshot→cluster:  JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.uuid)\n"
+                "  snapshot ticket IDs: UNNEST sn.zendesk AS t_id\n\n"
+                "EXAMPLE QUERIES:\n"
+                "  All customers: SELECT name FROM customer ORDER BY name\n"
+                "  Snapshots per customer: SELECT cu.name, COUNT(*) AS snaps FROM snapshot sn "
+                "JOIN cluster cl ON META(cl).id=(\"Cluster::\"|sn.uuid) "
+                "JOIN customer cu ON META(cu).id=(\"Customer::\"|cl.customer) GROUP BY cu.name ORDER BY snaps DESC\n"
+                "  Clusters for customer: SELECT cl.ui_name FROM cluster cl "
+                "JOIN customer cu ON META(cu).id=(\"Customer::\"|cl.customer) WHERE cu.name=\"Acme Corp\"\n"
+                "  Recent snapshots: SELECT sn.timestamp, cl.ui_name FROM snapshot sn "
+                "JOIN cluster cl ON META(cl).id=(\"Cluster::\"|sn.uuid) ORDER BY sn.timestamp DESC LIMIT 20\n"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "statement": {
+                        "type": "string",
+                        "description": "The SQL++ query to execute against Supportal Analytics.",
+                    },
+                    "limit_rows": {
+                        "type": "integer",
+                        "description": "Truncate result to this many rows before returning (default 100). Add LIMIT in your SQL for best performance.",
+                    },
+                },
+                "required": ["statement"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_organizations",
+            "description": (
+                "[LOCAL — queries your configured Couchbase instance, not Supportal] "
+                "Returns every customer/organization that has tickets stored in the local "
+                "Couchbase database, with ticket counts. Use for questions like: "
+                "'what customers are you aware of?', 'what orgs do you have data for?', "
+                "'which customers have I scraped?', 'who has the most tickets locally?'. "
+                "Always exempt from customer scoping — always returns all orgs. "
+                "Do NOT use for global Supportal data — use list_supportal_customers for that."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "min_tickets": {
+                        "type": "integer",
+                        "description": "Only include organizations with at least this many tickets (default 1).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_table",
+            "description": (
+                "Renders a real data table in the chat UI with CSV and Excel download buttons. "
+                "MUST be called when the user asks for a table, spreadsheet, or list of tickets "
+                "to export — never substitute with a markdown table. "
+                "Call this before your final text so the table appears above the explanation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Table title (also used as filename)."},
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Column header names.",
+                    },
+                    "rows": {
+                        "type": "array",
+                        "description": "Data rows — each row is an array of cell values.",
+                        "items": {"type": "array", "items": {}},
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional short description shown above the table.",
+                    },
+                },
+                "required": ["title", "columns", "rows"],
+            },
+        },
+    },
+]
+
+
+_SUPPORTAL_TICKET_URL = "https://supportal.couchbase.com/zendesk/ticket/{ticket_id}"
+_SUPPORTAL_CUSTOMER_URL = "https://supportal.couchbase.com/customer/{customer}"
+
+# ── Chat artifact rendering ──────────────────────────────────────────────────
+# Fenced blocks ```echart ... ``` and ```table ... ``` are embedded in agent
+# responses and rendered as live ECharts elements or HTML tables with download
+# buttons by _render_chat.
+_ARTIFACT_RE = re.compile(r"```(echart|table)\n(.*?)\n```", re.DOTALL)
+
+
+def _build_agent_echart_option(args: dict) -> dict:
+    """Build an ECharts option dict from generate_chart tool arguments."""
+    chart_type = (args.get("chart_type") or "bar").lower()
+    title      = args.get("title") or ""
+    labels     = args.get("labels") or []
+    values     = args.get("values") or []
+    series     = args.get("series") or []
+    x_label    = args.get("x_label") or ""
+    y_label    = args.get("y_label") or ""
+
+    _CB_PALETTE = ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6",
+                   "#06B6D4","#F97316","#84CC16","#EC4899","#6B7280"]
+
+    if chart_type in ("pie", "donut"):
+        if series:
+            data = [{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
+        else:
+            data = [{"name": l, "value": v} for l, v in zip(labels, values)]
+        radius = ["40%", "70%"] if chart_type == "donut" else "60%"
+        return {
+            "title":   {"text": title, "left": "center"},
+            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+            "legend":  {"orient": "vertical", "left": "left"},
+            "color":   _CB_PALETTE,
+            "series":  [{"type": "pie", "radius": radius, "data": data,
+                         "label": {"formatter": "{b}: {c}"}}],
+        }
+
+    ec_type = "line" if chart_type == "line" else "bar"
+    if series:
+        ec_series = [{"name": s["name"], "type": ec_type, "data": s.get("data") or []}
+                     for s in series]
+        legend_data = [s["name"] for s in series]
+    else:
+        ec_series = [{"type": ec_type, "data": values}]
+        legend_data = []
+
+    cat_axis = {"type": "category", "data": labels}
+    val_axis: dict = {"type": "value"}
+    if x_label: cat_axis["name"] = x_label       # type: ignore[index]
+    if y_label: val_axis["name"] = y_label
+
+    smooth = chart_type == "line"
+    for s in ec_series:
+        if smooth:
+            s["smooth"] = True
+
+    if chart_type == "horizontal_bar":
+        return {
+            "title":   {"text": title},
+            "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+            "legend":  {"data": legend_data} if legend_data else {},
+            "color":   _CB_PALETTE,
+            "grid":    {"left": "20%"},
+            "xAxis":   val_axis,
+            "yAxis":   cat_axis,
+            "series":  ec_series,
+        }
+    return {
+        "title":   {"text": title},
+        "tooltip": {"trigger": "axis"},
+        "legend":  {"data": legend_data} if legend_data else {},
+        "color":   _CB_PALETTE,
+        "xAxis":   cat_axis,
+        "yAxis":   val_axis,
+        "series":  ec_series,
+    }
+
+
+def _agent_filters_from_args(args: dict) -> dict:
+    """Map agent tool args to the filters dict expected by tool_query_tickets."""
+    filters: dict = {}
+    if args.get("organization"):
+        filters["organization"] = args["organization"]
+    if args.get("date_from"):
+        filters["date_from"] = args["date_from"]
+    if args.get("date_to"):
+        filters["date_to"] = args["date_to"]
+    if args.get("priority"):
+        filters["priorities"] = [args["priority"].upper()]
+    if args.get("status"):
+        filters["statuses"] = [args["status"].lower()]
+    struct_kws: list[str] = []
+    if args.get("cbse_only"):
+        struct_kws.append("cbse")
+    if args.get("jira_only"):
+        struct_kws.append("jira")
+    if args.get("cbse_id"):
+        struct_kws.append(args["cbse_id"].lower())
+    if args.get("keyword"):
+        struct_kws.append(args["keyword"].lower())
+    if struct_kws:
+        filters["struct_keywords"] = struct_kws
+    return filters
+
+
+def _execute_agent_tool(
+    name: str,
+    args: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    default_customer: str = "",
+) -> str:
+    """Execute an agent tool call and return a string result for the LLM."""
+    if name == "query_tickets":
+        limit = min(int(args.get("limit") or 50), 200)
+        filters = _agent_filters_from_args(args)
+        # Auto-scope to loaded customer when LLM omits the filter
+        if default_customer and not filters.get("organization"):
+            filters["organization"] = default_customer
+        tickets = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=limit,
+        )
+        if not tickets:
+            return "No tickets found matching the given filters."
+        _now_epoch = time.time()
+        lines = [
+            "| Ticket ID | Organization | Subject | Status | Priority | Created | Last Scraped | CBSEs | Jira |",
+            "|-----------|-------------|---------|--------|----------|---------|-------------|-------|------|",
+        ]
+        for t in tickets:
+            cbses = ", ".join(t.get("cbses") or []) or "—"
+            jiras = ", ".join(t.get("jira_issues") or []) or "—"
+            subj = (t.get("subject") or "")[:55].replace("|", "/")
+            _lsa = t.get("last_scraped_at") or 0
+            _age_h = (_now_epoch - _lsa) / 3600 if _lsa else None
+            _age_str = f"{_age_h:.0f}h ago" if _age_h is not None else "unknown"
+            lines.append(
+                f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
+                f"| {t.get('status','')} | {t.get('priority','')} "
+                f"| {(t.get('created') or '')[:10]} | {_age_str} | {cbses} | {jiras} |"
+            )
+        return "\n".join(lines) + f"\n\n**Total: {len(tickets)} tickets**"
+
+    elif name == "count_tickets":
+        filters = _agent_filters_from_args(args)
+        if default_customer and not filters.get("organization"):
+            filters["organization"] = default_customer
+        tickets = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=5000,
+        )
+        return str(len(tickets))
+
+    elif name == "get_ticket":
+        ticket_id = str(args.get("ticket_id") or "").strip()
+        if not ticket_id:
+            return "Error: ticket_id is required."
+        doc_key = f"ticket::{ticket_id}"
+        tickets = fetch_tickets_by_keys(
+            [doc_key], cb_url, bucket, username, password, use_tls, scope, collection,
+        )
+        if not tickets:
+            return f"Ticket {ticket_id} not found."
+        t = tickets[0]
+        _tid = t.get("ticket_id", ticket_id)
+        _lsa = t.get("last_scraped_at") or 0
+        _age_h = (time.time() - _lsa) / 3600 if _lsa else None
+        _age_str = f"{_age_h:.1f} hours ago" if _age_h is not None else "unknown"
+        _supportal_url = _SUPPORTAL_TICKET_URL.format(ticket_id=_tid)
+        parts = [
+            f"**Ticket {_tid}** — {t.get('subject','')}",
+            f"Organization: {t.get('organization','')}",
+            f"Status: {t.get('status','')} | Priority: {t.get('priority','')}",
+            f"Created: {t.get('created','')} | Closed: {t.get('closed','')}",
+            f"Requester: {t.get('requester','')}",
+            f"**Data freshness:** last scraped {_age_str}",
+            f"**Live verification:** {_supportal_url}",
+        ]
+        cbses = t.get("cbses") or []
+        if cbses:
+            parts.append(f"CBSEs: {', '.join(cbses)}")
+        jiras = t.get("jira_issues") or []
+        if jiras:
+            parts.append(f"Jira Issues: {', '.join(jiras)}")
+        _score = t.get("score") or {}
+        clusters = _score.get("cluster_names") or []
+        if clusters:
+            parts.append(f"Clusters: {', '.join(clusters)}")
+
+        # ── Snapshot topology ────────────────────────────────────────────────
+        topo = t.get("snapshot_topology") or {}
+        if isinstance(topo, str):
+            try:
+                topo = json.loads(topo)
+            except Exception:
+                topo = {}
+        if isinstance(topo, dict) and topo:
+            topo_lines = []
+            if topo.get("cluster_name"):
+                topo_lines.append(f"  Cluster Name:    {topo['cluster_name']}")
+            if topo.get("cluster_uuid"):
+                topo_lines.append(f"  Cluster UUID:    {topo['cluster_uuid']}")
+            if topo.get("cb_version"):
+                topo_lines.append(f"  CB Version:      {topo['cb_version']}")
+            if topo.get("total_nodes"):
+                topo_lines.append(f"  Nodes:           {topo['total_nodes']}")
+            svc_parts = []
+            for svc, key in [("KV/Data", "data_nodes"), ("Index", "index_nodes"),
+                              ("Query", "query_nodes"), ("Search", "fts_nodes"),
+                              ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
+                n = topo.get(key)
+                if n:
+                    svc_parts.append(f"{svc}×{n}")
+            if svc_parts:
+                topo_lines.append(f"  Services:        {', '.join(svc_parts)}")
+            if topo.get("bucket_count"):
+                topo_lines.append(f"  Buckets:         {topo['bucket_count']}")
+            _bn = topo.get("bucket_names") or []
+            if isinstance(_bn, list) and _bn:
+                topo_lines.append(f"  Bucket Names:    {', '.join(_bn[:10])}")
+            if topo.get("ram_per_node_mib"):
+                topo_lines.append(f"  RAM/Node:        {topo['ram_per_node_mib']} MiB")
+            if topo.get("auto_failover_seconds") is not None:
+                topo_lines.append(f"  Auto-failover:   {topo['auto_failover_seconds']}s")
+            bad  = topo.get("bad_items",  topo.get("bad_count",  0)) or 0
+            warn = topo.get("warn_items", topo.get("warn_count", 0)) or 0
+            if bad or warn:
+                topo_lines.append(f"  Health:          bad={bad}  warn={warn}")
+            if topo.get("os_name"):
+                topo_lines.append(f"  OS:              {topo['os_name']}")
+            if topo_lines:
+                parts.append("\n**Cluster Topology (snapshot):**\n" + "\n".join(topo_lines))
+        elif not topo:
+            snap_ids = t.get("snap_ids") or []
+            if snap_ids:
+                parts.append(f"\n*Snapshot IDs linked: {len(snap_ids)} — topology not yet enriched.*")
+
+        summary = (t.get("summary_text") or _score.get("interaction_summary") or "").strip()
+        if summary:
+            parts.append(f"\n**Summary:**\n{summary}")
+        desc = (t.get("description") or "")[:2000]
+        if desc:
+            parts.append(f"\n**Description:**\n{desc}")
+        comments = t.get("comments") or []
+        if comments:
+            parts.append(f"\n**Comments ({len(comments)}):**")
+            for c in comments[:5]:
+                author = c.get("author", {})
+                author_name = author.get("name", "") if isinstance(author, dict) else str(author)
+                body = (c.get("body") or c.get("plain_body") or "")[:500]
+                parts.append(f"  [{author_name}]: {body}")
+        return "\n".join(parts)
+
+    elif name == "check_data_freshness":
+        ticket_ids = args.get("ticket_ids") or []
+        if not ticket_ids:
+            return "No ticket IDs provided."
+        if not _CB_AVAILABLE:
+            return "Couchbase not available."
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator  # type: ignore
+            from couchbase.options import QueryOptions  # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            cluster.wait_until_ready(timedelta(seconds=10))
+            keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+            phs = ", ".join(f"${i+1}" for i in range(len(ticket_ids)))
+            rows = list(cluster.query(
+                f"SELECT ticket_id, status, last_scraped_at "
+                f"FROM {keyspace} WHERE ticket_id IN [{phs}]",
+                QueryOptions(positional_parameters=[str(t) for t in ticket_ids],
+                             timeout=timedelta(seconds=15)),
+            ))
+            cluster.close()
+        except Exception as exc:
+            return f"Freshness check failed: {exc}"
+
+        _now = time.time()
+        lines = [
+            "| Ticket ID | Status (local) | Last Scraped | Age | Verify Live |",
+            "|-----------|---------------|-------------|-----|------------|",
+        ]
+        for r in rows:
+            _lsa = r.get("last_scraped_at") or 0
+            _age_h = (_now - _lsa) / 3600 if _lsa else None
+            _age_str = f"{_age_h:.1f}h" if _age_h is not None else "unknown"
+            _stale = "⚠️ STALE" if (_age_h or 0) > 4 else "✓ fresh"
+            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=r.get("ticket_id", ""))
+            lines.append(
+                f"| {r.get('ticket_id','')} | {r.get('status','')} "
+                f"| {_age_str} ago | {_stale} | {_url} |"
+            )
+        result = "\n".join(lines)
+        stale_count = sum(1 for r in rows if ((_now - (r.get("last_scraped_at") or 0)) / 3600) > 4)
+        if stale_count:
+            result += (
+                f"\n\n⚠️ {stale_count}/{len(rows)} tickets have data older than 4 hours. "
+                f"Use rescrape_ticket to refresh individual tickets, or click the Verify Live "
+                f"links above to check current status on Supportal directly."
+            )
+        else:
+            result += f"\n\n✓ All {len(rows)} tickets have fresh data (scraped within 4 hours)."
+        return result
+
+    elif name == "rescrape_customer_tickets":
+        cust        = (args.get("customer") or default_customer or "").strip()
+        stale_hours = float(args.get("stale_hours") if args.get("stale_hours") is not None else 4.0)
+        max_tix     = min(int(args.get("max_tickets") or 50), 200)
+        status_filt = (args.get("status") or "").strip().lower() or None
+
+        cookie = _get_profile_cookie()
+        if not cookie:
+            return "No session cookie in saved profile — paste a fresh cookie in the Auth tab."
+
+        # Gather candidate ticket IDs from CB
+        filters: dict = {}
+        if cust and cust.lower() != "all customers":
+            filters["organization"] = cust
+        if status_filt:
+            filters["status"] = status_filt
+
+        candidates = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=max_tix * 4,
+        )
+        if not candidates:
+            return f"No tickets found in Couchbase for {cust or 'all customers'}."
+
+        # Filter to stale tickets
+        now_epoch = time.time()
+        stale_cutoff = now_epoch - stale_hours * 3600
+        if stale_hours > 0:
+            to_scrape = [
+                t for t in candidates
+                if (t.get("last_scraped_at") or 0) < stale_cutoff
+            ]
+        else:
+            to_scrape = list(candidates)
+
+        to_scrape = to_scrape[:max_tix]
+        if not to_scrape:
+            return (
+                f"All {len(candidates)} tickets for {cust or 'all customers'} "
+                f"were scraped within the last {stale_hours:.0f} hours — nothing to update."
+            )
+
+        # Connect to CB once for all writes
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator        # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            _bcluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            _bcluster.wait_until_ready(timedelta(seconds=10))
+            _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
+        except Exception as exc:
+            return f"Couchbase connection failed: {exc}"
+
+        ok = skipped = errors = 0
+        error_samples: list[str] = []
+
+        for t in to_scrape:
+            tid = str(t.get("ticket_id") or "").strip()
+            if not tid:
+                skipped += 1
+                continue
+            try:
+                fresh = scrape_single_ticket_cookie(cookie, tid)
+                if not fresh or not fresh.get("ticket_id"):
+                    skipped += 1
+                    continue
+                fresh["last_scraped_at"] = int(time.time())
+                fresh["type"] = "ticket"
+                doc_key = f"ticket::{tid}"
+                try:
+                    existing = _bcol.get(doc_key).content_as[dict]
+                    merged = {**existing}
+                    for k, v in fresh.items():
+                        if v not in (None, "", [], {}):
+                            merged[k] = v
+                    _bcol.upsert(doc_key, merged)
+                except Exception:
+                    _bcol.upsert(doc_key, fresh)
+                ok += 1
+            except Exception as exc:
+                errors += 1
+                if len(error_samples) < 3:
+                    error_samples.append(f"  ticket {tid}: {exc}")
+            time.sleep(0.35)  # ~3 req/s — stay well under rate limits
+
+        try:
+            _bcluster.close()
+        except Exception:
+            pass
+
+        parts = [
+            f"Bulk rescrape complete for **{cust or 'all customers'}**.",
+            f"- Scraped: {ok} tickets updated",
+            f"- Skipped: {skipped} (no ticket ID)",
+            f"- Errors:  {errors}",
+        ]
+        if error_samples:
+            parts.append("Sample errors:\n" + "\n".join(error_samples))
+        if errors and cookie:
+            parts.append("If errors persist the session cookie may have expired — paste a fresh one in the Auth tab.")
+        return "\n".join(parts)
+
+    elif name == "rescrape_ticket":
+        ticket_id = str(args.get("ticket_id") or "").strip()
+        if not ticket_id:
+            return "Error: ticket_id is required."
+
+        # Read session cookie from saved app profile
+        cookie = ""
+        try:
+            _settings = _load_settings_file()
+            _active = _settings.get("__last__", "")
+            _prof = _settings.get(_active, {}) if _active else {}
+            cookie = _prof.get("cookie", "")
+        except Exception as _pe:
+            print(f"[rescrape_ticket] profile read failed: {_pe}")
+
+        if not cookie:
+            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+            return (
+                f"No session cookie found in saved profile — cannot scrape automatically.\n"
+                f"Verify manually: {_url}"
+            )
+
+        # Scrape fresh data from Supportal
+        try:
+            fresh = scrape_single_ticket_cookie(cookie, ticket_id)
+        except Exception as exc:
+            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+            return (
+                f"Scrape failed ({exc}). Session cookie may have expired.\n"
+                f"Verify manually: {_url}"
+            )
+
+        if not fresh or not fresh.get("ticket_id"):
+            return f"Scrape returned no data for ticket {ticket_id}."
+
+        if fresh.get("_deleted"):
+            # Persist the deletion marker so future incremental scrapes skip it
+            doc_key = f"ticket::{ticket_id}"
+            try:
+                from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+                from couchbase.auth import PasswordAuthenticator  # type: ignore
+                from datetime import timedelta
+                conn_str = _cb_conn_str(cb_url, use_tls)
+                cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+                cluster.wait_until_ready(timedelta(seconds=10))
+                col = cluster.bucket(bucket).scope(scope).collection(collection)
+                try:
+                    existing = col.get(doc_key).content_as[dict]
+                    existing["_deleted"] = True
+                    existing["last_scraped_at"] = int(time.time())
+                    col.upsert(doc_key, existing)
+                except Exception:
+                    col.upsert(doc_key, {
+                        "ticket_id": ticket_id, "_deleted": True, "type": "ticket",
+                        "last_scraped_at": int(time.time()),
+                    })
+                cluster.close()
+            except Exception as _de:
+                print(f"[rescrape_ticket] failed to persist deletion marker: {_de}")
+            return f"Ticket {ticket_id} has been deleted on Supportal — marked in Couchbase, will be skipped in future scrapes."
+
+        fresh["last_scraped_at"] = int(time.time())
+        fresh["type"] = "ticket"
+        doc_key = f"ticket::{ticket_id}"
+
+        # ── Inline snapshot topology enrichment ──────────────────────────────
+        # Attempt before the CB write so topology lands in the same upsert.
+        topo_enriched = False
+        _snaps_raw = fresh.get("snapshots")
+        _snaps_str = _snaps_raw if isinstance(_snaps_raw, str) else ""
+        snap_ids_found = _SNAP_ID_RE.findall(_snaps_str)
+        if not snap_ids_found:
+            snap_ids_found = _UUID_RE.findall(_snaps_str)
+        if snap_ids_found:
+            fresh["snap_ids"] = list(dict.fromkeys(snap_ids_found))  # dedup, preserve order
+            best_snap = _highest_snap_id(snap_ids_found)
+            try:
+                topo = fetch_snapshot_topology(best_snap, cookie=cookie)
+                if topo:
+                    fresh["snapshot_topology"] = topo
+                    topo_enriched = True
+                    print(f"[rescrape_ticket] topology enriched from snap {best_snap[:16]}…")
+            except Exception as _te:
+                print(f"[rescrape_ticket] topology fetch failed for {best_snap}: {_te}")
+
+        # ── Merge onto existing CB doc (preserve score, embedding, etc.) ─────
+        _saved = False
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator  # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            cluster.wait_until_ready(timedelta(seconds=10))
+            col = cluster.bucket(bucket).scope(scope).collection(collection)
+            try:
+                existing = col.get(doc_key).content_as[dict]
+                # Start from existing; let fresh override, but skip None/empty fresh values
+                # so immutable fields (created, organization, requester) are never wiped.
+                merged = {**existing}
+                for _k, _v in fresh.items():
+                    if _v is not None and _v != "" and _v != [] and _v != {}:
+                        merged[_k] = _v
+                    elif _k not in merged:
+                        merged[_k] = _v  # key is new — write even if null
+            except Exception:
+                merged = fresh  # doc doesn't exist yet — insert as-is
+            col.upsert(doc_key, merged)
+            cluster.close()
+            fresh = merged  # use merged for summary output
+            _saved = True
+        except Exception as exc:
+            print(f"[rescrape_ticket] CB upsert failed: {exc}")
+
+        _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+        summary_lines = [
+            f"**Ticket {ticket_id} re-scraped from Supportal** {'(saved to CB ✓)' if _saved else '(CB save failed ✗)'}",
+            f"Status: {fresh.get('status','')} | Priority: {fresh.get('priority','')}",
+            f"Subject: {fresh.get('subject','')}",
+            f"Created: {fresh.get('created','')} | Closed: {fresh.get('closed','')}",
+            f"Scraped at: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+            f"Supportal URL: {_url}",
+        ]
+        cbses = fresh.get("cbses") or []
+        if cbses:
+            summary_lines.append(f"CBSEs: {', '.join(cbses)}")
+        jiras = fresh.get("jira_issues") or []
+        if jiras:
+            summary_lines.append(f"Jira Issues: {', '.join(jiras)}")
+        topo = fresh.get("snapshot_topology") or {}
+        if isinstance(topo, dict) and topo:
+            topo_note = []
+            if topo.get("cluster_name"):  topo_note.append(f"cluster={topo['cluster_name']}")
+            if topo.get("cb_version"):    topo_note.append(f"CB={topo['cb_version']}")
+            if topo.get("total_nodes"):   topo_note.append(f"nodes={topo['total_nodes']}")
+            bad  = topo.get("bad_items",  topo.get("bad_count",  0)) or 0
+            warn = topo.get("warn_items", topo.get("warn_count", 0)) or 0
+            if bad or warn:               topo_note.append(f"bad={bad} warn={warn}")
+            if topo_note:
+                src = " (freshly enriched)" if topo_enriched else " (from prior enrichment)"
+                summary_lines.append(f"Topology{src}: {', '.join(topo_note)}")
+        return "\n".join(summary_lines)
+
+    elif name == "list_supportal_customers":
+        sort_by = (args.get("sort_by") or "name").lower()
+        limit   = min(int(args.get("limit") or 200), 500)
+        cookie  = _get_profile_cookie()
+        if not cookie:
+            return (
+                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
+                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
+            )
+        try:
+            order = {"snapshots": "snaps DESC", "tickets": "tickets DESC"}.get(sort_by, "cu_name ASC")
+            statement = f"""
+SELECT cu.`name` AS cu_name,
+       COUNT(DISTINCT META(sn).id) AS snaps,
+       COUNT(DISTINCT t_id)        AS tickets
+FROM snapshot sn
+UNNEST sn.`zendesk` AS t_id
+JOIN cluster cl ON META(cl).id = ("Cluster::" || sn.`uuid`)
+JOIN customer cu ON META(cu).id = ("Customer::" || cl.`customer`)
+GROUP BY cu.`name`
+ORDER BY {order}
+LIMIT {limit}
+""".strip()
+            rows = query_supportal_analytics(statement, cookie)
+        except Exception as exc:
+            return f"Supportal Analytics error: {exc}"
+        if not rows:
+            return "No customers returned from Supportal Analytics."
+        lines = [f"**{len(rows)} customers in Supportal Analytics:**", ""]
+        for r in rows:
+            name_  = r.get("cu_name", "")
+            snaps  = r.get("snaps", 0)
+            tix    = r.get("tickets", 0)
+            lines.append(f"- **{name_}** — {snaps} snapshot{'s' if snaps != 1 else ''}, {tix} linked ticket{'s' if tix != 1 else ''}")
+        return "\n".join(lines)
+
+    elif name == "query_supportal":
+        statement  = (args.get("statement") or "").strip()
+        limit_rows = min(int(args.get("limit_rows") or 100), 500)
+        if not statement:
+            return "Error: statement is required."
+        cookie = _get_profile_cookie()
+        if not cookie:
+            return (
+                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
+                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
+            )
+        try:
+            rows = query_supportal_analytics(statement, cookie)
+        except Exception as exc:
+            return f"Supportal Analytics query error: {exc}"
+        if not rows:
+            return "Query returned no results."
+        rows = rows[:limit_rows]
+        # Format as markdown table
+        if not isinstance(rows[0], dict):
+            return "\n".join(str(r) for r in rows)
+        cols = list(rows[0].keys())
+        header = "| " + " | ".join(cols) + " |"
+        sep    = "| " + " | ".join("---" for _ in cols) + " |"
+        body   = "\n".join(
+            "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
+            for r in rows
+        )
+        return f"{header}\n{sep}\n{body}\n\n**{len(rows)} row(s) returned**"
+
+    elif name == "list_organizations":
+        min_tickets = max(1, int(args.get("min_tickets") or 1))
+        if not _CB_AVAILABLE:
+            return "Couchbase not available."
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator  # type: ignore
+            from couchbase.options import QueryOptions  # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            cluster.wait_until_ready(timedelta(seconds=10))
+            keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+            rows = list(cluster.query(
+                f"SELECT organization, COUNT(*) AS ticket_count "
+                f"FROM {keyspace} "
+                f"WHERE organization IS NOT MISSING AND organization != '' "
+                f"GROUP BY organization "
+                f"HAVING COUNT(*) >= {min_tickets} "
+                f"ORDER BY organization ASC",
+                QueryOptions(timeout=timedelta(seconds=30)),
+            ))
+            cluster.close()
+        except Exception as exc:
+            return f"list_organizations failed: {exc}"
+        if not rows:
+            return "No organizations found in the database."
+        lines = [f"**{len(rows)} organizations in Couchbase:**", ""]
+        for r in rows:
+            lines.append(f"- **{r['organization']}** ({r['ticket_count']} ticket{'s' if r['ticket_count'] != 1 else ''})")
+        return "\n".join(lines)
+
+    elif name == "generate_chart":
+        opt = _build_agent_echart_option(args)
+        # Return a fenced ```echart block — _render_chat renders it as a live ui.echart
+        return "```echart\n" + json.dumps(opt, ensure_ascii=False) + "\n```"
+
+    elif name == "generate_table":
+        title       = args.get("title") or "Table"
+        columns     = args.get("columns") or []
+        rows        = args.get("rows") or []
+        description = args.get("description") or ""
+        payload = {"title": title, "columns": columns, "rows": rows}
+        if description:
+            payload["description"] = description
+        return "```table\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+
+    else:
+        return f"Unknown tool: {name}"
+
+
+# Regex patterns for text-encoded tool calls that some local models emit
+# in message content instead of the proper tool_calls JSON field.
+_TC_PATTERNS = [
+    # Qwen/LMStudio native: <|tool_call>call:name{...}<tool_call|>
+    re.compile(r"<\|tool_call\>call:(\w+)\s*(\{.*?\})\s*<tool_call\|>", re.DOTALL),
+    # Hermes / ChatML: <tool_call>{"name":"...","arguments":{...}}</tool_call>
+    re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL),
+    # Qwen3 formal: <|tool_call|>{...}<|/tool_call|>
+    re.compile(r"<\|tool_call\|>\s*(\{.*?\})\s*<\|/tool_call\|>", re.DOTALL),
+]
+
+
+def _extract_text_tool_calls(content: str) -> list[tuple[str, dict]]:
+    """
+    Parse text-encoded tool calls from model content.
+    Returns [(tool_name, args_dict), ...] for each detected call.
+    Falls back to empty list if nothing parseable is found.
+    """
+    import json as _j, re as _re
+
+    results: list[tuple[str, dict]] = []
+
+    def _try_parse_args(raw: str) -> dict:
+        """Best-effort JSON parse with light cleanup for common model quirks."""
+        raw = raw.strip()
+        # Replace <|"|> (Qwen string-escape artifact) with real quotes
+        raw = raw.replace("<|\"|\">", '"').replace('<|"|>', '"')
+        try:
+            return _j.loads(raw)
+        except Exception:
+            pass
+        # Try quoting unquoted keys: {Ticket ID: 123} → {"Ticket ID": 123}
+        fixed = _re.sub(r'([{,])\s*([A-Za-z_][A-Za-z0-9_ ]*)\s*:', r'\1"\2":', raw)
+        try:
+            return _j.loads(fixed)
+        except Exception:
+            return {}
+
+    for pat in _TC_PATTERNS:
+        for m in pat.finditer(content):
+            groups = m.groups()
+            if len(groups) == 2 and not groups[0].startswith("{"):
+                # Pattern 1: (name, args_block)
+                name, args_raw = groups[0].strip(), groups[1]
+                args = _try_parse_args(args_raw)
+                results.append((name, args))
+            else:
+                # Patterns 2/3: single JSON blob with name + arguments
+                blob = _try_parse_args(groups[0])
+                if "name" in blob:
+                    results.append((blob["name"], blob.get("arguments") or blob.get("args") or {}))
+
+    return results
+
+
+def _normalise_tool_args(name: str, args: dict) -> dict:
+    """
+    Fix common arg-format mismatches from models that don't follow the schema.
+    generate_table: model may pass data=[{col:val,...}] instead of columns+rows.
+    generate_chart: model may pass data=[...] instead of labels+values.
+    """
+    if name == "generate_table":
+        if "data" in args and not args.get("columns") and not args.get("rows"):
+            data = args["data"]
+            if isinstance(data, list) and data:
+                if isinstance(data[0], dict):
+                    cols = list(data[0].keys())
+                    rows = [[str(row.get(c, "")) for c in cols] for row in data]
+                    args = {**args, "columns": cols, "rows": rows}
+    if name == "generate_chart":
+        if "data" in args and not args.get("values") and not args.get("series"):
+            data = args["data"]
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                keys = list(data[0].keys())
+                if len(keys) >= 2:
+                    args = {**args,
+                            "labels": [str(row.get(keys[0], "")) for row in data],
+                            "values": [float(row.get(keys[1], 0) or 0) for row in data]}
+    return args
+
+
+def call_llm_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    provider: str, model: str, api_key: str, base_url: str,
+    max_tokens: int = 8192,
+    max_rounds: int = 5,
+    default_customer: str = "",
+) -> str:
+    """
+    Agentic tool-calling loop. Sends messages + tools to the LLM, executes
+    any tool calls, appends results, and loops until the model produces a
+    final text answer or max_rounds is reached.
+
+    OpenAI-compatible function calling: lmstudio, ollama, openai, gemini.
+    Native Anthropic tool use: claude (requires anthropic package).
+    All others: falls back to plain call_llm (no tools).
+    """
+    import json as _json
+    import traceback as _tb
+
+    # ── Artifact stash shared by all provider paths ──────────────────────────
+    # generate_chart / generate_table return echart/table fenced blocks.
+    # Models often write prose as their final turn instead of echoing the block,
+    # so we collect every artifact produced by tool execution and prepend it to
+    # whatever text the model returns as its final answer.
+    _artifact_stash: list[str] = []
+
+    def _collect_artifact(result: str) -> None:
+        if "```echart" in result or "```table" in result:
+            _artifact_stash.append(result)
+
+    def _apply_stash(content: str) -> str:
+        prefix_parts = [a for a in _artifact_stash if a not in content]
+        if not prefix_parts:
+            return content
+        return "\n\n".join(prefix_parts) + ("\n\n" + content if content else "")
+
+    _openai_compat_providers = ("lmstudio", "ollama", "openai", "gemini")
+
+    if provider in _openai_compat_providers:
+        _base = (base_url or "").rstrip("/")
+        if provider == "lmstudio":
+            _base = _base or "http://localhost:1234/v1"
+            if not _base.endswith("/v1"):
+                _base += "/v1"
+        elif provider == "ollama":
+            _base = _base or "http://localhost:11434/v1"
+            if not _base.endswith("/v1"):
+                _base += "/v1"
+        elif provider == "gemini":
+            _base = _base or "https://generativelanguage.googleapis.com/v1beta/openai"
+
+        import openai as _oai
+        print(f"[agent] base_url={_base!r}  → will POST to {_base}/chat/completions")
+        client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
+
+        def _safe_choice(r):
+            """Return the first choice or raise with a clear diagnostic."""
+            choices = getattr(r, "choices", None)
+            if not choices:
+                _err = getattr(r, "error", None)
+                print(f"[agent] EMPTY choices — raw resp: {r!r}")
+                if _err:
+                    raise RuntimeError(
+                        f"LMStudio rejected the request: {_err}\n"
+                        "To fix: in LMStudio → select your model → Server tab → "
+                        "enable 'Tool Use' (function calling) → restart server."
+                    )
+                raise RuntimeError(
+                    "LLM returned no choices — model may not support function calling. "
+                    "In LMStudio: select model → Server tab → enable 'Tool Use' → restart."
+                )
+            return choices[0]
+
+        _msgs: list[dict] = list(messages)
+        _tool_calls_made = False
+
+        try:
+            for _round in range(max_rounds):
+                print(f"[agent] round={_round} msgs={len(_msgs)} tools_active={not _tool_calls_made}")
+                # Per LMStudio docs: after tool results are in the history,
+                # send the final request WITHOUT tools so the model writes
+                # a natural-language answer rather than calling more tools.
+                _req_tools = tools if not _tool_calls_made else None
+                _kwargs: dict = {"model": model, "messages": _msgs, "max_tokens": max_tokens}
+                if _req_tools:
+                    _kwargs["tools"] = _req_tools
+                resp = client.chat.completions.create(**_kwargs)
+                choice = _safe_choice(resp)
+                _tc_count = len(choice.message.tool_calls) if choice.message.tool_calls else 0
+                print(f"[agent] finish_reason={choice.finish_reason!r} "
+                      f"tool_calls_count={_tc_count} "
+                      f"content={repr((choice.message.content or '')[:120])}")
+
+                # Check tool_calls first — some models return finish_reason='stop'
+                # even when they've made tool calls (Gemma, some Qwen variants).
+                if not choice.message.tool_calls:
+                    _raw_content = choice.message.content or ""
+                    # Detect text-encoded tool calls in content (Qwen/Hermes/LMStudio
+                    # native formats that bypass the tool_calls field entirely).
+                    _text_calls = _extract_text_tool_calls(_raw_content)
+                    if not _text_calls:
+                        # Strip any residual noise from prior rounds before returning
+                        for _tp in _TC_PATTERNS:
+                            _raw_content = _tp.sub("", _raw_content).strip()
+                        return _apply_stash(_raw_content)
+
+                    # Execute each text-encoded tool call and inject results
+                    print(f"[agent] detected {len(_text_calls)} text-encoded tool call(s) in content — executing and retrying")
+                    _msgs.append({"role": "assistant", "content": _raw_content})
+                    for _tc_name, _tc_args in _text_calls:
+                        _tc_args = _normalise_tool_args(_tc_name, _tc_args)
+                        print(f"[agent] text-call executing tool={_tc_name!r} args_keys={list(_tc_args.keys())}")
+                        _tc_result = _execute_agent_tool(
+                            _tc_name, _tc_args,
+                            cb_url, bucket, username, password, use_tls, scope, collection,
+                            default_customer=default_customer,
+                        )
+                        print(f"[agent] text-call result length={len(_tc_result)}")
+                        _collect_artifact(_tc_result)
+                        # Inject as a user-visible tool result so the model can reference it
+                        _msgs.append({"role": "user", "content": f"[Tool result for {_tc_name}]:\n{_tc_result}"})
+                    _tool_calls_made = True
+                    continue  # retry: model will now write a clean final response
+
+                # Build assistant turn dict — omit content when null (matches LMStudio format)
+                _tool_calls_serial = []
+                for tc in choice.message.tool_calls:
+                    _fn = getattr(tc, "function", None)
+                    if _fn is None:
+                        print(f"[agent] WARNING: tool_call {tc!r} has no .function, skipping")
+                        continue
+                    print(f"[agent] serializing tool_call: name={_fn.name!r} id={tc.id!r}")
+                    _tool_calls_serial.append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": _fn.name, "arguments": _fn.arguments or "{}"},
+                    })
+                _asst_msg: dict = {"role": "assistant", "tool_calls": _tool_calls_serial}
+                if choice.message.content:
+                    _asst_msg["content"] = choice.message.content
+                _msgs.append(_asst_msg)
+
+                for tc in choice.message.tool_calls:
+                    _fn = getattr(tc, "function", None)
+                    if _fn is None:
+                        continue
+                    try:
+                        _args = _json.loads(_fn.arguments or "{}")
+                    except _json.JSONDecodeError:
+                        _args = {}
+                    print(f"[agent] executing tool={_fn.name!r} args={_args}")
+                    result = _execute_agent_tool(
+                        _fn.name, _args,
+                        cb_url, bucket, username, password, use_tls, scope, collection,
+                        default_customer=default_customer,
+                    )
+                    print(f"[agent] tool result length={len(result)}")
+                    _collect_artifact(result)
+                    _msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+                _tool_calls_made = True  # next round: no tools in request
+
+            # Exhausted rounds — final answer without tools
+            resp = client.chat.completions.create(
+                model=model, messages=_msgs, max_tokens=max_tokens,
+            )
+            _final = _safe_choice(resp)
+            _final_content = _final.message.content or ""
+            # Strip any residual text-encoded tool call blocks from the output
+            for _tp in _TC_PATTERNS:
+                _final_content = _tp.sub("", _final_content).strip()
+            return _apply_stash(_final_content)
+
+        except Exception:
+            _tb.print_exc()
+            raise
+
+    elif provider == "claude":
+        try:
+            import anthropic as _ant
+        except ImportError:
+            raise RuntimeError("anthropic package not installed — pip install anthropic")
+
+        _ant_client = _ant.Anthropic(api_key=api_key or "")
+        # Convert OpenAI-format tools → Anthropic format
+        _ant_tools = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"]["description"],
+                "input_schema": t["function"]["parameters"],
+            }
+            for t in tools
+        ]
+        _sys = next((m["content"] for m in messages if m["role"] == "system"), "")
+        _conv = [m for m in messages if m["role"] != "system"]
+
+        for _round in range(max_rounds):
+            resp = _ant_client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=_sys,
+                messages=_conv,
+                tools=_ant_tools,
+            )
+            if resp.stop_reason == "end_turn":
+                return _apply_stash(next((b.text for b in resp.content if hasattr(b, "text")), ""))
+
+            tool_use_blocks = [b for b in resp.content if b.type == "tool_use"]
+            if not tool_use_blocks:
+                return _apply_stash(next((b.text for b in resp.content if hasattr(b, "text")), ""))
+
+            _conv.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for tb in tool_use_blocks:
+                _args = tb.input if isinstance(tb.input, dict) else {}
+                print(f"[agent/claude] tool={tb.name} args={_args}")
+                result = _execute_agent_tool(
+                    tb.name, _args,
+                    cb_url, bucket, username, password, use_tls, scope, collection,
+                    default_customer=default_customer,
+                )
+                _collect_artifact(result)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tb.id,
+                    "content": result,
+                })
+            _conv.append({"role": "user", "content": tool_results})
+
+        _final_text = next(
+            (b.text for b in resp.content if hasattr(b, "text")), ""
+        ) if resp else ""
+        return _apply_stash(_final_text) or "Max tool-calling rounds reached without a final answer."
+
+    else:
+        # Bedrock or unknown — strip tools and fall back to plain call_llm
+        return call_llm(messages, provider, model, api_key, base_url, max_tokens)
 
 
 # ─────────────────────────── Phase 3: Scoring & Analytics ────────────────────
@@ -12125,7 +16630,7 @@ Schema per object:
   "complexity": <1-5>,
   "complexity_reason": "<one sentence>",
   "sentiment_summary": "<one sentence customer experience summary>",
-  "interaction_summary": "<2-4 sentence technical summary: the problem reported, key investigation findings or root cause, resolution outcome, and any notable patterns (recurring issue, escalation, workaround). Include specific CB component names, error types, version numbers, and resolution steps so this field is useful for semantic search.>"
+  "interaction_summary": "<2-4 sentence technical summary: who reported the issue (requester), when it was opened and closed, the application and cluster(s) affected, the problem reported, key investigation findings or root cause, resolution outcome, and any notable patterns (recurring issue, escalation, workaround). Include specific CB component names, error types, version numbers, and resolution steps so this field is useful for semantic search.>"
 }
 
 Definitions:
@@ -12138,12 +16643,13 @@ Definitions:
   complexity          — technical difficulty and scope (1=trivial how-to, 5=multi-team production incident)
   complexity_reason   — brief justification for complexity score
   sentiment_summary   — one-sentence description of the customer's experience
-  interaction_summary — 2-4 sentence technical narrative of the ticket: problem, investigation, resolution, patterns
+  interaction_summary — 2-4 sentence technical narrative: who reported, when opened/closed, app + clusters affected, problem, investigation, resolution, patterns
 
 --- FEW-SHOT EXAMPLES ---
 
 === TICKET_ID: EXAMPLE-A ===
   ID: EXAMPLE-A | Priority: normal | Status: solved | Comments: 2 | Escalations: none
+  Requester: jsmith@example.com | Created: 2025-03-01 | Closed: 2025-03-01
   Subject: How do I enable SSL for Python SDK connection to Capella
   Description: Customer asking for SSL configuration steps for the Python SDK.
   Last comment: "Thank you, the certificate configuration worked perfectly."
@@ -12153,13 +16659,16 @@ Output:
   "response_timeliness":5,"communication_clarity":5,"complexity":1,
   "complexity_reason":"Simple how-to answered in a single exchange.",
   "sentiment_summary":"Customer received a clear, immediate answer and confirmed success.",
-  "interaction_summary":"Customer asked how to configure SSL/TLS for a Python SDK connection to Capella. Support provided certificate configuration steps in a single exchange. Customer confirmed the solution worked immediately. No escalation or follow-up required."}]
+  "interaction_summary":"jsmith@example.com opened ticket on 2025-03-01 and it was closed the same day. No cluster or application specified. Customer asked how to configure SSL/TLS for a Python SDK connection to Capella. Support provided certificate configuration steps in a single exchange and customer confirmed success. No escalation required."}]
 
 ---
 
 === TICKET_ID: EXAMPLE-B ===
   ID: EXAMPLE-B | Priority: urgent | Status: solved | Comments: 18 | Escalations: ESC-441, ESC-442
+  Requester: ops-team@acme.com | Created: 2025-01-10 | Closed: 2025-01-31
   Subject: Production cluster completely unresponsive — possible data loss after failover
+  Application: PAYMENTS
+  Clusters: prod-cbec-node01
   Description: Customer reports all nodes showing as failed, application fully down since 2am.
   Last comment: "We finally recovered but this took 3 weeks and we lost confidence in the product."
 
@@ -12168,7 +16677,7 @@ Output:
   "response_timeliness":1,"communication_clarity":3,"complexity":5,
   "complexity_reason":"Multi-node production failure with data loss risk requiring two escalations and three weeks to resolve.",
   "sentiment_summary":"Customer experienced a prolonged critical outage and left the engagement with significantly damaged confidence.",
-  "interaction_summary":"Customer reported all Couchbase nodes showing as failed after an overnight failover event, with full application downtime and potential data loss. Investigation spanned multiple escalations (ESC-441, ESC-442) involving the engineering team to diagnose the root cause of the cluster-wide failure. Recovery was achieved after three weeks but without a definitive permanent fix. Customer expressed serious loss of confidence in product reliability."}]
+  "interaction_summary":"ops-team@acme.com opened on 2025-01-10 for the PAYMENTS application (cluster prod-cbec-node01); resolved 2025-01-31 (21 days). All Couchbase nodes reported as failed after an overnight failover event causing full application downtime and potential data loss. Two escalations (ESC-441, ESC-442) engaged engineering to diagnose the cluster-wide failure. Recovery was achieved but without a definitive permanent fix, leaving the customer with seriously damaged confidence."}]
 
 ---
 
@@ -12204,7 +16713,10 @@ Output:
 
 === TICKET_ID: EXAMPLE-E ===
   ID: EXAMPLE-E | Priority: high | Status: open | Comments: 12 | Escalations: ESC-389
+  Requester: admin@bigcorp.com | Created: 2025-08-15 | Closed: open
   Subject: Memory usage climbing indefinitely on analytics nodes — 4th report this year
+  Application: ANALYTICS-PLATFORM
+  Clusters: analytics-cbec-prod01
   Description: Customer has opened tickets about this exact issue in January, April, and July.
   Last comment: "This is the same problem again. We keep reporting it and nothing changes permanently."
 
@@ -12213,7 +16725,7 @@ Output:
   "response_timeliness":2,"communication_clarity":2,"complexity":4,
   "complexity_reason":"Recurring memory leak affecting analytics nodes with no permanent fix across four separate tickets.",
   "sentiment_summary":"Customer is visibly frustrated by the same unresolved issue recurring repeatedly with no lasting resolution.",
-  "interaction_summary":"Customer reported indefinitely climbing memory usage on Couchbase Analytics nodes, the fourth occurrence of this issue in the same year (previously reported in January, April, and July). ESC-389 was opened. Each prior ticket resulted in a temporary fix or restart, but no root cause was identified or permanently resolved. The customer expressed strong frustration and lack of confidence in the support process for this recurring analytics memory leak."}]
+  "interaction_summary":"admin@bigcorp.com opened on 2025-08-15 (still open) for ANALYTICS-PLATFORM (cluster analytics-cbec-prod01). Indefinitely climbing memory usage on Couchbase Analytics nodes — fourth occurrence this year (January, April, July, and August). ESC-389 was opened. Each prior ticket resulted in a temporary fix or restart with no permanent root-cause resolution. Customer expressed strong frustration and loss of confidence in the support process."}]
 
 --- END EXAMPLES ---
 
@@ -12260,7 +16772,8 @@ def extract_cluster_snapshot_info(ticket: dict) -> dict:
       snapshot_count    int        — number of discrete snapshot entries
       last_snapshot_id  str|None   — last snapshot ID ({32hex}::N format)
     """
-    snapshots_raw   = ticket.get("snapshots") or ""
+    _sv0 = ticket.get("snapshots")
+    snapshots_raw   = _sv0 if isinstance(_sv0, str) else ""
     fields_raw      = ticket.get("ticket_fields") or {}
     if isinstance(fields_raw, str):
         try:
@@ -12318,13 +16831,16 @@ def extract_cluster_snapshot_info(ticket: dict) -> dict:
         # split on commas, "and", semicolons
         parts = re.split(r"[,;]\s*|\s+and\s+", raw_list, flags=re.IGNORECASE)
         for part in parts:
-            name = part.strip().rstrip(".")
-            if name and name not in cluster_names:
+            name = re.sub(r'[^a-zA-Z0-9\-_]+$', '', part.strip())
+            if not name or len(name) < 5:
+                continue
+            if name not in cluster_names:
                 cluster_names.append(name)
 
     # Pattern 2: "<name> cluster" (e.g. "p-csmohsm09-cb52 cluster logs")
-    # Only accept names that look like real identifiers: must contain a digit,
-    # hyphen, underscore, or dot — pure English words are rejected.
+    # Accept names that: start with a letter, are >= 7 chars, contain a digit
+    # or hyphen/underscore (so plain English words like "starting" are excluded).
+    # Trailing punctuation (e.g. "starting.") is stripped before testing.
     _CLUSTER_NAME_STOPWORDS = {
         # articles / pronouns / prepositions
         "the", "a", "an", "this", "that", "these", "those",
@@ -12349,12 +16865,17 @@ def extract_cluster_snapshot_info(ticket: dict) -> dict:
         "physical", "external", "internal", "custom", "example",
     }
     for m in _CLUSTER_NAME_RE.finditer(full_text):
-        name = m.group(1).strip()
+        # Strip trailing punctuation (catches "starting." captured by the regex)
+        name = re.sub(r'[^a-zA-Z0-9\-_]+$', '', m.group(1).strip())
+        if not name or len(name) < 7:
+            continue
+        # Must start with a letter — filters "24-node", "25-node", etc.
+        if not re.match(r'^[a-zA-Z]', name):
+            continue
         if name.lower() in _CLUSTER_NAME_STOPWORDS:
             continue
-        # Require at least one non-alpha character (digit, hyphen, underscore, dot)
-        # so pure dictionary words are excluded even if not in the stopword list
-        if not re.search(r"[\d\-_\.]", name):
+        # Require at least one digit or hyphen/underscore — pure English words excluded
+        if not re.search(r"[\d\-_]", name):
             continue
         if name not in cluster_names:
             cluster_names.append(name)
@@ -13801,7 +18322,8 @@ def enrich_tickets_with_snapshots(
 
     # Pre-populate snap_ids on every ticket from its raw snapshots text (all IDs, not just highest)
     for ticket in with_snaps:
-        all_found = _SNAP_ID_RE.findall(ticket.get("snapshots", ""))
+        _sv = ticket.get("snapshots")
+        all_found = _SNAP_ID_RE.findall(_sv if isinstance(_sv, str) else "")
         if all_found:
             deduped: list[str] = []
             for sid in all_found:
@@ -13812,7 +18334,8 @@ def enrich_tickets_with_snapshots(
     # Build a map: snap_id → list of tickets that reference it (dedup fetch)
     snap_to_tickets: dict[str, list[dict]] = {}
     for ticket in with_snaps:
-        snap_ids = _SNAP_ID_RE.findall(ticket.get("snapshots", ""))
+        _sv2 = ticket.get("snapshots")
+        snap_ids = _SNAP_ID_RE.findall(_sv2 if isinstance(_sv2, str) else "")
         if not snap_ids:
             continue
         snap_id = _highest_snap_id(snap_ids)  # use highest ::N (most recent) snapshot
@@ -14432,6 +18955,254 @@ LIMIT {int(limit)}
     return results
 
 
+def fetch_ticket_clusters_via_analytics(
+    ticket_ids: list[str],
+    cookie: str | None,
+) -> dict[str, list[str]]:
+    """Query Analytics API for cluster UI names linked to each ticket via snapshots.
+    Returns {ticket_id: [cluster_ui_name, ...]}."""
+    if not ticket_ids:
+        return {}
+    id_list = ", ".join(json.dumps(str(tid)) for tid in ticket_ids[:500])
+    statement = (
+        "SELECT DISTINCT t_id, cl.ui_name AS cluster_ui_name "
+        "FROM snapshot sn "
+        "UNNEST sn.`zendesk` AS t_id "
+        "JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.`uuid`) "
+        f"WHERE t_id IN [{id_list}]"
+    )
+    rows = query_supportal_analytics(statement, cookie)
+    result: dict[str, list[str]] = {}
+    for row in rows:
+        tid   = str(row.get("t_id") or "").strip()
+        cname = (row.get("cluster_ui_name") or "").strip()
+        if not tid or not cname:
+            continue
+        if tid not in result:
+            result[tid] = []
+        if cname not in result[tid]:
+            result[tid].append(cname)
+    return result
+
+
+def enrich_ticket_apps_via_analytics(
+    customer_name: str,
+    cookie: str | None,
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    llm_provider: str = "",
+    llm_model: str = "",
+    llm_api_key: str = "",
+    llm_base_url: str = "",
+    progress_cb: Callable[[str, float], None] | None = None,
+) -> tuple[int, int]:
+    """Enrich application labels for tickets missing them.
+
+    Two-stage approach:
+    1. Analytics API: query which clusters (ui_name) are linked to each ticket via
+       snapshots. Match ui_name against known app aliases.
+    2. LLM fallback: for tickets still unlabeled after stage 1, send a batch prompt
+       asking the LLM to extract the app name from each ticket subject. AmEx encodes
+       the application name directly in the subject (e.g. "Enterprise Wallet - Unable
+       to process transactions" → "Enterprise Wallet").
+
+    Writes results to score.analytics_app_labels and score.analytics_cluster_names
+    on each updated CB ticket document.
+
+    Returns (enriched_count, error_count).
+    """
+    def _log(msg: str, pct: float = 0.0):
+        print(f"[APP-ENRICH] {msg}")
+        if progress_cb:
+            progress_cb(msg, pct)
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions, QueryOptions
+    from couchbase.auth import PasswordAuthenticator
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    col = cluster.bucket(bucket).scope(scope).collection(collection)
+    ks  = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    # Load tickets — only id, subject, and score fields needed
+    _cust_filter = ""
+    if customer_name and customer_name.lower() != "all customers":
+        _esc = customer_name.replace("'", "\\'")
+        _cust_filter = f" AND LOWER(t.organization) LIKE '%{_esc.lower()}%'"
+
+    _log(f"Loading tickets for {customer_name!r}…", 0.02)
+    q = (
+        f"SELECT META(t).id AS _key, t.ticket_id, t.subject, t.organization, "
+        f"t.score.cluster_names AS _cluster_names, "
+        f"t.score.analytics_app_labels AS _existing_labels "
+        f"FROM {ks} AS t "
+        f"WHERE t.ticket_id IS NOT MISSING{_cust_filter} LIMIT 5000"
+    )
+    try:
+        rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
+    except Exception as exc:
+        cluster.close()
+        raise RuntimeError(f"CB query failed: {exc}") from exc
+
+    _c2a = _get_cluster_to_app()
+
+    def _has_label(row: dict) -> bool:
+        if row.get("_existing_labels"):
+            return True
+        for cname in (row.get("_cluster_names") or []):
+            if _c2a.get((cname or "").lower()):
+                return True
+        return False
+
+    needs = [r for r in rows if not _has_label(r)]
+    _log(f"{len(needs)}/{len(rows)} tickets need app label enrichment.", 0.05)
+
+    if not needs:
+        _log("All tickets already have app labels.", 1.0)
+        cluster.close()
+        return 0, 0
+
+    ticket_ids_str = [str(r["ticket_id"]) for r in needs if r.get("ticket_id")]
+
+    # ── Stage 1: Analytics API ────────────────────────────────────────────────
+    _log(f"Stage 1: querying Analytics API for {len(ticket_ids_str)} tickets…", 0.1)
+    analytics_map: dict[str, list[str]] = {}
+    _batch = 200
+    for i in range(0, len(ticket_ids_str), _batch):
+        chunk = ticket_ids_str[i:i + _batch]
+        pct = 0.1 + 0.3 * (i / len(ticket_ids_str))
+        _log(f"  Analytics batch {i // _batch + 1}…", pct)
+        try:
+            analytics_map.update(fetch_ticket_clusters_via_analytics(chunk, cookie))
+        except Exception as exc:
+            _log(f"  Analytics batch error: {exc}", pct)
+
+    _log(f"Analytics returned cluster info for {len(analytics_map)} tickets.", 0.4)
+
+    # Map ui_name → app alias using known alias keys (longest match first)
+    _known_apps = sorted(_get_app_cluster_aliases().keys(), key=len, reverse=True)
+
+    def _ui_name_to_app(ui_name: str) -> str | None:
+        ui_lc = ui_name.lower()
+        for app in _known_apps:
+            if app in ui_lc:
+                return app
+        return None
+
+    # ── Stage 2: LLM subject extraction for remaining unlabeled tickets ───────
+    # Build list of tickets that stage 1 didn't resolve
+    stage1_resolved: set[str] = set()
+    for tid, ui_names in analytics_map.items():
+        if any(_ui_name_to_app(u) for u in ui_names):
+            stage1_resolved.add(tid)
+
+    still_needs_llm = [r for r in needs if str(r.get("ticket_id") or "") not in stage1_resolved]
+    llm_labels: dict[str, str] = {}
+
+    if still_needs_llm and llm_provider and llm_model:
+        _log(f"Stage 2: LLM extraction for {len(still_needs_llm)} remaining tickets…", 0.45)
+        _BATCH_LLM = 40
+        for i in range(0, len(still_needs_llm), _BATCH_LLM):
+            chunk = still_needs_llm[i:i + _BATCH_LLM]
+            pct = 0.45 + 0.3 * (i / len(still_needs_llm))
+            _log(f"  LLM batch {i // _BATCH_LLM + 1}/{(len(still_needs_llm)-1)//_BATCH_LLM + 1}…", pct)
+            lines = "\n".join(
+                f'- #{r["ticket_id"]}: "{(r.get("subject") or "").strip()}"'
+                for r in chunk
+            )
+            prompt = (
+                "You are analyzing support tickets. For each ticket below, extract the "
+                "application or product name from the subject line. Return a JSON array "
+                "where each element is {\"ticket_id\": \"<id>\", \"app_label\": \"<name>\"} "
+                "or {\"ticket_id\": \"<id>\", \"app_label\": null} if no specific application "
+                "is identifiable. Use only the information in the subject — do not invent names. "
+                "Common patterns: app names appear at the start of the subject before a dash or "
+                "colon, e.g. 'Enterprise Wallet - issue' → 'Enterprise Wallet', "
+                "'DQF Application timeout' → 'DQF', 'Griffin-Tier 0 cluster' → 'Griffin'.\n\n"
+                f"Tickets:\n{lines}\n\n"
+                "Return ONLY the JSON array, no other text."
+            )
+            try:
+                raw = call_llm(
+                    [{"role": "user", "content": prompt}],
+                    llm_provider, llm_model, llm_api_key, llm_base_url,
+                    max_tokens=1024,
+                )
+                # Parse JSON — strip markdown fences if present
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+                parsed = json.loads(raw)
+                for item in (parsed if isinstance(parsed, list) else []):
+                    tid_v = str(item.get("ticket_id") or "").strip()
+                    lbl_v = (item.get("app_label") or "").strip()
+                    if tid_v and lbl_v and lbl_v.lower() not in ("null", "none", "unknown", "n/a"):
+                        llm_labels[tid_v] = lbl_v
+            except Exception as exc:
+                _log(f"  LLM batch error: {exc}", pct)
+
+        _log(f"LLM extracted labels for {len(llm_labels)} tickets.", 0.75)
+    elif still_needs_llm:
+        _log(f"Stage 2 skipped ({len(still_needs_llm)} tickets remain unlabeled — no LLM configured).", 0.45)
+
+    # ── Write results to CB ───────────────────────────────────────────────────
+    enriched = errors = 0
+    total = len(needs)
+    for i, row in enumerate(needs):
+        tid      = str(row.get("ticket_id") or "")
+        doc_key  = row.get("_key") or f"ticket::{tid}"
+        pct      = 0.75 + 0.23 * (i / total)
+
+        ui_names = analytics_map.get(tid, [])
+        inferred: list[str] = []
+
+        # Stage 1 result
+        for uname in ui_names:
+            lbl = _ui_name_to_app(uname)
+            if lbl and lbl not in inferred:
+                inferred.append(lbl)
+        # If no alias match from ui_names, store ui_names themselves as labels
+        if not inferred and ui_names:
+            for uname in ui_names:
+                clean = uname.strip()
+                if clean and clean not in inferred:
+                    inferred.append(clean)
+
+        # Stage 2 result
+        if not inferred and tid in llm_labels:
+            inferred = [llm_labels[tid]]
+
+        if not inferred:
+            continue
+
+        _log(f"  [{i+1}/{total}] #{tid} → {inferred}", pct)
+        try:
+            result = col.get(doc_key)
+            doc    = result.content_as[dict]
+            _score = doc.get("score") or {}
+            _score["analytics_app_labels"]    = inferred
+            if ui_names:
+                _score["analytics_cluster_names"] = ui_names
+            doc["score"] = _score
+            col.replace(doc_key, doc)
+            enriched += 1
+        except Exception as exc:
+            errors += 1
+            _log(f"  Error updating #{tid}: {exc}", pct)
+
+    cluster.close()
+    _log(f"Done — {enriched} labels written, {errors} errors.", 1.0)
+    return enriched, errors
+
+
 def scrape_snapshots_from_stubs(
     stubs: list[dict],
     cookie: str | None,
@@ -14665,11 +19436,14 @@ def load_snapshots_to_couchbase(
     col = cluster.bucket(bucket).scope(scope).collection(snap_collection)
     upserted = errors = 0
     total = len(snapshots)
+    _now = int(time.time())
     try:
         for i, snap in enumerate(snapshots):
             key = f"snapshot::{snap['snap_id']}"
             try:
-                col.upsert(key, snap)
+                doc = snap.copy()
+                doc["last_scraped_at"] = _now
+                col.upsert(key, doc)
                 upserted += 1
             except Exception as exc:
                 errors += 1
@@ -14844,8 +19618,14 @@ def ensure_cb_indexes(
         (
             "idx_tickets_org_date",
             f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_date` "
-            f"ON {ks_t} (organization, created_at) "
-            f"WHERE organization IS NOT MISSING",
+            f"ON {ks_t} (organization, created DESC) "
+            f"WHERE organization IS NOT MISSING AND ticket_id IS NOT MISSING",
+        ),
+        (
+            "idx_tickets_org_status_priority",
+            f"CREATE INDEX IF NOT EXISTS `idx_tickets_org_status_priority` "
+            f"ON {ks_t} (organization, status, priority, created DESC) "
+            f"WHERE organization IS NOT MISSING AND ticket_id IS NOT MISSING",
         ),
         # ── Snapshots collection ──────────────────────────────────────────
         (
@@ -15362,6 +20142,31 @@ def build_scoring_input(
     """
     escs  = ticket.get("escalations") or "none"
     proactive = _is_proactive_ticket(ticket)
+
+    # Dates
+    _created_str = (ticket.get("created") or ticket.get("created_at") or "").strip()[:10]
+    _solved_raw  = (ticket.get("solved") or ticket.get("solved_at")
+                    or ticket.get("closed_at") or "").strip()
+    _solved_str  = _solved_raw[:10] if _solved_raw else ""
+    if not _solved_str and (ticket.get("status") or "").lower() in ("closed", "solved"):
+        _solved_str = (ticket.get("updated") or "").strip()[:10]
+
+    # App impact from cluster→app map; fallback to analytics-enriched labels
+    _c2a = _get_cluster_to_app()
+    _cids = _ticket_cluster_ids(ticket)
+    _app_labels = sorted({_c2a[c].upper() for c in _cids if _c2a.get(c)})
+    if not _app_labels:
+        _score_fmt = ticket.get("score") or {}
+        _analytics_lbl = _score_fmt.get("analytics_app_labels") or []
+        if _analytics_lbl:
+            _app_labels = sorted(str(l).upper() for l in _analytics_lbl)
+    _app_str = ", ".join(_app_labels) if _app_labels else ""
+
+    _cbses_val = ticket.get("cbses") or []
+    _cbse_str  = ", ".join(_cbses_val) if isinstance(_cbses_val, list) else str(_cbses_val)
+    _jira_val  = ticket.get("jira_issues") or []
+    _jira_str  = ", ".join(_jira_val) if isinstance(_jira_val, list) else str(_jira_val)
+
     parts = [
         f"ID: {ticket.get('ticket_id','?')} | "
         f"Priority: {ticket.get('priority','?')} | "
@@ -15369,8 +20174,18 @@ def build_scoring_input(
         f"Origin: {'Proactive (Couchbase-initiated)' if proactive else 'Customer-initiated'} | "
         f"Comments: {ticket.get('comment_count', 0)} | "
         f"Escalations: {escs}",
+        f"Requester: {ticket.get('requester') or '?'} | "
+        f"Created: {_created_str or '?'} | Closed: {_solved_str or 'open'}",
         f"Subject: {(ticket.get('subject') or '(no subject)')[:200]}",
     ]
+    if _cbse_str:
+        parts.append(f"CBSEs: {_cbse_str}")
+    if _jira_str:
+        parts.append(f"Jira Issues: {_jira_str}")
+    if _app_str:
+        parts.append(f"Application: {_app_str}")
+    if _cids:
+        parts.append(f"Clusters: {', '.join(_cids[:5])}")
     if ticket.get("description"):
         parts.append(f"Description: {ticket['description'][:desc_limit]}")
 
@@ -15584,10 +20399,11 @@ def score_tickets_batch(
             {"role": "user",   "content": content},
         ]
 
-    # Scale output budget: ~800 tokens per ticket (schema + interaction_summary),
-    # min 2048, max 8192.  LMStudio/Ollama reserves max_tokens from the context
+    # Scale output budget: ~1200 tokens per ticket (schema + enriched interaction_summary
+    # now includes requester, dates, app, clusters — larger than original).
+    # min 2048, max 16384.  LMStudio/Ollama reserves max_tokens from the context
     # window before reading the prompt, so this must cover the full JSON array.
-    _score_max_tokens = max(2048, min(8192, len(batch) * 800))
+    _score_max_tokens = max(2048, min(16384, len(batch) * 1200))
     _llm = lambda msgs, max_tok=_score_max_tokens: call_llm(
         msgs, provider, model, api_key, base_url,
         max_tokens=max_tok, num_ctx=num_ctx, no_think=_effective_no_think,
@@ -15731,6 +20547,29 @@ def score_all_tickets(
     # Filter out non-ticket documents (Couchbase design docs, metadata, etc.)
     tickets = [t for t in tickets if isinstance(t, dict) and t.get("ticket_id")]
 
+    # Skip scraping-failure stubs: HTTP error pages stored as ticket subjects
+    # (scraper received a 4xx/5xx response and stored the error title as subject).
+    # These have no description and no comments — the LLM would invent scores.
+    _HTTP_ERR_SUBJECTS = frozenset({
+        "404 page not found", "403 forbidden", "401 unauthorized",
+        "500 internal server error", "502 bad gateway", "503 service unavailable",
+        "access denied",
+    })
+    def _is_scrape_stub(t: dict) -> bool:
+        subj = (t.get("subject") or "").strip().lower()
+        if subj in _HTTP_ERR_SUBJECTS:
+            return True
+        # Also skip truly empty tickets (no subject, no description, no comments)
+        has_desc = bool((t.get("description") or "").strip())
+        has_cmts = bool(t.get("comments"))
+        return not subj and not has_desc and not has_cmts
+
+    scoreable = [t for t in tickets if not _is_scrape_stub(t)]
+    skipped   = len(tickets) - len(scoreable)
+    if skipped:
+        progress_cb(f"Skipping {skipped} empty/stub ticket(s) — no scoreable content.", 0.0)
+    tickets = scoreable
+
     total   = len(tickets)
     results: dict[str, dict] = {}
     results_lock = threading.Lock()
@@ -15861,6 +20700,425 @@ def backfill_analytics_fields(
     return updated, errors
 
 
+def embed_snapshots_from_cb(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    snap_collection: str,
+    embed_provider: str,
+    embed_model: str,
+    embed_api_key: str,
+    embed_base_url: str,
+    vector_dims: int,
+    progress_cb: Callable[[str, float], None],
+    max_workers: int = 1,
+) -> tuple[int, int]:
+    """
+    Read every snapshot doc from Couchbase, embed it, and write back only the
+    `embedding` field via subdocument mutation.  Never loads snapshot data into
+    UI state — safe to run against the full collection.
+    Returns (done, errors).
+    """
+    import concurrent.futures
+    from couchbase.subdocument import upsert as _SD_upsert
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    progress_cb("Connecting to Couchbase …", 0.0)
+    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    col       = scope_obj.collection(snap_collection)
+
+    fqn = f"`{bucket}`.`{scope}`.`{snap_collection}`"
+    progress_cb("Fetching snapshot list …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, * FROM {fqn} "
+        f"WHERE META().id LIKE 'snapshot::%'",
+        QueryOptions(timeout=timedelta(seconds=120)),
+    ))
+
+    total      = len(rows)
+    done_count = errors = 0
+    lock       = threading.Lock()
+
+    progress_cb(f"Embedding {total} snapshots …", 0.0)
+
+    def _embed_one(row: dict) -> tuple[str, list[float] | None, str | None]:
+        doc_key = row.get("doc_key")
+        snap    = row.get(snap_collection) or {k: v for k, v in row.items() if k != "doc_key"}
+        if not doc_key or not snap:
+            return doc_key or "?", None, "missing doc_key or body"
+        try:
+            text = build_snapshot_embed_text(snap)
+            vec  = embed_text(text, embed_provider, embed_model, embed_api_key,
+                              embed_base_url, dims=vector_dims)
+            if vector_dims and len(vec) > vector_dims:
+                vec = vec[:vector_dims]
+                norm = sum(x * x for x in vec) ** 0.5
+                if norm > 0:
+                    vec = [x / norm for x in vec]
+            return doc_key, vec, None
+        except Exception as exc:
+            return doc_key, None, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futs = {pool.submit(_embed_one, r): r for r in rows}
+        for fut in concurrent.futures.as_completed(futs):
+            doc_key, vec, err = fut.result()
+            if err or not vec:
+                with lock:
+                    errors += 1
+                progress_cb(f"Skipped {doc_key}: {err}", done_count / max(total, 1))
+                continue
+            try:
+                col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
+            except Exception as exc:
+                with lock:
+                    errors += 1
+                progress_cb(f"Write error {doc_key}: {exc}", done_count / max(total, 1))
+                continue
+            with lock:
+                done_count += 1
+                if done_count % 25 == 0 or done_count == total:
+                    progress_cb(f"Embedded {done_count}/{total} snapshots …", done_count / total)
+
+    cluster.close()
+    return done_count, errors
+
+
+# ─────────────────────────── Phase 2a: Ticket Summaries ──────────────────────
+
+_SUMMARY_SYSTEM = (
+    "You are a Couchbase support engineer writing concise internal ticket summaries "
+    "for a knowledge base. Be factual, technical, and brief."
+)
+
+_SUMMARY_PROMPT_TMPL = """\
+Summarize this Couchbase support ticket for an internal knowledge base.
+
+## Ticket
+- ID: {ticket_id}
+- Customer: {organization}
+- Subject: {subject}
+- Priority: {priority}
+- Status: {status}
+- Requester: {requester}
+- Created: {created_at}
+
+## Description (truncated)
+{description}
+{cluster_block}{cbse_block}
+## Instructions
+Write 2–4 sentences covering: (1) the core problem and customer impact, \
+(2) relevant cluster health if a snapshot was attached, \
+(3) how it was resolved or current status.
+
+Then output EXACTLY these tagged lines (no extra text after the block):
+CLUSTER: <cluster name or unknown>
+CB_VERSION: <version or unknown>
+HEALTH: <healthy|degraded|critical|unknown>
+RESOLUTION: <one sentence or "open">
+"""
+
+
+def _build_summary_prompt(ticket: dict) -> str:
+    topo = ticket.get("snapshot_topology") or {}
+    cluster_block = ""
+    if topo:
+        bad  = topo.get("bad_items")  or []
+        warn = topo.get("warn_items") or []
+        cluster_block = (
+            f"\n## Cluster Snapshot\n"
+            f"- Cluster: {topo.get('cluster_name','?')} | CB {topo.get('cb_version','?')} "
+            f"| {topo.get('total_nodes','?')} nodes\n"
+            f"- Bad ({topo.get('bad_count',0)}): {', '.join(bad[:8]) or 'none'}\n"
+            f"- Warn ({topo.get('warn_count',0)}): {', '.join(str(w) for w in warn[:8]) or 'none'}\n"
+        )
+    cbses  = ticket.get("cbses")  or []
+    jiras  = ticket.get("jira_issues") or []
+    cbse_block = ""
+    if cbses or jiras:
+        cbse_block = "\n## References\n"
+        if cbses:
+            cbse_block += f"- CBSEs: {', '.join(cbses)}\n"
+        if jiras:
+            cbse_block += f"- Jira: {', '.join(jiras)}\n"
+
+    import re as _re
+
+    def _clean(text: str) -> str:
+        text = _re.sub(r"<[^>]+>", " ", text)
+        return _re.sub(r"\s{2,}", " ", text).strip()
+
+    # Prefer comments thread over description — description is often just the
+    # final closure message; comments contain the full conversation.
+    comments_raw = ticket.get("comments")
+    if comments_raw:
+        try:
+            comments = json.loads(comments_raw) if isinstance(comments_raw, str) else comments_raw
+            comments = sorted(comments, key=lambda c: c.get("timestamp") or "")
+            lines = []
+            budget = 3500
+            for c in comments:
+                body = _clean(c.get("body") or "").strip()
+                if not body:
+                    continue
+                line = f"[{c.get('timestamp','')}] {c.get('author','')}: {body[:600]}"
+                if len("\n".join(lines)) + len(line) > budget:
+                    break
+                lines.append(line)
+            desc_clean = "\n".join(lines)
+        except Exception:
+            desc_clean = _clean(ticket.get("description") or "")[:2500]
+    else:
+        desc_clean = _clean(ticket.get("description") or "")[:2500]
+
+    return _SUMMARY_PROMPT_TMPL.format(
+        ticket_id   = ticket.get("ticket_id", "?"),
+        organization= ticket.get("organization", "?"),
+        subject     = ticket.get("subject", "?"),
+        priority    = ticket.get("priority", "?"),
+        status      = ticket.get("status", "?"),
+        requester   = ticket.get("requester", "?"),
+        created_at  = ticket.get("created_at", "?"),
+        description = desc_clean,
+        cluster_block = cluster_block,
+        cbse_block    = cbse_block,
+    )
+
+
+def _parse_summary_tags(text: str) -> dict:
+    """Extract CLUSTER/CB_VERSION/HEALTH/RESOLUTION tagged lines from LLM output."""
+    result = {"cluster": None, "cb_version": None, "health": "unknown", "resolution": None}
+    for line in text.splitlines():
+        line = line.strip()
+        for key, field in (
+            ("CLUSTER:", "cluster"),
+            ("CB_VERSION:", "cb_version"),
+            ("HEALTH:", "health"),
+            ("RESOLUTION:", "resolution"),
+        ):
+            if line.upper().startswith(key):
+                val = line[len(key):].strip()
+                if val and val.lower() != "unknown":
+                    result[field] = val
+                elif val.lower() == "unknown":
+                    result[field] = None
+    return result
+
+
+def summarize_ticket(
+    ticket: dict,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    max_tokens: int = 512,
+    max_retries: int = 3,
+) -> dict:
+    """
+    Generate a summary document for a single ticket.
+    Returns a dict ready to upsert to the summary collection.
+    Retries up to max_retries times on transient connection errors.
+    """
+    prompt   = _build_summary_prompt(ticket)
+    messages = [
+        {"role": "system",  "content": _SUMMARY_SYSTEM},
+        {"role": "user",    "content": prompt},
+    ]
+    last_exc: Exception | None = None
+    for attempt in range(max(1, max_retries)):
+        try:
+            raw = call_llm(messages, provider, model, api_key, base_url,
+                           max_tokens=max_tokens, no_think=True)
+            break
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc).lower()
+            transient = any(k in err_str for k in (
+                "connection", "timeout", "reset", "eof", "broken pipe",
+                "remotedisconnected", "503", "502", "429",
+            ))
+            if not transient or attempt >= max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s …
+    else:
+        raise last_exc  # type: ignore[misc]
+
+    # Split prose from tagged block
+    tag_start = -1
+    for i, line in enumerate(raw.splitlines()):
+        if line.strip().upper().startswith("CLUSTER:"):
+            tag_start = i
+            break
+    if tag_start >= 0:
+        prose = "\n".join(raw.splitlines()[:tag_start]).strip()
+        tags  = _parse_summary_tags("\n".join(raw.splitlines()[tag_start:]))
+    else:
+        prose = raw.strip()
+        tags  = _parse_summary_tags(raw)
+
+    topo = ticket.get("snapshot_topology") or {}
+    return {
+        "type":                 "ticket_summary",
+        "ticket_id":            str(ticket.get("ticket_id", "")),
+        "organization":         ticket.get("organization"),
+        "subject":              ticket.get("subject"),
+        "status":               ticket.get("status"),
+        "priority":             ticket.get("priority"),
+        "created_at":           ticket.get("created_at"),
+        "summary_text":         prose,
+        "cluster_name":         tags["cluster"] or topo.get("cluster_name"),
+        "cb_version":           tags["cb_version"] or topo.get("cb_version"),
+        "health":               tags["health"] or "unknown",
+        "resolution":           tags["resolution"],
+        "cbses":                ticket.get("cbses") or [],
+        "jira_issues":          ticket.get("jira_issues") or [],
+        "source_last_scraped_at": ticket.get("last_scraped_at"),
+        "generated_at":         int(time.time()),
+        "model":                f"{provider}/{model}",
+    }
+
+
+def summarize_tickets_from_cb(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    summary_collection: str,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    progress_cb: Callable[[str, float], None],
+    customer_filter: str = "",
+    force: bool = False,
+    max_workers: int = 1,
+) -> tuple[int, int]:
+    """
+    Read tickets from CB, generate summaries via LLM, write to summary collection.
+    Skips tickets that already have a summary unless force=True.
+    Returns (done, errors).
+    """
+    import concurrent.futures
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    progress_cb("Connecting to Couchbase …", 0.0)
+    cluster   = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    src_col   = scope_obj.collection(collection)
+    sum_col   = scope_obj.collection(summary_collection)
+
+    fqn = f"`{bucket}`.`{scope}`.`{collection}`"
+    where_parts = ["ticket_id IS NOT MISSING"]
+    params: list = []
+    if customer_filter.strip():
+        where_parts.append("LOWER(organization) LIKE $1")
+        params.append(f"%{customer_filter.strip().lower()}%")
+    where = " AND ".join(where_parts)
+
+    progress_cb("Fetching ticket list …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, ticket_id, organization, subject, status, priority, "
+        f"created_at, last_scraped_at, requester, cbses, jira_issues, snapshot_topology, "
+        f"SUBSTR(description, 0, 3000) AS description, comments "
+        f"FROM {fqn} WHERE {where}",
+        QueryOptions(positional_parameters=params, timeout=timedelta(seconds=120)),
+    ))
+
+    if not force:
+        # Filter to tickets without an existing summary
+        progress_cb("Checking existing summaries …", 0.0)
+        sum_fqn = f"`{bucket}`.`{scope}`.`{summary_collection}`"
+        existing_q = list(scope_obj.query(
+            f"SELECT META().id AS doc_key FROM {sum_fqn} WHERE type = 'ticket_summary'",
+            QueryOptions(timeout=timedelta(seconds=60)),
+        ))
+        existing_keys = {r.get("doc_key") for r in existing_q}
+        rows = [r for r in rows
+                if f"summary::{r.get('ticket_id','')}" not in existing_keys]
+
+    total      = len(rows)
+    done_count = errors = 0
+    lock       = threading.Lock()
+
+    progress_cb(f"Summarizing {total} tickets …", 0.0)
+
+    def _summarize_one(row: dict) -> tuple[str, dict | None, str | None]:
+        doc_key    = row.get("doc_key", "")
+        sum_key    = f"summary::{row.get('ticket_id','')}"
+        ticket     = {k: v for k, v in row.items() if k != "doc_key"}
+        try:
+            summary = summarize_ticket(ticket, provider, model, api_key, base_url)
+            return sum_key, summary, None
+        except Exception as exc:
+            return sum_key, None, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futs = {pool.submit(_summarize_one, r): r for r in rows}
+        for fut in concurrent.futures.as_completed(futs):
+            sum_key, summary, err = fut.result()
+            if err or not summary:
+                with lock:
+                    errors += 1
+                progress_cb(f"Skipped {sum_key}: {err}", done_count / max(total, 1))
+                continue
+            try:
+                sum_col.upsert(sum_key, summary)
+            except Exception as exc:
+                with lock:
+                    errors += 1
+                progress_cb(f"Write error {sum_key}: {exc}", done_count / max(total, 1))
+                continue
+            with lock:
+                done_count += 1
+                if done_count % 10 == 0 or done_count == total:
+                    progress_cb(
+                        f"Summarized {done_count}/{total} …", done_count / total
+                    )
+
+    cluster.close()
+    return done_count, errors
+
+
+def fetch_ticket_summary(
+    ticket_id: str,
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    summary_collection: str,
+) -> dict | None:
+    """Fetch a single summary doc by ticket ID. Returns None if not found."""
+    if not _CB_AVAILABLE:
+        return None
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        col  = cluster.bucket(bucket).scope(scope).collection(summary_collection)
+        doc  = col.get(f"summary::{ticket_id}").content_as[dict]
+        cluster.close()
+        return doc
+    except Exception:
+        return None
+
+
 def rescore_all_customers_cb(
     cb_url: str,
     bucket: str,
@@ -15979,13 +21237,15 @@ def rescore_all_customers_cb(
             _cf_rescore.wait(futs)
         errors_total = errors_total_ref[0]
 
-        # Persist scores back to CB
+        # Persist scores back to CB — merge into existing score to preserve
+        # cluster_names, cluster_ids, snapshot_count, last_snapshot_id, etc.
         for p_idx, (tid, score_data) in enumerate(scores.items()):
             doc_key = key_map.get(tid) or f"ticket::{tid}"
             try:
                 result  = col.get(doc_key)
                 doc     = result.content_as[dict]
-                doc["score"] = {**score_data, "scored_at": scored_at}
+                existing_score = doc.get("score") or {}
+                doc["score"] = {**existing_score, **score_data, "scored_at": scored_at}
                 col.upsert(doc_key, doc)
                 scored_total += 1
             except Exception as exc:
@@ -16023,6 +21283,72 @@ def rescore_all_customers_cb(
     )
     cluster.close()
     return scored_total, errors_total, error_log
+
+
+def recover_score_cluster_fields_cb(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    progress_cb: Callable[[str, float], None],
+) -> tuple[int, int]:
+    """Restore score.cluster_names/cluster_ids/snapshot_count/last_snapshot_id
+    for tickets where those fields were wiped by a broken rescore run.
+
+    Reads raw ticket fields (snapshots, ticket_fields, description, comments,
+    snapshot_topology) and calls extract_cluster_snapshot_info() — no LLM.
+    Only updates tickets that have a score but are missing cluster_names.
+    Returns (recovered, errors).
+    """
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cl  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl.wait_until_ready(timedelta(seconds=15))
+    col = cl.bucket(bucket).scope(scope).collection(collection)
+    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    # Fetch all tickets with a score but missing cluster_names
+    rows = list(cl.query(
+        f"SELECT META(t).id AS doc_id FROM {keyspace} AS t "
+        f"WHERE t.score IS NOT MISSING "
+        f"AND (t.score.cluster_names IS MISSING OR t.score.cluster_names IS NULL)",
+        QueryOptions(timeout=timedelta(seconds=60)),
+    ))
+    total = len(rows)
+    progress_cb(f"Found {total} tickets with missing cluster fields …", 0.0)
+
+    recovered = errors = 0
+    for i, row in enumerate(rows):
+        doc_key = row.get("doc_id", "")
+        if not doc_key:
+            continue
+        try:
+            result = col.get(doc_key)
+            doc    = result.content_as[dict]
+            # Recompute cluster fields from raw ticket data (deterministic, no LLM)
+            cluster_info = extract_cluster_snapshot_info(doc)
+            # Also supplement with text-scan via _ticket_cluster_ids (reads topo + text)
+            for cname in _ticket_cluster_ids(doc):
+                if cname and cname not in cluster_info["cluster_names"]:
+                    cluster_info["cluster_names"].append(cname)
+            existing_score = doc.get("score") or {}
+            existing_score.update({
+                "cluster_names":    cluster_info["cluster_names"],
+                "cluster_ids":      cluster_info["cluster_ids"],
+                "snapshot_count":   cluster_info["snapshot_count"],
+                "last_snapshot_id": cluster_info["last_snapshot_id"],
+            })
+            doc["score"] = existing_score
+            col.upsert(doc_key, doc)
+            recovered += 1
+        except Exception as exc:
+            errors += 1
+            print(f"[recover_cluster_fields] {doc_key}: {exc}")
+        if i % 100 == 0:
+            progress_cb(f"Recovered {recovered}/{total} …", i / max(total, 1))
+
+    cl.close()
+    progress_cb(f"Done — {recovered} recovered, {errors} errors.", 1.0)
+    return recovered, errors
 
 
 def persist_scores_to_cb(
@@ -16070,14 +21396,16 @@ def persist_scores_to_cb(
         try:
             result = col.get(doc_key)
             doc    = result.content_as[dict]
-            doc["score"] = {**score_data, "scored_at": scored_at}
+            existing_score = doc.get("score") or {}
+            doc["score"] = {**existing_score, **score_data, "scored_at": scored_at}
             col.upsert(doc_key, doc)
             saved += 1
         except CouchbaseException as exc:
             if "document_not_found" in str(exc) or "KEY_ENOENT" in str(exc):
                 # Ticket missing from CB — save it first if we have the data, then apply score
                 base_doc = dict(_ticket_lookup.get(str(tid), {"ticket_id": tid, "_stub": True}))
-                base_doc["score"] = {**score_data, "scored_at": scored_at}
+                existing_score = base_doc.get("score") or {}
+                base_doc["score"] = {**existing_score, **score_data, "scored_at": scored_at}
                 try:
                     col.upsert(doc_key, base_doc)
                     recovered = "_stub" not in base_doc
@@ -16782,21 +22110,22 @@ def build_cluster_timeline(tickets: list[dict], cluster_key: str) -> list[dict]:
 
 def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
     """
-    Convert a sorted list of timeline points into a list of Highcharts option
-    dicts ready to be passed to ui.highchart().  Returns an empty list when
-    there is no plottable data.
+    Convert a sorted list of timeline points into a list of ECharts option
+    dicts ready to be passed to ui.echart().  Each dict has a '_height' key
+    (popped at render time) so the caller can set the container height.
+    Returns an empty list when there is no plottable data.
     """
     if not points:
         return []
 
     dates = [p["date_label"] for p in points]
+    _zoom = [{"type": "inside"}, {"type": "slider", "bottom": 30}]
 
     charts = []
 
     # ── 1. Node count over time ────────────────────────────────────────────────
     node_vals = [p["node_count"] for p in points]
     if any(v is not None for v in node_vals):
-        # MDS service breakdown as stacked series when available
         svc_fields = [
             ("Data", "data_nodes"), ("Query", "query_nodes"),
             ("Index", "index_nodes"), ("Search", "fts_nodes"),
@@ -16805,51 +22134,63 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
         has_mds = any(p.get(f) for p in points for _, f in svc_fields)
         if has_mds:
             charts.append({
-                "chart":  {"type": "column", "height": 300},
-                "title":  {"text": "Node Count Over Time (by Service)"},
-                "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-                "yAxis":  {"title": {"text": "Nodes"}, "stackLabels": {"enabled": True}},
-                "plotOptions": {"column": {"stacking": "normal"}},
-                "series": [
-                    {"name": label, "data": [p.get(field, 0) or 0 for p in points]}
+                "_height": 300,
+                "title":    {"text": "Node Count Over Time (by Service)"},
+                "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+                "legend":   {"bottom": 0},
+                "dataZoom": _zoom,
+                "grid":     {"bottom": 70},
+                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+                "yAxis":    {"type": "value", "name": "Nodes"},
+                "series":   [
+                    {"name": label, "type": "bar", "stack": "total", "data": [p.get(field, 0) or 0 for p in points]}
                     for label, field in svc_fields
                     if any(p.get(field, 0) for p in points)
                 ],
             })
         else:
             charts.append({
-                "chart":  {"type": "spline", "height": 280},
-                "title":  {"text": "Node Count Over Time"},
-                "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-                "yAxis":  {"title": {"text": "Nodes"}, "allowDecimals": False},
-                "colors": ["#1E88E5"],
-                "series": [{"name": "Total Nodes", "data": [p["node_count"] for p in points]}],
+                "_height": 280,
+                "title":    {"text": "Node Count Over Time"},
+                "tooltip":  {"trigger": "axis"},
+                "dataZoom": _zoom,
+                "grid":     {"bottom": 70},
+                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+                "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1},
+                "color":    ["#1E88E5"],
+                "series":   [{"name": "Total Nodes", "type": "line", "smooth": True, "data": [p["node_count"] for p in points]}],
             })
 
     # ── 2. Bucket count over time ──────────────────────────────────────────────
     bucket_vals = [p["bucket_count"] for p in points]
     if any(v is not None for v in bucket_vals):
         charts.append({
-            "chart":  {"type": "spline", "height": 280},
-            "title":  {"text": "Bucket Count Over Time"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "Buckets"}, "allowDecimals": False},
-            "colors": ["#43A047"],
-            "series": [{"name": "Buckets", "data": [p["bucket_count"] for p in points]}],
+            "_height": 280,
+            "title":    {"text": "Bucket Count Over Time"},
+            "tooltip":  {"trigger": "axis"},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "Buckets", "minInterval": 1},
+            "color":    ["#43A047"],
+            "series":   [{"name": "Buckets", "type": "line", "smooth": True, "data": [p["bucket_count"] for p in points]}],
         })
 
     # ── 3. Checker health (BAD + WARN) over time ───────────────────────────────
     if any(p["bad_count"] or p["warn_count"] for p in points):
         charts.append({
-            "chart":  {"type": "spline", "height": 280},
-            "title":  {"text": "Checker Health Over Time"},
-            "subtitle": {"text": "Lower is better"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "Issue Count"}, "allowDecimals": False},
-            "colors": ["#E53935", "#FB8C00"],
-            "series": [
-                {"name": "BAD checks",  "data": [p["bad_count"]  for p in points]},
-                {"name": "WARN checks", "data": [p["warn_count"] for p in points]},
+            "_height": 280,
+            "title":    {"text": "Checker Health Over Time", "subtext": "Lower is better"},
+            "tooltip":  {"trigger": "axis"},
+            "legend":   {"bottom": 0},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "Issue Count", "minInterval": 1},
+            "color":    ["#E53935", "#FB8C00"],
+            "series":   [
+                {"name": "BAD checks",  "type": "line", "smooth": True, "data": [p["bad_count"]  for p in points]},
+                {"name": "WARN checks", "type": "line", "smooth": True, "data": [p["warn_count"] for p in points]},
             ],
         })
 
@@ -16857,25 +22198,30 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
     af_vals = [p["auto_failover_sec"] for p in points]
     if any(v is not None for v in af_vals):
         charts.append({
-            "chart":  {"type": "line", "height": 280},
-            "title":  {"text": "Auto-Failover Threshold Over Time"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "Seconds"}, "allowDecimals": False},
-            "colors": ["#8E24AA"],
-            "plotOptions": {"line": {"step": "left"}},
-            "series": [{"name": "Auto-failover (s)", "data": [p["auto_failover_sec"] for p in points]}],
+            "_height": 280,
+            "title":    {"text": "Auto-Failover Threshold Over Time"},
+            "tooltip":  {"trigger": "axis"},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "Seconds", "minInterval": 1},
+            "color":    ["#8E24AA"],
+            "series":   [{"name": "Auto-failover (s)", "type": "line", "step": "start", "data": [p["auto_failover_sec"] for p in points]}],
         })
 
     # ── 5. RAM per node over time ─────────────────────────────────────────────
     ram_vals = [p["ram_mib"] for p in points]
     if any(v is not None for v in ram_vals):
         charts.append({
-            "chart":  {"type": "spline", "height": 280},
-            "title":  {"text": "RAM per Node Over Time"},
-            "xAxis":  {"categories": dates, "title": {"text": "Ticket Date"}},
-            "yAxis":  {"title": {"text": "MiB"}, "allowDecimals": False},
-            "colors": ["#FB8C00"],
-            "series": [{"name": "RAM (MiB)", "data": [p["ram_mib"] for p in points]}],
+            "_height": 280,
+            "title":    {"text": "RAM per Node Over Time"},
+            "tooltip":  {"trigger": "axis"},
+            "dataZoom": _zoom,
+            "grid":     {"bottom": 70},
+            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "yAxis":    {"type": "value", "name": "MiB", "minInterval": 1},
+            "color":    ["#FB8C00"],
+            "series":   [{"name": "RAM (MiB)", "type": "line", "smooth": True, "data": [p["ram_mib"] for p in points]}],
         })
 
     return charts
