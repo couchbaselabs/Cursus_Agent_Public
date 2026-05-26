@@ -506,6 +506,17 @@ async def on_start():
     cl.user_session.set("overrides", {"provider": provider})
     cl.user_session.set("history", [])
 
+    # Associate this thread with the current user so it appears in the sidebar
+    dl = cl_data.get_data_layer()
+    if dl:
+        try:
+            user = cl.context.session.user
+            uid = getattr(user, "id", None)
+            if uid:
+                await dl.update_thread(cl.context.session.thread_id, user_id=uid)
+        except Exception:
+            pass
+
     await cl.Message(
         content=(
             "**Supportal Agent** — professional AI chat\n\n"

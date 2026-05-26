@@ -138,6 +138,20 @@ class CouchbaseDataLayer(BaseDataLayer):
 
     async def create_user(self, user: User) -> Optional[PersistedUser]:
         def _create():
+            key = f"user::{user.identifier}"
+            # Preserve existing UUID so threads stay linked across logins
+            try:
+                existing = self._col(_USERS).get(key).content_as[dict]
+                existing["metadata"] = user.metadata or existing.get("metadata", {})
+                self._col(_USERS).upsert(key, existing)
+                return PersistedUser(
+                    id=existing["id"],
+                    identifier=existing["identifier"],
+                    metadata=existing.get("metadata", {}),
+                    createdAt=existing["createdAt"],
+                )
+            except Exception:
+                pass
             uid = str(uuid.uuid4())
             now = _now()
             doc = {
@@ -146,7 +160,7 @@ class CouchbaseDataLayer(BaseDataLayer):
                 "metadata": user.metadata or {},
                 "createdAt": now,
             }
-            self._col(_USERS).upsert(f"user::{user.identifier}", doc)
+            self._col(_USERS).upsert(key, doc)
             return PersistedUser(
                 id=uid, identifier=user.identifier,
                 metadata=user.metadata or {}, createdAt=now,
