@@ -7,6 +7,7 @@ A two-UI, AI-powered platform for analysing Couchbase support tickets. It scrape
 ## Architecture
 
 > **Full interactive diagram:** open [`architecture.html`](architecture.html) in a browser.
+> **STAR vs Scraper comparison:** [`docs/star-vs-scraper-comparison.md`](docs/star-vs-scraper-comparison.md)
 
 ```mermaid
 flowchart TD
