@@ -56,3 +56,6 @@ analysis/
 # Secrets / env
 .env
 *.env
+
+# Chainlit temp uploads
+.files/

@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supportal AI Agent — Architecture</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #F1F5F9;
+  color: #1E293B;
+  padding: 40px 24px 60px;
+  min-width: 900px;
+}
+
+/* ── Title ─────────────────────────────────────────────────────── */
+.page-title {
+  text-align: center;
+  margin-bottom: 36px;
+}
+.page-title h1 {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: #0F172A;
+}
+.page-title p {
+  margin-top: 6px;
+  font-size: 14px;
+  color: #64748B;
+}
+
+/* ── Diagram canvas ─────────────────────────────────────────────── */
+.diagram {
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* ── Row helpers ─────────────────────────────────────────────────── */
+.row { display: flex; gap: 18px; }
+.row-center { justify-content: center; }
+.col { display: flex; flex-direction: column; gap: 18px; }
+
+/* ── Box base ────────────────────────────────────────────────────── */
+.box {
+  border-radius: 12px;
+  padding: 18px 22px;
+  border: 2px solid transparent;
+}
+.box-title {
+  font-size: 15px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.box-title .ico { font-size: 18px; line-height: 1; }
+.port-badge {
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.section-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+  margin: 12px 0 5px;
+}
+.items {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.items li {
+  font-size: 12.5px;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  line-height: 1.4;
+}
+.items li::before {
+  content: "›";
+  font-weight: 800;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 28px;
+  margin-top: 10px;
+}
+.divider {
+  border: none;
+  border-top: 1px dashed;
+  margin: 10px 0;
+  opacity: 0.35;
+}
+.inline-code {
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.chip {
+  display: inline-block;
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 20px;
+  letter-spacing: 0.3px;
+  vertical-align: middle;
+  margin-left: 3px;
+}
+
+/* ── Colour schemes ─────────────────────────────────────────────── */
+/* External / Supportal — Amber */
+.c-ext { background: #FFFBEB; border-color: #F59E0B; }
+.c-ext .box-title { color: #92400E; }
+.c-ext .port-badge { background: #FDE68A; color: #92400E; }
+.c-ext .section-label { color: #B45309; }
+.c-ext .items li::before { color: #F59E0B; }
+.c-ext .divider { border-color: #F59E0B; }
+.c-ext .inline-code { background: #FEF3C7; color: #92400E; }
+
+/* Playwright — Purple */
+.c-play { background: #F5F3FF; border-color: #7C3AED; }
+.c-play .box-title { color: #4C1D95; }
+.c-play .section-label { color: #5B21B6; }
+.c-play .items li::before { color: #7C3AED; }
+.c-play .inline-code { background: #EDE9FE; color: #4C1D95; }
+
+/* Couchbase — Rose/Red */
+.c-cb { background: #FFF1F2; border-color: #E11D48; }
+.c-cb .box-title { color: #881337; }
+.c-cb .port-badge { background: #FFE4E6; color: #881337; }
+.c-cb .section-label { color: #9F1239; }
+.c-cb .items li::before { color: #E11D48; }
+.c-cb .inline-code { background: #FFE4E6; color: #881337; }
+
+/* LLM — Blue */
+.c-llm { background: #EFF6FF; border-color: #2563EB; }
+.c-llm .box-title { color: #1E3A8A; }
+.c-llm .section-label { color: #1D4ED8; }
+.c-llm .items li::before { color: #2563EB; }
+.c-llm .divider { border-color: #2563EB; }
+.c-llm .inline-code { background: #DBEAFE; color: #1E3A8A; }
+.chip-cloud { background: #DBEAFE; color: #1D4ED8; }
+.chip-local { background: #D1FAE5; color: #065F46; }
+
+/* NiceGUI — Emerald */
+.c-ng { background: #F0FDF4; border-color: #10B981; }
+.c-ng .box-title { color: #064E3B; }
+.c-ng .port-badge { background: #D1FAE5; color: #065F46; }
+.c-ng .section-label { color: #047857; }
+.c-ng .items li::before { color: #10B981; }
+
+/* Chainlit — Teal */
+.c-cl { background: #F0FDFA; border-color: #0D9488; }
+.c-cl .box-title { color: #134E4A; }
+.c-cl .port-badge { background: #CCFBF1; color: #0F766E; }
+.c-cl .section-label { color: #0F766E; }
+.c-cl .items li::before { color: #0D9488; }
+
+/* ── Arrows ──────────────────────────────────────────────────────── */
+.arrow-zone {
+  display: flex;
+  gap: 18px;
+  padding: 2px 0;
+  min-height: 52px;
+}
+.arrow-slot {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+.arrow-slot.flex2 { flex: 2; }
+.arrow-slot.flex0 { flex: 0 0 0; }
+
+.arr {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+.arr-line {
+  width: 2px;
+  background: #94A3B8;
+  flex: 1;
+  min-height: 10px;
+}
+.arr-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: #475569;
+  background: #F1F5F9;
+  padding: 2px 8px;
+  border-radius: 20px;
+  white-space: nowrap;
+  border: 1px solid #CBD5E1;
+  margin: 3px 0;
+  letter-spacing: 0.2px;
+}
+.arr-down { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid #94A3B8; }
+.arr-up   { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 7px solid #94A3B8; }
+.arr-both { display: flex; flex-direction: column; align-items: center; gap: 0; }
+
+/* ── Agent tools panel ────────────────────────────────────────────── */
+.tools-panel {
+  background: #F8FAFC;
+  border: 1.5px solid #E2E8F0;
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-top: 10px;
+}
+.tools-panel .tl { font-size: 10px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; color: #64748B; margin-bottom: 6px; }
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px 8px;
+}
+.tool-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 6px;
+  text-align: center;
+  white-space: nowrap;
+}
+.tt-local { background: #F0FDF4; color: #065F46; border: 1px solid #6EE7B7; }
+.tt-live  { background: #FFF7ED; color: #92400E; border: 1px solid #FCD34D; }
+.tt-action { background: #EFF6FF; color: #1D4ED8; border: 1px solid #93C5FD; }
+
+/* ── Shared history banner ────────────────────────────────────────── */
+.shared-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+.sb-line {
+  flex: 1;
+  height: 2px;
+  background: repeating-linear-gradient(to right, #94A3B8 0, #94A3B8 6px, transparent 6px, transparent 14px);
+}
+.sb-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #475569;
+  background: #E2E8F0;
+  padding: 4px 14px;
+  border-radius: 20px;
+  white-space: nowrap;
+  letter-spacing: 0.3px;
+}
+
+/* ── Legend ─────────────────────────────────────────────────────── */
+.legend {
+  max-width: 1080px;
+  margin: 28px auto 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  justify-content: center;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: #475569;
+}
+.legend-dot {
+  width: 13px; height: 13px; border-radius: 3px; flex-shrink: 0;
+}
+
+.footnote {
+  text-align: center;
+  margin-top: 24px;
+  font-size: 11px;
+  color: #94A3B8;
+}
+</style>
+</head>
+<body>
+
+<div class="page-title">
+  <h1>Supportal AI Agent — Application Architecture</h1>
+  <p>Two-UI AI platform for Couchbase support ticket analysis · scraping, embedding, agent tooling, and chat history</p>
+</div>
+
+<div class="diagram">
+
+  <!-- ═══ ROW 1: External source ═══════════════════════════════════════ -->
+  <div class="row">
+    <div class="box c-ext" style="flex:1">
+      <div class="box-title">
+        <span class="ico">🌐</span> Supportal / Zendesk
+        <span class="port-badge">supportal.couchbase.com</span>
+      </div>
+      <div class="two-col">
+        <div>
+          <div class="section-label">Ticket data</div>
+          <ul class="items">
+            <li>Support ticket listings &amp; detail</li>
+            <li>Comments, tags, priority, status</li>
+            <li>Requester / assignee / organization</li>
+          </ul>
+        </div>
+        <div>
+          <div class="section-label">Analytics API &nbsp;<span class="inline-code">POST /api/support360/query</span></div>
+          <ul class="items">
+            <li>SQL++ against <em>customer</em>, <em>cluster</em>, <em>snapshot</em></li>
+            <li>Live ticket counts &amp; version stats</li>
+            <li>Session-cookie authenticated</li>
+          </ul>
+        </div>
+      </div>
+      <div class="two-col" style="margin-top:0">
+        <div>
+          <div class="section-label">Cluster snapshots</div>
+          <ul class="items">
+            <li>Topology pages (node / service layout)</li>
+            <li>CB version, RAM, auto-failover</li>
+            <li>Health warnings &amp; bad-item counts</li>
+          </ul>
+        </div>
+        <div>
+          <div class="section-label">Auth modes</div>
+          <ul class="items">
+            <li>Cookie / header paste (headless)</li>
+            <li>Browser SSO login (headful Playwright)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Arrow row 1 ═══════════════════════════════════════════════════ -->
+  <div class="arrow-zone">
+    <div class="arrow-slot">
+      <div class="arr">
+        <div class="arr-line"></div>
+        <div class="arr-label">Playwright scraping</div>
+        <div class="arr-line"></div>
+        <div class="arr-down"></div>
+      </div>
+    </div>
+    <div class="arrow-slot">
+      <div class="arr">
+        <div class="arr-line"></div>
+        <div class="arr-label">direct HTTP (analytics API)</div>
+        <div class="arr-line"></div>
+        <div class="arr-down"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ ROW 2: Playwright | LLM Providers ════════════════════════════ -->
+  <div class="row">
+
+    <!-- Playwright -->
+    <div class="box c-play" style="flex:1">
+      <div class="box-title"><span class="ico">🎭</span> Playwright Browser Automation</div>
+      <div class="section-label">Session management</div>
+      <ul class="items">
+        <li>Cookie paste → headless <span class="inline-code">requests</span> scrape</li>
+        <li>SSO login → headful Chromium → saves session to <span class="inline-code">.playwright_supportal/</span></li>
+        <li>Session reused across runs; re-login on 403</li>
+      </ul>
+      <div class="section-label">Ingestion pipeline</div>
+      <ul class="items">
+        <li>Ticket listing pagination with change-detection</li>
+        <li>Full ticket detail + comments per ticket</li>
+        <li>Snapshot listing + per-snapshot topology fetch</li>
+        <li>Analytics stub fetch (fast metadata via API)</li>
+        <li>Parallel snapshot topology workers</li>
+      </ul>
+    </div>
+
+    <!-- LLM Providers -->
+    <div class="box c-llm" style="flex:1">
+      <div class="box-title"><span class="ico">🤖</span> LLM Providers</div>
+
+      <div class="section-label">Cloud APIs <span class="chip chip-cloud">cloud</span></div>
+      <ul class="items">
+        <li>Claude (Anthropic) — default agent model</li>
+        <li>Gemini (Google)</li>
+        <li>OpenAI / compatible endpoints</li>
+      </ul>
+
+      <hr class="divider">
+
+      <div class="section-label">Local inference <span class="chip chip-local">local</span></div>
+      <ul class="items">
+        <li>LMStudio — <span class="inline-code">localhost:1234</span></li>
+        <li>Ollama — <span class="inline-code">localhost:11434</span></li>
+        <li>Live model list fetched at startup</li>
+      </ul>
+
+      <hr class="divider">
+
+      <div class="section-label">Embedding providers</div>
+      <ul class="items">
+        <li>Same providers (separate model config)</li>
+        <li>1024-dim vectors stored in Couchbase FTS index</li>
+        <li>Supports <span class="inline-code">num_ctx</span> tuning for Ollama</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <!-- ═══ Arrow row 2 ═══════════════════════════════════════════════════ -->
+  <div class="arrow-zone">
+    <div class="arrow-slot">
+      <div class="arr">
+        <div class="arr-line"></div>
+        <div class="arr-label">upsert tickets &amp; snapshots</div>
+        <div class="arr-line"></div>
+        <div class="arr-down"></div>
+      </div>
+    </div>
+    <div class="arrow-slot">
+      <div class="arr">
+        <div class="arr-up"></div>
+        <div class="arr-line"></div>
+        <div class="arr-label">embed + chat inference</div>
+        <div class="arr-line"></div>
+        <div class="arr-down"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ ROW 3: Couchbase ══════════════════════════════════════════════ -->
+  <div class="row">
+    <div class="box c-cb" style="flex:1">
+      <div class="box-title">
+        <span class="ico">🗄</span> Couchbase (local)
+        <span class="port-badge">localhost:8091</span>
+        <span style="font-size:12px;color:#9F1239;font-weight:500">Enterprise Edition 7.6.6</span>
+      </div>
+      <div class="two-col">
+        <div>
+          <div class="section-label">transcripts scope — ticket &amp; cluster data</div>
+          <ul class="items">
+            <li><strong>tickets</strong> — full Zendesk docs keyed <span class="inline-code">ticket::&lt;id&gt;</span></li>
+            <li><strong>snapshots</strong> — topology keyed <span class="inline-code">snapshot::&lt;uuid&gt;::&lt;ver&gt;</span></li>
+            <li>FTS hybrid index — BM25 text + 1024-dim vector (dot_product)</li>
+            <li>Indexed fields: subject, description, comments, tags, CB version, bad/warn items</li>
+            <li>RRF merge: structured + vector + BM25 + topology legs</li>
+          </ul>
+        </div>
+        <div>
+          <div class="section-label">chat scope — Chainlit persistence</div>
+          <ul class="items">
+            <li><strong>threads</strong> — session metadata, customer scope</li>
+            <li><strong>steps / elements</strong> — message history</li>
+            <li><strong>users / feedback</strong> — auth &amp; ratings</li>
+            <li><strong>assets</strong> — charts &amp; tables (base64 JSON, tagged with prompt)</li>
+            <li><strong>history</strong> — shared NiceGUI ↔ Chainlit conversation log</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Arrow row 3 ═══════════════════════════════════════════════════ -->
+  <div class="arrow-zone">
+    <div class="arrow-slot">
+      <div class="arr">
+        <div class="arr-up"></div>
+        <div class="arr-line"></div>
+        <div class="arr-label">query / FTS search / store</div>
+        <div class="arr-line"></div>
+        <div class="arr-down"></div>
+      </div>
+    </div>
+    <div class="arrow-slot">
+      <div class="arr">
+        <div class="arr-up"></div>
+        <div class="arr-line"></div>
+        <div class="arr-label">thread &amp; asset persistence</div>
+        <div class="arr-line"></div>
+        <div class="arr-down"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ ROW 4: NiceGUI | Chainlit ════════════════════════════════════ -->
+  <div class="row">
+
+    <!-- NiceGUI -->
+    <div class="box c-ng" style="flex:1">
+      <div class="box-title">
+        <span class="ico">🖥</span> NiceGUI App
+        <span class="port-badge">localhost:8765</span>
+      </div>
+
+      <div class="section-label">Main tabs</div>
+      <ul class="items">
+        <li><strong>Configuration</strong> — profiles, CB connection, auth, embedding &amp; AI model settings</li>
+        <li><strong>Scraping</strong> — tickets (cookie/headful) &amp; snapshots (listing/analytics/topology)</li>
+        <li><strong>Results</strong> — ticket table with filters, sorting, CSV/Excel export</li>
+        <li><strong>Chat</strong> — multi-turn agent with ECharts visualisations &amp; table downloads</li>
+        <li><strong>Scoring &amp; Analysis</strong> — LLM complexity scoring, bulk rescore, cluster health</li>
+        <li><strong>Customers</strong> — organization browser, alias map, preflight checks</li>
+      </ul>
+
+      <!-- Agent tools -->
+      <div class="tools-panel">
+        <div class="tl">Agent tools (shared with Chainlit)</div>
+        <div class="tool-grid">
+          <span class="tool-tag tt-local">query_tickets</span>
+          <span class="tool-tag tt-local">count_tickets</span>
+          <span class="tool-tag tt-local">get_ticket</span>
+          <span class="tool-tag tt-local">list_organizations</span>
+          <span class="tool-tag tt-local">check_data_freshness</span>
+          <span class="tool-tag tt-local">rescrape_ticket</span>
+          <span class="tool-tag tt-local">rescrape_customer_tickets</span>
+          <span class="tool-tag tt-live">list_supportal_customers</span>
+          <span class="tool-tag tt-live">query_supportal</span>
+          <span class="tool-tag tt-action">generate_chart</span>
+          <span class="tool-tag tt-action">generate_table</span>
+        </div>
+        <div style="margin-top:6px;display:flex;gap:10px;font-size:10px;color:#64748B;">
+          <span>🟢 LOCAL — hits Couchbase</span>
+          <span>🟡 LIVE — hits Supportal Analytics API</span>
+          <span>🔵 OUTPUT — renders artifact</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chainlit -->
+    <div class="box c-cl" style="flex:1">
+      <div class="box-title">
+        <span class="ico">💬</span> Chainlit Chat
+        <span class="port-badge">localhost:8766</span>
+      </div>
+
+      <div class="section-label">Interface</div>
+      <ul class="items">
+        <li>Password-authenticated login (any username, any password)</li>
+        <li>Thread sidebar — browse &amp; resume prior sessions</li>
+        <li>Thread named from first user message + customer prefix</li>
+        <li>Settings panel — customer scope, LLM provider, model override</li>
+      </ul>
+
+      <div class="section-label">AI agent</div>
+      <ul class="items">
+        <li>Same tool suite as NiceGUI (LOCAL + LIVE + OUTPUT)</li>
+        <li>Tool-calling loop up to 5 turns per message</li>
+        <li>DATA SOURCE ROUTING — local vs Supportal based on query intent</li>
+        <li>SCOPING RULE — customer-scoped with discovery exceptions</li>
+      </ul>
+
+      <div class="section-label">Persistence</div>
+      <ul class="items">
+        <li>Charts → Plotly inline; stored as base64 JSON in <span class="inline-code">chat.assets</span></li>
+        <li>Tables → Dataframe inline; also stored in <span class="inline-code">chat.assets</span>, tagged with originating prompt</li>
+        <li>Assets restored on thread resume</li>
+        <li>Conversation log shared with NiceGUI via <span class="inline-code">chat.history</span></li>
+      </ul>
+
+      <div class="section-label">Custom data layer</div>
+      <ul class="items">
+        <li>CouchbaseDataLayer — full Chainlit BaseDataLayer implementation</li>
+        <li>Auto-creates <span class="inline-code">chat</span> scope + collections + primary indexes on first run</li>
+        <li>Connection loaded from active NiceGUI profile (no separate config)</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <!-- Shared history banner -->
+  <div class="shared-banner">
+    <div class="sb-line"></div>
+    <div class="sb-label">↔ Shared conversation history (chat.history) — write from either UI, read from both</div>
+    <div class="sb-line"></div>
+  </div>
+
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#F59E0B"></div>External data source</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#7C3AED"></div>Scraping / ingestion</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#E11D48"></div>Couchbase data store</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#2563EB"></div>LLM inference layer</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>NiceGUI app (main UI)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#0D9488"></div>Chainlit chat (secondary UI)</div>
+</div>
+
+<div class="footnote">
+  Supportal AI Agent · architecture diagram · generated 2026-05-26
+</div>
+
+</body>
+</html>

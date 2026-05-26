@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.3.1"
+__version__ = "1.3.6"
 
 import asyncio
 import threading
@@ -38,6 +38,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 from nicegui import run, ui
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+
+def _safe_notify(client, message: str, type: str = "info") -> None:  # noqa: A002
+    """Notify the client only if it is still connected; silently no-ops on disconnect."""
+    if client is None:
+        ui.notify(message, type=type)
+        return
+    try:
+        from nicegui.client import Client as _NClient
+        if client.id not in _NClient.instances:
+            return
+        with client:
+            ui.notify(message, type=type)
+    except Exception:
+        pass
 
 
 def _run_in_playwright_thread(fn, *args, timeout: int = 90, **kwargs):
@@ -400,6 +415,71 @@ def chat_memory_clear(
 ) -> int:
     """Delete permanent memory summary entries (chat_cache::memory::*)."""
     return _chat_cache_delete_by_prefix("chat_cache::memory::", cb_url, bucket, username, password, use_tls, scope, collection)
+
+
+def _ensure_chat_history_col(bkt) -> None:
+    """Create chat scope + history collection if missing. Ignores errors."""
+    try:
+        from couchbase.management.collections import CollectionSpec
+        cm = bkt.collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if "chat" not in existing:
+            cm.create_scope("chat")
+        if "history" not in existing.get("chat", set()):
+            cm.create_collection(CollectionSpec("history", scope_name="chat"))
+    except Exception:
+        pass
+
+
+def _history_key(customer: str) -> str:
+    return "history::" + (customer or "__all__").strip().lower().replace(" ", "_")
+
+
+def save_customer_chat_history(
+    customer: str,
+    history: list[dict],
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+) -> None:
+    """Persist per-customer NiceGUI/shared chat history in the `chat.history` CB collection."""
+    if not _CB_AVAILABLE or not history:
+        return
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        bkt = cluster.bucket(bucket)
+        _ensure_chat_history_col(bkt)
+        bkt.scope("chat").collection("history").upsert(_history_key(customer), {
+            "customer": customer or "",
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "messages": history,
+        })
+        cluster.close()
+    except Exception:
+        pass
+
+
+def load_customer_chat_history(
+    customer: str,
+    cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
+) -> list[dict]:
+    """Load per-customer shared chat history from the `chat.history` CB collection."""
+    if not _CB_AVAILABLE:
+        return []
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=10))
+        bkt = cluster.bucket(bucket)
+        try:
+            doc = bkt.scope("chat").collection("history").get(_history_key(customer)).content_as[dict]
+            cluster.close()
+            return doc.get("messages", [])
+        except Exception:
+            cluster.close()
+            return []
+    except Exception:
+        return []
 
 
 def save_chat_session(
@@ -885,6 +965,16 @@ def _load_settings_file() -> dict:
 
 def _save_settings_file(profiles: dict) -> None:
     SETTINGS_FILE.write_text(json.dumps(profiles, indent=2))
+
+
+def _get_profile_cookie() -> str:
+    """Return the session cookie from the active saved profile, or empty string."""
+    try:
+        s = _load_settings_file()
+        active = s.get("__last__", "")
+        return s.get(active, {}).get("cookie", "") if active else ""
+    except Exception:
+        return ""
 
 
 # Module-level state — safe because NiceGUI runs as a single process.
@@ -2534,6 +2624,8 @@ _DELETED_TICKET_PHRASES = (
 
 def _is_deleted_ticket_page(status_code: int, html: str) -> bool:
     """Return True if the page indicates the ticket was deleted or does not exist."""
+    if not html:
+        return False
     if status_code not in (200, 404):
         return False
     text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True).lower()
@@ -3428,6 +3520,14 @@ def main_page():
                                     )
 
                                 state["results"] = data
+                                # Save old customer's history, then load new customer's
+                                _old_cust = state.get("customer_name", "")
+                                if _CB_AVAILABLE and state.get("chat_history") and _old_cust != customer:
+                                    await run.io_bound(
+                                        save_customer_chat_history, _old_cust, list(state["chat_history"]),
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
                                 state["customer_name"] = customer
                                 _SERVER_STATE["results"] = data
                                 _SERVER_STATE["customer_name"] = customer
@@ -3436,6 +3536,17 @@ def main_page():
                                 _results.clear()
                                 _results.extend(data)
                                 _set_customer_banner(customer or "All Customers")
+                                if _CB_AVAILABLE and _old_cust != customer:
+                                    _loaded_hist = await run.io_bound(
+                                        load_customer_chat_history, customer,
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
+                                    state["chat_history"] = _loaded_hist
+                                    state["chat_session_turns"] = []
+                                    state["chat_session_id"] = str(uuid.uuid4())
+                                    state["prior_session_block"] = ""
+                                    _render_chat()
 
                                 _refresh_table(data)
                                 btn_dl_json.set_enabled(True)
@@ -4876,10 +4987,28 @@ def main_page():
                                 )
                                 state["results"] = tickets
                                 cb_cust = (cb_load_filter.value or "").strip() or "All Customers"
+                                _old_cust2 = state.get("customer_name", "")
+                                if _CB_AVAILABLE and state.get("chat_history") and _old_cust2 != cb_cust:
+                                    await run.io_bound(
+                                        save_customer_chat_history, _old_cust2, list(state["chat_history"]),
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
                                 state["customer_name"] = cb_cust
                                 _SERVER_STATE["results"] = tickets
                                 _SERVER_STATE["customer_name"] = cb_cust
                                 _set_customer_banner(cb_cust)
+                                if _CB_AVAILABLE and _old_cust2 != cb_cust:
+                                    _loaded_hist2 = await run.io_bound(
+                                        load_customer_chat_history, cb_cust,
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    )
+                                    state["chat_history"] = _loaded_hist2
+                                    state["chat_session_turns"] = []
+                                    state["chat_session_id"] = str(uuid.uuid4())
+                                    state["prior_session_block"] = ""
+                                    _render_chat()
 
                                 # Auto-extract scores if already present on the docs
                                 auto_scores = {
@@ -5940,6 +6069,14 @@ def main_page():
                         with ui.row().classes("items-center gap-2 mt-2 mb-1"):
                             ui.icon("info").classes("text-blue-400 text-sm")
                             ui.label("LLM provider is configured in the AI Models tab").classes("text-xs text-gray-500")
+                            ui.space()
+                            ui.button(
+                                "Open Chainlit Chat ↗",
+                                on_click=lambda: ui.run_javascript("window.open('http://localhost:8766','_blank')"),
+                            ).props("flat dense size=sm color=indigo").tooltip(
+                                "Open the professional Chainlit chat UI in a new tab.\n"
+                                "Start it first: python run_chainlit.py --port 8766"
+                            )
 
                         with ui.row().classes("items-center gap-4 mt-2 flex-wrap"):
                             with ui.column().classes("gap-1"):
@@ -5986,11 +6123,8 @@ def main_page():
                         chat_status = ui.label("").classes("text-xs text-gray-400 mt-1 min-h-4")
 
                         # Live streaming display — visible only while Ollama/LMStudio generates
-                        with ui.row().classes("justify-start w-full mt-1") as _stream_row:
-                            _stream_label = ui.label("").classes(
-                                "bg-gray-100 text-gray-900 rounded-xl px-4 py-2 max-w-2xl "
-                                "text-sm whitespace-pre-wrap font-mono"
-                            )
+                        with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2") as _stream_row:
+                            _stream_label = ui.label("").classes("text-sm whitespace-pre-wrap font-mono")
                         _stream_row.set_visibility(False)
 
                         def _render_chat():
@@ -5998,91 +6132,88 @@ def main_page():
                             with chat_log:
                                 for msg in state["chat_history"]:
                                     if msg["role"] == "user":
-                                        with ui.row().classes("justify-end w-full"):
-                                            ui.label(msg["content"]).classes(
-                                                "bg-blue-600 text-white rounded-xl px-4 py-2 max-w-3xl text-sm whitespace-pre-wrap"
-                                            )
+                                        with ui.chat_message(name="You", sent=True).props("bg-color=blue-6 text-color=white"):
+                                            ui.label(msg["content"]).classes("text-sm whitespace-pre-wrap")
                                     elif msg["role"] == "assistant":
                                         _content = msg["content"]
-                                        with ui.row().classes("justify-start w-full items-start gap-1"):
-                                            with ui.column().classes("bg-gray-100 text-gray-900 rounded-xl px-4 py-2 max-w-3xl text-sm"):
-                                                # Render text + artifact (echart/table) blocks interleaved
-                                                _last_pos = 0
-                                                _has_artifact = bool(_ARTIFACT_RE.search(_content))
-                                                for _am in _ARTIFACT_RE.finditer(_content):
-                                                    _pre = _content[_last_pos:_am.start()].strip()
-                                                    if _pre:
-                                                        ui.markdown(_pre).classes("prose prose-sm max-w-none")
-                                                    _atype, _araw = _am.group(1), _am.group(2)
-                                                    _last_pos = _am.end()
-                                                    try:
-                                                        _ap = json.loads(_araw)
-                                                    except Exception:
-                                                        ui.label(f"[{_atype} parse error]").classes("text-red-500 text-xs")
-                                                        continue
-                                                    if _atype == "echart":
-                                                        _cuid = f"agchart-{abs(hash(_araw)):x}"
-                                                        _ctitle = ((_ap.get("title") or {}).get("text") or "chart").replace(" ", "_")
-                                                        with ui.element("div").classes(f"w-full {_cuid} mt-2"):
-                                                            ui.echart(_ap).classes("w-full").style("height:320px")
-                                                        ui.button(
-                                                            "PNG", icon="image",
-                                                            on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
-                                                                f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
-                                                                f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
-                                                                f"if(!inst)return;var img=inst.getDataURL({{type:'png',pixelRatio:2,backgroundColor:'#fff'}});"
-                                                                f"var a=document.createElement('a');a.href=img;a.download='{fn}.png';a.click();}})();"
-                                                            ),
-                                                        ).props("flat dense size=sm color=blue-grey").classes("mt-1").tooltip("Download PNG")
-                                                    elif _atype == "table":
-                                                        import html as _hmod
-                                                        _tcols = _ap.get("columns") or []
-                                                        _trows = _ap.get("rows") or []
-                                                        _tname = _ap.get("title") or "table"
-                                                        if _tname:
-                                                            ui.label(_tname).classes("font-semibold text-sm mt-2 mb-1")
-                                                        if _ap.get("description"):
-                                                            ui.markdown(_ap["description"]).classes("prose prose-sm mb-1")
-                                                        _th = "".join(f'<th class="border border-gray-300 px-2 py-1 bg-gray-200 font-semibold whitespace-nowrap">{_hmod.escape(str(c))}</th>' for c in _tcols)
-                                                        _tb = "".join(
-                                                            "<tr>" + "".join(f'<td class="border border-gray-300 px-2 py-1 whitespace-nowrap">{_hmod.escape(str(cell))}</td>' for cell in row) + "</tr>"
-                                                            for row in _trows
-                                                        )
-                                                        ui.html(f'<div class="overflow-x-auto mt-1"><table class="border-collapse text-xs"><thead><tr>{_th}</tr></thead><tbody>{_tb}</tbody></table></div>')
-                                                        with ui.row().classes("gap-1 mt-1"):
-                                                            def _dl_csv(_c=_tcols, _r=_trows, _n=_tname):
-                                                                import csv as _cm, io as _im
-                                                                buf = _im.StringIO()
-                                                                w = _cm.writer(buf)
-                                                                w.writerow(_c)
-                                                                w.writerows(_r)
-                                                                ui.download(buf.getvalue().encode(), f"{_n}.csv", "text/csv")
-                                                            ui.button("CSV", icon="download", on_click=_dl_csv).props("flat dense size=sm color=green").tooltip("Download CSV")
-                                                            def _dl_xlsx(_c=_tcols, _r=_trows, _n=_tname):
-                                                                try:
-                                                                    import openpyxl as _xl, io as _im
-                                                                    wb = _xl.Workbook()
-                                                                    ws = wb.active
-                                                                    ws.title = _n[:31]
-                                                                    ws.append(_c)
-                                                                    for row in _r:
-                                                                        ws.append([str(c) for c in row])
-                                                                    buf = _im.BytesIO()
-                                                                    wb.save(buf)
-                                                                    ui.download(buf.getvalue(), f"{_n}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                                                                except ImportError:
-                                                                    ui.notify("Install openpyxl: pip install openpyxl", type="warning")
-                                                            ui.button("Excel", icon="table_view", on_click=_dl_xlsx).props("flat dense size=sm color=green").tooltip("Download Excel")
-                                                _post = _content[_last_pos:].strip()
-                                                if _post or not _has_artifact:
-                                                    ui.markdown(_post or _content).classes("prose prose-sm max-w-none")
+                                        with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2"):
+                                            # Render text + artifact (echart/table) blocks interleaved
+                                            _last_pos = 0
+                                            _has_artifact = bool(_ARTIFACT_RE.search(_content))
+                                            for _am in _ARTIFACT_RE.finditer(_content):
+                                                _pre = _content[_last_pos:_am.start()].strip()
+                                                if _pre:
+                                                    ui.markdown(_pre).classes("prose prose-sm max-w-none")
+                                                _atype, _araw = _am.group(1), _am.group(2)
+                                                _last_pos = _am.end()
+                                                try:
+                                                    _ap = json.loads(_araw)
+                                                except Exception:
+                                                    ui.label(f"[{_atype} parse error]").classes("text-red-500 text-xs")
+                                                    continue
+                                                if _atype == "echart":
+                                                    _cuid = f"agchart-{abs(hash(_araw)):x}"
+                                                    _ctitle = ((_ap.get("title") or {}).get("text") or "chart").replace(" ", "_")
+                                                    with ui.element("div").classes(f"w-full {_cuid} mt-2"):
+                                                        ui.echart(_ap).classes("w-full").style("height:320px")
+                                                    ui.button(
+                                                        "PNG", icon="image",
+                                                        on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
+                                                            f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
+                                                            f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
+                                                            f"if(!inst)return;var img=inst.getDataURL({{type:'png',pixelRatio:2,backgroundColor:'#fff'}});"
+                                                            f"var a=document.createElement('a');a.href=img;a.download='{fn}.png';a.click();}})();"
+                                                        ),
+                                                    ).props("flat dense size=sm color=blue-grey").classes("mt-1").tooltip("Download PNG")
+                                                elif _atype == "table":
+                                                    import html as _hmod
+                                                    _tcols = _ap.get("columns") or []
+                                                    _trows = _ap.get("rows") or []
+                                                    _tname = _ap.get("title") or "table"
+                                                    if _tname:
+                                                        ui.label(_tname).classes("font-semibold text-sm mt-2 mb-1")
+                                                    if _ap.get("description"):
+                                                        ui.markdown(_ap["description"]).classes("prose prose-sm mb-1")
+                                                    _th = "".join(f'<th class="border border-gray-300 px-2 py-1 bg-gray-200 font-semibold whitespace-nowrap">{_hmod.escape(str(c))}</th>' for c in _tcols)
+                                                    _tb = "".join(
+                                                        "<tr>" + "".join(f'<td class="border border-gray-300 px-2 py-1 whitespace-nowrap">{_hmod.escape(str(cell))}</td>' for cell in row) + "</tr>"
+                                                        for row in _trows
+                                                    )
+                                                    ui.html(f'<div class="overflow-x-auto mt-1"><table class="border-collapse text-xs"><thead><tr>{_th}</tr></thead><tbody>{_tb}</tbody></table></div>')
+                                                    with ui.row().classes("gap-1 mt-1"):
+                                                        def _dl_csv(_c=_tcols, _r=_trows, _n=_tname):
+                                                            import csv as _cm, io as _im
+                                                            buf = _im.StringIO()
+                                                            w = _cm.writer(buf)
+                                                            w.writerow(_c)
+                                                            w.writerows(_r)
+                                                            ui.download(buf.getvalue().encode(), f"{_n}.csv", "text/csv")
+                                                        ui.button("CSV", icon="download", on_click=_dl_csv).props("flat dense size=sm color=green").tooltip("Download CSV")
+                                                        def _dl_xlsx(_c=_tcols, _r=_trows, _n=_tname):
+                                                            try:
+                                                                import openpyxl as _xl, io as _im
+                                                                wb = _xl.Workbook()
+                                                                ws = wb.active
+                                                                ws.title = _n[:31]
+                                                                ws.append(_c)
+                                                                for row in _r:
+                                                                    ws.append([str(c) for c in row])
+                                                                buf = _im.BytesIO()
+                                                                wb.save(buf)
+                                                                ui.download(buf.getvalue(), f"{_n}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                                                            except ImportError:
+                                                                ui.notify("Install openpyxl: pip install openpyxl", type="warning")
+                                                        ui.button("Excel", icon="table_view", on_click=_dl_xlsx).props("flat dense size=sm color=green").tooltip("Download Excel")
+                                            _post = _content[_last_pos:].strip()
+                                            if _post or not _has_artifact:
+                                                ui.markdown(_post or _content).classes("prose prose-sm max-w-none")
                                             # Copy button — writes raw markdown to clipboard
                                             ui.button(
                                                 icon="content_copy",
                                                 on_click=lambda e, txt=_content: ui.run_javascript(
                                                     f"navigator.clipboard.writeText({json.dumps(txt)})"
                                                 ),
-                                            ).props("flat round dense color=gray").classes("mt-1 opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
+                                            ).props("flat round dense color=gray").classes("mt-2 opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
                             # Scroll to bottom
                             ui.run_javascript(
                                 "var el = document.querySelector('.chat-log-scroll');"
@@ -6485,6 +6616,13 @@ def main_page():
                                         "Use the available tools to answer questions accurately. "
                                         "Always call tools to retrieve data — never guess at counts or ticket details.\n\n"
                                         "TOOL GUIDANCE:\n"
+                                        "DATA SOURCE ROUTING — choose based on what the user is asking about:\n"
+                                        "  LOCAL (your Couchbase): list_organizations, query_tickets, count_tickets, get_ticket\n"
+                                        "    → 'what customers are you aware of?', 'what do you have locally?', 'which orgs have I scraped?'\n"
+                                        "  LIVE/GLOBAL (Supportal Analytics API): list_supportal_customers, query_supportal\n"
+                                        "    → 'how many customers get support today?', 'what's in Supportal globally?', "
+                                        "'how many clusters exist?', 'live snapshot data', 'version distribution across all customers'\n"
+                                        "When ambiguous, prefer LOCAL unless the user says 'today', 'live', 'Supportal', 'globally', or 'all customers'.\n"
                                         "- count_tickets: for total/count questions\n"
                                         "- query_tickets: to list or filter tickets (returns Last Scraped age per ticket)\n"
                                         "- get_ticket: full detail on one ticket including cluster topology from the linked "
@@ -6494,24 +6632,34 @@ def main_page():
                                         "- check_data_freshness: ALWAYS call this when the user asks about 'current status', "
                                         "'latest', 'live', 'today', or 'has this changed'. Pass the ticket_ids from a prior "
                                         "query_tickets call. Report the age and include Supportal URLs for live verification.\n"
-                                        "- rescrape_ticket: call this when data is stale AND the user wants it refreshed. "
-                                        "It fetches the live ticket from Supportal and saves the updated data to Couchbase "
-                                        "in a single step — always prefer this over just linking the URL when the user "
-                                        "says 'verify', 'refresh', 'update', or 'check the latest'.\n"
+                                        "- rescrape_ticket: refresh a single ticket from Supportal.\n"
+                                        "- rescrape_customer_tickets: bulk-refresh all stale tickets for a customer. "
+                                        "Call this when the user says 'rescrape all', 'refresh all tickets', 'update everything', "
+                                        "'get the latest for all tickets'. By default only rescrapes tickets older than 4 hours. "
+                                        "Use stale_hours=0 to force-refresh all regardless of age.\n"
                                         "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true.\n"
-                                        "- generate_chart: call this to render a bar, line, pie, donut, or horizontal_bar "
-                                        "chart inline in the chat. Use it proactively when counts or trends are involved.\n"
-                                        "- generate_table: call this to render a formatted table with CSV/Excel download "
-                                        "buttons. Prefer this over a plain markdown table when the user may want to export "
-                                        "the data. Always call generate_table BEFORE your final summary text so the table "
-                                        "appears above your explanation."
+                                        "- generate_chart: MANDATORY when the user asks for any chart, graph, or "
+                                        "visualization. Call this tool — do NOT describe a chart in text or say 'here is "
+                                        "a bar chart:' followed by a text description. The tool renders a real interactive "
+                                        "chart in the UI. Supported types: bar, horizontal_bar, line, pie, donut. "
+                                        "Also call proactively when comparing counts across categories.\n"
+                                        "- generate_table: MANDATORY when the user asks for a table, spreadsheet, or "
+                                        "exportable data. Call this tool — do NOT render a markdown table. Always call "
+                                        "generate_table BEFORE your final summary text so the table appears above your "
+                                        "explanation. Produces real CSV and Excel download buttons."
                                     )
                                     if _cust_agent and _cust_agent.lower() != "all customers":
                                         _agent_sys += (
-                                            f"\n\nSCOPING RULE: A specific customer is loaded: \"{_cust_agent}\". "
-                                            f"You MUST include customer=\"{_cust_agent}\" in EVERY query_tickets and "
-                                            f"count_tickets call. Never omit it. Never query across all customers. "
-                                            f"Never ask the user for the customer name — it is already set."
+                                            f"\n\nSCOPING RULE: Customer is scoped to \"{_cust_agent}\". "
+                                            f"You MUST include customer=\"{_cust_agent}\" in every query_tickets and "
+                                            f"count_tickets call. Never ask the user for the customer name — it is already set.\n"
+                                            f"DISCOVERY EXCEPTIONS (cross-customer queries are allowed ONLY for):\n"
+                                            f"  1. list_organizations — always exempt, always runs across all customers.\n"
+                                            f"  2. Discovering what customers exist ('what orgs are in the system', "
+                                            f"'what other customers are there', 'update the customer list').\n"
+                                            f"  3. Getting a basic ticket count or summary for a specific other customer "
+                                            f"the user names explicitly.\n"
+                                            f"For all analysis, trends, ticket details, and comparisons: stay scoped to \"{_cust_agent}\"."
                                         )
                                     if state.get("prior_session_block"):
                                         _agent_sys += "\n" + state["prior_session_block"]
@@ -6531,6 +6679,43 @@ def main_page():
                                         5,
                                         _cust_agent,
                                     )
+                                    # ── Chart enforcement ─────────────────────────────────────────
+                                    # Some models describe charts in text instead of calling
+                                    # generate_chart. Detect this and force one more tool-call round.
+                                    _CHART_KWS = ("chart", "graph", "bar chart", "pie chart",
+                                                  "line chart", "plot", "visuali")
+                                    _wants_chart = any(kw in question.lower() for kw in _CHART_KWS)
+                                    if _wants_chart and "```echart" not in (answer or ""):
+                                        chat_status.set_text("Agent — generating chart …")
+                                        _force_msgs = list(_agent_msgs) + [
+                                            {"role": "assistant", "content": answer or ""},
+                                            {"role": "user", "content": (
+                                                "You described the chart in text but did not call "
+                                                "generate_chart. Call generate_chart RIGHT NOW using "
+                                                "the exact numbers from your previous response. "
+                                                "Do not write any text — only make the tool call."
+                                            )},
+                                        ]
+                                        try:
+                                            _chart_ans = await run.io_bound(
+                                                call_llm_with_tools,
+                                                _force_msgs,
+                                                _AGENT_TOOLS,
+                                                *_cb_agent,
+                                                provider, model, api_key, base_url,
+                                                2048, 2, _cust_agent,
+                                            )
+                                            if _chart_ans and "```echart" in _chart_ans:
+                                                # Strip placeholder text from original answer then
+                                                # prepend the real chart artifact.
+                                                _clean = re.sub(
+                                                    r'\[.*?chart.*?(?:appear|here|above|generat).*?\]',
+                                                    '', answer or '', flags=re.IGNORECASE | re.DOTALL
+                                                ).strip()
+                                                answer = _chart_ans + ("\n\n" + _clean if _clean else "")
+                                        except Exception as _cef:
+                                            print(f"[chart enforcement] failed: {_cef}")
+                                    # ─────────────────────────────────────────────────────────────
                                     state["chat_history"].append({"role": "assistant", "content": answer})
                                     _render_chat()
                                     chat_status.set_text("Agent mode complete.")
@@ -6779,6 +6964,15 @@ def main_page():
                                 _render_chat()
                             finally:
                                 btn_send.set_enabled(True)
+                                # Persist history if last exchange completed successfully
+                                if (_CB_AVAILABLE and state.get("chat_history")
+                                        and state["chat_history"][-1]["role"] == "assistant"):
+                                    asyncio.ensure_future(run.io_bound(
+                                        save_customer_chat_history,
+                                        state.get("customer_name", ""), list(state["chat_history"]),
+                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
+                                    ))
 
                         def _clear_chat():
                             # Persist the completed session before clearing
@@ -7094,8 +7288,7 @@ def main_page():
                                 msg = f"Scored {len(scores)}/{len(state['results'])} tickets."
                                 score_status.set_text(msg)
                                 score_progress.set_value(1.0)
-                                with client:
-                                    ui.notify(msg, type="positive")
+                                _safe_notify(client, msg, type="positive")
                                 btn_render_charts.set_enabled(True)
 
                                 if score_autosave_toggle.value and scores:
@@ -7132,8 +7325,7 @@ def main_page():
                                         )
                             except Exception as exc:
                                 score_status.set_text(f"Error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                             finally:
                                 btn_score.set_enabled(True)
                                 btn_load_scores.set_enabled(True)
@@ -7176,14 +7368,12 @@ def main_page():
                                 msg = f"Loaded {len(loaded)} scores from Couchbase."
                                 score_status.set_text(msg)
                                 score_progress.set_value(1.0)
-                                with client:
-                                    ui.notify(msg, type="positive")
+                                _safe_notify(client, msg, type="positive")
                                 if loaded:
                                     btn_render_charts.set_enabled(True)
                             except Exception as exc:
                                 score_status.set_text(f"Error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                             finally:
                                 btn_load_scores.set_enabled(True)
                                 btn_rescore_all.set_enabled(True)
@@ -7230,22 +7420,25 @@ def main_page():
                                 msg = f"Bulk rescore complete — {scored} scored, {errs} errors."
                                 score_status.set_text(msg)
                                 score_progress.set_value(1.0)
-                                with client:
-                                    ui.notify(msg, type="positive" if errs == 0 else "warning")
+                                _safe_notify(client, msg, type="positive" if errs == 0 else "warning")
                                 if err_log:
-                                    with client:
-                                        with ui.dialog() as err_dialog, ui.card().classes("w-full max-w-2xl"):
-                                            ui.label(f"Rescore Errors ({len(err_log)})").classes("text-base font-semibold text-red-600")
-                                            ui.separator()
-                                            with ui.scroll_area().classes("w-full h-64"):
-                                                for e in err_log:
-                                                    ui.label(e).classes("text-xs font-mono text-red-700 break-all")
-                                            ui.button("Close", on_click=err_dialog.close).classes("mt-2")
-                                        err_dialog.open()
+                                    try:
+                                        from nicegui.client import Client as _NC
+                                        if client and client.id in _NC.instances:
+                                            with client:
+                                                with ui.dialog() as err_dialog, ui.card().classes("w-full max-w-2xl"):
+                                                    ui.label(f"Rescore Errors ({len(err_log)})").classes("text-base font-semibold text-red-600")
+                                                    ui.separator()
+                                                    with ui.scroll_area().classes("w-full h-64"):
+                                                        for e in err_log:
+                                                            ui.label(e).classes("text-xs font-mono text-red-700 break-all")
+                                                    ui.button("Close", on_click=err_dialog.close).classes("mt-2")
+                                                err_dialog.open()
+                                    except Exception:
+                                        pass
                             except Exception as exc:
                                 score_status.set_text(f"Bulk rescore error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                             finally:
                                 btn_rescore_all.set_enabled(True)
                                 btn_score.set_enabled(True)
@@ -8749,8 +8942,7 @@ def main_page():
                         async def _do_profile(client=None):
                             org = (profile_org_select.value or "").strip()
                             if not org:
-                                with client:
-                                    ui.notify("Select a customer first.", type="warning")
+                                _safe_notify(client, "Select a customer first.", type="warning")
                                 return
                             btn_profile.set_enabled(False)
                             profile_status.set_text(f"Building profile for {org}…")
@@ -9551,8 +9743,7 @@ def main_page():
                             """Fetch snapshot listing + ticket IDs via analytics API (fast, no Playwright)."""
                             customer = (ch_cust_input.value or main_cust_input.value or "").strip()
                             if not customer:
-                                with client:
-                                    ui.notify("Enter a customer name or URL.", type="warning")
+                                _safe_notify(client, "Enter a customer name or URL.", type="warning")
                                 return
                             btn_ch_fetch_analytics.set_enabled(False)
                             ch_progress.set_visibility(True)
@@ -9603,8 +9794,7 @@ def main_page():
                                 ch_status.set_text(f"Analytics fetch error: {exc}")
                                 try:
                                     if client:
-                                        with client:
-                                            ui.notify(str(exc), type="negative")
+                                        _safe_notify(client, str(exc), type="negative")
                                     else:
                                         ui.notify(str(exc), type="negative")
                                 except Exception:
@@ -9644,8 +9834,7 @@ def main_page():
                                 and s.get("snap_id")
                             ]
                             if not all_stubs:
-                                with client:
-                                    ui.notify("No analytics stubs to scrape — fetch via Analytics API first, or all snaps already have topology.", type="info")
+                                _safe_notify(client, "No analytics stubs to scrape — fetch via Analytics API first, or all snaps already have topology.", type="info")
                                 return
                             btn_ch_scrape_stubs.set_enabled(False)
                             ch_progress.set_visibility(True)
@@ -9685,8 +9874,7 @@ def main_page():
                                     + (f", capped at {max_snaps}" if max_snaps > 0 else "") + "."
                                 )
                                 if not stubs:
-                                    with client:
-                                        ui.notify(f"All {n_skipped} snapshots already complete in Couchbase.", type="info")
+                                    _safe_notify(client, f"All {n_skipped} snapshots already complete in Couchbase.", type="info")
                                     btn_ch_scrape_stubs.set_enabled(True)
                                     ch_progress.set_visibility(False)
                                     return
@@ -9710,8 +9898,7 @@ def main_page():
                                 import traceback as _tb
                                 _tb.print_exc()
                                 ch_status.set_text(f"Scrape error: {exc}")
-                                with client:
-                                    ui.notify(str(exc), type="negative")
+                                _safe_notify(client, str(exc), type="negative")
                                 btn_ch_scrape_stubs.set_enabled(True)
                                 ch_progress.set_visibility(False)
                                 return
@@ -9734,8 +9921,7 @@ def main_page():
                             ch_status.set_text(
                                 f"Scraped topology for {len(scraped)} snapshots ({len(all_snaps)} total)."
                             )
-                            with client:
-                                ui.notify(f"Scraped {len(scraped)} snapshots.", type="positive")
+                            _safe_notify(client, f"Scraped {len(scraped)} snapshots.", type="positive")
 
                             if scraped and ch_auto_save_cb.value and _CB_AVAILABLE and cb_url_input.value.strip():
                                 ch_status.set_text(f"Auto-saving {len(scraped)} snapshots to Couchbase…")
@@ -15175,6 +15361,42 @@ _AGENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "rescrape_customer_tickets",
+            "description": (
+                "Bulk re-scrape tickets for a customer from Supportal and update Couchbase. "
+                "Use when the user asks to refresh all tickets, update stale data, or rescrape "
+                "a customer's full ticket history. By default only scrapes tickets older than 4 hours. "
+                "Runs sequentially with a short delay between requests to avoid rate-limiting. "
+                "Returns a summary of how many succeeded, failed, or were skipped."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer": {
+                        "type": "string",
+                        "description": "Customer/organization name to rescrape. Defaults to the currently scoped customer.",
+                    },
+                    "stale_hours": {
+                        "type": "number",
+                        "description": "Only rescrape tickets not updated within this many hours (default 4). Set to 0 to force-rescrape all.",
+                    },
+                    "max_tickets": {
+                        "type": "integer",
+                        "description": "Safety cap on how many tickets to rescrape in one call (default 50, max 200).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "pending", "solved", "closed", "hold"],
+                        "description": "Only rescrape tickets with this status. Leave blank for all statuses.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "rescrape_ticket",
             "description": (
                 "Re-fetch a ticket directly from Supportal Analytics and update Couchbase "
@@ -15199,10 +15421,10 @@ _AGENT_TOOLS: list[dict] = [
         "function": {
             "name": "generate_chart",
             "description": (
-                "Render a chart in the chat UI from structured data. "
+                "Renders a real interactive chart in the chat UI. "
+                "MUST be called whenever the user asks for a chart, graph, bar chart, "
+                "pie chart, or any visualization — never substitute with text. "
                 "Supported types: bar, horizontal_bar, line, pie, donut. "
-                "Use this whenever a visual summary would help — ticket counts by "
-                "priority/status, trends over time, distribution breakdowns, etc. "
                 "For multi-series data pass series instead of labels+values."
             ),
             "parameters": {
@@ -15245,11 +15467,112 @@ _AGENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "list_supportal_customers",
+            "description": (
+                "[LIVE / GLOBAL — hits Supportal Analytics API, not local Couchbase] "
+                "Returns every customer Supportal is aware of globally, with snapshot and "
+                "linked ticket counts. Use for questions like: 'how many customers get support?', "
+                "'what customers are in Supportal?', 'show me all customers globally', "
+                "'how many orgs does Couchbase support?'. "
+                "Do NOT use for questions about locally scraped data — use list_organizations for that. "
+                "Requires a valid session cookie in the saved profile."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["name", "snapshots", "tickets"],
+                        "description": "Sort order: alphabetical by name, by snapshot count, or by linked ticket count. Default: name.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max customers to return (default 200).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_supportal",
+            "description": (
+                "[LIVE / GLOBAL — hits Supportal Analytics API, not local Couchbase] "
+                "Run a SQL++ query against the live Supportal Analytics API. "
+                "Use for global/live questions not covered by other tools: snapshot details, "
+                "cluster configurations, version distributions, ticket-to-cluster mappings, "
+                "counts of customers/clusters/snapshots as seen by Supportal today. "
+                "Do NOT use for locally scraped ticket data — use query_tickets/count_tickets for that.\n\n"
+                "SCHEMA (scope: v1):\n"
+                "  customer   — name (string). Key: Customer::{id}\n"
+                "  cluster    — ui_name (string), customer (string, customer id). Key: Cluster::{uuid}\n"
+                "  snapshot   — timestamp (ISO string), uuid (cluster uuid), zendesk (array of int ticket IDs). Key: Snapshot::{id}\n\n"
+                "JOIN PATTERNS:\n"
+                "  cluster→customer:  JOIN customer cu ON META(cu).id = (\"Customer::\" || cl.customer)\n"
+                "  snapshot→cluster:  JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.uuid)\n"
+                "  snapshot ticket IDs: UNNEST sn.zendesk AS t_id\n\n"
+                "EXAMPLE QUERIES:\n"
+                "  All customers: SELECT name FROM customer ORDER BY name\n"
+                "  Snapshots per customer: SELECT cu.name, COUNT(*) AS snaps FROM snapshot sn "
+                "JOIN cluster cl ON META(cl).id=(\"Cluster::\"|sn.uuid) "
+                "JOIN customer cu ON META(cu).id=(\"Customer::\"|cl.customer) GROUP BY cu.name ORDER BY snaps DESC\n"
+                "  Clusters for customer: SELECT cl.ui_name FROM cluster cl "
+                "JOIN customer cu ON META(cu).id=(\"Customer::\"|cl.customer) WHERE cu.name=\"Acme Corp\"\n"
+                "  Recent snapshots: SELECT sn.timestamp, cl.ui_name FROM snapshot sn "
+                "JOIN cluster cl ON META(cl).id=(\"Cluster::\"|sn.uuid) ORDER BY sn.timestamp DESC LIMIT 20\n"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "statement": {
+                        "type": "string",
+                        "description": "The SQL++ query to execute against Supportal Analytics.",
+                    },
+                    "limit_rows": {
+                        "type": "integer",
+                        "description": "Truncate result to this many rows before returning (default 100). Add LIMIT in your SQL for best performance.",
+                    },
+                },
+                "required": ["statement"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_organizations",
+            "description": (
+                "[LOCAL — queries your configured Couchbase instance, not Supportal] "
+                "Returns every customer/organization that has tickets stored in the local "
+                "Couchbase database, with ticket counts. Use for questions like: "
+                "'what customers are you aware of?', 'what orgs do you have data for?', "
+                "'which customers have I scraped?', 'who has the most tickets locally?'. "
+                "Always exempt from customer scoping — always returns all orgs. "
+                "Do NOT use for global Supportal data — use list_supportal_customers for that."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "min_tickets": {
+                        "type": "integer",
+                        "description": "Only include organizations with at least this many tickets (default 1).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_table",
             "description": (
-                "Render a data table in the chat UI with CSV and Excel download buttons. "
-                "Use this to present structured query results, ticket lists, or any "
-                "tabular data that the user may want to export to a spreadsheet."
+                "Renders a real data table in the chat UI with CSV and Excel download buttons. "
+                "MUST be called when the user asks for a table, spreadsheet, or list of tickets "
+                "to export — never substitute with a markdown table. "
+                "Call this before your final text so the table appears above the explanation."
             ),
             "parameters": {
                 "type": "object",
@@ -15585,6 +15908,109 @@ def _execute_agent_tool(
             result += f"\n\n✓ All {len(rows)} tickets have fresh data (scraped within 4 hours)."
         return result
 
+    elif name == "rescrape_customer_tickets":
+        cust        = (args.get("customer") or default_customer or "").strip()
+        stale_hours = float(args.get("stale_hours") if args.get("stale_hours") is not None else 4.0)
+        max_tix     = min(int(args.get("max_tickets") or 50), 200)
+        status_filt = (args.get("status") or "").strip().lower() or None
+
+        cookie = _get_profile_cookie()
+        if not cookie:
+            return "No session cookie in saved profile — paste a fresh cookie in the Auth tab."
+
+        # Gather candidate ticket IDs from CB
+        filters: dict = {}
+        if cust and cust.lower() != "all customers":
+            filters["organization"] = cust
+        if status_filt:
+            filters["status"] = status_filt
+
+        candidates = tool_query_tickets(
+            filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=max_tix * 4,
+        )
+        if not candidates:
+            return f"No tickets found in Couchbase for {cust or 'all customers'}."
+
+        # Filter to stale tickets
+        now_epoch = time.time()
+        stale_cutoff = now_epoch - stale_hours * 3600
+        if stale_hours > 0:
+            to_scrape = [
+                t for t in candidates
+                if (t.get("last_scraped_at") or 0) < stale_cutoff
+            ]
+        else:
+            to_scrape = list(candidates)
+
+        to_scrape = to_scrape[:max_tix]
+        if not to_scrape:
+            return (
+                f"All {len(candidates)} tickets for {cust or 'all customers'} "
+                f"were scraped within the last {stale_hours:.0f} hours — nothing to update."
+            )
+
+        # Connect to CB once for all writes
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator        # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            _bcluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            _bcluster.wait_until_ready(timedelta(seconds=10))
+            _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
+        except Exception as exc:
+            return f"Couchbase connection failed: {exc}"
+
+        ok = skipped = errors = 0
+        error_samples: list[str] = []
+
+        for t in to_scrape:
+            tid = str(t.get("ticket_id") or "").strip()
+            if not tid:
+                skipped += 1
+                continue
+            try:
+                fresh = scrape_single_ticket_cookie(cookie, tid)
+                if not fresh or not fresh.get("ticket_id"):
+                    skipped += 1
+                    continue
+                fresh["last_scraped_at"] = int(time.time())
+                fresh["type"] = "ticket"
+                doc_key = f"ticket::{tid}"
+                try:
+                    existing = _bcol.get(doc_key).content_as[dict]
+                    merged = {**existing}
+                    for k, v in fresh.items():
+                        if v not in (None, "", [], {}):
+                            merged[k] = v
+                    _bcol.upsert(doc_key, merged)
+                except Exception:
+                    _bcol.upsert(doc_key, fresh)
+                ok += 1
+            except Exception as exc:
+                errors += 1
+                if len(error_samples) < 3:
+                    error_samples.append(f"  ticket {tid}: {exc}")
+            time.sleep(0.35)  # ~3 req/s — stay well under rate limits
+
+        try:
+            _bcluster.close()
+        except Exception:
+            pass
+
+        parts = [
+            f"Bulk rescrape complete for **{cust or 'all customers'}**.",
+            f"- Scraped: {ok} tickets updated",
+            f"- Skipped: {skipped} (no ticket ID)",
+            f"- Errors:  {errors}",
+        ]
+        if error_samples:
+            parts.append("Sample errors:\n" + "\n".join(error_samples))
+        if errors and cookie:
+            parts.append("If errors persist the session cookie may have expired — paste a fresh one in the Auth tab.")
+        return "\n".join(parts)
+
     elif name == "rescrape_ticket":
         ticket_id = str(args.get("ticket_id") or "").strip()
         if not ticket_id:
@@ -15653,9 +16079,11 @@ def _execute_agent_tool(
         # ── Inline snapshot topology enrichment ──────────────────────────────
         # Attempt before the CB write so topology lands in the same upsert.
         topo_enriched = False
-        snap_ids_found = _SNAP_ID_RE.findall(fresh.get("snapshots", ""))
+        _snaps_raw = fresh.get("snapshots")
+        _snaps_str = _snaps_raw if isinstance(_snaps_raw, str) else ""
+        snap_ids_found = _SNAP_ID_RE.findall(_snaps_str)
         if not snap_ids_found:
-            snap_ids_found = _UUID_RE.findall(fresh.get("snapshots", ""))
+            snap_ids_found = _UUID_RE.findall(_snaps_str)
         if snap_ids_found:
             fresh["snap_ids"] = list(dict.fromkeys(snap_ids_found))  # dedup, preserve order
             best_snap = _highest_snap_id(snap_ids_found)
@@ -15725,6 +16153,104 @@ def _execute_agent_tool(
                 src = " (freshly enriched)" if topo_enriched else " (from prior enrichment)"
                 summary_lines.append(f"Topology{src}: {', '.join(topo_note)}")
         return "\n".join(summary_lines)
+
+    elif name == "list_supportal_customers":
+        sort_by = (args.get("sort_by") or "name").lower()
+        limit   = min(int(args.get("limit") or 200), 500)
+        cookie  = _get_profile_cookie()
+        if not cookie:
+            return (
+                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
+                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
+            )
+        try:
+            order = {"snapshots": "snaps DESC", "tickets": "tickets DESC"}.get(sort_by, "cu_name ASC")
+            statement = f"""
+SELECT cu.`name` AS cu_name,
+       COUNT(DISTINCT META(sn).id) AS snaps,
+       COUNT(DISTINCT t_id)        AS tickets
+FROM snapshot sn
+UNNEST sn.`zendesk` AS t_id
+JOIN cluster cl ON META(cl).id = ("Cluster::" || sn.`uuid`)
+JOIN customer cu ON META(cu).id = ("Customer::" || cl.`customer`)
+GROUP BY cu.`name`
+ORDER BY {order}
+LIMIT {limit}
+""".strip()
+            rows = query_supportal_analytics(statement, cookie)
+        except Exception as exc:
+            return f"Supportal Analytics error: {exc}"
+        if not rows:
+            return "No customers returned from Supportal Analytics."
+        lines = [f"**{len(rows)} customers in Supportal Analytics:**", ""]
+        for r in rows:
+            name_  = r.get("cu_name", "")
+            snaps  = r.get("snaps", 0)
+            tix    = r.get("tickets", 0)
+            lines.append(f"- **{name_}** — {snaps} snapshot{'s' if snaps != 1 else ''}, {tix} linked ticket{'s' if tix != 1 else ''}")
+        return "\n".join(lines)
+
+    elif name == "query_supportal":
+        statement  = (args.get("statement") or "").strip()
+        limit_rows = min(int(args.get("limit_rows") or 100), 500)
+        if not statement:
+            return "Error: statement is required."
+        cookie = _get_profile_cookie()
+        if not cookie:
+            return (
+                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
+                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
+            )
+        try:
+            rows = query_supportal_analytics(statement, cookie)
+        except Exception as exc:
+            return f"Supportal Analytics query error: {exc}"
+        if not rows:
+            return "Query returned no results."
+        rows = rows[:limit_rows]
+        # Format as markdown table
+        if not isinstance(rows[0], dict):
+            return "\n".join(str(r) for r in rows)
+        cols = list(rows[0].keys())
+        header = "| " + " | ".join(cols) + " |"
+        sep    = "| " + " | ".join("---" for _ in cols) + " |"
+        body   = "\n".join(
+            "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
+            for r in rows
+        )
+        return f"{header}\n{sep}\n{body}\n\n**{len(rows)} row(s) returned**"
+
+    elif name == "list_organizations":
+        min_tickets = max(1, int(args.get("min_tickets") or 1))
+        if not _CB_AVAILABLE:
+            return "Couchbase not available."
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator  # type: ignore
+            from couchbase.options import QueryOptions  # type: ignore
+            from datetime import timedelta
+            conn_str = _cb_conn_str(cb_url, use_tls)
+            cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+            cluster.wait_until_ready(timedelta(seconds=10))
+            keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+            rows = list(cluster.query(
+                f"SELECT organization, COUNT(*) AS ticket_count "
+                f"FROM {keyspace} "
+                f"WHERE organization IS NOT MISSING AND organization != '' "
+                f"GROUP BY organization "
+                f"HAVING COUNT(*) >= {min_tickets} "
+                f"ORDER BY organization ASC",
+                QueryOptions(timeout=timedelta(seconds=30)),
+            ))
+            cluster.close()
+        except Exception as exc:
+            return f"list_organizations failed: {exc}"
+        if not rows:
+            return "No organizations found in the database."
+        lines = [f"**{len(rows)} organizations in Couchbase:**", ""]
+        for r in rows:
+            lines.append(f"- **{r['organization']}** ({r['ticket_count']} ticket{'s' if r['ticket_count'] != 1 else ''})")
+        return "\n".join(lines)
 
     elif name == "generate_chart":
         opt = _build_agent_echart_option(args)
@@ -15848,6 +16374,23 @@ def call_llm_with_tools(
     import json as _json
     import traceback as _tb
 
+    # ── Artifact stash shared by all provider paths ──────────────────────────
+    # generate_chart / generate_table return echart/table fenced blocks.
+    # Models often write prose as their final turn instead of echoing the block,
+    # so we collect every artifact produced by tool execution and prepend it to
+    # whatever text the model returns as its final answer.
+    _artifact_stash: list[str] = []
+
+    def _collect_artifact(result: str) -> None:
+        if "```echart" in result or "```table" in result:
+            _artifact_stash.append(result)
+
+    def _apply_stash(content: str) -> str:
+        prefix_parts = [a for a in _artifact_stash if a not in content]
+        if not prefix_parts:
+            return content
+        return "\n\n".join(prefix_parts) + ("\n\n" + content if content else "")
+
     _openai_compat_providers = ("lmstudio", "ollama", "openai", "gemini")
 
     if provider in _openai_compat_providers:
@@ -15887,6 +16430,7 @@ def call_llm_with_tools(
 
         _msgs: list[dict] = list(messages)
         _tool_calls_made = False
+
         try:
             for _round in range(max_rounds):
                 print(f"[agent] round={_round} msgs={len(_msgs)} tools_active={not _tool_calls_made}")
@@ -15915,7 +16459,7 @@ def call_llm_with_tools(
                         # Strip any residual noise from prior rounds before returning
                         for _tp in _TC_PATTERNS:
                             _raw_content = _tp.sub("", _raw_content).strip()
-                        return _raw_content
+                        return _apply_stash(_raw_content)
 
                     # Execute each text-encoded tool call and inject results
                     print(f"[agent] detected {len(_text_calls)} text-encoded tool call(s) in content — executing and retrying")
@@ -15929,6 +16473,7 @@ def call_llm_with_tools(
                             default_customer=default_customer,
                         )
                         print(f"[agent] text-call result length={len(_tc_result)}")
+                        _collect_artifact(_tc_result)
                         # Inject as a user-visible tool result so the model can reference it
                         _msgs.append({"role": "user", "content": f"[Tool result for {_tc_name}]:\n{_tc_result}"})
                     _tool_calls_made = True
@@ -15967,6 +16512,7 @@ def call_llm_with_tools(
                         default_customer=default_customer,
                     )
                     print(f"[agent] tool result length={len(result)}")
+                    _collect_artifact(result)
                     _msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
                 _tool_calls_made = True  # next round: no tools in request
@@ -15980,7 +16526,7 @@ def call_llm_with_tools(
             # Strip any residual text-encoded tool call blocks from the output
             for _tp in _TC_PATTERNS:
                 _final_content = _tp.sub("", _final_content).strip()
-            return _final_content
+            return _apply_stash(_final_content)
 
         except Exception:
             _tb.print_exc()
@@ -16014,11 +16560,11 @@ def call_llm_with_tools(
                 tools=_ant_tools,
             )
             if resp.stop_reason == "end_turn":
-                return next((b.text for b in resp.content if hasattr(b, "text")), "")
+                return _apply_stash(next((b.text for b in resp.content if hasattr(b, "text")), ""))
 
             tool_use_blocks = [b for b in resp.content if b.type == "tool_use"]
             if not tool_use_blocks:
-                return next((b.text for b in resp.content if hasattr(b, "text")), "")
+                return _apply_stash(next((b.text for b in resp.content if hasattr(b, "text")), ""))
 
             _conv.append({"role": "assistant", "content": resp.content})
             tool_results = []
@@ -16030,6 +16576,7 @@ def call_llm_with_tools(
                     cb_url, bucket, username, password, use_tls, scope, collection,
                     default_customer=default_customer,
                 )
+                _collect_artifact(result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tb.id,
@@ -16037,7 +16584,10 @@ def call_llm_with_tools(
                 })
             _conv.append({"role": "user", "content": tool_results})
 
-        return "Max tool-calling rounds reached without a final answer."
+        _final_text = next(
+            (b.text for b in resp.content if hasattr(b, "text")), ""
+        ) if resp else ""
+        return _apply_stash(_final_text) or "Max tool-calling rounds reached without a final answer."
 
     else:
         # Bedrock or unknown — strip tools and fall back to plain call_llm
@@ -16222,7 +16772,8 @@ def extract_cluster_snapshot_info(ticket: dict) -> dict:
       snapshot_count    int        — number of discrete snapshot entries
       last_snapshot_id  str|None   — last snapshot ID ({32hex}::N format)
     """
-    snapshots_raw   = ticket.get("snapshots") or ""
+    _sv0 = ticket.get("snapshots")
+    snapshots_raw   = _sv0 if isinstance(_sv0, str) else ""
     fields_raw      = ticket.get("ticket_fields") or {}
     if isinstance(fields_raw, str):
         try:
@@ -17771,7 +18322,8 @@ def enrich_tickets_with_snapshots(
 
     # Pre-populate snap_ids on every ticket from its raw snapshots text (all IDs, not just highest)
     for ticket in with_snaps:
-        all_found = _SNAP_ID_RE.findall(ticket.get("snapshots", ""))
+        _sv = ticket.get("snapshots")
+        all_found = _SNAP_ID_RE.findall(_sv if isinstance(_sv, str) else "")
         if all_found:
             deduped: list[str] = []
             for sid in all_found:
@@ -17782,7 +18334,8 @@ def enrich_tickets_with_snapshots(
     # Build a map: snap_id → list of tickets that reference it (dedup fetch)
     snap_to_tickets: dict[str, list[dict]] = {}
     for ticket in with_snaps:
-        snap_ids = _SNAP_ID_RE.findall(ticket.get("snapshots", ""))
+        _sv2 = ticket.get("snapshots")
+        snap_ids = _SNAP_ID_RE.findall(_sv2 if isinstance(_sv2, str) else "")
         if not snap_ids:
             continue
         snap_id = _highest_snap_id(snap_ids)  # use highest ::N (most recent) snapshot
