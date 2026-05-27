@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.3.7"
+__version__ = "1.3.8"
 
 import asyncio
 import threading
@@ -15399,17 +15399,17 @@ _AGENT_TOOLS: list[dict] = [
         "function": {
             "name": "rescrape_ticket",
             "description": (
-                "Re-fetch a ticket directly from Supportal Analytics and update Couchbase "
-                "with the latest status, priority, comments, and metadata. Use this when "
-                "the user wants to verify or refresh a specific ticket's current state. "
-                "Requires a valid session cookie saved in the app profile."
+                "Re-fetch a SINGLE ticket directly from Supportal and update Couchbase "
+                "with the latest status, priority, comments, and metadata. Call once per "
+                "ticket — pass ONE ticket_id string per call. "
+                "To refresh all stale tickets for a customer at once use rescrape_customer_tickets instead."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "ticket_id": {
                         "type": "string",
-                        "description": "The numeric ticket ID to re-scrape.",
+                        "description": "A single numeric ticket ID, e.g. \"12345\". One call per ticket.",
                     },
                 },
                 "required": ["ticket_id"],
@@ -16014,7 +16014,20 @@ def _execute_agent_tool(
     elif name == "rescrape_ticket":
         ticket_id = str(args.get("ticket_id") or "").strip()
         if not ticket_id:
-            return "Error: ticket_id is required."
+            # Local models often hallucinate "ticket_ids" (list) — tolerate it and take first element
+            _ids = args.get("ticket_ids")
+            if isinstance(_ids, list) and _ids:
+                ticket_id = str(_ids[0]).strip()
+                _remaining = _ids[1:]
+            elif _ids:
+                ticket_id = str(_ids).strip()
+                _remaining = []
+            else:
+                _remaining = []
+        else:
+            _remaining = []
+        if not ticket_id:
+            return "Error: ticket_id is required. Pass a single numeric ticket ID, e.g. {\"ticket_id\": \"12345\"}. For bulk refresh use rescrape_customer_tickets instead."
 
         # Read session cookie from saved app profile
         cookie = ""
@@ -16152,7 +16165,15 @@ def _execute_agent_tool(
             if topo_note:
                 src = " (freshly enriched)" if topo_enriched else " (from prior enrichment)"
                 summary_lines.append(f"Topology{src}: {', '.join(topo_note)}")
-        return "\n".join(summary_lines)
+        result = "\n".join(summary_lines)
+        if _remaining:
+            result += (
+                f"\n\n**Note:** you passed {len(_remaining) + 1} ticket IDs but rescrape_ticket "
+                f"processes one at a time. Call rescrape_ticket again for each remaining ID: "
+                + ", ".join(str(x) for x in _remaining)
+                + ". Or call rescrape_customer_tickets to refresh all stale tickets at once."
+            )
+        return result
 
     elif name == "list_supportal_customers":
         sort_by = (args.get("sort_by") or "name").lower()
