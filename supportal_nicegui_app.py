@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import asyncio
 import threading
@@ -6527,7 +6527,16 @@ def main_page():
                                         "- batch_score_tickets: score up to 10 tickets at once — pass ticket_ids list OR organization+limit. "
                                         "Prefer over calling score_ticket repeatedly.\n"
                                         "- batch_rescrape_tickets: re-fetch up to 20 tickets from Supportal in one call. "
-                                        "Prefer over calling rescrape_ticket in a loop."
+                                        "Prefer over calling rescrape_ticket in a loop.\n"
+                                        "CUSTOMER INTELLIGENCE (v1.6.0):\n"
+                                        "- get_customer_health_score: 0-100 composite score (P1s, escalations, resolution, freshness). "
+                                        "Call for any 'how is X doing', 'status of X', 'health of X' question.\n"
+                                        "- check_sla_compliance: SLA compliance % by priority for a customer.\n"
+                                        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions.\n"
+                                        "- get_digest: what's new/changed for a customer in the last N hours.\n"
+                                        "- tag_ticket: apply tags to a ticket (e.g. 'performance', 'upgrade').\n"
+                                        "- save_query / list_saved_queries: bookmark and recall queries.\n"
+                                        "- generate_customer_report: full markdown report (health + SLA + open tickets + digest)."
                                     )
                                     if _cust_agent and _cust_agent.lower() != "all customers":
                                         _agent_sys += (
@@ -7145,6 +7154,74 @@ def main_page():
                                     _dash_status.set_text(f"Dashboard error: {_classify_agent_error(exc)}")
 
                             ui.button("Refresh", icon="refresh", on_click=_refresh_dashboard).props("flat size=sm color=primary")
+
+                        # ── AFTER v1.6.0: Quick access actions ────────────────────────────
+                        with ui.row().classes("w-full gap-2 mt-3 flex-wrap items-center"):
+                            ui.label("Quick:").classes("text-xs text-gray-400 self-center")
+
+                            async def _whats_new():
+                                _org = (main_cust_input.value or "").strip()
+                                if not _org:
+                                    ui.notify("Set a customer in the Analytics tab first.", type="warning")
+                                    return
+                                chat_input.value = f"What's new for {_org} in the last 24 hours?"
+                                await _send_chat()
+
+                            ui.button(
+                                "What's New?", icon="new_releases", on_click=_whats_new
+                            ).props("outline dense size=sm color=green").tooltip(
+                                "Get 24h new/resolved digest for the current customer"
+                            )
+
+                        # ── AFTER v1.6.0: Saved queries quick-launch ──────────────────────
+                        with ui.expansion("Saved Queries", icon="bookmarks").classes("w-full mt-2 border rounded"):
+                            _sq_status = ui.label("").classes("text-xs text-gray-400")
+                            with ui.row().classes("w-full items-center gap-2 mt-1"):
+                                _sq_select = (
+                                    ui.select([], label="Select a saved query")
+                                    .classes("flex-1")
+                                    .props("dense outlined")
+                                )
+
+                                async def _run_saved_query():
+                                    _val = _sq_select.value
+                                    if not _val:
+                                        ui.notify("Select a query first.", type="warning")
+                                        return
+                                    chat_input.value = _val
+                                    await _send_chat()
+
+                                ui.button("Run", icon="play_arrow", on_click=_run_saved_query).props(
+                                    "dense color=primary size=sm"
+                                ).tooltip("Load this query into the chat input and send")
+
+                            async def _reload_saved_queries():
+                                _sq_status.set_text("Loading…")
+                                try:
+                                    _sq_rows = await run.io_bound(
+                                        _list_saved_queries,
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                        (main_cust_input.value or "").strip(),
+                                    )
+                                    _sq_opts = [r.get("question") or r.get("name", "") for r in _sq_rows]
+                                    _sq_select.options = _sq_opts
+                                    _sq_select.update()
+                                    _n = len(_sq_opts)
+                                    _sq_status.set_text(
+                                        f"{_n} saved quer{'y' if _n == 1 else 'ies'}" if _n else "No saved queries yet — ask the agent to save one."
+                                    )
+                                except Exception as _exc:
+                                    _sq_status.set_text(f"Error: {_classify_agent_error(_exc)}")
+
+                            ui.button("Refresh list", icon="refresh", on_click=_reload_saved_queries).props(
+                                "flat dense size=sm color=primary"
+                            )
 
             with ui.tab_panel(tab_scoring):
                 with ui.column().classes("w-full gap-0"):
@@ -10550,12 +10627,14 @@ def main_page():
 
                     dir_table = ui.table(
                         columns=[
-                            {"name": "organization",    "label": "Customer",          "field": "organization",    "align": "left",   "sortable": True},
+                            {"name": "health_score",    "label": "Health",             "field": "health_score",    "align": "center", "sortable": True},
+                            {"name": "organization",    "label": "Customer",           "field": "organization",    "align": "left",   "sortable": True},
                             {"name": "active_clusters", "label": "Active (≤90d)",      "field": "active_clusters", "align": "center", "sortable": True},
                             {"name": "stale_clusters",  "label": "Stale (>90d)",       "field": "stale_clusters",  "align": "center", "sortable": True},
                             {"name": "total_clusters",  "label": "Total Clusters",     "field": "total_clusters",  "align": "center", "sortable": True},
                             {"name": "total_snapshots", "label": "Snapshots",          "field": "total_snapshots", "align": "center", "sortable": True},
                             {"name": "total_tickets",   "label": "Tickets",            "field": "total_tickets",   "align": "center", "sortable": True},
+                            {"name": "open_p1",         "label": "Open P1",            "field": "open_p1",         "align": "center", "sortable": True},
                             {"name": "last_scraped_at", "label": "Last Scraped",       "field": "last_scraped_at", "align": "left",   "sortable": True},
                             {"name": "customer_url",    "label": "Supportal URL",      "field": "customer_url",    "align": "left"},
                         ],
@@ -10566,6 +10645,14 @@ def main_page():
                     dir_table.add_slot("body-row", """
                         <q-tr :props="props" class="cursor-pointer hover:bg-blue-50"
                               @click="$emit('rowclick', props.row)">
+                          <q-td key="health_score" :props="props" class="text-center">
+                            <q-badge v-if="props.row.health_score != null"
+                              :color="props.row.health_score >= 70 ? 'green' : props.row.health_score >= 40 ? 'orange' : 'red'"
+                              class="text-white font-bold px-2">
+                              {{ props.row.health_score }}
+                            </q-badge>
+                            <span v-else class="text-gray-300 text-xs">—</span>
+                          </q-td>
                           <q-td key="organization" :props="props">
                             <span class="font-medium">{{ props.row.organization }}</span>
                           </q-td>
@@ -10583,6 +10670,12 @@ def main_page():
                           <q-td key="total_clusters"  :props="props" class="text-center">{{ props.row.total_clusters }}</q-td>
                           <q-td key="total_snapshots" :props="props" class="text-center">{{ props.row.total_snapshots }}</q-td>
                           <q-td key="total_tickets"   :props="props" class="text-center">{{ props.row.total_tickets }}</q-td>
+                          <q-td key="open_p1" :props="props" class="text-center">
+                            <q-badge v-if="props.row.open_p1 > 0" color="red" class="font-bold">
+                              {{ props.row.open_p1 }}
+                            </q-badge>
+                            <span v-else class="text-gray-400">0</span>
+                          </q-td>
                           <q-td key="last_scraped_at" :props="props">
                             {{ props.row.last_scraped_at ? (typeof props.row.last_scraped_at === 'number' ? new Date(props.row.last_scraped_at * 1000) : new Date(props.row.last_scraped_at)).toISOString().substring(0,16).replace('T',' ') : '—' }}
                           </q-td>
@@ -15962,6 +16055,164 @@ _AGENT_TOOLS: list[dict] = [
             },
         },
     },
+    # ── v1.6.0: Feature set tools ─────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "get_customer_health_score",
+            "description": (
+                "Compute a 0-100 composite health score for a customer. "
+                "Considers: open P1/P2 count, escalation rate, avg resolution time, "
+                "cluster bad/warn ratio, and data freshness. "
+                "Returns score, grade (Healthy/At Risk/Critical), and dimension breakdown. "
+                "Call proactively when the user asks about a customer's status or health."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {"type": "string", "description": "Customer name."},
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_sla_compliance",
+            "description": (
+                "Calculate SLA compliance for a customer — what % of tickets were resolved "
+                "within the SLA threshold for each priority "
+                "(P1/critical=4h, P2/high=24h, P3/normal=72h, P4/low=168h). "
+                "Returns compliance % per priority, average resolution hours, and total analyzed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {"type": "string"},
+                    "date_from": {"type": "string", "description": "Filter start date YYYY-MM-DD."},
+                    "date_to":   {"type": "string", "description": "Filter end date YYYY-MM-DD."},
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_portfolio_status",
+            "description": (
+                "Return a ranked status overview of ALL customers — health scores, open P1 counts, "
+                "data freshness. Use for 'status of all my accounts', 'which customers need attention', "
+                "'who has open P1s', 'show me the fleet'. "
+                "Returns a list sorted by urgency (critical first)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max customers to return (default 20)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tag_ticket",
+            "description": (
+                "Add user-defined tags to a ticket stored in Couchbase. "
+                "Tags are stored in ticket.tags as a list of strings. "
+                "Use to categorize tickets (e.g. 'performance', 'upgrade', 'security', 'escalated'). "
+                "Set replace=true to overwrite all existing tags instead of merging."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string", "description": "Numeric ticket ID."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tags to apply.",
+                    },
+                    "replace": {"type": "boolean", "description": "If true, replace existing tags. Default false (merge)."},
+                },
+                "required": ["ticket_id", "tags"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_digest",
+            "description": (
+                "Return a 'what's new' digest for a customer — new tickets opened, "
+                "recently resolved tickets, and stale open tickets not refreshed in the window. "
+                "Use when the user asks 'what's new', 'what changed', 'any updates', "
+                "'what happened since last time'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {"type": "string", "description": "Customer name. Leave blank for all customers."},
+                    "since_hours": {"type": "integer", "description": "Look-back window in hours (default 24)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_query",
+            "description": (
+                "Bookmark a natural-language query for reuse. "
+                "Saves the question to Couchbase so it can be listed and re-run later. "
+                "Call when the user says 'save this query', 'bookmark this', 'remember this question'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":         {"type": "string", "description": "Short memorable name for this query."},
+                    "question":     {"type": "string", "description": "The question to save."},
+                    "organization": {"type": "string", "description": "Customer scope for this query (optional)."},
+                },
+                "required": ["name", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_saved_queries",
+            "description": "List all saved/bookmarked queries stored in Couchbase.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {"type": "string", "description": "Filter by customer (optional)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_customer_report",
+            "description": (
+                "Generate a structured markdown customer report from Couchbase data — no LLM required. "
+                "Includes: health score, SLA compliance, open ticket table, new/resolved digest (72h). "
+                "Call when the user asks for a 'report', 'summary', 'briefing', or 'status report' for a customer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {"type": "string", "description": "Customer name."},
+                },
+                "required": ["organization"],
+            },
+        },
+    },
 ]
 
 
@@ -17285,6 +17536,174 @@ LIMIT {limit}
         lines.extend(_result_rows)
         return "\n".join(lines)
 
+    # ── v1.6.0: feature set tools ─────────────────────────────────────────────
+
+    elif name == "get_customer_health_score":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required."
+        try:
+            h = _compute_health_score(_org, cb_url, bucket, username, password,
+                                       use_tls, scope, collection)
+            lines = [
+                f"## Health Score: {_org}",
+                f"**{h['score']}/100** — {h['grade']}\n",
+                f"| Dimension | Value |",
+                f"|---|---|",
+                f"| Open P1 | {h['open_p1']} |",
+                f"| Open P2 | {h['open_p2']} |",
+                f"| Total tickets | {h['total_tickets']} |",
+                f"| Escalation rate | {h['escalation_rate_pct']}% |",
+                f"| Avg resolution | {h['avg_resolution_days']} days |",
+                f"| Data age | {h['hours_since_scraped']}h |",
+                f"| Cluster bad ratio | {h['cluster_bad_ratio']} |",
+            ]
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Health score error: {exc}"
+
+    elif name == "check_sla_compliance":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required."
+        try:
+            s = _compute_sla_compliance(
+                _org, cb_url, bucket, username, password, use_tls, scope, collection,
+                date_from=args.get("date_from") or "",
+                date_to=args.get("date_to") or "",
+            )
+            lines = [
+                f"## SLA Compliance: {_org}",
+                f"**Overall: {s['overall_compliance_pct']}%** ({s['tickets_analyzed']} tickets analyzed)\n",
+                "| Priority | Compliance | Met | Breached | Avg Hours | SLA Threshold |",
+                "|---|---|---|---|---|---|",
+            ]
+            for p, d in s.get("by_priority", {}).items():
+                lines.append(
+                    f"| {p.capitalize()} | {d['compliance_pct']}% | {d['met']} | {d['breached']} "
+                    f"| {d['avg_resolution_hours']}h | {d['sla_threshold_hours']}h |"
+                )
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"SLA compliance error: {exc}"
+
+    elif name == "get_portfolio_status":
+        limit = min(int(args.get("limit") or 20), 50)
+        try:
+            conn = _cb_conn_str(cb_url, use_tls)
+            cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+            cl_.wait_until_ready(timedelta(seconds=10))
+            from couchbase.options import QueryOptions as _PfQO
+            orgs_rows = list(cl_.query(
+                f"SELECT DISTINCT t.organization FROM `{bucket}`.`{scope}`.`{collection}` t "
+                f"WHERE t.type='ticket' AND t.organization IS NOT NULL LIMIT {limit * 2}",
+            ))
+            orgs = [r.get("organization") for r in orgs_rows if r.get("organization")][:limit]
+            results = []
+            for org in orgs:
+                try:
+                    h = _compute_health_score(org, cb_url, bucket, username, password,
+                                               use_tls, scope, collection)
+                    results.append(h)
+                except Exception:
+                    pass
+            results.sort(key=lambda x: x["score"])
+            lines = [
+                "## Portfolio Status (ranked by urgency)\n",
+                "| Customer | Score | Grade | Open P1 | Open P2 | Esc% | Data Age |",
+                "|---|---|---|---|---|---|---|",
+            ]
+            for h in results:
+                lines.append(
+                    f"| {h['organization']} | {h['score']} | {h['grade']} "
+                    f"| {h['open_p1']} | {h['open_p2']} "
+                    f"| {h['escalation_rate_pct']}% | {h['hours_since_scraped']}h |"
+                )
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Portfolio error: {exc}"
+
+    elif name == "tag_ticket":
+        tid  = str(args.get("ticket_id") or "").strip()
+        tags = args.get("tags") or []
+        repl = bool(args.get("replace"))
+        if not tid:
+            return "Error: ticket_id is required."
+        if not tags:
+            return "Error: tags list is required."
+        return _tag_ticket_in_cb(tid, tags, cb_url, bucket, username, password,
+                                  use_tls, scope, collection, replace=repl)
+
+    elif name == "get_digest":
+        _org    = (args.get("organization") or default_customer or "").strip()
+        _hours  = max(1, min(168, int(args.get("since_hours") or 24)))
+        try:
+            d = _get_digest(_org, cb_url, bucket, username, password, use_tls, scope, collection, _hours)
+            _new = d["new_tickets"]
+            _res = d["resolved_tickets"]
+            _stl = d["stale_open_tickets"]
+            lines = [
+                f"## What's New{' — ' + _org if _org else ''} (last {_hours}h)\n",
+                f"**{len(_new)} new** · **{len(_res)} resolved** · **{len(_stl)} stale open**\n",
+            ]
+            if _new:
+                lines.append("### New Tickets")
+                for t in _new[:15]:
+                    lines.append(f"- [{t.get('ticket_id','')}] **{t.get('priority','')}** {(t.get('subject') or '')[:70]}")
+            if _res:
+                lines.append("\n### Resolved")
+                for t in _res[:10]:
+                    lines.append(f"- [{t.get('ticket_id','')}] {(t.get('subject') or '')[:70]}")
+            if _stl:
+                lines.append("\n### Stale Open (not refreshed in window)")
+                for t in _stl[:10]:
+                    lines.append(f"- [{t.get('ticket_id','')}] {t.get('priority','')} — {(t.get('subject') or '')[:60]}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Digest error: {exc}"
+
+    elif name == "save_query":
+        _name = (args.get("name") or "").strip()
+        _q    = (args.get("question") or "").strip()
+        _org  = (args.get("organization") or default_customer or "").strip()
+        if not _name or not _q:
+            return "Error: name and question are required."
+        try:
+            key = _save_query_to_cb(_name, _q, _org, cb_url, bucket, username, password,
+                                     use_tls, scope, collection)
+            return f"Query saved as **{_name}** (key: `{key}`). Run it anytime with list_saved_queries."
+        except Exception as exc:
+            return f"Save query error: {exc}"
+
+    elif name == "list_saved_queries":
+        _org = (args.get("organization") or default_customer or "").strip()
+        try:
+            rows = _list_saved_queries(cb_url, bucket, username, password,
+                                        use_tls, scope, collection, org=_org)
+            if not rows:
+                return "No saved queries found."
+            lines = ["## Saved Queries\n",
+                     "| Name | Question | Customer | Saved |",
+                     "|---|---|---|---|"]
+            for r in rows:
+                lines.append(f"| **{r.get('name','')}** | {(r.get('question') or '')[:60]} | {r.get('organization','—')} | {(r.get('created_at') or '')[:10]} |")
+            lines.append("\nTo run a saved query, just paste or type the question above.")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"List saved queries error: {exc}"
+
+    elif name == "generate_customer_report":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required."
+        try:
+            return _generate_customer_report(
+                _org, cb_url, bucket, username, password,
+                use_tls, scope, collection,
+            )
+        except Exception as exc:
+            return f"Report generation error: {exc}"
+
     else:
         return f"Unknown tool: {name}"
 
@@ -17722,6 +18141,375 @@ def _generate_followup_suggestions(
     except Exception:
         pass
     return []
+
+
+# ── Feature set helpers (v1.6.0) ─────────────────────────────────────────────
+
+_SLA_HOURS: dict[str, float] = {"critical": 4, "high": 24, "normal": 72, "low": 168, "unknown": 168}
+
+def _compute_health_score(
+    org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    snap_collection: str = "snapshots",
+) -> dict:
+    """
+    Compute a 0-100 composite health score for a customer.
+    Returns a dict with the score, grade, dimensions, and a summary string.
+    """
+    import datetime as _dt
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+
+    def _q(sql, **kw):
+        from couchbase.options import QueryOptions as _QO
+        return list(cl_.query(sql, _QO(named_parameters=kw)))
+
+    _org_like = f"%{org.lower()}%"
+
+    # Open P1/P2 counts
+    pri_rows = _q(
+        f"SELECT t.priority, t.status FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org",
+        org=_org_like,
+    )
+    open_p1 = sum(1 for r in pri_rows if (r.get("priority") or "").lower() == "critical"
+                  and (r.get("status") or "").lower() not in ("solved", "closed"))
+    open_p2 = sum(1 for r in pri_rows if (r.get("priority") or "").lower() == "high"
+                  and (r.get("status") or "").lower() not in ("solved", "closed"))
+    total   = len(pri_rows)
+
+    # Escalation rate
+    esc_rows = _q(
+        f"SELECT COUNT(*) AS n FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org AND ARRAY_LENGTH(t.escalations) > 0",
+        org=_org_like,
+    )
+    escalated    = (esc_rows[0].get("n") or 0) if esc_rows else 0
+    esc_rate     = (escalated / total) if total else 0.0
+
+    # Avg resolution days
+    res_rows = _q(
+        f"SELECT t.created, t.closed_at FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org "
+        f"AND t.closed_at IS NOT NULL AND t.created IS NOT NULL LIMIT 200",
+        org=_org_like,
+    )
+    days_list = []
+    for r in res_rows:
+        try:
+            c = _dt.datetime.fromisoformat(r["created"][:19])
+            x = _dt.datetime.fromisoformat(r["closed_at"][:19])
+            d = (x - c).days
+            if 0 <= d <= 365:
+                days_list.append(d)
+        except Exception:
+            pass
+    avg_days = sum(days_list) / len(days_list) if days_list else 0.0
+
+    # Data freshness (hours since last scraped)
+    fresh_rows = _q(
+        f"SELECT MAX(t.last_scraped_at) AS ts FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org",
+        org=_org_like,
+    )
+    last_ts     = (fresh_rows[0].get("ts") or 0) if fresh_rows else 0
+    hours_stale = (_dt.datetime.now().timestamp() - last_ts) / 3600 if last_ts else 9999
+
+    # Cluster bad/warn ratio from snapshots
+    snap_rows = _q(
+        f"SELECT s.bad_count, s.warn_count, s.node_count FROM `{bucket}`.`{scope}`.`{snap_collection}` s "
+        f"WHERE LOWER(s.organization) LIKE $org AND s.node_count > 0 LIMIT 20",
+        org=_org_like,
+    )
+    total_nodes = sum(r.get("node_count") or 0 for r in snap_rows)
+    total_bad   = sum(r.get("bad_count") or 0 for r in snap_rows)
+    cluster_ratio = (total_bad / total_nodes) if total_nodes else 0.0
+
+    # Score computation (penalty model, 0-100)
+    p1_penalty      = min(50, open_p1 * 20)
+    p2_penalty      = min(15, open_p2 * 5)
+    esc_penalty     = min(15, esc_rate * 20)
+    res_penalty     = min(10, max(0, avg_days - 5) * 0.5)
+    cluster_penalty = min(10, cluster_ratio * 50)
+    stale_penalty   = min(10, max(0, (hours_stale - 24) / 48) * 10)
+    score = max(0, round(100 - p1_penalty - p2_penalty - esc_penalty - res_penalty - cluster_penalty - stale_penalty))
+
+    grade = "🟢 Healthy" if score >= 70 else ("🟡 At Risk" if score >= 40 else "🔴 Critical")
+    summary = (
+        f"Health: {score}/100 ({grade}) | "
+        f"Open P1: {open_p1} | Open P2: {open_p2} | "
+        f"Escalation rate: {esc_rate*100:.0f}% | "
+        f"Avg resolution: {avg_days:.1f}d | "
+        f"Data age: {hours_stale:.0f}h"
+    )
+    return {
+        "organization": org, "score": score, "grade": grade, "summary": summary,
+        "open_p1": open_p1, "open_p2": open_p2, "total_tickets": total,
+        "escalation_rate_pct": round(esc_rate * 100, 1),
+        "avg_resolution_days": round(avg_days, 1),
+        "hours_since_scraped": round(hours_stale, 1),
+        "cluster_bad_ratio": round(cluster_ratio, 3),
+    }
+
+
+def _compute_sla_compliance(
+    org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    date_from: str = "", date_to: str = "",
+) -> dict:
+    """Compute SLA compliance by priority for an org. Returns per-priority stats + overall."""
+    import datetime as _dt
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+
+    def _q(sql, **kw):
+        from couchbase.options import QueryOptions as _QO
+        return list(cl_.query(sql, _QO(named_parameters=kw)))
+
+    _org_like = f"%{org.lower()}%"
+    _date_filter = ""
+    if date_from:
+        _date_filter += f" AND t.created >= '{date_from}'"
+    if date_to:
+        _date_filter += f" AND t.created <= '{date_to}'"
+
+    rows = _q(
+        f"SELECT t.priority, t.created, t.closed_at FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org "
+        f"AND t.closed_at IS NOT NULL AND t.created IS NOT NULL {_date_filter} LIMIT 1000",
+        org=_org_like,
+    )
+
+    from collections import defaultdict
+    stats: dict = defaultdict(lambda: {"met": 0, "breached": 0, "total": 0, "avg_hours": []})
+    for r in rows:
+        pri   = (r.get("priority") or "unknown").lower()
+        limit = _SLA_HOURS.get(pri, 168)
+        try:
+            c = _dt.datetime.fromisoformat(r["created"][:19])
+            x = _dt.datetime.fromisoformat(r["closed_at"][:19])
+            hrs = (x - c).total_seconds() / 3600
+            stats[pri]["total"] += 1
+            stats[pri]["avg_hours"].append(hrs)
+            if hrs <= limit:
+                stats[pri]["met"] += 1
+            else:
+                stats[pri]["breached"] += 1
+        except Exception:
+            pass
+
+    result = {}
+    all_met = all_total = 0
+    for pri, s in sorted(stats.items()):
+        avg_h = sum(s["avg_hours"]) / len(s["avg_hours"]) if s["avg_hours"] else 0
+        pct   = round(s["met"] / s["total"] * 100, 1) if s["total"] else None
+        result[pri] = {
+            "priority": pri, "met": s["met"], "breached": s["breached"],
+            "total": s["total"], "compliance_pct": pct,
+            "avg_resolution_hours": round(avg_h, 1),
+            "sla_threshold_hours": _SLA_HOURS.get(pri, 168),
+        }
+        all_met   += s["met"]
+        all_total += s["total"]
+
+    overall = round(all_met / all_total * 100, 1) if all_total else None
+    return {"organization": org, "overall_compliance_pct": overall,
+            "by_priority": result, "tickets_analyzed": all_total}
+
+
+def _get_digest(
+    org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    since_hours: int = 24,
+) -> dict:
+    """Return new/changed/resolved tickets for an org in the last N hours."""
+    import datetime as _dt
+    cutoff_epoch = _dt.datetime.now().timestamp() - since_hours * 3600
+    cutoff_iso   = _dt.datetime.fromtimestamp(cutoff_epoch).isoformat()
+
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+
+    def _q(sql, **kw):
+        from couchbase.options import QueryOptions as _QO
+        return list(cl_.query(sql, _QO(named_parameters=kw)))
+
+    _org_filter = f"AND LOWER(t.organization) LIKE '%{org.lower()}%'" if org else ""
+
+    new_rows = _q(
+        f"SELECT t.ticket_id, t.subject, t.priority, t.status, t.organization, t.created "
+        f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND t.created >= $cutoff {_org_filter} "
+        f"ORDER BY t.created DESC LIMIT 50",
+        cutoff=cutoff_iso,
+    )
+    resolved_rows = _q(
+        f"SELECT t.ticket_id, t.subject, t.priority, t.organization, t.closed_at "
+        f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND t.closed_at >= $cutoff {_org_filter} "
+        f"ORDER BY t.closed_at DESC LIMIT 50",
+        cutoff=cutoff_iso,
+    )
+    stale_rows = _q(
+        f"SELECT t.ticket_id, t.subject, t.priority, t.status, t.organization, t.last_scraped_at "
+        f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND t.status NOT IN ['solved','closed'] {_org_filter} "
+        f"AND t.last_scraped_at < $cutoff_epoch ORDER BY t.last_scraped_at ASC LIMIT 20",
+        cutoff_epoch=cutoff_epoch,
+    )
+    return {
+        "organization": org or "all", "since_hours": since_hours,
+        "new_tickets": new_rows, "resolved_tickets": resolved_rows,
+        "stale_open_tickets": stale_rows,
+    }
+
+
+def _save_query_to_cb(
+    name: str, question: str, org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+) -> str:
+    """Save a named query to CB. Returns the doc key."""
+    import uuid as _uuid
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+    key  = f"saved_query::{name.lower().replace(' ', '_')}"
+    doc  = {"type": "saved_query", "name": name, "question": question,
+            "organization": org, "created_at": datetime.now(timezone.utc).isoformat()}
+    cl_.bucket(bucket).scope(scope).collection(collection).upsert(key, doc)
+    return key
+
+
+def _list_saved_queries(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    org: str = "",
+) -> list[dict]:
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+
+    def _q(sql, **kw):
+        from couchbase.options import QueryOptions as _QO
+        return list(cl_.query(sql, _QO(named_parameters=kw)))
+
+    _org_filter = "AND LOWER(q.organization) LIKE $org" if org else ""
+    return _q(
+        f"SELECT q.name, q.question, q.organization, q.created_at "
+        f"FROM `{bucket}`.`{scope}`.`{collection}` q "
+        f"WHERE q.type='saved_query' {_org_filter} ORDER BY q.created_at DESC",
+        **({"org": f"%{org.lower()}%"} if org else {}),
+    )
+
+
+def _tag_ticket_in_cb(
+    ticket_id: str, tags: list[str],
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    replace: bool = False,
+) -> str:
+    conn = _cb_conn_str(cb_url, use_tls)
+    col  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))\
+           .bucket(bucket).scope(scope).collection(collection)
+    try:
+        doc = col.get(f"ticket::{ticket_id}").content_as[dict]
+    except Exception:
+        return f"Ticket {ticket_id} not found in Couchbase."
+    existing = [] if replace else (doc.get("tags") or [])
+    merged   = list(dict.fromkeys(existing + [t.strip() for t in tags if t.strip()]))
+    doc["tags"] = merged
+    col.upsert(f"ticket::{ticket_id}", doc)
+    return f"Tags on {ticket_id} updated: {merged}"
+
+
+def _generate_customer_report(
+    org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    snap_collection: str = "snapshots",
+) -> str:
+    """
+    Build a structured markdown customer report from CB data (no LLM required).
+    The agent can call this then append its own analysis.
+    """
+    from collections import Counter
+    import datetime as _dt
+
+    health = _compute_health_score(org, cb_url, bucket, username, password,
+                                    use_tls, scope, collection, snap_collection)
+    sla    = _compute_sla_compliance(org, cb_url, bucket, username, password,
+                                      use_tls, scope, collection)
+    digest = _get_digest(org, cb_url, bucket, username, password,
+                          use_tls, scope, collection, since_hours=72)
+
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+
+    def _q(sql, **kw):
+        from couchbase.options import QueryOptions as _QO
+        return list(cl_.query(sql, _QO(named_parameters=kw)))
+
+    _org_like = f"%{org.lower()}%"
+    open_rows = _q(
+        f"SELECT t.ticket_id, t.subject, t.priority, t.status, t.created, t.comment_count "
+        f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org "
+        f"AND t.status NOT IN ['solved','closed'] "
+        f"ORDER BY CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, t.created DESC "
+        f"LIMIT 20",
+        org=_org_like,
+    )
+
+    today  = _dt.date.today().isoformat()
+    lines  = [
+        f"# Customer Report: {org}",
+        f"*Generated {today}*\n",
+        f"## Health Score",
+        f"**{health['score']}/100** — {health['grade']}",
+        f"",
+        f"| Dimension | Value |",
+        f"|---|---|",
+        f"| Open P1 tickets | {health['open_p1']} |",
+        f"| Open P2 tickets | {health['open_p2']} |",
+        f"| Escalation rate | {health['escalation_rate_pct']}% |",
+        f"| Avg resolution | {health['avg_resolution_days']} days |",
+        f"| Data freshness | {health['hours_since_scraped']}h ago |",
+        f"",
+        f"## SLA Compliance",
+        f"Overall: **{sla['overall_compliance_pct']}%** ({sla['tickets_analyzed']} closed tickets analyzed)\n",
+    ]
+    for pri, s in sla.get("by_priority", {}).items():
+        lines.append(f"- **{pri.capitalize()}**: {s['compliance_pct']}% met ({s['met']}/{s['total']}, threshold {s['sla_threshold_hours']}h, avg {s['avg_resolution_hours']}h)")
+
+    lines += ["", "## Open Tickets", ""]
+    if open_rows:
+        lines.append("| ID | Subject | Priority | Status | Created | Comments |")
+        lines.append("|---|---|---|---|---|---|")
+        for t in open_rows:
+            subj = (t.get("subject") or "")[:60]
+            lines.append(f"| {t.get('ticket_id','')} | {subj} | {t.get('priority','')} | {t.get('status','')} | {(t.get('created') or '')[:10]} | {t.get('comment_count',0)} |")
+    else:
+        lines.append("*No open tickets found.*")
+
+    if digest["new_tickets"]:
+        lines += ["", "## New Tickets (last 72h)", ""]
+        for t in digest["new_tickets"][:10]:
+            lines.append(f"- [{t.get('ticket_id','')}] {(t.get('subject') or '')[:70]} ({t.get('priority','')})")
+
+    if digest["resolved_tickets"]:
+        lines += ["", "## Recently Resolved (last 72h)", ""]
+        for t in digest["resolved_tickets"][:10]:
+            lines.append(f"- [{t.get('ticket_id','')}] {(t.get('subject') or '')[:70]}")
+
+    return "\n".join(lines)
 
 
 # ─────────────────────────── Phase 3: Scoring & Analytics ────────────────────

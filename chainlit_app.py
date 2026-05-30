@@ -241,6 +241,15 @@ def _system_prompt(customer: str) -> str:
         "Prefer over calling score_ticket repeatedly.\n"
         "- batch_rescrape_tickets: re-fetch up to 20 tickets from Supportal in one call. "
         "Prefer over calling rescrape_ticket in a loop.\n"
+        "CUSTOMER INTELLIGENCE (v1.6.0):\n"
+        "- get_customer_health_score: 0-100 composite score (P1s, escalations, resolution, freshness). "
+        "Call for any 'how is X doing', 'status of X', 'health of X' question.\n"
+        "- check_sla_compliance: SLA compliance % by priority for a customer.\n"
+        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions.\n"
+        "- get_digest: what's new/changed for a customer in the last N hours.\n"
+        "- tag_ticket: apply tags to a ticket (e.g. 'performance', 'upgrade').\n"
+        "- save_query / list_saved_queries: bookmark and recall queries.\n"
+        "- generate_customer_report: full markdown report (health + SLA + open tickets + digest).\n"
     )
     if customer and customer.lower() != "all customers":
         prompt += (
