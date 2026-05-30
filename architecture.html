@@ -134,12 +134,13 @@ body {
 .c-ext .divider { border-color: #F59E0B; }
 .c-ext .inline-code { background: #FEF3C7; color: #92400E; }
 
-/* Playwright — Purple */
-.c-play { background: #F5F3FF; border-color: #7C3AED; }
-.c-play .box-title { color: #4C1D95; }
-.c-play .section-label { color: #5B21B6; }
-.c-play .items li::before { color: #7C3AED; }
-.c-play .inline-code { background: #EDE9FE; color: #4C1D95; }
+/* REST API Scraping Layer — Orange */
+.c-play { background: #FFF7ED; border-color: #EA580C; }
+.c-play .box-title { color: #7C2D12; }
+.c-play .section-label { color: #9A3412; }
+.c-play .items li::before { color: #EA580C; }
+.c-play .inline-code { background: #FFEDD5; color: #7C2D12; }
+.c-play .divider { border-color: #EA580C; }
 
 /* Couchbase — Rose/Red */
 .c-cb { background: #FFF1F2; border-color: #E11D48; }
@@ -298,7 +299,7 @@ body {
 
 <div class="page-title">
   <h1>Supportal AI Agent — Application Architecture</h1>
-  <p>Two-UI AI platform for Couchbase support ticket analysis · scraping, embedding, agent tooling, and chat history</p>
+  <p>Two-UI AI platform for Couchbase support ticket analysis · REST API scraping, embedding, agent tooling, and chat history</p>
 </div>
 
 <div class="diagram">
@@ -312,36 +313,39 @@ body {
       </div>
       <div class="two-col">
         <div>
-          <div class="section-label">Ticket data</div>
+          <div class="section-label">Ticket REST endpoints</div>
           <ul class="items">
-            <li>Support ticket listings &amp; detail</li>
-            <li>Comments, tags, priority, status</li>
-            <li>Requester / assignee / organization</li>
+            <li><span class="inline-code">GET /customer/{org}/status/tickets</span> — listing</li>
+            <li><span class="inline-code">GET /zendesk/ticket/{id}/status</span> — detail</li>
+            <li>Comments, tags, priority, status, CBSE IDs</li>
           </ul>
         </div>
         <div>
-          <div class="section-label">Analytics API &nbsp;<span class="inline-code">POST /api/support360/query</span></div>
+          <div class="section-label">Analytics API</div>
           <ul class="items">
-            <li>SQL++ against <em>customer</em>, <em>cluster</em>, <em>snapshot</em></li>
-            <li>Live ticket counts &amp; version stats</li>
-            <li>Session-cookie authenticated</li>
+            <li><span class="inline-code">POST /api/support360/query</span></li>
+            <li>SQL++ against <em>snapshot</em>, <em>cluster</em>, <em>customer</em></li>
+            <li>Fast bulk snapshot listing with ticket IDs</li>
+            <li>Live fleet-wide counts &amp; version stats</li>
           </ul>
         </div>
       </div>
       <div class="two-col" style="margin-top:0">
         <div>
-          <div class="section-label">Cluster snapshots</div>
+          <div class="section-label">Snapshot REST endpoints</div>
           <ul class="items">
-            <li>Topology pages (node / service layout)</li>
-            <li>CB version, RAM, auto-failover</li>
-            <li>Health warnings &amp; bad-item counts</li>
+            <li><span class="inline-code">GET /customer/{org}/status/snapshots</span> — listing</li>
+            <li><span class="inline-code">GET /snapshot/{enc}/nutshell</span> — topology (primary)</li>
+            <li><span class="inline-code">GET /api/snapshots/{enc}/nutshell/summary</span> — fallback</li>
+            <li>CB version, RAM, node services, bad/warn items</li>
           </ul>
         </div>
         <div>
           <div class="section-label">Auth modes</div>
           <ul class="items">
-            <li>Cookie / header paste (headless)</li>
-            <li>Browser SSO login (headful Playwright)</li>
+            <li>Cookie paste → all REST calls headless</li>
+            <li>Browser SSO login (headful Playwright — session cookie only)</li>
+            <li>Re-authenticate on 403 / session expiry</li>
           </ul>
         </div>
       </div>
@@ -353,7 +357,7 @@ body {
     <div class="arrow-slot">
       <div class="arr">
         <div class="arr-line"></div>
-        <div class="arr-label">Playwright scraping</div>
+        <div class="arr-label">REST API scraping (tickets, snapshots, topology)</div>
         <div class="arr-line"></div>
         <div class="arr-down"></div>
       </div>
@@ -361,7 +365,7 @@ body {
     <div class="arrow-slot">
       <div class="arr">
         <div class="arr-line"></div>
-        <div class="arr-label">direct HTTP (analytics API)</div>
+        <div class="arr-label">direct HTTP (analytics API — agent tools)</div>
         <div class="arr-line"></div>
         <div class="arr-down"></div>
       </div>
@@ -371,22 +375,28 @@ body {
   <!-- ═══ ROW 2: Playwright | LLM Providers ════════════════════════════ -->
   <div class="row">
 
-    <!-- Playwright -->
+    <!-- REST API Scraping Layer -->
     <div class="box c-play" style="flex:1">
-      <div class="box-title"><span class="ico">🎭</span> Playwright Browser Automation</div>
-      <div class="section-label">Session management</div>
+      <div class="box-title"><span class="ico">🔌</span> REST API Scraping Layer</div>
+      <div class="section-label">Ticket ingestion</div>
       <ul class="items">
-        <li>Cookie paste → headless <span class="inline-code">requests</span> scrape</li>
-        <li>SSO login → headful Chromium → saves session to <span class="inline-code">.playwright_supportal/</span></li>
-        <li>Session reused across runs; re-login on 403</li>
+        <li>Fetch ticket listing via <span class="inline-code">/customer/{org}/status/tickets</span></li>
+        <li>Resolve canonical org slug via redirect before listing call</li>
+        <li>Fetch full ticket detail via <span class="inline-code">/zendesk/ticket/{id}/status</span></li>
+        <li>Change-detection — skip unchanged tickets on incremental runs</li>
       </ul>
-      <div class="section-label">Ingestion pipeline</div>
+      <hr class="divider">
+      <div class="section-label">Snapshot ingestion — two-step</div>
       <ul class="items">
-        <li>Ticket listing pagination with change-detection</li>
-        <li>Full ticket detail + comments per ticket</li>
-        <li>Snapshot listing + per-snapshot topology fetch</li>
-        <li>Analytics stub fetch (fast metadata via API)</li>
-        <li>Parallel snapshot topology workers</li>
+        <li><strong>Step 1 — Analytics stub fetch</strong> (fast): <span class="inline-code">POST /api/support360/query</span> SQL++ returns all snapshot IDs + ticket associations in one round-trip</li>
+        <li><strong>Step 2 — Topology backfill</strong>: per-stub <span class="inline-code">GET /snapshot/{enc}/nutshell</span> fetches CB version, node layout, services, bad/warn items; parallel workers configurable</li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">Session — Playwright (SSO login only)</div>
+      <ul class="items">
+        <li>Cookie paste → all scraping runs headless via <span class="inline-code">requests</span></li>
+        <li>SSO required → headful Chromium launched once → cookie extracted &amp; saved to <span class="inline-code">.playwright_supportal/</span></li>
+        <li>Playwright not used for data scraping — REST API only</li>
       </ul>
     </div>
 
@@ -595,7 +605,7 @@ body {
 <!-- Legend -->
 <div class="legend">
   <div class="legend-item"><div class="legend-dot" style="background:#F59E0B"></div>External data source</div>
-  <div class="legend-item"><div class="legend-dot" style="background:#7C3AED"></div>Scraping / ingestion</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#EA580C"></div>REST API scraping / ingestion</div>
   <div class="legend-item"><div class="legend-dot" style="background:#E11D48"></div>Couchbase data store</div>
   <div class="legend-item"><div class="legend-dot" style="background:#2563EB"></div>LLM inference layer</div>
   <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>NiceGUI app (main UI)</div>
@@ -603,7 +613,7 @@ body {
 </div>
 
 <div class="footnote">
-  Supportal AI Agent · architecture diagram · generated 2026-05-26
+  Supportal AI Agent · architecture diagram · updated 2026-05-26 (branch: supportal_api_enabled)
 </div>
 
 </body>
