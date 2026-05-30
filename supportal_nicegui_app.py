@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import asyncio
 import threading
@@ -6464,11 +6464,18 @@ def main_page():
                                         "explanation. Produces real CSV and Excel download buttons.\n"
                                         "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
                                         "- vector_search: semantic/similarity search — use when keyword filters won't capture the concept.\n"
-                                        "- get_cluster_health: summary of all clusters for a customer from stored snapshots.\n"
+                                        "- get_cluster_health: summary of all clusters for a customer from stored snapshots. "
+                                        "Auto-triggers sync_snapshots if no local snapshots exist and a cookie is available.\n"
+                                        "- sync_snapshots: ONE-STEP snapshot sync — fetches stubs then enriches topology. "
+                                        "Prefer this over calling fetch_snapshots + backfill_snapshot_topology separately.\n"
                                         "- fetch_snapshots: pull snapshot listing from Analytics API → saves stubs to CB. Fast.\n"
                                         "- backfill_snapshot_topology: enrich CB snapshot stubs with CB version, nodes, bad/warn. Call after fetch_snapshots.\n"
                                         "- scrape_customer_tickets: scrape fresh tickets from Supportal (capped at 50). Use when tickets are missing.\n"
-                                        "- score_ticket: LLM-score a single ticket for stars, temperature, complexity."
+                                        "- score_ticket: LLM-score a single ticket for stars, temperature, complexity.\n"
+                                        "- batch_score_tickets: score up to 10 tickets at once — pass ticket_ids list OR organization+limit. "
+                                        "Prefer over calling score_ticket repeatedly.\n"
+                                        "- batch_rescrape_tickets: re-fetch up to 20 tickets from Supportal in one call. "
+                                        "Prefer over calling rescrape_ticket in a loop."
                                     )
                                     if _cust_agent and _cust_agent.lower() != "all customers":
                                         _agent_sys += (
@@ -6492,6 +6499,7 @@ def main_page():
                                     _agent_msgs.append({"role": "user", "content": question})
                                     chat_status.set_text("Agent — planning tool calls …")
                                     _emb_p, _emb_m, _emb_k, _emb_u, _emb_d, _ = _get_embed_config()
+                                    # ── AFTER v1.5.0: carry session log across turns ──────────
                                     _agent_ctx = {
                                         "provider": provider, "model": model,
                                         "api_key": api_key, "base_url": base_url,
@@ -6499,7 +6507,9 @@ def main_page():
                                         "emb_api_key": _emb_k, "emb_base_url": _emb_u,
                                         "emb_dims": _emb_d,
                                         "cookie": (cookie_input.value or "").strip() or _get_profile_cookie(),
+                                        "_session_log": state.get("_session_log", {}),
                                     }
+                                    # ── BEFORE v1.5.0: no _session_log key in _agent_ctx ──────
                                     answer = await run.io_bound(
                                         call_llm_with_tools,
                                         _agent_msgs,
@@ -6511,6 +6521,7 @@ def main_page():
                                         _cust_agent,
                                         _agent_ctx,
                                     )
+                                    state["_session_log"] = _agent_ctx.get("_session_log", {})  # AFTER v1.5.0
                                     # ── Chart enforcement ─────────────────────────────────────────
                                     # Some models describe charts in text instead of calling
                                     # generate_chart. Detect this and force one more tool-call round.
@@ -15545,7 +15556,8 @@ _AGENT_TOOLS: list[dict] = [
             "description": (
                 "Run LLM scoring on a single ticket to generate stars (1-5), temperature (cold/warm/hot), "
                 "complexity, resolution_quality, and communication_clarity scores. "
-                "Use when the user asks about ticket quality, complexity, or when a ticket has no scores yet."
+                "Use when the user asks about ticket quality, complexity, or when a ticket has no scores yet. "
+                "To score multiple tickets at once use batch_score_tickets instead."
             ),
             "parameters": {
                 "type": "object",
@@ -15556,6 +15568,106 @@ _AGENT_TOOLS: list[dict] = [
                     },
                 },
                 "required": ["ticket_id"],
+            },
+        },
+    },
+    # ── BEFORE v1.5.0: fetch_snapshots + backfill_snapshot_topology were two separate ──
+    # ── calls that the agent often only half-completed. sync_snapshots wraps both.    ──
+    {
+        "type": "function",
+        "function": {
+            "name": "sync_snapshots",
+            "description": (
+                "Fetch AND enrich snapshot data for a customer in one step — "
+                "runs fetch_snapshots (Analytics API stub list) then immediately runs "
+                "backfill_snapshot_topology (REST topology per stub). "
+                "PREFER this over calling fetch_snapshots + backfill_snapshot_topology separately. "
+                "Use when the user says 'get snapshots', 'refresh snapshot data', 'sync cluster info', "
+                "'show cluster health' when no local snapshots exist, or any time you need fresh topology."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name.",
+                    },
+                    "max_stubs": {
+                        "type": "integer",
+                        "description": "Max stubs to enrich with topology (default 10, max 25).",
+                    },
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    # ── BEFORE v1.5.0: score_ticket and rescrape_ticket were single-ID tools that ────
+    # ── burned the 5-turn limit fast on bulk requests. These batch versions fix that. ─
+    {
+        "type": "function",
+        "function": {
+            "name": "batch_score_tickets",
+            "description": (
+                "Score multiple tickets for quality/complexity in one call. "
+                "Use when the user asks to score several tickets, 'all unscored' tickets, "
+                "or a filtered set. Returns a score summary table. "
+                "Far more efficient than calling score_ticket once per ticket. "
+                "Limit is 10 per call — call again to continue larger batches."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Explicit list of numeric ticket IDs to score. Takes priority over organization mode.",
+                    },
+                    "organization": {
+                        "type": "string",
+                        "description": "Score unscored tickets for this customer (used when ticket_ids is empty).",
+                    },
+                    "unscored_only": {
+                        "type": "boolean",
+                        "description": "Only score tickets without existing scores (default true).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max tickets to score in this call (default 5, max 10).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "pending", "solved", "closed", "hold"],
+                        "description": "Filter by status when using organization mode.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "batch_rescrape_tickets",
+            "description": (
+                "Re-fetch multiple specific tickets from Supportal in one call. "
+                "Use when the user provides a list of ticket IDs to refresh. "
+                "For refreshing all stale tickets for a customer use rescrape_customer_tickets instead. "
+                "Returns a per-ticket result summary. Limit is 20 per call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of numeric ticket IDs to re-scrape from Supportal.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Safety cap on how many to process (default 10, max 20).",
+                    },
+                },
+                "required": ["ticket_ids"],
             },
         },
     },
@@ -15684,6 +15796,11 @@ def _execute_agent_tool(
       cookie
     """
     ctx = ctx or {}
+    # ── v1.5.0: session log tracks tools called this conversation ────────────
+    # Populated here; injected into the LLM system prompt in call_llm_with_tools
+    # so the model avoids redundant re-calls across multiple messages.
+    _slog: dict = ctx.setdefault("_session_log", {})
+
     if name == "query_tickets":
         limit = min(int(args.get("limit") or 50), 200)
         filters = _agent_filters_from_args(args)
@@ -15695,7 +15812,20 @@ def _execute_agent_tool(
             use_tls, scope, collection, limit=limit,
         )
         if not tickets:
-            return "No tickets found matching the given filters."
+            # BEFORE v1.5.0: just returned "No tickets found."
+            # AFTER v1.5.0: hint at scrape_customer_tickets when data is missing for a scoped customer
+            _org = filters.get("organization") or default_customer
+            if _org:
+                _cookie_ok = bool(ctx.get("cookie") or _get_profile_cookie())
+                _ingest_hint = (
+                    f" No local tickets for '{_org}'. "
+                    + ("Call scrape_customer_tickets to pull them from Supportal first."
+                       if _cookie_ok else
+                       "Paste a session cookie to enable scrape_customer_tickets.")
+                )
+            else:
+                _ingest_hint = ""
+            return f"No tickets found matching the given filters.{_ingest_hint}"
         _now_epoch = time.time()
         lines = [
             "| Ticket ID | Organization | Subject | Status | Priority | Created | Last Scraped | CBSEs | Jira |",
@@ -16334,10 +16464,41 @@ LIMIT {limit}
         except Exception as exc:
             return f"Failed to load snapshots from Couchbase: {exc}"
         if not _rows:
-            return (
-                f"No snapshots found for '{org}' in Couchbase. "
-                "Use fetch_snapshots to pull them from the Analytics API first."
+            # BEFORE v1.5.0: returned a "use fetch_snapshots first" message and stopped.
+            # AFTER v1.5.0: auto-triggers sync_snapshots if a cookie is available, then re-queries.
+            _auto_cookie = ctx.get("cookie") or _get_profile_cookie()
+            if not _auto_cookie:
+                return (
+                    f"No snapshots for '{org}' in Couchbase and no session cookie to auto-fetch. "
+                    "Paste a cookie in the Configuration tab, then try again."
+                )
+            _auto_prefix = f"No snapshots in Couchbase for '{org}' — auto-syncing now.\n\n"
+            _sync_result = _execute_agent_tool(
+                "sync_snapshots", {"organization": org, "max_stubs": 10},
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                default_customer=default_customer, ctx=ctx,
             )
+            _auto_prefix += _sync_result + "\n\n"
+            # Re-query after sync
+            try:
+                from couchbase.cluster import Cluster as _Cl2, ClusterOptions as _CO2
+                from couchbase.auth import PasswordAuthenticator as _PA2
+                from couchbase.options import QueryOptions as _QO2
+                _conn2 = _cb_conn_str(cb_url, use_tls)
+                _cl2 = _Cl2(_conn2, _CO2(_PA2(username, password)))
+                _cl2.wait_until_ready(timedelta(seconds=15))
+                _rows = list(_cl2.query(
+                    f"SELECT s.* FROM `{bucket}`.`{scope}`.`snapshots` AS s "
+                    f"WHERE LOWER(s.organization) LIKE $org ORDER BY s.date DESC LIMIT 500",
+                    _QO2(named_parameters={"org": f"%{org.lower()}%"}, timeout=timedelta(seconds=30)),
+                ))
+                _cl2.close()
+            except Exception:
+                pass
+            if not _rows:
+                return _auto_prefix + f"Still no snapshot data for '{org}' after sync. The customer may not exist in Supportal or has no snapshots."
+        else:
+            _auto_prefix = ""
         tickets = tool_query_tickets(
             {"organization": org}, cb_url, bucket, username, password, use_tls, scope, collection, limit=500,
         )
@@ -16357,7 +16518,7 @@ LIMIT {limit}
             warn  = c.get("warn_count", 0)
             status = "Deprecated" if c.get("is_deprecated") else ("Active" if c.get("is_active") else "Inactive")
             lines.append(f"| {name} | {ver} | {nodes} | {last} | {bad} | {warn} | {status} |")
-        return "\n".join(lines)
+        return _auto_prefix + "\n".join(lines)
 
     elif name == "fetch_snapshots":
         org   = (args.get("organization") or default_customer or "").strip()
@@ -16553,6 +16714,183 @@ LIMIT {limit}
             lines.append(f"\n**Summary:** {summary[:500]}")
         return "\n".join(lines)
 
+    # ── v1.5.0 new tools ──────────────────────────────────────────────────────
+
+    elif name == "sync_snapshots":
+        # BEFORE v1.5.0: agent had to call fetch_snapshots then backfill_snapshot_topology
+        #   separately — often only completing step 1.
+        # AFTER v1.5.0: single tool that does both atomically.
+        org       = (args.get("organization") or default_customer or "").strip()
+        max_stubs = min(int(args.get("max_stubs") or 10), 25)
+        if not org:
+            return "Error: organization is required."
+        fetch_r = _execute_agent_tool(
+            "fetch_snapshots", {"organization": org, "limit": 200},
+            cb_url, bucket, username, password, use_tls, scope, collection,
+            default_customer=default_customer, ctx=ctx,
+        )
+        backfill_r = _execute_agent_tool(
+            "backfill_snapshot_topology", {"organization": org, "max_stubs": max_stubs},
+            cb_url, bucket, username, password, use_tls, scope, collection,
+            default_customer=default_customer, ctx=ctx,
+        )
+        return (
+            f"**Snapshot sync complete for '{org}'**\n\n"
+            f"**Step 1 — Stub fetch:** {fetch_r}\n\n"
+            f"**Step 2 — Topology backfill:** {backfill_r}"
+        )
+
+    elif name == "batch_score_tickets":
+        # BEFORE v1.5.0: score_ticket processed one ticket per call, burning 5-turn limit.
+        # AFTER v1.5.0: scores up to 10 tickets per call, returns a summary table.
+        raw_ids     = args.get("ticket_ids") or []
+        org         = (args.get("organization") or default_customer or "").strip()
+        limit       = min(int(args.get("limit") or 5), 10)
+        unscored_only = bool(args.get("unscored_only", True))
+        status_filt = (args.get("status") or "").strip().lower() or None
+        provider = ctx.get("provider", "claude")
+        model    = ctx.get("model", "claude-sonnet-4-6")
+        api_key  = ctx.get("api_key", "")
+        base_url = ctx.get("base_url", "")
+
+        ticket_ids = [str(t).strip() for t in raw_ids if t]
+        if not ticket_ids:
+            if not org:
+                return "Error: provide ticket_ids list or organization to run batch scoring."
+            _filt: dict = {"organization": org}
+            if status_filt:
+                _filt["status"] = status_filt
+            candidates = tool_query_tickets(
+                _filt, cb_url, bucket, username, password, use_tls, scope, collection, limit=limit * 6,
+            )
+            if unscored_only:
+                candidates = [t for t in candidates if not (t.get("score") or {}).get("stars")]
+            ticket_ids = [str(t.get("ticket_id")) for t in candidates[:limit] if t.get("ticket_id")]
+
+        ticket_ids = ticket_ids[:limit]
+        if not ticket_ids:
+            return f"No tickets to score{' (all already scored)' if unscored_only else ''}."
+
+        tickets = fetch_tickets_by_keys(
+            [f"ticket::{tid}" for tid in ticket_ids],
+            cb_url, bucket, username, password, use_tls, scope, collection,
+        )
+        if not tickets:
+            return f"Could not fetch tickets from Couchbase."
+
+        try:
+            scored = score_tickets_batch(tickets, provider, model, api_key, base_url)
+        except Exception as exc:
+            return f"Scoring failed: {exc}"
+        if not scored:
+            return "Scoring returned no results."
+
+        _saved = 0
+        try:
+            from couchbase.cluster import Cluster as _ScCl, ClusterOptions as _ScCO
+            from couchbase.auth import PasswordAuthenticator as _ScPA
+            _sc_conn = _cb_conn_str(cb_url, use_tls)
+            _sc_cl = _ScCl(_sc_conn, _ScCO(_ScPA(username, password)))
+            _sc_cl.wait_until_ready(timedelta(seconds=15))
+            _sc_col = _sc_cl.bucket(bucket).scope(scope).collection(collection)
+            for s in scored:
+                _stid = str(s.get("ticket_id") or "").strip()
+                if not _stid:
+                    continue
+                try:
+                    _ex = _sc_col.get(f"ticket::{_stid}").content_as[dict]
+                    _ex.update({k: v for k, v in s.items() if v is not None})
+                    _sc_col.upsert(f"ticket::{_stid}", _ex)
+                    _saved += 1
+                except Exception:
+                    pass
+            _sc_cl.close()
+        except Exception:
+            pass
+
+        lines = [f"**Batch scoring — {len(scored)} tickets scored, {_saved} saved**\n"]
+        lines.append("| Ticket ID | Stars | Temperature | Complexity |")
+        lines.append("|-----------|-------|-------------|------------|")
+        for s in scored:
+            lines.append(
+                f"| {s.get('ticket_id','')} "
+                f"| {s.get('stars','?')} "
+                f"| {s.get('temperature','?')} "
+                f"| {s.get('complexity','?')} |"
+            )
+        return "\n".join(lines)
+
+    elif name == "batch_rescrape_tickets":
+        # BEFORE v1.5.0: rescrape_ticket took one ID per call, agent called it N times
+        #   burning the 5-turn limit and often stopping after 2-3 tickets.
+        # AFTER v1.5.0: re-fetches up to 20 tickets per call, returns per-ticket results.
+        raw_ids    = args.get("ticket_ids") or []
+        limit      = min(int(args.get("limit") or 10), 20)
+        ticket_ids = [str(t).strip() for t in raw_ids if t][:limit]
+        if not ticket_ids:
+            return "Error: ticket_ids list is required and must not be empty."
+
+        cookie = ctx.get("cookie") or _get_profile_cookie()
+        if not cookie:
+            return "No session cookie available — paste a cookie in the Configuration tab first."
+
+        try:
+            from couchbase.cluster import Cluster as _BrCl, ClusterOptions as _BrCO
+            from couchbase.auth import PasswordAuthenticator as _BrPA
+            _br_conn = _cb_conn_str(cb_url, use_tls)
+            _br_cl = _BrCl(_br_conn, _BrCO(_BrPA(username, password)))
+            _br_cl.wait_until_ready(timedelta(seconds=10))
+            _br_col = _br_cl.bucket(bucket).scope(scope).collection(collection)
+        except Exception as exc:
+            return f"Couchbase connection failed: {exc}"
+
+        _ok = _skipped = _errors = 0
+        _result_rows: list[str] = []
+        for tid in ticket_ids:
+            try:
+                _sess = _make_api_session(cookie)
+                fresh = fetch_ticket_api(tid, _sess)
+                if not fresh or not fresh.get("ticket_id"):
+                    _skipped += 1
+                    _result_rows.append(f"| {tid} | ⚠ skipped (no data returned) |")
+                    continue
+                fresh["last_scraped_at"] = int(time.time())
+                fresh["type"]            = "ticket"
+                fresh["cb_version"]      = extract_ticket_version(fresh)
+                fresh["feature_area"]    = classify_ticket_feature(fresh)
+                fresh["ticket_origin"]   = classify_ticket_origin(fresh)
+                _doc_key = f"ticket::{tid}"
+                try:
+                    _ex = _br_col.get(_doc_key).content_as[dict]
+                    _merged = {**_ex}
+                    for _k, _v in fresh.items():
+                        if _v not in (None, "", [], {}):
+                            _merged[_k] = _v
+                        elif _k not in _merged:
+                            _merged[_k] = _v
+                    _br_col.upsert(_doc_key, _merged)
+                except Exception:
+                    _br_col.upsert(_doc_key, fresh)
+                _ok += 1
+                _result_rows.append(
+                    f"| {tid} | ✓ {fresh.get('status','')} / {fresh.get('priority','')} |"
+                )
+            except Exception as exc:
+                _errors += 1
+                _result_rows.append(f"| {tid} | ✗ {str(exc)[:60]} |")
+            time.sleep(0.3)
+
+        try:
+            _br_cl.close()
+        except Exception:
+            pass
+
+        lines = [f"**Batch rescrape: {_ok} updated, {_skipped} skipped, {_errors} errors**\n"]
+        lines.append("| Ticket ID | Result |")
+        lines.append("|-----------|--------|")
+        lines.extend(_result_rows)
+        return "\n".join(lines)
+
     else:
         return f"Unknown tool: {name}"
 
@@ -16661,6 +16999,32 @@ def call_llm_with_tools(
     import json as _json
     import traceback as _tb
 
+    # ── AFTER v1.5.0: session log + system-message injection ─────────────────
+    # ctx is the mutable dict threaded through the whole agent loop. We keep a
+    # running tally of every tool called (tool_name → call_count) in _session_log
+    # and prepend a compact summary to the system message so the LLM knows what
+    # it has already done this session — reducing redundant re-calls.
+    ctx = ctx or {}
+    _slog: dict = ctx.setdefault("_session_log", {})
+
+    def _inject_slog(msgs: list[dict]) -> list[dict]:
+        """Return a copy of msgs with the session-tool-log appended to the first system message."""
+        if not _slog:
+            return msgs
+        _block = "\n\nTOOLS USED THIS SESSION (do not re-call unnecessarily):\n" + "\n".join(
+            f"  - {t}: {c}x" for t, c in sorted(_slog.items())
+        )
+        out = []
+        _injected = False
+        for _m in msgs:
+            if _m.get("role") == "system" and not _injected:
+                out.append({**_m, "content": (_m.get("content") or "") + _block})
+                _injected = True
+            else:
+                out.append(_m)
+        return out
+    # ── BEFORE v1.5.0: no session log, ctx was caller-supplied or None ────────
+
     # ── Artifact stash shared by all provider paths ──────────────────────────
     # generate_chart / generate_table return echart/table fenced blocks.
     # Models often write prose as their final turn instead of echoing the block,
@@ -16715,7 +17079,7 @@ def call_llm_with_tools(
                 )
             return choices[0]
 
-        _msgs: list[dict] = list(messages)
+        _msgs: list[dict] = _inject_slog(list(messages))
         _tool_calls_made = False
 
         try:
@@ -16759,6 +17123,7 @@ def call_llm_with_tools(
                             cb_url, bucket, username, password, use_tls, scope, collection,
                             default_customer=default_customer, ctx=ctx,
                         )
+                        _slog[_tc_name] = _slog.get(_tc_name, 0) + 1  # AFTER v1.5.0: session log
                         print(f"[agent] text-call result length={len(_tc_result)}")
                         _collect_artifact(_tc_result)
                         # Inject as a user-visible tool result so the model can reference it
@@ -16798,6 +17163,7 @@ def call_llm_with_tools(
                         cb_url, bucket, username, password, use_tls, scope, collection,
                         default_customer=default_customer, ctx=ctx,
                     )
+                    _slog[_fn.name] = _slog.get(_fn.name, 0) + 1  # AFTER v1.5.0: session log
                     print(f"[agent] tool result length={len(result)}")
                     _collect_artifact(result)
                     _msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -16835,8 +17201,9 @@ def call_llm_with_tools(
             }
             for t in tools
         ]
-        _sys = next((m["content"] for m in messages if m["role"] == "system"), "")
-        _conv = [m for m in messages if m["role"] != "system"]
+        _msgs_injected = _inject_slog(messages)  # AFTER v1.5.0: slog in system prompt
+        _sys = next((m["content"] for m in _msgs_injected if m["role"] == "system"), "")
+        _conv = [m for m in _msgs_injected if m["role"] != "system"]
 
         for _round in range(max_rounds):
             resp = _ant_client.messages.create(
@@ -16863,6 +17230,7 @@ def call_llm_with_tools(
                     cb_url, bucket, username, password, use_tls, scope, collection,
                     default_customer=default_customer, ctx=ctx,
                 )
+                _slog[tb.name] = _slog.get(tb.name, 0) + 1  # AFTER v1.5.0: session log
                 _collect_artifact(result)
                 tool_results.append({
                     "type": "tool_result",

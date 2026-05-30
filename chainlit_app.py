@@ -225,11 +225,18 @@ def _system_prompt(customer: str) -> str:
         "Call this tool — do NOT render markdown tables.\n"
         "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
         "- vector_search: semantic/similarity search — finds tickets by meaning, not just keywords.\n"
-        "- get_cluster_health: cluster health summary from stored snapshots (versions, nodes, bad/warn).\n"
+        "- get_cluster_health: cluster health summary from stored snapshots (versions, nodes, bad/warn). "
+        "Auto-triggers sync_snapshots if no local snapshots exist and a cookie is available.\n"
+        "- sync_snapshots: ONE-STEP snapshot sync — fetches stubs then enriches topology. "
+        "Prefer this over calling fetch_snapshots + backfill_snapshot_topology separately.\n"
         "- fetch_snapshots: pull snapshot listing from Analytics API and save stubs to CB.\n"
         "- backfill_snapshot_topology: enrich snapshot stubs with topology detail. Call after fetch_snapshots.\n"
         "- scrape_customer_tickets: scrape fresh tickets from Supportal (capped). Use when tickets are missing.\n"
         "- score_ticket: LLM-score a single ticket for stars, temperature, complexity.\n"
+        "- batch_score_tickets: score up to 10 tickets at once — pass ticket_ids list OR organization+limit. "
+        "Prefer over calling score_ticket repeatedly.\n"
+        "- batch_rescrape_tickets: re-fetch up to 20 tickets from Supportal in one call. "
+        "Prefer over calling rescrape_ticket in a loop.\n"
     )
     if customer and customer.lower() != "all customers":
         prompt += (
@@ -579,6 +586,8 @@ async def on_message(message: cl.Message):
 
     provider, model, api_key, base_url = _llm_config(profile, overrides)
     cb = _cb_args(profile)
+    # AFTER v1.5.0: carry session log across turns so call_llm_with_tools can
+    # inject it into the system prompt (reduces redundant re-calls by the LLM).
     agent_ctx = {
         "provider": provider, "model": model,
         "api_key": api_key, "base_url": base_url,
@@ -590,7 +599,9 @@ async def on_message(message: cl.Message):
         "emb_dims":     int(profile.get("emb_ollama_dims") or profile.get("emb_lms_dims") or
                             profile.get("emb_gemini_dims") or profile.get("emb_openai_dims") or 1024),
         "cookie":       profile.get("cookie") or "",
+        "_session_log": cl.user_session.get("_session_log", {}),  # AFTER v1.5.0
     }
+    # BEFORE v1.5.0: no _session_log key
 
     # Name the thread from the first user message, before the agent call so it
     # persists even if the agent errors out. Use a session flag instead of
@@ -628,6 +639,8 @@ async def on_message(message: cl.Message):
     except Exception as exc:
         await cl.Message(content=f"Agent error: {exc}", author="Supportal").send()
         return
+
+    cl.user_session.set("_session_log", agent_ctx.get("_session_log", {}))  # AFTER v1.5.0
 
     history.append({"role": "user",      "content": message.content})
     history.append({"role": "assistant", "content": answer})
