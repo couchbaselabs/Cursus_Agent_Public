@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.3.9"
+__version__ = "1.3.10"
 
 import asyncio
 import threading
@@ -17597,6 +17597,85 @@ def _extract_snapshot_rows(html: str) -> list[dict]:
                         row["ticket_ids"].append(txt)
         out.append(row)
     return out
+
+def scrape_snapshots_from_stubs(
+    stubs: list[dict],
+    cookie: str | None,
+    max_detail_workers: int,
+    progress_cb: Callable[[str, float], None],
+) -> list[dict]:
+    """Fetch full topology for analytics-fetched stubs via REST API (no Playwright)."""
+    import concurrent.futures
+    import datetime as _dt
+
+    def log(msg: str, pct: float):
+        print(f"[SNAP-DIRECT] {msg}")
+        progress_cb(msg, pct)
+
+    if not stubs:
+        log("No stubs to scrape.", 1.0)
+        return []
+
+    total = len(stubs)
+    log(f"Fetching topology for {total} snapshots via REST API…", 0.0)
+
+    session = _make_api_session(cookie) if cookie else None
+    results: list[dict] = []
+    done_n = [0]
+    errors_n = [0]
+    lock = threading.Lock()
+
+    def _fetch_one(stub: dict) -> None:
+        snap_id = stub.get("snap_id", "")
+        if not snap_id:
+            return
+        try:
+            enc = urllib.parse.quote(snap_id, safe="")
+            topo = fetch_snapshot_topology_api(enc, session) if session else {}
+            now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            doc = {
+                "snap_id":            snap_id,
+                "cluster_id":         snap_id.split("::")[0],
+                "url":                f"{BASE_URL}/snapshot/{enc}",
+                "date":               stub.get("date"),
+                "organization":       stub.get("organization", ""),
+                "customer_url":       stub.get("customer_url", ""),
+                "cluster_name":       topo.get("cluster_name") or stub.get("cluster_name") or "",
+                "cluster_uuid":       topo.get("cluster_uuid") or stub.get("cluster_uuid") or "",
+                "capella_cluster_id": topo.get("capella_cluster_id") or "",
+                "topology":           topo,
+                "ticket_ids":         stub.get("ticket_ids") or [],
+                "scraped_at":         now_iso,
+                "bad_count":          topo.get("bad_count", 0),
+                "warn_count":         topo.get("warn_count", 0),
+                "bad_items":          topo.get("bad_items") or [],
+                "warn_items":         topo.get("warn_items") or [],
+                "cb_version":         topo.get("cb_version") or "",
+                "node_count":         topo.get("total_nodes") or 0,
+                "bucket_names":       topo.get("bucket_names") or [],
+                "auto_failover_seconds": topo.get("auto_failover_seconds"),
+                "ram_per_node_mib":   topo.get("ram_per_node_mib"),
+                "bucket_count":       topo.get("bucket_count", 0),
+                "server_groups":      topo.get("server_groups") or [],
+            }
+            with lock:
+                done_n[0] += 1
+                results.append(doc)
+                log(f"[{done_n[0]}/{total}] {snap_id[:16]}… bad={doc['bad_count']} warn={doc['warn_count']}",
+                    done_n[0] / total)
+        except Exception as exc:
+            with lock:
+                done_n[0] += 1
+                errors_n[0] += 1
+                log(f"[{done_n[0]}/{total}] Error {snap_id[:16]}…: {exc}", done_n[0] / total)
+
+    workers = max(1, min(max_detail_workers, total))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_fetch_one, stubs))
+
+    log(f"Done — {len(results)} scraped, {errors_n[0]} errors.", 1.0)
+    return results
+
 
 def scrape_snapshots_for_customer(
     customer: str,
