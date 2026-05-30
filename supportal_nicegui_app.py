@@ -37,7 +37,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 from nicegui import run, ui
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+import subprocess
 
 
 def _safe_notify(client, message: str, type: str = "info") -> None:  # noqa: A002
@@ -55,37 +55,6 @@ def _safe_notify(client, message: str, type: str = "info") -> None:  # noqa: A00
         pass
 
 
-def _run_in_playwright_thread(fn, *args, timeout: int = 90, **kwargs):
-    """
-    Run fn(*args, **kwargs) in a brand-new daemon thread and return its result.
-
-    Playwright's sync_api uses greenlets to bridge sync↔async.  When called
-    from a thread-pool thread (e.g. via asyncio run_in_executor / NiceGUI
-    run.io_bound), the greenlet switch-back targets whichever pool thread
-    started the playwright context.  If that thread is later reused for a
-    different task, the original greenlet's thread appears "exited" and
-    Playwright raises "cannot switch to a different thread".
-
-    Spawning a fresh thread for every playwright call sidesteps reuse entirely.
-    """
-    import queue
-    q: queue.Queue = queue.Queue()
-
-    def _target():
-        try:
-            q.put((True, fn(*args, **kwargs)))
-        except BaseException as exc:       # noqa: BLE001
-            q.put((False, exc))
-
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        raise TimeoutError(f"_run_in_playwright_thread: {fn.__name__} timed out after {timeout}s")
-    ok, val = q.get_nowait()
-    if not ok:
-        raise val
-    return val
 
 
 # Optional — Couchbase SDK (Phase 1 + 2).  Import lazily so the app starts
@@ -942,7 +911,8 @@ _mlx_emb_cache: dict = {"model": None, "tokenizer": None, "model_id": None}
 # ─────────────────────────── Constants ────────────────────────────────────────
 
 BASE_URL = "https://supportal.couchbase.com"
-PROFILE_DIR = os.path.join(os.path.dirname(__file__), ".playwright_supportal")
+PROFILE_DIR = os.path.join(os.path.dirname(__file__), ".playwright_supportal")  # kept for login_browser.py reference
+COOKIES_FILE = Path.home() / ".supportal_cookies.json"
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -998,35 +968,15 @@ _OP_STATUS: dict = {
     "done":     True,
 }
 
-# The headful browser is kept alive between "Open Browser" and "Confirm Login"
-# by holding a reference here.
+# Browser-login state — populated by login_browser.py subprocess.
 _browser_state: dict = {
-    "pw": None,       # sync_playwright() handle
-    "ctx": None,      # launch_persistent_context() handle
-    "logged_in": False,
+    "logged_in":     False,
+    "cookie_string": "",
 }
 
 # Coordination events for the browser-login flow.
-# open_browser_thread() blocks on _browser_close_event so it can perform
-# ctx.close()/pw.stop() in the *same* thread that created the playwright
-# instance — switching greenlets across thread boundaries causes the
-# "cannot switch to a different thread (which has exited)" error.
-_browser_close_event:  threading.Event = threading.Event()
 _browser_closed_event: threading.Event = threading.Event()
-_browser_ready_event:  threading.Event = threading.Event()  # set when browser is open & navigated
-
-# Network API logger — captures XHR/fetch calls while user browses Supportal.
-_net_log_state: dict = {
-    "pw":      None,
-    "ctx":     None,
-    "entries": [],   # list of captured call dicts
-    "running": False,
-    "_loop":   None, # asyncio event loop for UI callbacks
-    "_ui_cb":  None, # async coroutine callback(entry) → None
-}
-_net_log_close_event:  threading.Event = threading.Event()
-_net_log_closed_event: threading.Event = threading.Event()
-_net_log_ready_event:  threading.Event = threading.Event()
+_browser_ready_event:  threading.Event = threading.Event()  # set when subprocess has started
 
 # Shared results — written by worker thread, read by UI download handlers.
 _results: list[dict] = []
@@ -1484,6 +1434,98 @@ def parse_ticket_detail(html: str, url: str) -> dict:
     }
 
 
+def parse_ticket_from_api(body: dict, ticket_id: str) -> dict:
+    """Map a /zendesk/ticket/{id}/status JSON response to the same schema as parse_ticket_detail."""
+    ticket = body.get("ticket") or {}
+
+    # Build author_id -> name map from known user objects in the response
+    id_to_name: dict[int, str] = {}
+    for user_key in ("assignee", "requester", "current_user"):
+        u = body.get(user_key) or {}
+        if u.get("id") and u.get("name"):
+            id_to_name[u["id"]] = u["name"]
+
+    fields = ticket.get("fields") or {}
+
+    # Normalize ticket_fields keys — skip None/empty-string values
+    ticket_fields = {
+        _normalize_field_key(k): v
+        for k, v in fields.items()
+        if v is not None and v != ""
+    }
+
+    # cbses — API pre-parses at body level; fall back to fields.CBSE string
+    cbses: list[str] = list(body.get("cbses") or [])
+    if not cbses and fields.get("CBSE"):
+        cbses = [
+            c.upper()
+            for c in re.split(r"[,\s]+", str(fields["CBSE"]))
+            if re.match(r"CBSE-\d+", c, re.IGNORECASE)
+        ]
+
+    # escalations — pre-parsed list; join to string for schema compatibility
+    esc_list: list[str] = list(body.get("escalations") or [])
+    escalations_text = ", ".join(esc_list) if esc_list else None
+
+    # jira_issues — pre-parsed list
+    jira_issues: list[str] = list(body.get("jira_issues") or [])
+
+    # snapshots — structured list; convert to text for schema compatibility.
+    # Include decoded snap IDs so _SNAP_ID_RE (hex32::N) can match them for enrichment.
+    snap_list = body.get("snapshots") or []
+    snap_lines = []
+    for s in snap_list:
+        parts = []
+        enc = s.get("encoded_uid", "")
+        if enc:
+            parts.append(urllib.parse.unquote(enc))   # e.g. "b9fc95c4...::1"
+        if s.get("timestamp"):
+            parts.append(s["timestamp"])
+        if parts:
+            snap_lines.append("  ".join(parts))
+    snapshots_text = "\n".join(snap_lines) if snap_lines else None
+
+    # tags — list to space-separated string
+    tags_list = ticket.get("tags") or []
+    tags_text = " ".join(tags_list) if tags_list else None
+
+    priority = (fields.get("Priority") or ticket.get("priority")) or None
+
+    # Map comments
+    comments: list[dict] = []
+    for c in ticket.get("comments") or []:
+        author_id = c.get("author_id")
+        author_name = id_to_name.get(author_id, str(author_id) if author_id else None)
+        comments.append({
+            "timestamp": c.get("created_at"),
+            "author":    author_name,
+            "body":      c.get("body"),
+        })
+
+    url = f"{BASE_URL}/zendesk/ticket/{ticket_id}"
+    return {
+        "ticket_id":     str(ticket.get("id", ticket_id)),
+        "url":           url,
+        "subject":       ticket.get("subject"),
+        "status":        ticket.get("status"),
+        "priority":      priority,
+        "requester":     ticket.get("requester"),
+        "assignee":      ticket.get("assignee"),
+        "organization":  ticket.get("organization"),
+        "ticket_group":  ticket.get("group"),
+        "created":       ticket.get("created_at"),
+        "tags":          tags_text,
+        "escalations":   escalations_text,
+        "cbses":         cbses if cbses else None,
+        "jira_issues":   jira_issues if jira_issues else None,
+        "snapshots":     snapshots_text,
+        "ticket_fields": ticket_fields if ticket_fields else None,
+        "description":   ticket.get("description"),
+        "comment_count": len(comments),
+        "comments":      comments if comments else None,
+    }
+
+
 # ─────────────────────────── Listing / navigation helpers ─────────────────────
 
 _STATUS_MAP = {"O": "Open", "P": "Pending", "S": "Solved", "C": "Closed", "H": "Hold"}
@@ -1696,115 +1738,290 @@ def _find_customer_url_in_search(html: str, query: str) -> Optional[str]:
     return None
 
 
+# ─────────────────────────── REST API helpers ─────────────────────────────────
+
+def _make_api_session(cookie: str) -> requests.Session:
+    """Create a requests.Session authenticated for Supportal REST APIs."""
+    sess = requests.Session()
+    sess.verify = False
+    sess.headers.update({
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": cookie,
+    })
+    return sess
+
+
+def query_supportal_analytics(statement: str, cookie: str | None = None) -> list[dict]:
+    """POST /v2/analytics/query with a SQL++ statement; returns result rows as dicts."""
+    if not cookie:
+        cookie = _get_profile_cookie()
+    if not cookie:
+        raise RuntimeError("No session cookie — log in first.")
+    sess = _make_api_session(cookie)
+    try:
+        r = sess.get(
+            f"{BASE_URL}/v2/analytics/query",
+            params={"statement": statement},
+            timeout=60,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Analytics request failed: {exc}") from exc
+    if r.status_code != 200:
+        raise RuntimeError(f"Analytics HTTP {r.status_code}: {r.text[:400]}")
+    try:
+        body = r.json()
+    except Exception:
+        raise RuntimeError(f"Analytics non-JSON response: {r.text[:300]}")
+    status = body.get("status")
+    if status and status != "success":
+        errors = body.get("errors") or body.get("error") or []
+        raise RuntimeError(f"Analytics error ({status}): {errors}")
+    return body.get("results", []) or []
+
+
+def fetch_ticket_api(ticket_id: str, session: requests.Session) -> dict:
+    """GET /zendesk/ticket/{id}/status → parsed ticket dict."""
+    url = f"{BASE_URL}/zendesk/ticket/{ticket_id}/status"
+    ticket_url = f"{BASE_URL}/zendesk/ticket/{ticket_id}"
+    try:
+        resp = session.get(url, timeout=30, allow_redirects=True)
+        if resp.status_code == 200:
+            body = resp.json()
+            return parse_ticket_from_api(body, ticket_id)
+        if resp.status_code == 404:
+            return {"ticket_id": ticket_id, "_deleted": True, "url": ticket_url}
+        return {"ticket_id": ticket_id, "error": f"HTTP {resp.status_code}", "url": ticket_url}
+    except Exception as exc:
+        return {"ticket_id": ticket_id, "error": str(exc), "url": ticket_url}
+
+
+def _get_customer_ticket_listing_api(
+    org_name: str,
+    session: requests.Session,
+    progress_cb: Optional[Callable] = None,
+) -> list[dict]:
+    """GET /customer/{org}/status/tickets → list of ticket summary dicts.
+
+    Supportal slugs are case-sensitive ('NetDocuments' ≠ 'netdocuments').
+    We first hit the customer page with allow_redirects to discover the
+    canonical casing, then call /status/tickets on that resolved slug.
+    """
+    encoded = urllib.parse.quote(org_name.strip(), safe="")
+    base_url = f"{BASE_URL}/customer/{encoded}"
+
+    # Resolve the canonical slug via a HEAD-like redirect on the customer page
+    canonical_base = base_url
+    try:
+        head = session.get(base_url, timeout=15, allow_redirects=True)
+        m = re.search(r"/customer/([^/?#]+)", head.url)
+        if m:
+            canonical_base = f"{BASE_URL}/customer/{m.group(1)}"
+    except Exception:
+        pass
+
+    url = f"{canonical_base}/status/tickets"
+    print(f"[LISTING-API] GET {url}")
+    try:
+        resp = session.get(url, timeout=30, allow_redirects=True)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("tickets") or data.get("data") or []
+    except Exception as exc:
+        if progress_cb:
+            progress_cb(f"Listing API error: {exc}", 0.01)
+        print(f"[LISTING-API] error: {exc}")
+    return []
+
+
+def _get_customer_snapshot_listing_api(
+    org_name: str,
+    session: requests.Session,
+) -> list[dict]:
+    """GET /customer/{org}/status/snapshots → list of snapshot summary dicts.
+    Returns empty list if the endpoint is unavailable."""
+    encoded = urllib.parse.quote(org_name.strip(), safe="")
+    url = f"{BASE_URL}/customer/{encoded}/status/snapshots"
+    try:
+        resp = session.get(url, timeout=30, allow_redirects=True)
+        if resp.status_code in (404, 500):
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("snapshots") or data.get("data") or []
+    except Exception:
+        pass
+    return []
+
+
+def fetch_snapshot_topology_api(
+    snap_uid_enc: str,
+    session: requests.Session,
+) -> dict:
+    """
+    Fetch full cluster topology via the snapshot nutshell endpoints.
+
+    Primary:  GET /snapshot/{enc}/nutshell
+              Returns { nutshell_beta_output, nutshell, nutshell_output } — full structured
+              data including buckets, auto_failover, server_groups.  Parsed by
+              _parse_structured_api_json which already understands this format.
+
+    Fallback: GET /api/snapshots/{enc}/nutshell/summary  (cbs.* format)
+              + GET /api/snapshots/{enc}/nutshell/results?scopeType=cluster
+              Used when the primary endpoint fails or returns no useful topology.
+    """
+    snap_base  = f"{BASE_URL}/snapshot/{snap_uid_enc}"
+    api_base   = f"{BASE_URL}/api/snapshots/{snap_uid_enc}"
+
+    # ── Primary: /snapshot/{enc}/nutshell ────────────────────────────────────
+    try:
+        r = session.get(f"{snap_base}/nutshell", timeout=30)
+        if r.status_code == 200:
+            body = r.json()
+            if isinstance(body, dict) and ("nutshell_beta_output" in body or "nutshell" in body):
+                parsed = _parse_structured_api_json(body)
+                if parsed.get("total_nodes") or parsed.get("cluster_uuid") or parsed.get("cluster_name"):
+                    return parsed
+    except Exception as exc:
+        pass  # fall through to fallback
+
+    # ── Fallback: /api/snapshots/{enc}/nutshell/summary (cbs.* format) ───────
+    topo: dict = {
+        "cluster_name": None, "cluster_uuid": None, "capella_cluster_id": None,
+        "cluster_hostname": None, "total_nodes": None,
+        "data_nodes": 0, "query_nodes": 0, "index_nodes": 0,
+        "fts_nodes": 0, "eventing_nodes": 0, "analytics_nodes": 0, "backup_nodes": 0,
+        "cb_version": None, "ram_per_node_mib": None, "cpus_per_node": None,
+        "os_name": None, "bucket_count": 0, "bucket_names": [],
+        "total_bucket_quota_mb": None, "server_groups": [],
+        "auto_failover_seconds": None, "orchestrator": None,
+        "ldap_enabled": None, "bad_count": 0, "warn_count": 0,
+        "bad_items": [], "warn_items": [],
+        "raw_fields": {},
+    }
+    try:
+        r = session.get(f"{api_base}/nutshell/summary", timeout=20)
+        if r.status_code == 200:
+            summ = r.json()
+            if isinstance(summ, dict):
+                cbs = summ.get("cbs") if isinstance(summ.get("cbs"), dict) else None
+                if cbs:
+                    nodes = cbs.get("nodes") or {}
+                    topo["cluster_uuid"] = cbs.get("clusterUuid")
+                    topo["cluster_name"] = cbs.get("clusterUiName")
+                    topo["total_nodes"]  = cbs.get("clusterSize") or len(nodes)
+                    first = next(iter(nodes.values()), {})
+                    topo["cb_version"]   = first.get("serverVersion")
+                    hw = first.get("hardwareStats") or {}
+                    mem = hw.get("memLimit")
+                    if mem:
+                        topo["ram_per_node_mib"] = round(mem / (1024 * 1024))
+                    topo["cpus_per_node"] = hw.get("cpuCores")
+                    os_d = first.get("osDetails") or {}
+                    topo["os_name"] = os_d.get("name") or os_d.get("type")
+                    _SVC_MAP = {"kv": "data", "n1ql": "query", "index": "index",
+                                "fts": "fts", "eventing": "eventing",
+                                "cbas": "analytics", "backup": "backup"}
+                    svc_counts: dict = {}
+                    for node in nodes.values():
+                        for svc in (node.get("services") or []):
+                            svc_counts[svc] = svc_counts.get(svc, 0) + 1
+                    for raw_svc, canon in _SVC_MAP.items():
+                        if svc_counts.get(raw_svc):
+                            topo[f"{canon}_nodes"] = svc_counts[raw_svc]
+    except Exception as exc:
+        topo["raw_fields"]["summary_error"] = str(exc)
+
+    try:
+        r = session.get(f"{api_base}/nutshell/results", params={"scopeType": "cluster"}, timeout=20)
+        if r.status_code == 200:
+            res = r.json()
+            if isinstance(res, dict):
+                results = res.get("results") or {}
+                bad_items, warn_items = [], []
+                for rule_id, entry in (results.items() if isinstance(results, dict) else []):
+                    if not isinstance(entry, dict):
+                        continue
+                    sev = (entry.get("severity") or "").upper()
+                    if sev in ("BAD", "ERROR"):
+                        bad_items.append(rule_id)
+                    elif sev == "WARN":
+                        warn_items.append(rule_id)
+                topo["bad_count"]  = len(bad_items)
+                topo["warn_count"] = len(warn_items)
+                topo["bad_items"]  = bad_items
+                topo["warn_items"] = warn_items
+    except Exception as exc:
+        topo["raw_fields"]["results_error"] = str(exc)
+
+    return topo
+
+
 def search_customers_on_supportal(
     query: str,
     cookie: Optional[str],
     max_results: int = 30,
 ) -> list[dict]:
     """
-    Search Supportal /search/{query} and return Customer-type results.
+    Search Supportal /search/{query}/data and return Customer-type results.
     Returns list of {slug, display_name, url} sorted by relevance.
-
-    Uses Playwright (headless) because the search results page is Vue.js
-    client-side rendered — a plain requests GET only returns the HTML shell
-    with no result entries.
     """
     if not query.strip():
         return []
-
-    search_url = f"{BASE_URL}/search/{urllib.parse.quote(query.strip(), safe='')}"
-
-    parsed_cookies = []
-    if cookie:
-        for part in cookie.split(";"):
-            part = part.strip()
-            if "=" in part:
-                name, _, value = part.partition("=")
-                parsed_cookies.append({
-                    "name": name.strip(), "value": value.strip(), "url": BASE_URL,
-                })
-
-    html = ""
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
-            if parsed_cookies:
-                ctx.add_cookies(parsed_cookies)
-            page = ctx.new_page()
-            page.set_default_timeout(30_000)
-            try:
-                page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-                # Wait for Vue to render at least one customer link
-                try:
-                    page.wait_for_selector("a[href*='/customer/']", timeout=10_000)
-                except Exception:
-                    pass
-                # Small extra wait for remaining results to render
-                page.wait_for_timeout(800)
-                html = page.content()
-            finally:
-                ctx.close()
-                browser.close()
-    except Exception as exc:
-        print(f"[CUST-SEARCH] Playwright error: {exc}")
+    if not cookie:
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
+    session = _make_api_session(cookie)
+    api_url = (
+        f"{BASE_URL}/search/{urllib.parse.quote(query.strip(), safe='')}/data"
+        f"?page=0&index=Customers&resultsPerPage={max_results}&sortOrder=-_score"
+    )
+
+    try:
+        resp = session.get(api_url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        print(f"[CUST-SEARCH] API error: {exc}")
+        return []
+
+    rows = data if isinstance(data, list) else (
+        data.get("results") or data.get("data") or data.get("hits") or []
+    )
+
     results: list[dict] = []
     seen_slugs: set[str] = set()
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/customer/" not in href:
+    for item in rows:
+        if not isinstance(item, dict):
             continue
-        m = re.search(r"/customer/([^/?#]+)", href)
+        src = item.get("_source", {}) or {}
+        link_url = item.get("link_url") or item.get("url") or src.get("link_url") or ""
+        item_type = (item.get("type") or src.get("type") or "").lower()
+        if item_type and item_type not in ("customer", "customers"):
+            continue
+
+        m = re.search(r"/customer/([^/?#]+)", link_url, re.I)
         if not m:
             continue
         slug = urllib.parse.unquote(m.group(1))
         if not slug or slug in seen_slugs:
             continue
-
-        # Walk up the DOM (max 6 levels) looking for a block that contains the
-        # word "Customer" as a type label.  Stop before we reach elements whose
-        # text is so long they must be the full page body (avoid false positives
-        # from nav bars / footers that also mention "Customer").
-        container = a.parent
-        found_customer_type = False
-        for _ in range(6):
-            if container is None:
-                break
-            txt = container.get_text(" ", strip=True)
-            if len(txt) > 500:          # too large — we've left the result block
-                break
-            if re.search(r"\bCustomer\b", txt):
-                found_customer_type = True
-                break
-            container = container.parent
-
-        if not found_customer_type:
-            continue
-
         seen_slugs.add(slug)
 
-        # Extract alias (human display name).
-        # Rendered structure: "Customer  alias  Royal Caribbean  name  royal-caribbean-cruise-line"
-        container_text = container.get_text(" ", strip=True) if container else ""
-        alias: Optional[str] = None
-        alias_m = re.search(r"\balias\s+(.+?)\s+(?:name\b|$)", container_text, re.I)
-        if alias_m:
-            candidate = alias_m.group(1).strip()
-            if candidate and len(candidate) < 120:
-                alias = candidate
-
-        display_name = alias or slug.replace("-", " ").title()
-
-        results.append({
-            "slug":         slug,
-            "display_name": display_name,
-            "url":          f"{BASE_URL}/customer/{urllib.parse.quote(slug, safe='')}",
-        })
-
+        display_name = (
+            item.get("name") or item.get("display_name") or item.get("title") or
+            src.get("name") or slug
+        )
+        url = f"{BASE_URL}/customer/{urllib.parse.quote(slug, safe='')}"
+        results.append({"slug": slug, "display_name": display_name, "url": url})
         if len(results) >= max_results:
             break
 
@@ -2188,6 +2405,86 @@ def scrape_with_cookie(
     return out
 
 
+def scrape_with_cookie(
+    cookie: str,
+    customer: str,
+    max_pages: int,
+    progress_cb: Callable[[str, float], None],
+    skip_ids: set | None = None,
+    change_signals: dict | None = None,
+    max_tickets: int = 0,
+) -> list[dict]:
+    """Scrape all tickets for a customer using REST APIs only (no browser required)."""
+    customer = customer.strip().strip('"\'')
+    session  = _make_api_session(cookie)
+    customer_url = f"{BASE_URL}/customer/{urllib.parse.quote(customer, safe='')}"
+
+    # ── Step 1: get ticket listing ─────────────────────────────────────────
+    progress_cb("Fetching ticket listing via REST API…", 0.02)
+    raw_listing = _get_customer_ticket_listing_api(customer, session, progress_cb)
+
+    listing_summaries: list[dict] = []
+    for item in raw_listing:
+        tid = str(item.get("id") or "").strip()
+        if not tid:
+            continue
+        listing_summaries.append({
+            "ticket_id": tid,
+            "url":       f"{BASE_URL}/zendesk/ticket/{tid}",
+            "status":    item.get("status", ""),
+            "priority":  item.get("Priority", ""),
+            "subject":   item.get("subject", ""),
+            "created":   item.get("created_at", ""),
+            "solved":    item.get("solved_at", ""),
+        })
+
+    progress_cb(f"Listing complete — {len(listing_summaries)} tickets found. Fetching details…", 0.15)
+
+    # ── Step 2: change detection / incremental filtering ──────────────────
+    if change_signals is not None:
+        listing_summaries, n_new, n_changed, n_skipped = _filter_changed_tickets(
+            listing_summaries, change_signals, max_tickets
+        )
+        progress_cb(
+            f"Change detection: {n_new} new, {n_changed} changed, {n_skipped} unchanged (skipped)"
+            + (f", capped at {max_tickets}" if max_tickets > 0 else "") + ".",
+            0.15,
+        )
+    elif skip_ids:
+        all_count = len(listing_summaries)
+        listing_summaries = [s for s in listing_summaries if str(s.get("ticket_id", "")) not in skip_ids]
+        if max_tickets > 0:
+            listing_summaries = listing_summaries[:max_tickets]
+        skipped = all_count - len(listing_summaries)
+        progress_cb(
+            f"Incremental mode: {len(listing_summaries)} new tickets, {skipped} skipped.",
+            0.15,
+        )
+    elif max_tickets > 0:
+        listing_summaries = listing_summaries[:max_tickets]
+        progress_cb(f"Capped at {max_tickets} tickets.", 0.15)
+
+    # ── Step 3: fetch full ticket details via /status API ─────────────────
+    total = len(listing_summaries)
+    results: list[dict] = []
+    for i, summary in enumerate(listing_summaries):
+        tid = str(summary.get("ticket_id", ""))
+        if not tid:
+            continue
+        pct = 0.15 + 0.84 * (i / max(total, 1))
+        progress_cb(f"Detail {i + 1}/{total}  ticket #{tid}", pct)
+        rec = fetch_ticket_api(tid, session)
+        for field in ("status", "priority", "subject", "created", "solved"):
+            if not rec.get(field) and summary.get(field):
+                rec[field] = summary[field]
+        rec.setdefault("customer_url", customer_url)
+        results.append(rec)
+        time.sleep(0.05)
+
+    progress_cb("Done", 1.0)
+    return results
+
+
 def scrape_with_cookie_playwright(
     cookie: str,
     customer: str,
@@ -2197,104 +2494,8 @@ def scrape_with_cookie_playwright(
     change_signals: dict | None = None,
     max_tickets: int = 0,
 ) -> list[dict]:
-    """Auth mode C: headless Playwright with cookie injection.
-
-    Uses Playwright for the listing phase (JS-rendered SPA requires it) and
-    for ticket detail pages (Vue renders ticket fields via XHR).  The captured
-    cookie string is injected directly into the browser context so no saved
-    profile directory is needed.
-    """
-    # Parse "name=value; name2=value2" into Playwright cookie objects.
-    # Playwright requires either url OR domain+path — use url only.
-    parsed_cookies: list[dict] = []
-    for part in cookie.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, _, value = part.partition("=")
-            parsed_cookies.append({
-                "name":  name.strip(),
-                "value": value.strip(),
-                "url":   BASE_URL,
-            })
-
-    results: list[dict] = []
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
-        if parsed_cookies:
-            ctx.add_cookies(parsed_cookies)
-
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
-
-        listing_summaries, customer_url = _scrape_listing_playwright(page, customer, max_pages, progress_cb)
-        progress_cb(f"Listing complete — {len(listing_summaries)} tickets found. Fetching details…", 0.15)
-
-        if change_signals is not None:
-            listing_summaries, n_new, n_changed, n_skipped = _filter_changed_tickets(
-                listing_summaries, change_signals, max_tickets
-            )
-            progress_cb(
-                f"Change detection: {n_new} new, {n_changed} changed, {n_skipped} unchanged (skipped)"
-                + (f", capped at {max_tickets}" if max_tickets > 0 else "") + ".",
-                0.15,
-            )
-        elif skip_ids:
-            all_count = len(listing_summaries)
-            listing_summaries = [s for s in listing_summaries if str(s.get("ticket_id", "")) not in skip_ids]
-            if max_tickets > 0:
-                listing_summaries = listing_summaries[:max_tickets]
-            skipped = all_count - len(listing_summaries)
-            progress_cb(
-                f"Incremental mode: {len(listing_summaries)} new tickets, {skipped} skipped.",
-                0.15,
-            )
-        elif max_tickets > 0:
-            listing_summaries = listing_summaries[:max_tickets]
-            progress_cb(f"Capped at {max_tickets} tickets.", 0.15)
-
-        total = len(listing_summaries)
-        for i, summary in enumerate(listing_summaries):
-            tid = str(summary.get("ticket_id", ""))
-            if not tid:
-                continue
-            url  = f"{BASE_URL}/zendesk/ticket/{tid}"
-            pct  = 0.15 + 0.84 * (i / max(total, 1))
-            progress_cb(f"Detail {i + 1}/{total}  ticket #{tid}", pct)
-            try:
-                page.goto(url, wait_until="commit", timeout=60_000)
-                try:
-                    page.wait_for_function(
-                        """() => {
-                            const sec = document.querySelector('section.content');
-                            return sec && sec.innerText && sec.innerText.trim().length > 50;
-                        }""",
-                        timeout=30_000,
-                    )
-                except PWTimeoutError:
-                    pass
-                html = page.content()
-                if _is_deleted_ticket_page(200, html):
-                    rec = {**summary, "url": url, "_deleted": True}
-                else:
-                    rec = parse_ticket_detail(html, url)
-                    for field in ("status", "priority", "subject", "created", "solved"):
-                        if not rec.get(field) and summary.get(field):
-                            rec[field] = summary[field]
-            except PWTimeoutError:
-                rec = {**summary, "url": url, "error": "timeout"}
-            except Exception as exc:
-                rec = {**summary, "url": url, "error": str(exc)}
-            rec.setdefault("customer_url", customer_url)
-            results.append(rec)
-            time.sleep(0.15)
-
-        ctx.close()
-        browser.close()
-
-    progress_cb("Done", 1.0)
-    return results
+    """Alias for scrape_with_cookie (Playwright no longer used)."""
+    return scrape_with_cookie(cookie, customer, max_pages, progress_cb, skip_ids, change_signals, max_tickets)
 
 
 def _scrape_listing_playwright(
@@ -2303,217 +2504,10 @@ def _scrape_listing_playwright(
     max_pages: int,
     progress_cb: Callable[[str, float], None],
     debug: bool = False,
-) -> list[dict]:
-    """
-    Playwright-native listing: navigates with proper wait_for_selector calls at
-    each step so JS-rendered content is available before we parse.
-    """
-    # Strip any accidental surrounding quotes from the input
-    customer = customer.strip().strip('"\'')
-
-    all_tickets: list[tuple[str, str]] = []
-    seen_urls: set[str] = set()
-    visited_pages: set[str] = set()
-
-    def log(msg: str, pct: float):
-        print(f"[SCRAPE] {msg}")
-        progress_cb(msg, pct)
-
-    # ── Step 1: search ────────────────────────────────────────────────────────
-    # The SPA makes continuous background XHR requests so "networkidle" never
-    # fires.  Use "domcontentloaded" + explicit wait for Vue to render results.
-    _customer_decoded = urllib.parse.unquote(customer)
-    search_url = f"{BASE_URL}/search/{urllib.parse.quote(_customer_decoded)}"
-    log(f"Search: {search_url}", 0.01)
-    page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-    # Wait for Vue to inject search results (customer links appear after JS runs)
-    try:
-        page.wait_for_selector("a[href*='/customer/']", timeout=15_000)
-    except PWTimeoutError:
-        log("Timeout waiting for /customer/ links — waiting 4s for Vue render", 0.01)
-        page.wait_for_timeout(4000)
-    search_html = page.content()
-    if debug:
-        _save_debug("01_search", search_url, search_html)
-
-    soup_s = BeautifulSoup(search_html, "html.parser")
-    clinks = [a["href"] for a in soup_s.find_all("a", href=True) if "/customer/" in a["href"]]
-    log(f"Search: {len(clinks)} /customer/ links found. First 5: {clinks[:5]}", 0.015)
-
-    # ── Step 2: find and navigate to customer page ────────────────────────────
-    customer_url = _find_customer_url_in_search(search_html, customer)
-
-    if not customer_url and clinks:
-        # Search hrefs use lowercase names (e.g. "american express az") which the
-        # server may not accept. Confirm a match exists, then build the URL from
-        # the user-supplied name (which preserves original capitalisation).
-        try:
-            loc = page.locator("a[href*='/customer/']").filter(
-                has_text=re.compile(re.escape(_customer_decoded), re.I)
-            )
-            if loc.count() > 0:
-                customer_url = f"{BASE_URL}/customer/{urllib.parse.quote(_customer_decoded, safe='')}"
-                log(f"Search confirmed customer exists → using canonical URL: {customer_url}", 0.02)
-        except Exception as exc:
-            log(f"Locator match failed: {exc}", 0.02)
-
-    if not customer_url:
-        customer_url = f"{BASE_URL}/customer/{urllib.parse.quote(_customer_decoded, safe='')}"
-        log(f"No search match — using direct URL: {customer_url}", 0.02)
-
-    log(f"Navigating to customer page: {customer_url}", 0.03)
-    page.goto(customer_url, wait_until="domcontentloaded", timeout=30_000)
-
-    # Vue (customer.js) renders ALL content into the page after load.
-    # Vue (customer.js) loads ticket data via XHR after domcontentloaded.
-    # For large customers (1650 tickets) this can take >30s.
-    # Strategy: try a short wait first; if it times out check for a zero-ticket
-    # state before committing to the full 90s wait.
-    log("Waiting for pagination widget (Vue data load)…", 0.03)
-    try:
-        page.wait_for_selector("ul.pagination", timeout=15_000)
-        log("Pagination widget visible — data loaded", 0.035)
-    except PWTimeoutError:
-        # Check if this is a zero-ticket customer so we don't wait 90s for nothing
-        body = page.inner_text("body") if page.query_selector("body") else ""
-        if re.search(r'0\s+matching|no\s+tickets|no\s+results|0\s+tickets', body, re.I):
-            log("No tickets found for customer — proceeding", 0.035)
-        else:
-            # Large customer still loading — wait the rest of the full timeout
-            try:
-                page.wait_for_selector("ul.pagination", timeout=75_000)
-                log("Pagination widget visible — data loaded (slow load)", 0.035)
-            except PWTimeoutError:
-                log("Timeout waiting for pagination — proceeding with whatever rendered", 0.035)
-
-    if debug:
-        _save_debug("02_customer", customer_url, page.content())
-
-    # The customer URL base — used to detect when pagination navigates away
-    customer_base = customer_url.split("?")[0].split("#")[0]
-
-    def _collect_current_page() -> list[dict]:
-        """Extract ticket summaries from the currently rendered page."""
-        current = page.url.split("?")[0].split("#")[0]
-        # Compare case-insensitively — Supportal canonicalises slugs to title-case
-        # (e.g. navigating to /customer/apple → redirects to /customer/Apple)
-        if customer_base and customer_base.lower() not in current.lower() and "/zendesk/ticket/" not in current:
-            log(f"Context guard: URL drifted to {page.url} — skipping", 0.0)
-            return []
-        html = page.content()
-        rows = _extract_ticket_rows(html)
-        new = [r for r in rows.values() if r["url"] not in seen_urls]
-        if not new:
-            for tid, turl in _extract_ticket_links(html):
-                if turl not in seen_urls:
-                    new.append({"ticket_id": tid, "url": turl})
-        return new
-
-    # Dismiss any intro.js tutorial overlay before interacting
-    try:
-        page.evaluate("""() => {
-            document.querySelectorAll(
-                '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                '[class*="introjs"], .modal-backdrop'
-            ).forEach(el => el.remove());
-        }""")
-    except Exception:
-        pass
-
-    # ── Collect page 1 ────────────────────────────────────────────────────────
-    new_items = _collect_current_page()
-    for item in new_items:
-        all_tickets.append(item)
-        seen_urls.add(item["url"])
-    log(f"Page 1: {len(new_items)} tickets ({len(all_tickets)} total)", 0.06)
-
-    if debug:
-        _save_debug("03_tickets_page1", page.url, page.content())
-
-    # ── Step 4: paginate ──────────────────────────────────────────────────────
-    # Pagination: <ul class="pagination pagination-sm no-margin pull-right">
-    #   <li><a>First</a></li> <li class="active"><a>1</a></li>
-    #   <li class=""><a>2</a></li> … <li><a>Last</a></li>
-    # NOTE: <a> tags have NO href — Vue uses click handlers.
-    # Page change detected by waiting for li.active a text to equal new page num.
-
-    def _parse_total_from_page() -> int | None:
-        # "Showing 15 of 1650 matching items (out of total 1650)"
-        m = re.search(r"Showing\s+\d+\s+of\s+(\d+)\s+matching", page.content(), re.I)
-        return int(m.group(1)) if m else None
-
-    def _tickets_per_page() -> int:
-        rows = _extract_ticket_rows(page.content())
-        return len(rows) if rows else 15
-
-    import math
-    total_tickets = _parse_total_from_page()
-    per_page = _tickets_per_page() or 15
-    if total_tickets:
-        total_pages = math.ceil(total_tickets / per_page)
-        log(f"Total: {total_tickets} tickets → {total_pages} pages ({per_page}/page)", 0.07)
-    else:
-        total_pages = 9999
-        log("Could not parse total — paginating until no more buttons", 0.07)
-
-    page_num = 1
-    while page_num < total_pages:
-        if max_pages and page_num >= max_pages:
-            break
-
-        next_page_num = page_num + 1
-        pct = min(0.07 + 0.88 * (page_num / max(total_pages, 1)), 0.94)
-
-        # Find the page button inside ul.pagination — <a> with exact text
-        btn = page.locator("ul.pagination li a").filter(
-            has_text=re.compile(rf"^\s*{next_page_num}\s*$")
-        )
-        if btn.count() == 0:
-            log(f"No button for page {next_page_num} — done at page {page_num}", 0.95)
-            break
-
-        log(f"Clicking page {next_page_num}…", pct)
-        try:
-            # Dismiss intro.js / tutorial overlays that block pointer events
-            page.evaluate("""() => {
-                document.querySelectorAll(
-                    '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                    '[class*="introjs"], .modal-backdrop, .overlay'
-                ).forEach(el => el.remove());
-            }""")
-            btn.first.scroll_into_view_if_needed()
-            try:
-                btn.first.click(timeout=10_000)
-            except Exception:
-                # Re-dismiss in case overlay re-appeared, then force-click
-                page.evaluate("document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())")
-                btn.first.click(force=True, timeout=10_000)
-
-            # Wait for ul.pagination li.active to show the new page number
-            try:
-                page.wait_for_function(
-                    """(n) => {
-                        const active = document.querySelector('ul.pagination li.active a');
-                        return active && active.innerText.trim() === String(n);
-                    }""",
-                    arg=next_page_num,
-                    timeout=15_000,
-                )
-            except Exception:
-                page.wait_for_timeout(2000)
-
-            new_items = _collect_current_page()
-            for item in new_items:
-                all_tickets.append(item)
-                seen_urls.add(item["url"])
-            log(f"Page {next_page_num}: +{len(new_items)} → {len(all_tickets)} total", pct)
-            page_num = next_page_num
-            time.sleep(0.3)
-        except Exception as exc:
-            log(f"Page {next_page_num} error: {exc}", pct)
-            break
-
-    return all_tickets, customer_url
+) -> tuple[list[dict], str]:
+    """Stub — Playwright listing removed; callers should use scrape_with_cookie instead."""
+    progress_cb("Playwright listing not available — use cookie auth.", 0.0)
+    return [], f"{BASE_URL}/customer/{urllib.parse.quote(customer.strip(), safe='')}"
 
 
 def scrape_with_playwright(
@@ -2524,90 +2518,11 @@ def scrape_with_playwright(
     change_signals: dict | None = None,
     max_tickets: int = 0,
 ) -> list[dict]:
-    """Auth mode B: headless Playwright using the saved session profile.
-
-    Ticket detail pages are Vue.js rendered so they require Playwright navigation.
-    The listing phase now works with pagination (intro.js overlay dismissed), and
-    detail pages are fetched sequentially in the same browser context.
-    """
-    os.makedirs(PROFILE_DIR, exist_ok=True)
-    results: list[dict] = []
-
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=PROFILE_DIR,
-            headless=True,
-            user_agent=UA,
-            ignore_https_errors=True,
-        )
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
-
-        listing_summaries, customer_url = _scrape_listing_playwright(page, customer, max_pages, progress_cb)
-        progress_cb(f"Listing complete — {len(listing_summaries)} tickets found. Fetching details…", 0.15)
-
-        if change_signals is not None:
-            listing_summaries, n_new, n_changed, n_skipped = _filter_changed_tickets(
-                listing_summaries, change_signals, max_tickets
-            )
-            progress_cb(
-                f"Change detection: {n_new} new, {n_changed} changed, {n_skipped} unchanged (skipped)"
-                + (f", capped at {max_tickets}" if max_tickets > 0 else "") + ".",
-                0.15,
-            )
-        elif skip_ids:
-            all_count = len(listing_summaries)
-            listing_summaries = [s for s in listing_summaries if str(s.get("ticket_id", "")) not in skip_ids]
-            if max_tickets > 0:
-                listing_summaries = listing_summaries[:max_tickets]
-            skipped = all_count - len(listing_summaries)
-            progress_cb(
-                f"Incremental mode: {len(listing_summaries)} new tickets to scrape, {skipped} already in Couchbase (skipped).",
-                0.15,
-            )
-        elif max_tickets > 0:
-            listing_summaries = listing_summaries[:max_tickets]
-            progress_cb(f"Capped at {max_tickets} tickets.", 0.15)
-
-        total = len(listing_summaries)
-        for i, summary in enumerate(listing_summaries):
-            tid  = summary.get("ticket_id", "")
-            url  = f"{BASE_URL}/zendesk/ticket/{tid}"
-            pct  = 0.15 + 0.84 * (i / max(total, 1))
-            progress_cb(f"Detail {i + 1}/{total}  ticket #{tid}", pct)
-            try:
-                page.goto(url, wait_until="commit", timeout=60_000)
-                # ticket.js (Vue) renders fields into section.content via XHR
-                try:
-                    page.wait_for_function(
-                        """() => {
-                            const sec = document.querySelector('section.content');
-                            return sec && sec.innerText && sec.innerText.trim().length > 50;
-                        }""",
-                        timeout=30_000,
-                    )
-                except PWTimeoutError:
-                    pass
-                html = page.content()
-                if _is_deleted_ticket_page(200, html):
-                    rec = {**summary, "url": url, "_deleted": True}
-                else:
-                    rec = parse_ticket_detail(html, url)
-                    for field in ("status", "priority", "subject", "created", "solved"):
-                        if not rec.get(field) and summary.get(field):
-                            rec[field] = summary[field]
-            except PWTimeoutError:
-                rec = {**summary, "url": url, "error": "timeout"}
-            except Exception as exc:
-                rec = {**summary, "url": url, "error": str(exc)}
-            rec.setdefault("customer_url", customer_url)
-            results.append(rec)
-            time.sleep(0.15)
-
-        ctx.close()
-
-    progress_cb("Done", 1.0)
-    return results
+    """Auth mode B: uses saved browser session cookie for REST-based scraping."""
+    cookie = _browser_state.get("cookie_string", "") or _get_profile_cookie()
+    if not cookie:
+        raise RuntimeError("No session cookie available — complete browser login first.")
+    return scrape_with_cookie(cookie, customer, max_pages, progress_cb, skip_ids, change_signals, max_tickets)
 
 
 _DELETED_TICKET_PHRASES = (
@@ -2654,31 +2569,12 @@ def scrape_single_ticket_cookie(cookie: str, ticket_id: str) -> dict:
 
 
 def scrape_single_ticket_playwright(ticket_id: str) -> dict:
-    """Fetch and parse a single ticket detail page using the saved Playwright session."""
-    url = f"{BASE_URL}/zendesk/ticket/{ticket_id}"
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=PROFILE_DIR,
-            headless=True,
-            user_agent=UA,
-            ignore_https_errors=True,
-        )
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
-        page.goto(url, wait_until="commit", timeout=60_000)
-        try:
-            page.wait_for_function(
-                """() => {
-                    const sec = document.querySelector('section.content');
-                    return sec && sec.innerText && sec.innerText.trim().length > 50;
-                }""",
-                timeout=60_000,
-            )
-        except PWTimeoutError:
-            pass
-        html = page.content()
-        ctx.close()
-    return parse_ticket_detail(html, url)
+    """Fetch a single ticket via REST API using the saved browser session cookie."""
+    cookie = _browser_state.get("cookie_string", "") or _get_profile_cookie()
+    if not cookie:
+        raise RuntimeError("No session cookie available — complete browser login first.")
+    session = _make_api_session(cookie)
+    return fetch_ticket_api(ticket_id, session)
 
 
 def validate_and_recover_pipeline(
@@ -2701,8 +2597,8 @@ def validate_and_recover_pipeline(
     llm_base_url: str,
     score_batch_size: int,
     cookie: str,
-    use_playwright: bool,
-    progress_cb: Callable[[str, float], None],
+    use_playwright: bool = False,  # kept for backwards compat; ignored (always uses REST)
+    progress_cb: Callable[[str, float], None] = lambda m, p: None,
     cancel: threading.Event | None = None,
     raw_tickets: list[dict] | None = None,
 ) -> tuple[int, int]:
@@ -2789,10 +2685,12 @@ def validate_and_recover_pipeline(
         progress_cb(f"[{i+1}/{total}] Re-scraping ticket #{tid}…", pct)
         doc_key = f"ticket::{tid}"
 
-        # 2. Re-scrape
+        # 2. Re-scrape via REST API
         try:
-            if use_playwright:
-                ticket = scrape_single_ticket_playwright(tid)
+            _ck = cookie or _browser_state.get("cookie_string", "") or _get_profile_cookie()
+            if _ck:
+                sess = _make_api_session(_ck)
+                ticket = fetch_ticket_api(tid, sess)
             else:
                 ticket = scrape_single_ticket_cookie(cookie, tid)
         except Exception as exc:
@@ -2858,209 +2756,55 @@ def validate_and_recover_pipeline(
 
 def open_browser_thread() -> None:
     """
-    Launch a headful Chromium window so the user can complete interactive login.
-
-    This function BLOCKS on _browser_close_event so that ctx.close() and
-    pw.stop() happen in the same OS thread that called sync_playwright().start().
-    Playwright's sync API binds greenlets to the creating thread; closing from a
-    different thread causes "cannot switch to a different thread (has exited)".
+    Launch login_browser.py as a subprocess for interactive SSO login.
+    The subprocess opens a headed browser, detects successful login,
+    saves cookies to ~/.supportal_cookies.json, then exits.
     """
-    os.makedirs(PROFILE_DIR, exist_ok=True)
-    _browser_close_event.clear()
+    import sys as _sys
     _browser_closed_event.clear()
     _browser_ready_event.clear()
+    _browser_state["logged_in"]     = False
+    _browser_state["cookie_string"] = ""
 
-    pw = sync_playwright().start()
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=PROFILE_DIR,
-        headless=False,
-        viewport={"width": 1280, "height": 900},
-        user_agent=UA,
-        ignore_https_errors=True,
-    )
-    page = ctx.new_page()
-    # Use domcontentloaded here — SSO chains may prevent networkidle from firing.
-    # ERR_ABORTED / "frame was detached" can fire mid-SSO-redirect; check whether
-    # the page actually landed somewhere before deciding to raise.
-    try:
-        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=120_000)
-    except Exception as _nav_err:
-        _estr = str(_nav_err)
-        if "ERR_ABORTED" in _estr or "frame was detached" in _estr:
-            try:
-                _landed = page.url
-            except Exception:
-                _landed = ""
-            if not _landed or _landed in ("about:blank", ""):
-                raise  # truly failed to navigate
-            # else: page navigated via SSO redirect — proceed normally
-        else:
-            raise
-    _browser_state["pw"] = pw
-    _browser_state["ctx"] = ctx
+    script = Path(__file__).parent / "login_browser.py"
+    venv_python = Path(__file__).parent / "venv" / "bin" / "python"
+    python = str(venv_python) if venv_python.exists() else _sys.executable
 
-    # Signal that the browser is open and ready for the user to log in.
+    # Signal "subprocess starting" so the UI unblocks from _browser_ready_event.wait()
     _browser_ready_event.set()
 
-    # Wait here until confirm_login_thread() signals us to close.
-    # The browser window stays open because this thread is alive.
-    _browser_close_event.wait()
-
-    # Capture only the cookies scoped to the Supportal origin before the
-    # context is destroyed.  Passing urls= filters out SSO/OAuth/CDN cookies
-    # from every other domain visited during the login flow.
     try:
-        raw_cookies = ctx.cookies(urls=[BASE_URL])
-        _browser_state["cookie_string"] = "; ".join(
-            f"{c['name']}={c['value']}" for c in raw_cookies
-        )
-    except Exception:
-        _browser_state["cookie_string"] = ""
+        subprocess.run([python, str(script)], check=False, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("[LOGIN] login_browser.py timed out after 5 min")
+    except Exception as exc:
+        print(f"[LOGIN] subprocess error: {exc}")
 
-    # Clean up in this thread — same greenlet context as pw.start() above.
+    # Read cookies saved by login_browser.py
     try:
-        ctx.close()
-    finally:
-        pw.stop()
-    _browser_state["ctx"] = None
-    _browser_state["pw"]  = None
-    _browser_state["logged_in"] = True
+        if COOKIES_FILE.exists():
+            data = json.loads(COOKIES_FILE.read_text())
+            ck = data.get("cookie", "")
+            if ck:
+                _browser_state["cookie_string"] = ck
+                _browser_state["logged_in"]     = True
+    except Exception as exc:
+        print(f"[LOGIN] cookie read error: {exc}")
+
     _browser_closed_event.set()
 
 
 def confirm_login_thread() -> None:
-    """
-    Signal open_browser_thread() to close the browser, then wait for it to finish.
-    All playwright teardown happens in the thread that created the session.
-    """
-    _browser_close_event.set()
-    # Wait up to 30 s for the browser thread to finish closing.
-    if not _browser_closed_event.wait(timeout=30):
-        raise TimeoutError("Browser did not close within 30 seconds.")
-
-
-# ─────────────────────────── Network API logger ───────────────────────────────
-
-def start_net_log_thread() -> None:
-    """
-    Open a headful Chromium window and capture every XHR/fetch call made to
-    supportal.couchbase.com into _net_log_state['entries'].
-
-    Uses a separate profile dir so it doesn't share cookies with the login
-    browser.  Blocks on _net_log_close_event — call stop_net_log_thread() to
-    shut down cleanly from another thread.
-    """
-    _net_log_close_event.clear()
-    _net_log_closed_event.clear()
-    _net_log_ready_event.clear()
-    _net_log_state["entries"] = []
-    _net_log_state["running"] = True
-
-    profile_dir = os.path.join(os.path.dirname(__file__), ".playwright_netlog")
-    os.makedirs(profile_dir, exist_ok=True)
-
-    pw  = sync_playwright().start()
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=profile_dir,
-        headless=False,
-        viewport={"width": 1280, "height": 900},
-        user_agent=UA,
-        ignore_https_errors=True,
-    )
-    _net_log_state["pw"]  = pw
-    _net_log_state["ctx"] = ctx
-    page = ctx.new_page() if not ctx.pages else ctx.pages[0]
-
-    def _handle_route(route):
-        # page.route() fires synchronously for each request while the page is
-        # alive — unlike requestfinished/response events which fire at browser
-        # shutdown after body buffers are released.  route.fetch() re-issues
-        # the request through Playwright's fetch infrastructure and returns a
-        # fully-buffered APIResponse whose .body() is always available.
-        request = route.request
-        url     = request.url
-
-        if "supportal.couchbase.com" not in url or request.resource_type not in ("xhr", "fetch"):
-            try:
-                route.continue_()
-            except Exception:
-                pass
-            return
-
-        resp_text  = ""
-        resp_error = ""
-        status     = 0
-        try:
-            api_resp  = route.fetch()
-            status    = api_resp.status
-            try:
-                resp_text = api_resp.body().decode("utf-8", errors="replace")
-            except Exception as e:
-                resp_error = str(e)
-            try:
-                route.fulfill(response=api_resp)
-            except Exception:
-                pass
-        except Exception as e:
-            resp_error = str(e)
-            try:
-                route.continue_()
-            except Exception:
-                pass
-
-        try:
-            req_body = request.post_data or ""
-        except Exception:
-            req_body = ""
-
-        entry = {
-            "ts":         int(time.time()),
-            "time":       time.strftime("%H:%M:%S"),
-            "method":     request.method,
-            "url":        url,
-            "status":     status,
-            "req_body":   req_body[:4000],
-            "resp_body":  resp_text[:50000],
-            "resp_size":  len(resp_text),
-            "resp_error": resp_error,
-        }
-        _net_log_state["entries"].append(entry)
-        cb = _net_log_state.get("_ui_cb")
-        lp = _net_log_state.get("_loop")
-        if cb and lp:
-            asyncio.run_coroutine_threadsafe(cb(entry), lp)
-
-    page.route("**/*", _handle_route)
+    """Read saved cookie from COOKIES_FILE (login_browser.py already saved it)."""
     try:
-        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
-    except Exception:
-        pass
-    _net_log_ready_event.set()
-    _net_log_close_event.wait()
-
-    try:
-        ctx.close()
-    finally:
-        pw.stop()
-    _net_log_state["pw"]      = None
-    _net_log_state["ctx"]     = None
-    _net_log_state["running"] = False
-    _net_log_closed_event.set()
-
-
-def stop_net_log_thread() -> None:
-    """Signal start_net_log_thread() to close the browser and wait for cleanup."""
-    _net_log_close_event.set()
-    _net_log_closed_event.wait(timeout=15)
-
-
-def save_net_log() -> str:
-    """Write captured entries to a timestamped JSON file. Returns the path."""
-    ts   = time.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(os.path.dirname(__file__), f"network_log_{ts}.json")
-    with open(path, "w") as f:
-        json.dump(_net_log_state["entries"], f, indent=2)
-    return path
+        if COOKIES_FILE.exists():
+            data = json.loads(COOKIES_FILE.read_text())
+            ck = data.get("cookie", "")
+            if ck:
+                _browser_state["cookie_string"] = ck
+                _browser_state["logged_in"]     = True
+    except Exception as exc:
+        print(f"[LOGIN] confirm_login_thread read error: {exc}")
 
 
 # ─────────────────────────── Export helpers ───────────────────────────────────
@@ -3445,17 +3189,31 @@ def main_page():
                                 return
                             max_pages = int(max_pages_input.value or 0)
 
-                            # Resolve auth
-                            active_tab = auth_tabs.value          # NiceGUI tab label text
-                            using_browser = (active_tab == tab_browser.name if hasattr(tab_browser, "name")
-                                             else str(active_tab) == "Browser Login (SSO)")
+                            # Resolve auth — always use cookie (from paste or browser login)
                             cookie = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                            if not cookie:
+                                cookie = _browser_state.get("cookie_string", "") or _get_profile_cookie()
 
-                            if using_browser and not _browser_state.get("logged_in"):
-                                ui.notify("Complete browser login first.", type="warning")
-                                return
-                            if not using_browser and not cookie:
-                                ui.notify("Paste a cookie string or set SUPPORTAL_COOKIE env var.", type="warning")
+                            # Auto-resolve plain name to exact Supportal slug via search API
+                            if cookie and not customer_input.value.strip().startswith("http"):
+                                progress_label.set_text(f"Searching Supportal for '{customer}'…")
+                                _hits = await run.io_bound(
+                                    search_customers_on_supportal, customer, cookie, 10
+                                )
+                                if _hits:
+                                    _best = _hits[0]
+                                    customer      = _best.get("slug") or customer
+                                    _resolved_url = _best.get("url")  or _resolved_url
+                                    customer_input.set_value(_resolved_url)
+                                    progress_label.set_text(
+                                        f"Resolved '{_best.get('display_name', customer)}' → {_resolved_url}"
+                                    )
+                                    print(f"[SCRAPE] auto-resolved to slug={customer!r} url={_resolved_url}")
+                            if not cookie:
+                                ui.notify(
+                                    "Paste a cookie string in the Cookie tab, or use Browser Login first.",
+                                    type="warning",
+                                )
                                 return
 
                             loop = asyncio.get_event_loop()
@@ -3497,27 +3255,10 @@ def main_page():
                                 ui.notify("Couchbase not available — falling back to full scrape.", type="warning")
 
                             try:
-                                if using_browser:
-                                    _scrape_loop = asyncio.get_event_loop()
-                                    _scrape_fut: asyncio.Future = _scrape_loop.create_future()
-
-                                    def _scrape_thread():
-                                        try:
-                                            _r = scrape_with_playwright(
-                                                customer, max_pages, progress_cb,
-                                                skip_ids, change_signals, max_tickets,
-                                            )
-                                            _scrape_loop.call_soon_threadsafe(_scrape_fut.set_result, _r)
-                                        except Exception as _exc:
-                                            _scrape_loop.call_soon_threadsafe(_scrape_fut.set_exception, _exc)
-
-                                    threading.Thread(target=_scrape_thread, daemon=True).start()
-                                    data = await _scrape_fut
-                                else:
-                                    data = await run.io_bound(
-                                        scrape_with_cookie_playwright, cookie, customer, max_pages, progress_cb,
-                                        skip_ids, change_signals, max_tickets,
-                                    )
+                                data = await run.io_bound(
+                                    scrape_with_cookie, cookie, customer, max_pages, progress_cb,
+                                    skip_ids, change_signals, max_tickets,
+                                )
 
                                 state["results"] = data
                                 # Save old customer's history, then load new customer's
@@ -3737,7 +3478,7 @@ def main_page():
                                                 _enrich_cookie or None,
                                                 _make_step_prog("enrich"),
                                                 _cancel,
-                                                4,
+                                                int(enrich_workers_input.value or 4),
                                                 _snap_upsert_fn,
                                             )
                                             _snap_count = len([t for t in data if t.get("snapshots")])
@@ -3939,9 +3680,12 @@ def main_page():
                                 ui.notify("Could not resolve a customer name from the input.", type="warning")
                                 return
 
-                            if not _browser_state.get("logged_in"):
+                            _ck_diag = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                            if not _ck_diag:
+                                _ck_diag = _browser_state.get("cookie_string", "") or _get_profile_cookie()
+                            if not _ck_diag:
                                 ui.notify(
-                                    "Diagnose uses the browser session — complete Browser Login first.",
+                                    "Paste a cookie string or complete Browser Login first.",
                                     type="warning",
                                 )
                                 return
@@ -3956,48 +3700,32 @@ def main_page():
 
                             btn_diagnose.props("loading disabled")
                             progress_bar.set_value(0)
-                            progress_label.set_text("Running diagnostics (Playwright)…")
+                            progress_label.set_text("Running diagnostics (REST API)…")
 
                             def run_diag():
-                                os.makedirs(PROFILE_DIR, exist_ok=True)
                                 report_lines: list[str] = []
-
                                 def log_cb(msg: str, pct: float):
                                     report_lines.append(msg)
                                     progress_cb(msg, pct)
 
-                                with sync_playwright() as pw:
-                                    ctx = pw.chromium.launch_persistent_context(
-                                        user_data_dir=PROFILE_DIR,
-                                        headless=True,
-                                        user_agent=UA,
-                                        ignore_https_errors=True,
-                                    )
-                                    pg = ctx.new_page()
-                                    pg.set_default_timeout(60_000)
-                                    _scrape_listing_playwright(pg, customer, max_pages=1,
-                                                               progress_cb=log_cb, debug=True)
-                                    ctx.close()
+                                log_cb(f"Testing listing API for: {customer}", 0.1)
+                                try:
+                                    sess = _make_api_session(_ck_diag)
+                                    tickets = _get_customer_ticket_listing_api(customer, sess, log_cb)
+                                    log_cb(f"Listing OK — {len(tickets)} tickets found", 0.5)
+                                    if tickets:
+                                        t0 = tickets[0]
+                                        log_cb(f"First ticket: id={t0.get('id')} status={t0.get('status')} subject={t0.get('subject','')[:60]}", 0.6)
+                                except Exception as exc:
+                                    log_cb(f"Listing error: {exc}", 0.5)
 
-                                report_lines.append(f"\nDebug HTML saved to: {DEBUG_DIR}")
                                 return "\n".join(report_lines)
 
                             try:
-                                _diag_loop = asyncio.get_event_loop()
-                                _diag_fut: asyncio.Future = _diag_loop.create_future()
-
-                                def _diag_thread():
-                                    try:
-                                        _r = run_diag()
-                                        _diag_loop.call_soon_threadsafe(_diag_fut.set_result, _r)
-                                    except Exception as _exc:
-                                        _diag_loop.call_soon_threadsafe(_diag_fut.set_exception, _exc)
-
-                                threading.Thread(target=_diag_thread, daemon=True).start()
-                                report = await _diag_fut
+                                report = await run.io_bound(run_diag)
                                 diag_output.set_text(report)
                                 diag_output.set_visibility(True)
-                                progress_label.set_text("Diagnostics complete — check output and debug_html/ folder")
+                                progress_label.set_text("Diagnostics complete")
                             except Exception as exc:
                                 diag_output.set_text(str(exc))
                                 diag_output.set_visibility(True)
@@ -4021,12 +3749,80 @@ def main_page():
                                 "Enable steps to run automatically after a successful scrape. "
                                 "Uses the Couchbase, Embedding, and LLM configurations from the Analysis tab."
                             ).classes("text-xs text-gray-500 mb-2")
-                            with ui.column().classes("gap-1"):
-                                pipeline_save_toggle     = ui.checkbox("Save tickets to Couchbase")
-                                pipeline_enrich_toggle   = ui.checkbox("Enrich with Snapshot Topology (fetches 1st snapshot per ticket; requires Save)")
-                                pipeline_embed_toggle    = ui.checkbox("Embed tickets (requires Save)")
-                                pipeline_score_toggle    = ui.checkbox("Score tickets and save scores (requires Save)")
-                                pipeline_validate_toggle = ui.checkbox("Validate & Recover (re-scrape, re-embed, re-score any missing tickets)")
+                            _step_label_cls = "text-sm min-w-[13rem]"
+                            _ctrl_col_cls   = "gap-0 items-start"
+                            _ctrl_lbl_cls   = "text-xs text-gray-400 leading-none mb-0.5"
+
+                            # ── Save ──────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_save_toggle = ui.checkbox("").tooltip("Save scraped tickets to Couchbase")
+                                ui.label("Save to Couchbase").classes(_step_label_cls)
+
+                            # ── Enrich ────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_enrich_toggle = ui.checkbox("").tooltip("Fetch first snapshot per ticket; requires Save")
+                                ui.label("Enrich with Snapshots").classes(_step_label_cls)
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Workers").classes(_ctrl_lbl_cls)
+                                    enrich_workers_input = ui.number(value=4, min=1, max=16).classes("w-20").tooltip(
+                                        "Concurrent HTTP requests to Supportal for snapshot data"
+                                    )
+
+                            # ── Embed ─────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_embed_toggle = ui.checkbox("").tooltip("Generate embeddings; requires Save")
+                                ui.label("Embed Tickets").classes(_step_label_cls)
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Parallel").classes(_ctrl_lbl_cls)
+                                    embed_parallel_input = ui.number(value=1, min=1, max=32).classes("w-20").tooltip(
+                                        "Concurrent embedding requests. Match to LMStudio 'Parallel requests' "
+                                        "or OLLAMA_NUM_PARALLEL. Use 1 for MLX (not thread-safe)."
+                                    )
+                                async def _probe_lmstudio_concurrency():
+                                    _, _, _, emb_base_url, _, _ = _get_embed_config()
+                                    url = emb_base_url.strip() or "http://localhost:1234"
+                                    info = await run.io_bound(poll_lmstudio_model_info, url)
+                                    if info.get("n_parallel"):
+                                        embed_parallel_input.set_value(info["n_parallel"])
+                                        ui.notify(
+                                            f"LMStudio reports {info['n_parallel']} parallel slots"
+                                            + (f", context {info['context_length']}" if info.get("context_length") else ""),
+                                            type="positive",
+                                        )
+                                    elif info.get("api_version"):
+                                        ui.notify(
+                                            f"LMStudio API v{info['api_version']} reachable but did not "
+                                            "expose parallel count — set manually.",
+                                            type="info",
+                                        )
+                                    else:
+                                        ui.notify("Could not reach LMStudio API", type="warning")
+                                ui.button("Probe LMStudio", icon="network_ping",
+                                          on_click=_probe_lmstudio_concurrency).props("outline color=teal dense")
+
+                            # ── Score ─────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_score_toggle = ui.checkbox("").tooltip("Score tickets with LLM and save scores; requires Save")
+                                ui.label("Score & Save").classes(_step_label_cls)
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Batch").classes(_ctrl_lbl_cls)
+                                    score_batch_input = ui.number(value=5, min=1, max=50).classes("w-20")
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Parallel").classes(_ctrl_lbl_cls)
+                                    score_parallel_input = ui.number(value=1, min=1, max=8).classes("w-20").tooltip(
+                                        "Batches sent to the LLM concurrently. Match to your model server's "
+                                        "parallel request capacity."
+                                    )
+                                score_no_think_toggle = ui.checkbox("No-think").classes("ml-2").tooltip(
+                                    "Suppresses Qwen3/QwQ reasoning traces (Ollama think=false). "
+                                    "Auto-enabled when a thinking-capable model is detected. "
+                                    "Ignored for Claude, Gemini, and LMStudio."
+                                )
+
+                            # ── Validate ──────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_validate_toggle = ui.checkbox("").tooltip("Re-scrape, re-embed, re-score any tickets missing from Couchbase")
+                                ui.label("Validate & Recover").classes(_step_label_cls)
                         pipeline_status = ui.label("").classes("text-sm text-gray-500 mt-1")
 
                         # ── Pipeline observability card ───────────────────────────────────
@@ -4498,168 +4294,72 @@ def main_page():
                             # ── Browser login tab ───────────────────────────────────────
                             with ui.tab_panel(tab_browser):
                                 ui.label(
-                                    "Click Open Browser. A Chromium window will appear — log in through SSO "
-                                    "as normal and navigate to at least one ticket to confirm access. "
-                                    "Then click Confirm Login to save the session for headless scraping."
+                                    "Click Open Browser to launch login_browser.py. "
+                                    "A Chromium window will open — complete the Okta SSO login. "
+                                    "The browser auto-closes when login is detected and the cookie is saved automatically."
                                 ).classes("text-sm text-gray-500 mb-3")
 
                                 with ui.row().classes("items-center gap-2 mb-2"):
                                     browser_dot    = ui.icon("circle").classes("text-red-500 text-sm")
                                     browser_status = ui.label("Not logged in").classes("text-sm font-semibold text-gray-600")
 
-                                async def _run_in_plain_thread(fn):
-                                    """Run fn in a plain daemon thread (not asyncio executor).
-                                    Playwright's sync API uses its own internal event loop /
-                                    greenlets and must NOT run inside asyncio's thread-pool
-                                    executor — doing so causes greenlet context conflicts."""
-                                    loop = asyncio.get_event_loop()
-                                    done = asyncio.Event()
-                                    exc_holder: list[Exception] = []
-
-                                    def _run():
-                                        try:
-                                            fn()
-                                        except Exception as e:
-                                            exc_holder.append(e)
-                                        finally:
-                                            loop.call_soon_threadsafe(done.set)
-
-                                    threading.Thread(target=_run, daemon=True).start()
-                                    await done.wait()
-                                    if exc_holder:
-                                        raise exc_holder[0]
-
                                 async def do_open_browser():
                                     btn_open.props("loading disabled")
                                     browser_dot.classes(replace="text-orange-500 text-sm")
-                                    browser_status.set_text("Browser opening…")
+                                    browser_status.set_text("Starting browser (login_browser.py)…")
                                     try:
-                                        # Start the browser thread as fire-and-forget — it blocks
-                                        # internally on _browser_close_event, so we must NOT await it.
                                         threading.Thread(target=open_browser_thread, daemon=True).start()
-                                        # Wait only until the browser has launched and navigated.
+                                        # Wait until subprocess has started
                                         await asyncio.get_event_loop().run_in_executor(
                                             None, _browser_ready_event.wait
                                         )
                                         browser_dot.classes(replace="text-blue-500 text-sm")
-                                        browser_status.set_text("Browser open — log in then click Confirm Login")
-                                        btn_confirm.props(remove="disabled")
+                                        browser_status.set_text("Browser open — log in (will auto-close when complete)")
+                                        # Wait for login to complete in background
+                                        asyncio.ensure_future(_poll_login_complete())
                                     except Exception as exc:
                                         browser_dot.classes(replace="text-red-600 text-sm")
                                         browser_status.set_text(f"Error: {exc}")
                                     finally:
                                         btn_open.props(remove="loading disabled")
 
-                                async def do_confirm_login():
-                                    btn_confirm.props("loading disabled")
-                                    browser_status.set_text("Closing browser and saving session…")
-                                    try:
-                                        await _run_in_plain_thread(confirm_login_thread)
-                                        captured = _browser_state.get("cookie_string", "")
-                                        if captured:
-                                            cookie_input.set_value(captured)
+                                async def _poll_login_complete():
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, _browser_closed_event.wait
+                                    )
+                                    captured = _browser_state.get("cookie_string", "")
+                                    if captured:
+                                        cookie_input.set_value(captured)
                                         browser_dot.classes(replace="text-green-500 text-sm")
                                         browser_status.set_text("Logged in ✓ — cookie captured and ready")
-                                        ui.notify("Session saved — cookie captured into Authentication tab.", type="positive")
-                                    except Exception as exc:
+                                    else:
                                         browser_dot.classes(replace="text-red-600 text-sm")
-                                        browser_status.set_text(f"Error: {exc}")
-                                        ui.notify(f"Error saving session: {exc}", type="negative")
-                                        btn_confirm.props(remove="loading disabled")
+                                        browser_status.set_text(
+                                            "Login subprocess finished but no cookie found — "
+                                            "check that login_browser.py saved ~/.supportal_cookies.json"
+                                        )
+
+                                async def do_load_saved_cookie():
+                                    """Read cookie from ~/.supportal_cookies.json if it exists."""
+                                    try:
+                                        if COOKIES_FILE.exists():
+                                            data = json.loads(COOKIES_FILE.read_text())
+                                            ck = data.get("cookie", "")
+                                            if ck:
+                                                cookie_input.set_value(ck)
+                                                _browser_state["cookie_string"] = ck
+                                                _browser_state["logged_in"]     = True
+                                                browser_dot.classes(replace="text-green-500 text-sm")
+                                                browser_status.set_text("Loaded saved cookie ✓")
+                                                ui.notify("Loaded saved cookie.", type="positive")
+                                                return
+                                        ui.notify("No saved cookie found — run Open Browser first.", type="warning")
+                                    except Exception as exc:
+                                        ui.notify(f"Load error: {exc}", type="negative")
 
                                 with ui.row().classes("gap-3"):
                                     btn_open = ui.button("Open Browser & Login", on_click=do_open_browser, icon="open_in_browser")
-                                    btn_confirm = ui.button("Confirm Login", on_click=do_confirm_login, icon="check_circle")
-                                    btn_confirm.props("disabled color=positive")
-
-                                # ── Network API Inspector ──────────────────────────────
-                                ui.separator().classes("mt-5")
-                                with ui.row().classes("items-center gap-2 mt-2"):
-                                    ui.icon("network_check").classes("text-purple-500")
-                                    ui.label("Network API Inspector").classes("text-sm font-semibold text-gray-700")
-                                ui.label(
-                                    "Opens a browser window — log in, then click through tickets and snapshots. "
-                                    "Every API call Supportal makes is captured here with its URL, "
-                                    "request body, and response. Save to JSON when done."
-                                ).classes("text-xs text-gray-400 mt-1 mb-2")
-
-                                with ui.row().classes("items-center gap-2"):
-                                    netlog_dot    = ui.icon("circle").classes("text-gray-400 text-sm")
-                                    netlog_status = ui.label("Not running").classes("text-sm text-gray-500")
-                                    netlog_count  = ui.badge("0 calls", color="purple").classes("ml-2")
-
-                                netlog_log = ui.log(max_lines=300).classes("w-full mt-2 font-mono text-xs")
-                                netlog_log.set_visibility(False)
-
-                                async def _do_start_netlog():
-                                    if _net_log_state["running"]:
-                                        return
-                                    btn_netlog_start.props("loading disabled")
-                                    netlog_dot.classes(replace="text-orange-400 text-sm")
-                                    netlog_status.set_text("Opening browser…")
-                                    netlog_log.clear()
-                                    netlog_log.set_visibility(True)
-                                    netlog_count.set_text("0 calls")
-
-                                    _net_log_state["_loop"] = asyncio.get_event_loop()
-
-                                    async def _on_entry(entry):
-                                        short_url = entry["url"].split("supportal.couchbase.com")[-1][:80]
-                                        netlog_log.push(
-                                            f"[{entry['time']}] {entry['method']:4} {short_url} → {entry['status']}"
-                                        )
-                                        netlog_count.set_text(f"{len(_net_log_state['entries'])} calls")
-
-                                    _net_log_state["_ui_cb"] = _on_entry
-
-                                    threading.Thread(target=start_net_log_thread, daemon=True).start()
-                                    await asyncio.get_event_loop().run_in_executor(
-                                        None, _net_log_ready_event.wait
-                                    )
-                                    netlog_dot.classes(replace="text-green-500 text-sm")
-                                    netlog_status.set_text("Running — browse Supportal to capture calls")
-                                    btn_netlog_start.props(remove="loading disabled")
-                                    btn_netlog_stop.props(remove="disabled")
-                                    btn_netlog_save.props(remove="disabled")
-
-                                async def _do_stop_netlog():
-                                    btn_netlog_stop.props("loading disabled")
-                                    netlog_status.set_text("Stopping…")
-                                    await run.io_bound(stop_net_log_thread)
-                                    netlog_dot.classes(replace="text-gray-400 text-sm")
-                                    netlog_status.set_text(
-                                        f"Stopped — {len(_net_log_state['entries'])} calls captured"
-                                    )
-                                    btn_netlog_stop.props(remove="loading")
-                                    btn_netlog_stop.props("disabled")
-
-                                async def _do_save_netlog():
-                                    if not _net_log_state["entries"]:
-                                        ui.notify("No calls captured yet.", type="warning")
-                                        return
-                                    try:
-                                        path = await run.io_bound(save_net_log)
-                                        ui.notify(
-                                            f"Saved {len(_net_log_state['entries'])} calls → {os.path.basename(path)}",
-                                            type="positive",
-                                        )
-                                        netlog_status.set_text(f"Saved → {os.path.basename(path)}")
-                                    except Exception as exc:
-                                        ui.notify(f"Save error: {exc}", type="negative")
-
-                                with ui.row().classes("gap-3 mt-2"):
-                                    btn_netlog_start = ui.button(
-                                        "Start", icon="play_circle",
-                                        on_click=_do_start_netlog,
-                                    ).props("color=purple")
-                                    btn_netlog_stop = ui.button(
-                                        "Stop", icon="stop_circle",
-                                        on_click=_do_stop_netlog,
-                                    ).props("outline color=red disabled")
-                                    btn_netlog_save = ui.button(
-                                        "Save Log", icon="save",
-                                        on_click=_do_save_netlog,
-                                    ).props("outline color=green disabled")
+                                    ui.button("Load Saved Cookie", on_click=do_load_saved_cookie, icon="key").props("outline color=teal")
 
                     with ui.tab_panel(cfg_cb):
                         with ui.row().classes("items-center justify-between w-full"):
@@ -5302,38 +5002,41 @@ def main_page():
                             finally:
                                 btn_backfill.set_enabled(True)
 
-                        # ── Parallel embedding concurrency ────────────────────────────
-                        with ui.row().classes("gap-3 mt-2 items-end flex-wrap"):
-                            with ui.column().classes("gap-1"):
-                                ui.label("Parallel embeddings").classes("text-xs text-gray-500")
-                                embed_parallel_input = ui.number(
-                                    value=1, min=1, max=32,
-                                ).classes("w-24").tooltip(
-                                    "Number of concurrent embedding requests. "
-                                    "Match this to 'Parallel requests' in LMStudio or "
-                                    "OLLAMA_NUM_PARALLEL in Ollama. Use 1 for MLX (not thread-safe)."
+                        async def _do_backfill_cbse():
+                            btn_backfill_cbse.set_enabled(False)
+                            emb_status.set_text("Backfilling missing CBSE/JIRA fields …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_cbse(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog_cbse(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_cbse(msg, pct), loop)
+
+                            try:
+                                updated, errs = await run.io_bound(
+                                    backfill_missing_cbse_fields,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    _prog_cbse,
                                 )
-                            async def _probe_lmstudio_concurrency():
-                                _, _, _, emb_base_url, _, _ = _get_embed_config()
-                                url = emb_base_url.strip() or "http://localhost:1234"
-                                info = await run.io_bound(poll_lmstudio_model_info, url)
-                                if info.get("n_parallel"):
-                                    embed_parallel_input.set_value(info["n_parallel"])
-                                    ui.notify(
-                                        f"LMStudio reports {info['n_parallel']} parallel slots"
-                                        + (f", context {info['context_length']}" if info.get("context_length") else ""),
-                                        type="positive",
-                                    )
-                                elif info.get("api_version"):
-                                    ui.notify(
-                                        f"LMStudio API v{info['api_version']} reachable but did not "
-                                        "expose parallel count — set manually.",
-                                        type="info",
-                                    )
-                                else:
-                                    ui.notify("Could not reach LMStudio API", type="warning")
-                            ui.button("Probe LMStudio", icon="network_ping",
-                                      on_click=_probe_lmstudio_concurrency).props("outline color=teal dense")
+                                msg = f"CBSE backfill complete — {updated} updated, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"CBSE backfill error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_backfill_cbse.set_enabled(True)
 
                         with ui.row().classes("items-center gap-4 mt-2"):
                             summarize_force_cb = ui.checkbox("Force re-summarize (overwrite existing)", value=False)
@@ -5343,8 +5046,9 @@ def main_page():
                             btn_embed_snaps = ui.button("Embed All Snapshots",       on_click=_do_embed_snaps_from_cb,    icon="hub").props("outline color=indigo")
                             btn_summarize   = ui.button("Summarize Tickets",         on_click=_do_summarize,              icon="summarize").props("outline color=teal")
                             btn_create_idx  = ui.button("Create Vector Index",       on_click=_do_create_index,           icon="manage_search").props("outline color=secondary")
-                            btn_backfill    = ui.button("Backfill Analytics Fields", on_click=_do_backfill,               icon="auto_fix_high").props("outline color=brown")
-                            btn_stop_embed  = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
+                            btn_backfill      = ui.button("Backfill Analytics Fields", on_click=_do_backfill,          icon="auto_fix_high").props("outline color=brown")
+                            btn_backfill_cbse = ui.button("Backfill Missing CBSEs",    on_click=_do_backfill_cbse,     icon="bug_report").props("outline color=deep-orange")
+                            btn_stop_embed    = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
                             btn_stop_embed.set_enabled(False)
                         btn_embed.set_enabled(_CB_AVAILABLE)
                         btn_embed_snaps.set_enabled(_CB_AVAILABLE)
@@ -7204,17 +6908,6 @@ def main_page():
                         ui.separator().classes("my-2")
 
                         with ui.row().classes("items-center gap-4 mt-2 flex-wrap"):
-                            score_batch_input = ui.number("Tickets per batch", value=5, min=1, max=50).classes("w-40")
-                            score_parallel_input = ui.number("Parallelism", value=1, min=1, max=8).classes("w-28").tooltip(
-                                "Batches sent to the LLM concurrently. Match to your model server's "
-                                "parallel request capacity."
-                            )
-                            score_no_think_toggle = ui.checkbox("Disable thinking (Ollama)").tooltip(
-                                "Uses Ollama's native API with think=false — suppresses Qwen3/QwQ "
-                                "reasoning traces for faster, more reliable JSON output. "
-                                "Auto-enabled when a thinking-capable model is detected. "
-                                "Ignored for Claude, Gemini, and LMStudio."
-                            )
                             score_ctx_input = ui.number(
                                 "Ollama num_ctx (K)", value=131, min=8, max=512,
                             ).classes("w-44").props(
@@ -9776,13 +9469,63 @@ def main_page():
                             new_snaps: list = []
                             try:
                                 limit = int(ch_analytics_limit.value or 200)
-                                new_snaps = await run.io_bound(
-                                    fetch_snapshots_via_analytics,
-                                    cust_name,
-                                    cookie_input.value or None,
-                                    limit,
-                                    _prog,
-                                )
+                                cookie = (cookie_input.value or "").strip() or _get_profile_cookie()
+
+                                def _fetch_snap_listing():
+                                    """Query Supportal Analytics V1 SQL++ for snapshot listing."""
+                                    if not cookie:
+                                        return []
+                                    # Resolve canonical customer name via redirect (slug may differ from display name)
+                                    org = cust_name
+                                    try:
+                                        sess_tmp = _make_api_session(cookie)
+                                        head = sess_tmp.get(f"{BASE_URL}/customer/{urllib.parse.quote(org, safe='')}", timeout=15, allow_redirects=True)
+                                        m = re.search(r"/customer/([^/?#]+)", head.url)
+                                        if m:
+                                            org = urllib.parse.unquote(m.group(1))
+                                    except Exception:
+                                        pass
+                                    # SQL++ across: snapshot (Snapshot::{uuid}::{idx}),
+                                    #               cluster  (Cluster::{uuid}),
+                                    #               customer (Customer::{name})
+                                    statement = (
+                                        "SELECT META(sn).id AS snapshot_key, "
+                                        "sn.`uuid` AS cluster_uuid, sn.`timestamp`, "
+                                        "sn.`zendesk` AS ticket_ids, cl.`ui_name` AS cluster_name "
+                                        "FROM snapshot sn "
+                                        "JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.`uuid`) "
+                                        "JOIN customer cu ON META(cu).id = (\"Customer::\" || cl.`customer`) "
+                                        f"WHERE cu.`name` = {json.dumps(org)} "
+                                        "ORDER BY sn.`timestamp` DESC "
+                                        f"LIMIT {limit}"
+                                    )
+                                    _prog(f"Querying Analytics V1 for {org!r}…", 0.2)
+                                    try:
+                                        rows = query_supportal_analytics(statement, cookie)
+                                    except Exception as exc:
+                                        _prog(f"Analytics error: {exc}", 0.5)
+                                        print(f"[Analytics] query error for {org!r}: {exc}")
+                                        return []
+                                    _prog(f"Analytics: {len(rows)} rows returned", 0.6)
+                                    snaps = []
+                                    for row in rows:
+                                        snapshot_key = row.get("snapshot_key", "")
+                                        # Strip "Snapshot::" prefix → hex32::N
+                                        snap_id = snapshot_key.removeprefix("Snapshot::") if snapshot_key else ""
+                                        if not snap_id:
+                                            continue
+                                        enc = urllib.parse.quote(snap_id, safe="")
+                                        snaps.append({
+                                            "snap_id":      snap_id,
+                                            "url":          f"{BASE_URL}/snapshot/{enc}",
+                                            "date":         row.get("timestamp"),
+                                            "cluster_name": row.get("cluster_name") or "",
+                                            "organization": org,
+                                            "ticket_ids":   row.get("ticket_ids") or [],
+                                        })
+                                    return snaps
+
+                                new_snaps = await run.io_bound(_fetch_snap_listing)
                                 # Merge with existing — skip snap_ids already present
                                 existing_ids = {s.get("snap_id", "") for s in ch_snap_state["snapshots"]}
                                 added = [s for s in new_snaps if s.get("snap_id", "") not in existing_ids]
@@ -10582,6 +10325,7 @@ def main_page():
             "emb_openai_model":   emb_openai_model_input.value or "",
             "emb_openai_dims":    emb_openai_dims_input.value,
             "embed_parallel":     embed_parallel_input.value,
+            "enrich_workers":     enrich_workers_input.value,
             # LLM (chat/scoring)
             "llm_provider":       ai_llm_provider.value,
             "claude_key":         claude_key_input.value,
@@ -10663,6 +10407,7 @@ def main_page():
             emb_openai_model_input.set_value(p["emb_openai_model"])
         _set(emb_openai_dims_input,  "emb_openai_dims")
         _set(embed_parallel_input,   "embed_parallel")
+        _set(enrich_workers_input,   "enrich_workers")
         if p.get("emb_provider"):
             ai_emb_provider.set_value(p["emb_provider"])
 
@@ -11984,17 +11729,12 @@ def run_ticket_pipeline(
 
     # Scrape
     _prog("Scraping tickets…", 0.05)
-    mode     = auth.get("mode", "cookie")
-    cookie   = auth.get("cookie", "")
+    mode   = auth.get("mode", "cookie")
+    cookie = auth.get("cookie", "") or _browser_state.get("cookie_string", "") or _get_profile_cookie()
 
-    if mode == "browser":
-        tickets = scrape_with_playwright(
-            customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
-        )
-    else:
-        tickets = scrape_with_cookie_playwright(
-            cookie, customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
-        )
+    tickets = scrape_with_cookie(
+        cookie, customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
+    )
 
     _prog(f"Scraped {len(tickets)} tickets. Saving to Couchbase…", 0.7)
 
@@ -15971,12 +15711,16 @@ def _execute_agent_tool(
                 skipped += 1
                 continue
             try:
-                fresh = scrape_single_ticket_cookie(cookie, tid)
+                _sess = _make_api_session(cookie)
+                fresh = fetch_ticket_api(tid, _sess)
                 if not fresh or not fresh.get("ticket_id"):
                     skipped += 1
                     continue
                 fresh["last_scraped_at"] = int(time.time())
                 fresh["type"] = "ticket"
+                fresh["cb_version"]    = extract_ticket_version(fresh)
+                fresh["feature_area"]  = classify_ticket_feature(fresh)
+                fresh["ticket_origin"] = classify_ticket_origin(fresh)
                 doc_key = f"ticket::{tid}"
                 try:
                     existing = _bcol.get(doc_key).content_as[dict]
@@ -15984,6 +15728,8 @@ def _execute_agent_tool(
                     for k, v in fresh.items():
                         if v not in (None, "", [], {}):
                             merged[k] = v
+                        elif k not in merged:
+                            merged[k] = v  # new key — write even if null
                     _bcol.upsert(doc_key, merged)
                 except Exception:
                     _bcol.upsert(doc_key, fresh)
@@ -16039,16 +15785,20 @@ def _execute_agent_tool(
         except Exception as _pe:
             print(f"[rescrape_ticket] profile read failed: {_pe}")
 
+        # Prefer Playwright when a saved session profile exists — the ticket detail
+        # page is a Vue SPA that renders CBSEs/JIRA Issues only after JS executes,
+        # so a plain HTTP GET silently misses those fields.
         if not cookie:
             _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
             return (
-                f"No session cookie found in saved profile — cannot scrape automatically.\n"
+                f"No session cookie found — cannot scrape automatically.\n"
                 f"Verify manually: {_url}"
             )
 
-        # Scrape fresh data from Supportal
+        # Scrape fresh data from Supportal via REST API
         try:
-            fresh = scrape_single_ticket_cookie(cookie, ticket_id)
+            _sess = _make_api_session(cookie)
+            fresh = fetch_ticket_api(ticket_id, _sess)
         except Exception as exc:
             _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
             return (
@@ -16087,6 +15837,10 @@ def _execute_agent_tool(
 
         fresh["last_scraped_at"] = int(time.time())
         fresh["type"] = "ticket"
+        # Recompute analytics classification fields from fresh data
+        fresh["cb_version"]    = extract_ticket_version(fresh)
+        fresh["feature_area"]  = classify_ticket_feature(fresh)
+        fresh["ticket_origin"] = classify_ticket_origin(fresh)
         doc_key = f"ticket::{ticket_id}"
 
         # ── Inline snapshot topology enrichment ──────────────────────────────
@@ -17231,702 +16985,6 @@ def _parse_snapshot_checker_text(text: str) -> dict:
 
     return topo
 
-
-def _fetch_snapshot_combined_playwright(url: str, cookie: str | None = None) -> dict:
-    """
-    Navigate to the snapshot page ONCE and capture both:
-      • text_content  — Original/Couchbase Server tab (===Checker results format)
-      • nutshell_html — Beta UI/nutshell-alternative tab (Bootstrap table HTML)
-
-    Both are captured via XHR response interception so we never need to wait for
-    Vue to fully render — the raw API responses arrive before the DOM updates.
-
-    Returns: {"text": str, "nutshell": str, "structured": dict}
-    """
-    text_captured:       list[str]  = []
-    nutshell_captured:   list[str]  = []
-    structured_captured: list[dict] = []
-    page_html_captured:  list[str]  = []  # full body HTML before tab switch (has header section)
-
-    def _on_response(resp):
-        try:
-            ct = resp.headers.get("content-type", "")
-            # Skip JS/CSS/image/font bundles
-            if any(x in ct for x in ("javascript", "css", "image", "font")):
-                return
-            if resp.url.lower().split("?")[0].endswith((".js", ".css", ".png", ".woff", ".woff2")):
-                return
-            body = resp.text()
-            # Skip minified JS bundles that slipped through
-            if body.lstrip().startswith(("/*!", "(()=>", "!function", "define([")):
-                return
-            # Unwrap JSON envelope
-            if body.lstrip().startswith("{"):
-                try:
-                    import json as _json
-                    _data = _json.loads(body)
-                    if isinstance(_data, dict):
-                        # New Supportal API format: {"nutshell_output": "<html>...", "nutshell_beta_output": {...}, "nutshell": {...}}
-                        if "nutshell_output" in _data or "nutshell_beta_output" in _data or "nutshell" in _data:
-                            # Store structured data for direct field extraction
-                            if "nutshell_beta_output" in _data or "nutshell" in _data:
-                                structured_captured.append(_data)
-                            # Extract ANSI HTML for text parser fallback
-                            no = _data.get("nutshell_output")
-                            if no and isinstance(no, str):
-                                body = no
-                        else:
-                            body = _data.get("results") or _data.get("html") or _data.get("content") or body
-                except Exception:
-                    pass
-            # Nutshell: HTML with Bootstrap table structure (must start with HTML tag)
-            if "table-bordered" in body and "Checker results" in body and "<" in body[:50]:
-                nutshell_captured.append(body)
-            # Text: ANSI-HTML or plain-text checker output
-            elif "===Checker results" in body or "===Cluster" in body:
-                text_captured.append(body)
-        except Exception:
-            pass
-
-    with sync_playwright() as pw:
-        _browser = None
-        if cookie:
-            _browser = pw.chromium.launch(headless=True, args=["--ignore-certificate-errors"])
-            _parsed  = urllib.parse.urlparse(url)
-            _domain  = _parsed.netloc
-            _cookies: list[dict] = []
-            for part in cookie.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    name, val = part.split("=", 1)
-                    _cookies.append({"name": name.strip(), "value": val.strip(),
-                                     "domain": _domain, "path": "/"})
-            ctx = _browser.new_context(user_agent=UA, ignore_https_errors=True)
-            if _cookies:
-                ctx.add_cookies(_cookies)
-        else:
-            ctx = pw.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_DIR, headless=True,
-                user_agent=UA, ignore_https_errors=True,
-            )
-
-        page = ctx.new_page()
-        page.on("response", _on_response)
-        page.set_default_timeout(20_000)
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            page.wait_for_timeout(500)
-
-            # Dismiss any intro.js tutorial overlays that would block tab clicks
-            try:
-                page.evaluate("""() => {
-                    document.querySelectorAll(
-                        '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                        '[class*="introjs"], .modal-backdrop'
-                    ).forEach(el => el.remove());
-                }""")
-            except Exception:
-                pass
-
-            # ── Capture full page body HTML (includes Cluster Information header) ─
-            # This is captured BEFORE clicking any tab so the page header section
-            # (Customer Name, Cluster, Capella Cluster Id) is still in the DOM.
-            try:
-                _body_html = page.inner_html("body")
-                if _body_html and len(_body_html) > 200:
-                    page_html_captured.append(_body_html)
-            except Exception:
-                pass
-
-            # ── Step 1: click "Original" / "Couchbase Server" tab ─────────────
-            for sel in [
-                "a:has-text('Couchbase Server')",
-                "li:has-text('Couchbase Server') > a",
-                "[role='tab']:has-text('Couchbase Server')",
-                "a:has-text('Original')",
-                ".nav-link:has-text('Couchbase Server')",
-                ".nav-item:has-text('Couchbase Server') a",
-            ]:
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        try:
-                            el.first.click(timeout=5_000)
-                        except Exception:
-                            # Overlay may have appeared — dismiss and force-click
-                            page.evaluate("document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())")
-                            el.first.click(force=True, timeout=5_000)
-                        break
-                except Exception:
-                    continue
-
-            # Wait for the text checker response to arrive
-            try:
-                page.wait_for_function(
-                    "() => document.body.innerText.includes('===Checker results')"
-                    " || document.body.innerText.includes('===Cluster')",
-                    timeout=8_000,
-                )
-            except Exception:
-                page.wait_for_timeout(1_000)
-
-            # Snapshot the DOM text NOW before switching tabs — Vue will replace it
-            if not text_captured:
-                _dom_text = page.inner_text("body")
-                if "===Checker results" in _dom_text or "===Cluster" in _dom_text:
-                    text_captured.append(_dom_text)
-
-            # ── Step 2: click "Beta UI" / nutshell tab ─────────────────────────
-            try:
-                page.evaluate("""() => {
-                    document.querySelectorAll(
-                        '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                        '[class*="introjs"], .modal-backdrop'
-                    ).forEach(el => el.remove());
-                }""")
-            except Exception:
-                pass
-            for sel in [
-                "a[href='#nutshell-alternative']",
-                "a[href*='nutshell']",
-                "a:has-text('Beta UI')",
-                "[role='tab']:has-text('Beta UI')",
-                ".nav-link:has-text('Beta UI')",
-                ".nav-item:has-text('Beta UI') a",
-            ]:
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        try:
-                            el.first.click(timeout=5_000)
-                        except Exception:
-                            page.evaluate("document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())")
-                            el.first.click(force=True, timeout=5_000)
-                        break
-                except Exception:
-                    continue
-
-            # Wait for nutshell API response — it can be slow; cap at 8s
-            try:
-                page.wait_for_function(
-                    "() => document.body.innerHTML.includes('table-bordered')"
-                    " && document.body.innerHTML.includes('Checker results')",
-                    timeout=8_000,
-                )
-            except Exception:
-                page.wait_for_timeout(2_000)
-
-            # Capture nutshell from DOM if interception missed it
-            if not nutshell_captured:
-                # Try the specific tab container first, then full body
-                for dom_sel in ["#nutshell-alternative", ".tab-pane.active", "body"]:
-                    try:
-                        dom_html = page.inner_html(dom_sel)
-                        if "table-bordered" in dom_html and "Checker results" in dom_html:
-                            nutshell_captured.append(dom_html)
-                            break
-                    except Exception:
-                        continue
-
-            text_out     = text_captured[0]     if text_captured     else page.inner_text("body")
-            nutshell_out = nutshell_captured[0] if nutshell_captured else ""
-            page_html_out = page_html_captured[0] if page_html_captured else ""
-            return {
-                "text": text_out,
-                "nutshell": nutshell_out,
-                "structured": structured_captured[0] if structured_captured else {},
-                "page_html": page_html_out,
-            }
-        finally:
-            try:
-                page.close()
-            except Exception:
-                pass
-            try:
-                ctx.close()
-            except Exception:
-                pass
-            try:
-                if _browser:
-                    _browser.close()
-            except Exception:
-                pass
-
-
-# Keep old name as alias so any other callers still work
-def _fetch_snapshot_text_playwright(url: str, cookie: str | None = None) -> str:
-    result = _fetch_snapshot_combined_playwright(url, cookie=cookie)
-    return result.get("text", "")
-
-
-def _parse_cluster_info_header(html_or_text: str) -> dict:
-    """
-    Extract cluster metadata from the Supportal snapshot page header section.
-
-    The "Cluster Information" card appears BEFORE the tab bar (Logfile /
-    Couchbase Server / Beta UI) and contains:
-      Customer Name: eCollege.com, Inc.
-      Cluster:       PRODUCTION-CLS-1
-      Capella Cluster Id: c9785e04-06c7-4288-87ab-695b9a210028
-
-    These are distinct from the fields inside the accordion:
-      - "Cluster" here is the human-readable cluster name (e.g. "PRODUCTION-CLS-1")
-      - "Capella Cluster Id" is the Capella-level UUID (different from the CB
-        internal UUID stored as cluster_uuid in the accordion's UUID row)
-
-    Works on both raw HTML (inner_html) and plain text (inner_text) inputs.
-    Returns a dict with any of: cluster_name, capella_cluster_id, header_customer_name.
-    """
-    result: dict = {}
-    if not html_or_text:
-        return result
-
-    # ── Convert HTML to searchable plain text ─────────────────────────────────
-    search_text = html_or_text
-    if "<" in html_or_text[:200]:
-        try:
-            _soup = BeautifulSoup(html_or_text, "html.parser")
-
-            # Strategy A: find a container whose heading is "Cluster Information"
-            # then search only within that container
-            for heading_tag in _soup.find_all(re.compile(r"h[1-6]|strong|b|th|dt")):
-                if "Cluster Information" in heading_tag.get_text(strip=True):
-                    container = heading_tag.find_parent(
-                        lambda t: t.name in ("div", "section", "card", "article", "tbody", "table", "dl", "ul")
-                    )
-                    if container:
-                        search_text = container.get_text("\n")
-                        break
-            else:
-                # Strategy B: grab all text before the first tab label
-                full_text = _soup.get_text("\n")
-                for tab_marker in ("Couchbase Server", "Beta UI", "Logfile", "===Checker", "===Cluster"):
-                    pos = full_text.find(tab_marker)
-                    if 0 < pos < len(full_text):
-                        full_text = full_text[:pos]
-                        break
-                search_text = full_text
-
-            # Strategy C: look for label/value in <dl>, <table>, <div class="row">
-            # This is more precise than regex-on-text and covers Bootstrap dl/dt/dd grids
-            for dt in _soup.find_all(["dt", "th", "label", "strong", "b"]):
-                lbl = dt.get_text(strip=True).rstrip(":").strip().lower()
-                if lbl not in ("cluster", "capella cluster id", "customer name"):
-                    continue
-                # Try <dd> sibling, then next <td>, then parent container next text
-                sibling = dt.find_next_sibling(["dd", "td"])
-                if not sibling:
-                    # Bootstrap row: <div class="col-..."><strong>Label</strong></div>
-                    # followed by another <div class="col-..."> with the value
-                    parent = dt.parent
-                    if parent:
-                        next_sib = parent.find_next_sibling()
-                        if next_sib:
-                            sibling = next_sib
-                if sibling:
-                    val = sibling.get_text(strip=True)
-                    if val:
-                        if lbl == "cluster" and val.lower() != "information":
-                            result.setdefault("cluster_name", val)
-                        elif lbl == "capella cluster id":
-                            result.setdefault("capella_cluster_id", val)
-                        elif lbl == "customer name":
-                            result.setdefault("header_customer_name", val)
-        except Exception:
-            pass
-
-    # ── Regex scan on the plain-text portion ──────────────────────────────────
-    # Capella Cluster Id — UUID format: 8-4-4-4-12
-    m = re.search(
-        r"Capella Cluster Id\s*:?\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
-        search_text, re.IGNORECASE,
-    )
-    if m and "capella_cluster_id" not in result:
-        result["capella_cluster_id"] = m.group(1).strip()
-
-    # Cluster: NAME  (but not "Cluster Information:")
-    m = re.search(
-        r"(?:^|\n)\s*Cluster\s*:\s*(?!Information)([^\n/]{1,120})",
-        search_text, re.MULTILINE,
-    )
-    if m and "cluster_name" not in result:
-        val = m.group(1).strip()
-        if val:
-            result["cluster_name"] = val
-
-    # Customer Name: NAME
-    m = re.search(r"Customer Name\s*:?\s*([^\n/]{1,120})", search_text, re.IGNORECASE)
-    if m and "header_customer_name" not in result:
-        val = m.group(1).strip()
-        if val:
-            result["header_customer_name"] = val
-
-    return result
-
-
-def _parse_snapshot_nutshell_html(html: str) -> dict:
-    """
-    Parse the #nutshell-alternative tab HTML from a Supportal snapshot page.
-
-    Actual structure (confirmed from Chrome DevTools):
-      <div class="card-block">
-        <b>Checker results for cluster NODE1,...</b>
-        <span>
-          <table class="table table-bordered">  ← 3-cell rows: icon | label | <p>value</p>
-        </span>
-        <b>Analyser results for cluster NODE1,...</b>
-        <span>
-          <table class="table table-bordered">  ← 2-cell rows: section | <table.striped>
-        </span>
-      </div>
-
-    Fields mapped to canonical topo keys; everything kept verbatim in raw_fields.
-    """
-    topo: dict = {
-        "cluster_name": None,
-        "cluster_uuid": None,
-        "capella_cluster_id": None,   # Capella-level UUID from page header (≠ CB internal UUID)
-        "cluster_hostname": None,
-        "total_nodes": None,
-        "data_nodes": 0,
-        "query_nodes": 0,
-        "index_nodes": 0,
-        "fts_nodes": 0,
-        "eventing_nodes": 0,
-        "analytics_nodes": 0,
-        "backup_nodes": 0,
-        "cb_version": None,
-        "ram_per_node_mib": None,
-        "cpus_per_node": None,
-        "os_name": None,
-        "bucket_count": 0,
-        "bucket_names": [],
-        "total_bucket_quota_mb": None,
-        "server_groups": [],
-        "auto_failover_seconds": None,
-        "orchestrator": None,
-        "ldap_enabled": None,
-        "bad_count": 0,
-        "warn_count": 0,
-        "raw_fields": {},
-    }
-    if not html:
-        return topo
-
-    # Unwrap JSON envelope {"results": "<html>..."} if present
-    if html.lstrip().startswith("{"):
-        try:
-            import json as _json
-            _env = _json.loads(html)
-            if isinstance(_env, dict):
-                html = _env.get("results") or _env.get("html") or _env.get("content") or html
-        except Exception:
-            pass
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # ── Helpers ────────────────────────────────────────────────────────────────
-    def _set_auto_failover(v: str, t: dict) -> None:
-        m = re.search(r"(\d+)", v)
-        if m:
-            t["auto_failover_seconds"] = int(m.group(1))
-
-    def _set_ldap(v: str, t: dict) -> None:
-        t["ldap_enabled"] = v.strip().lower() in ("enabled", "true", "yes", "1")
-
-    def _set_node_count(v: str, t: dict) -> None:
-        try:
-            t["total_nodes"] = int(v.strip())
-        except ValueError:
-            pass
-
-    _LABEL_MAP: dict[str, object] = {
-        "ui cluster name":   "cluster_name",
-        "cluster name":      "cluster_name",
-        "uuid":              "cluster_uuid",
-        "cluster uuid":      "cluster_uuid",
-        "node count":        _set_node_count,
-        "number of nodes":   _set_node_count,
-        "orchestrator":      "orchestrator",
-        "auto-failover":     _set_auto_failover,
-        "auto failover":     _set_auto_failover,
-        "ldap":              _set_ldap,
-        "cb version":        "cb_version",
-        "couchbase version": "cb_version",
-        "version":           "cb_version",
-        "installed ram":     lambda v, t: t.update(
-            {"ram_per_node_mib": int(re.search(r"\d+", v).group())}
-            if re.search(r"\d+", v) else {}),
-        "installed cpus":    lambda v, t: t.update(
-            {"cpus_per_node": int(re.search(r"\d+", v).group())}
-            if re.search(r"\d+", v) else {}),
-        "os version":        "os_name",
-    }
-
-    def _find_next_bordered_table(b_tag):
-        """Return the first table.table-bordered that is a sibling or child-of-sibling of b_tag."""
-        for sib in b_tag.next_siblings:
-            if not hasattr(sib, "name"):
-                continue
-            # Table wrapped in a <span> (most common structure)
-            if sib.name == "span":
-                tbl = sib.find("table", class_=lambda c: c and "table-bordered" in c)
-                if tbl:
-                    return tbl
-            # Direct table sibling
-            if sib.name == "table" and "table-bordered" in (sib.get("class") or []):
-                return sib
-        return None
-
-    def _apply_label(label: str, value: str) -> None:
-        topo["raw_fields"][label] = value
-        handler = _LABEL_MAP.get(label.strip().lower())
-        if handler is None:
-            return
-        if callable(handler):
-            try:
-                handler(value, topo)
-            except Exception:
-                pass
-        else:
-            if not topo.get(handler):
-                topo[handler] = value or None
-
-    # ── Walk all <b> tags — each heads a section ───────────────────────────────
-    for b_tag in soup.find_all("b"):
-        section_text = b_tag.get_text(strip=True)
-        table = _find_next_bordered_table(b_tag)
-        if not table:
-            continue
-
-        # ── Checker results ── rows: [icon, label, <p>value</p>]  (3-cell)
-        #                       OR   [label, <p>value</p>]         (2-cell, no icon)
-        if "Checker results" in section_text:
-            # Also try to extract cluster hostname from the section title itself
-            # e.g. "Checker results for cluster node1.example.com,node2.example.com"
-            host_m = re.search(r"for cluster\s+(.+)", section_text)
-            if host_m and not topo["cluster_hostname"]:
-                topo["cluster_hostname"] = host_m.group(1).strip()
-
-            for row in table.select("tr"):
-                cells = row.select("td")
-                n = len(cells)
-                if n == 3:
-                    # Standard: [icon | label | value]
-                    label = cells[1].get_text(strip=True)
-                    val_cell = cells[2]
-                elif n == 2:
-                    # No icon column: [label | value]
-                    label = cells[0].get_text(strip=True)
-                    val_cell = cells[1]
-                else:
-                    continue
-                p = val_cell.find("p")
-                value = p.get_text(strip=True) if p else val_cell.get_text(" ", strip=True)
-                if label:
-                    topo["raw_fields"].setdefault("_html_labels_seen", [])
-                    if isinstance(topo["raw_fields"]["_html_labels_seen"], list):
-                        topo["raw_fields"]["_html_labels_seen"].append(label)
-                    _apply_label(label, value)
-
-        # ── Analyser results ── 2-cell rows: [section, nested-table] ───────────
-        elif "Analyser results" in section_text:
-            for row in table.select("tr"):
-                cells = row.select("td")
-                if len(cells) < 2:
-                    continue
-                section = cells[0].get_text(strip=True)
-                nested = cells[1].find("table")
-                if not nested:
-                    continue
-
-                # ── Bucket Details ─────────────────────────────────────────────
-                if "Bucket Details" in section:
-                    bucket_names: list[str] = []
-                    total_quota = 0
-                    for brow in nested.select("tr"):
-                        bcells = brow.select("td")
-                        if not bcells:
-                            continue
-                        first = bcells[0].get_text(strip=True)
-                        # Summary row: "Total (9 buckets)"
-                        m = re.search(r"Total\s*\((\d+)\s*buckets?\)", first, re.I)
-                        if m:
-                            topo["bucket_count"] = int(m.group(1))
-                            continue
-                        # Skip header/empty rows
-                        if not first or first.lower() in ("bucket", "name"):
-                            continue
-                        # Bucket data row — cell[1] is bucket type
-                        if len(bcells) >= 2:
-                            btype = bcells[1].get_text(strip=True).upper()
-                            if btype in ("CB", "EPH", "MEM", "EPHEMERAL", "MEMCACHED", "COUCHBASE"):
-                                bucket_names.append(first)
-                                if len(bcells) >= 3:
-                                    try:
-                                        quota_str = re.sub(r"[^\d]", "", bcells[2].get_text(strip=True))
-                                        if quota_str:
-                                            total_quota += int(quota_str)
-                                    except (ValueError, AttributeError):
-                                        pass
-                    if bucket_names:
-                        topo["bucket_names"] = bucket_names
-                        if not topo["bucket_count"]:
-                            topo["bucket_count"] = len(bucket_names)
-                    if total_quota:
-                        topo["total_bucket_quota_mb"] = total_quota
-
-                # ── Multi-Dimensional Scaling (MDS) ────────────────────────────
-                elif "Multi-Dimensional" in section or "MDS" in section:
-                    for mrow in nested.select("tr"):
-                        mcells = mrow.select("td")
-                        if len(mcells) < 2:
-                            continue
-                        svc = mcells[0].get_text(strip=True).lower()
-                        count_str = re.sub(r"[^\d]", "", mcells[1].get_text(strip=True))
-                        if not count_str:
-                            continue
-                        count = int(count_str)
-                        if "data" in svc or svc == "kv":
-                            topo["data_nodes"] = count
-                        elif "query" in svc or "n1ql" in svc:
-                            topo["query_nodes"] = count
-                        elif "index" in svc:
-                            topo["index_nodes"] = count
-                        elif "fts" in svc or "search" in svc:
-                            topo["fts_nodes"] = count
-                        elif "eventing" in svc:
-                            topo["eventing_nodes"] = count
-                        elif "analytics" in svc or "cbas" in svc:
-                            topo["analytics_nodes"] = count
-                        elif "backup" in svc:
-                            topo["backup_nodes"] = count
-
-                # ── Server Group Awareness ─────────────────────────────────────
-                elif "Server Group" in section:
-                    groups: list[str] = []
-                    for grow in nested.select("tr"):
-                        gcells = grow.select("td")
-                        if gcells:
-                            gname = gcells[0].get_text(strip=True)
-                            if gname and gname.lower() not in ("group", "name", "server group", ""):
-                                groups.append(gname)
-                    if groups:
-                        topo["server_groups"] = groups
-
-    # NOTE: do NOT fall back to UUID for cluster_name — that pollutes the
-    # names chart with UUIDs.  Leave cluster_name as None when absent;
-    # analytics and drill-down already handle None gracefully.
-
-    return topo
-
-
-def _fetch_snapshot_nutshell_playwright(url: str, cookie: str | None = None) -> str:
-    """
-    Navigate to the snapshot #nutshell-alternative tab and return the inner HTML
-    of the page body so BeautifulSoup can parse the accordion structure.
-
-    Uses the same cookie-injection / persistent-context dual strategy as the
-    existing Couchbase Server tab fetcher.
-    """
-    base_url = url.split("#")[0]
-    nutshell_url = base_url + "#nutshell-alternative"
-
-    with sync_playwright() as pw:
-        _browser = None
-        if cookie:
-            _browser = pw.chromium.launch(headless=True, args=["--ignore-certificate-errors"])
-            _parsed  = urllib.parse.urlparse(url)
-            _domain  = _parsed.netloc
-            _cookies: list[dict] = []
-            for part in cookie.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    name, val = part.split("=", 1)
-                    _cookies.append({"name": name.strip(), "value": val.strip(),
-                                     "domain": _domain, "path": "/"})
-            ctx = _browser.new_context(user_agent=UA, ignore_https_errors=True)
-            if _cookies:
-                ctx.add_cookies(_cookies)
-        else:
-            ctx = pw.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_DIR, headless=True,
-                user_agent=UA, ignore_https_errors=True,
-            )
-
-        page = ctx.new_page()
-        page.set_default_timeout(25_000)
-
-        # Intercept API responses — nutshell data may arrive via XHR
-        nutshell_api_html: list[str] = []
-        def _on_nutshell_response(resp):
-            try:
-                if "nutshell" in resp.url.lower() or "checker" in resp.url.lower():
-                    body = resp.text()
-                    if "Checker results" in body or "table-bordered" in body:
-                        nutshell_api_html.append(body)
-            except Exception:
-                pass
-        page.on("response", _on_nutshell_response)
-
-        try:
-            # Navigate to base URL (fragment isn't sent to server, Vue handles it client-side)
-            page.goto(nutshell_url, wait_until="domcontentloaded", timeout=25_000)
-            # Give Vue/JS time to boot before trying to interact
-            page.wait_for_timeout(1_000)
-
-            # Try clicking the "Beta UI" tab (= #nutshell-alternative)
-            clicked = False
-            for sel in [
-                "a[href='#nutshell-alternative']",
-                "a[href*='nutshell-alternative']",
-                "a[href*='nutshell']",
-                "a:has-text('Beta UI')",
-                "[role='tab']:has-text('Beta UI')",
-                ".nav-link:has-text('Beta UI')",
-                ".nav-item:has-text('Beta UI') a",
-                "a:has-text('Nutshell')",
-                "[role='tab']:has-text('Nutshell')",
-                ".nav-link[href*='nutshell']",
-            ]:
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        el.first.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-
-            # Wait longer after click for Vue to render the accordion
-            page.wait_for_timeout(2_000 if clicked else 1_000)
-
-            # Wait for the actual nutshell content structure
-            try:
-                page.wait_for_selector("div.card-block table.table-bordered", timeout=10_000)
-            except Exception:
-                try:
-                    page.wait_for_selector("table.table-bordered", timeout=5_000)
-                except Exception:
-                    # Last resort: wait for any <b> tag containing "Checker results"
-                    try:
-                        page.wait_for_function(
-                            "() => [...document.querySelectorAll('b')].some(b => b.textContent.includes('Checker results'))",
-                            timeout=5_000,
-                        )
-                    except Exception:
-                        page.wait_for_timeout(1_500)
-
-            # If API interception captured nutshell HTML, prefer that
-            if nutshell_api_html:
-                return nutshell_api_html[0]
-            return page.inner_html("body")
-        finally:
-            ctx.close()
-            if _browser:
-                _browser.close()
-
-
 _SNAP_DEBUG_DIR = Path(os.path.expanduser("~")) / "Downloads" / "Apps" / "Scraper" / "snap_debug"
 
 
@@ -18211,100 +17269,22 @@ def fetch_snapshot_topology(snap_id: str, cookie: str | None = None) -> dict:
         except Exception as _e:
             _snap_log.append(f"s1: exception {_e}")
 
-    # ── Strategy 2+3: single Playwright session — captures BOTH tabs ───────────
-    # _fetch_snapshot_combined_playwright clicks the text tab then the nutshell
-    # tab in one browser session, intercepting XHR responses for both.
-    try:
-        combined = _run_in_playwright_thread(
-            _fetch_snapshot_combined_playwright, url, cookie=cookie, timeout=60
-        )
-        nutshell_html   = combined.get("nutshell", "")
-        text_content    = combined.get("text", "")
-        structured_data = combined.get("structured", {})
-        page_html       = combined.get("page_html", "")
-        _snap_log.append(f"combined: nutshell_html len={len(nutshell_html)} text len={len(text_content)} page_html len={len(page_html)} structured={'yes' if structured_data else 'no'}")
-
-        # ── Pre-parse Cluster Information header section ──────────────────────
-        # The header appears on the page before any tab is clicked; it contains
-        # the human-readable cluster name and Capella Cluster Id that are NOT
-        # present in the accordion content captured by the other strategies.
-        _header_info = _parse_cluster_info_header(page_html or text_content)
-        _snap_log.append(f"header_info: {_header_info}")
-
-        def _apply_header_info(topo: dict) -> dict:
-            """Supplement topo with fields extracted from the page header section."""
-            if not _header_info:
-                return topo
-            if not topo.get("cluster_name") and _header_info.get("cluster_name"):
-                topo["cluster_name"] = _header_info["cluster_name"]
-                _snap_log.append(f"header_info: set cluster_name={topo['cluster_name']}")
-            if not topo.get("capella_cluster_id") and _header_info.get("capella_cluster_id"):
-                topo["capella_cluster_id"] = _header_info["capella_cluster_id"]
-                _snap_log.append(f"header_info: set capella_cluster_id={topo['capella_cluster_id']}")
-            # Store header customer name for cross-validation (not authoritative)
-            if _header_info.get("header_customer_name"):
-                topo.setdefault("raw_fields", {})["header_customer_name"] = _header_info["header_customer_name"]
-            return topo
-
-        # ── Strategy A: structured JSON — all fields in one shot ─────────────
-        if structured_data and (structured_data.get("nutshell") or structured_data.get("nutshell_beta_output")):
-            _write_snap_debug(snap_id, "s2_structured", str(structured_data)[:8000])
-            topo = _parse_structured_api_json(structured_data)
-            topo = _apply_header_info(topo)
-            # Log the checker keys that were present in the structured JSON so
-            # we can diagnose "UI Cluster Name" lookup failures in snap_debug
-            _checker_keys = topo.get("raw_fields", {}).get("_checker_keys", "")
-            _snap_log.append(
-                f"structured topo: cluster_name={topo.get('cluster_name')} "
-                f"capella_id={topo.get('capella_cluster_id')} "
-                f"nodes={topo.get('total_nodes')} cb_ver={topo.get('cb_version')} "
-                f"checker_keys=[{_checker_keys}]"
-            )
-            if topo.get("total_nodes") or topo.get("cluster_uuid") or topo.get("cluster_name"):
+    # ── Strategy 2: REST API nutshell endpoints ─────────────────────────────────
+    if cookie:
+        try:
+            snap_uid_enc = urllib.parse.quote(snap_id, safe="")
+            sess = _make_api_session(cookie)
+            api_topo = fetch_snapshot_topology_api(snap_uid_enc, sess)
+            if api_topo.get("total_nodes") or api_topo.get("cluster_uuid") or api_topo.get("cluster_name"):
+                _snap_log.append(
+                    f"s2: API topo: cluster_name={api_topo.get('cluster_name')} "
+                    f"nodes={api_topo.get('total_nodes')} cb_ver={api_topo.get('cb_version')}"
+                )
                 _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
-                return topo
-
-        # ── Strategy B: parse text content (has cb_version, ram, cpus) ───────
-        text_topo: dict = {}
-        if text_content and ("===Checker results" in text_content or "===Cluster" in text_content):
-            _write_snap_debug(snap_id, "s3_text", text_content)
-            text_topo = _parse_snapshot_checker_text(text_content)
-            _snap_log.append(f"text topo: cluster_name={text_topo.get('cluster_name')} cb_ver={text_topo.get('cb_version')} ram={text_topo.get('ram_per_node_mib')}")
-
-        # ── Strategy C: nutshell HTML + supplement with text fields ───────────
-        if nutshell_html and "Checker results" in nutshell_html:
-            _write_snap_debug(snap_id, "s2_nutshell", nutshell_html)
-            topo = _parse_snapshot_nutshell_html(nutshell_html)
-            topo = _apply_header_info(topo)
-            _html_labels = topo.get("raw_fields", {}).get("_html_labels_seen") or []
-            _snap_log.append(
-                f"nutshell topo: cluster_name={topo.get('cluster_name')} "
-                f"capella_id={topo.get('capella_cluster_id')} "
-                f"nodes={topo.get('total_nodes')} buckets={topo.get('bucket_count')} "
-                f"html_labels=[{', '.join(_html_labels[:20])}]"
-            )
-            # Supplement nutshell with per-node fields only available in text tab
-            _TEXT_ONLY_FIELDS = ("cb_version", "ram_per_node_mib", "cpus_per_node",
-                                 "os_name", "bad_count", "warn_count", "orchestrator",
-                                 "bad_items", "warn_items")
-            for _f in _TEXT_ONLY_FIELDS:
-                if not topo.get(_f) and text_topo.get(_f):
-                    topo[_f] = text_topo[_f]
-            _snap_log.append(f"merged: cb_ver={topo.get('cb_version')} ram={topo.get('ram_per_node_mib')} bad={topo.get('bad_count')}")
-            if topo.get("total_nodes") or topo.get("cluster_uuid") or topo.get("cluster_name"):
-                _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
-                return topo
-
-        # ── Strategy D: text-only result ──────────────────────────────────────
-        if text_topo.get("cluster_name") or text_topo.get("cluster_uuid") or text_topo.get("total_nodes"):
-            _apply_header_info(text_topo)
-            _snap_log.append("using text-only topo as final fallback")
-            _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
-            return text_topo
-
-    except Exception as _e:
-        _snap_log.append(f"combined: exception {type(_e).__name__}: {_e}")
-        _write_snap_debug(snap_id, "combined_exception", f"{type(_e).__name__}: {_e}")
+                return api_topo
+            _snap_log.append("s2: API returned no usable topology")
+        except Exception as _e:
+            _snap_log.append(f"s2: exception {type(_e).__name__}: {_e}")
 
     _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
     return {}
@@ -18558,762 +17538,6 @@ def _extract_snapshot_rows(html: str) -> list[dict]:
         out.append(row)
     return out
 
-
-def _scrape_snapshot_listing_playwright(
-    page,
-    customer_url: str,
-    max_pages: int,
-    progress_cb: Callable[[str, float], None],
-) -> list[dict]:
-    """
-    Navigate to the customer Snapshots tab and paginate through all pages.
-    Returns list of snapshot summary dicts.
-    """
-    import math as _math
-
-    def log(msg: str, pct: float):
-        print(f"[SNAP-LIST] {msg}")
-        progress_cb(msg, pct)
-
-    all_snaps: list[dict] = []
-    seen_ids: set[str] = set()
-
-    # Navigate to the customer base page (no hash). The Snapshots tab content is
-    # Bootstrap-lazy-loaded via AJAX when the tab link is clicked — navigating
-    # directly with a hash only sets the fragment and does NOT trigger the AJAX.
-    _base_url = customer_url.split("#")[0]
-    log(f"Loading customer page: {_base_url}", 0.01)
-    try:
-        page.goto(_base_url, wait_until="commit", timeout=60_000)
-    except Exception as _ge:
-        _es = str(_ge)
-        if "ERR_ABORTED" in _es or "frame was detached" in _es:
-            pass  # SSO redirect — check where we landed below
-        else:
-            raise
-
-    # Wait for the page skeleton to be interactive (nav tabs present)
-    try:
-        page.wait_for_selector('a[data-toggle="tab"][href="#snapshots_tab"]', timeout=30_000)
-    except Exception:
-        page.wait_for_timeout(5_000)
-
-    # Capture the ACTUAL normalized base URL the server settled on after any
-    # redirects/encoding (e.g. american-express-az → American%20Express%20AZ).
-    _settled_base = page.url.split("?")[0].split("#")[0].lower()
-    log(f"Customer page settled at: {page.url}", 0.02)
-
-    def _on_customer_page() -> bool:
-        current = page.url.split("?")[0].split("#")[0].lower()
-        return current == _settled_base
-
-    if not _on_customer_page():
-        log(f"Unexpected redirect to {page.url} — aborting", 0.0)
-        return []
-
-    # Dismiss intro.js overlays before clicking the tab
-    try:
-        page.evaluate(
-            "document.querySelectorAll('.introjs-overlay,.introjs-helperLayer,"
-            ".introjs-tooltip,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())"
-        )
-    except Exception:
-        pass
-
-    # Activate the Bootstrap Snapshots tab to trigger its AJAX data load.
-    # Strategy:
-    #   1. Try jQuery $(...).tab('show') — forces show.bs.tab even if already active.
-    #   2. Fall back to plain click() if jQuery or Bootstrap tab plugin unavailable.
-    # This handles the case where the tab is already marked active on page load
-    # (Bootstrap won't re-fire show.bs.tab on a plain click in that case).
-    tab_result = page.evaluate("""
-        (() => {
-            const link = document.querySelector('a[data-toggle="tab"][href="#snapshots_tab"]');
-            if (!link) return 'not_found';
-            // Prefer jQuery + Bootstrap tab plugin (forces show.bs.tab regardless of state)
-            if (window.$ && typeof window.$(link).tab === 'function') {
-                window.$(link).tab('show');
-                return 'jquery_tab_show';
-            }
-            // Fallback: deactivate first if needed, then click
-            const li = link.closest('li');
-            if (li && li.classList.contains('active')) {
-                const other = document.querySelector(
-                    'a[data-toggle="tab"]:not([href="#snapshots_tab"])'
-                );
-                if (other) other.click();
-            }
-            link.click();
-            return 'click';
-        })()
-    """)
-    log(f"Snapshots tab activation: {tab_result}", 0.03)
-
-    if tab_result == "not_found":
-        # No Bootstrap tab — snapshots may already be in the DOM (different page layout)
-        log("No Bootstrap tab found — will collect from full page", 0.04)
-    else:
-        # Wait for the AJAX content to replace the loader spinner with actual rows.
-        # Also accept an empty-state indicator (no rows means this customer has no snapshots).
-        try:
-            page.wait_for_selector(
-                "#snapshots_tab a[href*='/snapshot/'], "
-                "#snapshots_tab .empty, #snapshots_tab p, #snapshots_tab td",
-                timeout=30_000,
-            )
-        except Exception:
-            log("Timed out waiting for snapshot tab content", 0.04)
-            _tab_state = page.evaluate("""
-                (() => {
-                    const el = document.querySelector('#snapshots_tab');
-                    if (!el) return 'NOT FOUND';
-                    return el.innerHTML.substring(0, 400);
-                })()
-            """)
-            log(f"#snapshots_tab after timeout: {_tab_state[:200]}", 0.04)
-            page.wait_for_timeout(3_000)
-
-    log(f"Final URL before collect: {page.url}", 0.05)
-
-    # ── Debug dump ────────────────────────────────────────────────────────────
-    import os as _os
-    _dbg_dir = _os.path.join(_os.path.dirname(__file__), "snap_debug")
-    _os.makedirs(_dbg_dir, exist_ok=True)
-    try:
-        _full_html = page.content()
-        with open(_os.path.join(_dbg_dir, "page1_full.html"), "w", encoding="utf-8") as _f:
-            _f.write(_full_html)
-        _tab_inner = page.evaluate("""
-            (() => {
-                const el = document.querySelector('#snapshots_tab');
-                return el ? el.innerHTML : '<!-- #snapshots_tab NOT FOUND -->';
-            })()
-        """)
-        with open(_os.path.join(_dbg_dir, "page1_snapshots_tab.html"), "w", encoding="utf-8") as _f:
-            _f.write(_tab_inner)
-        _pag_info = page.evaluate("""
-            (() => {
-                const scope = document.querySelector('#snapshots_tab');
-                const scopedLinks = scope
-                    ? Array.from(scope.querySelectorAll('ul.pagination li a')).map(a => a.textContent.trim())
-                    : [];
-                const globalLinks = Array.from(document.querySelectorAll('ul.pagination li a')).map(a => ({
-                    text: a.textContent.trim(),
-                    inScope: scope ? scope.contains(a) : false
-                }));
-                const countTexts = Array.from(document.querySelectorAll('*')).filter(
-                    e => /showing\\s+\\d+\\s+of\\s+\\d+/i.test(e.innerText || '')
-                        && e.children.length === 0
-                ).map(e => ({text: e.innerText.trim(), id: e.closest('[id]')?.id || ''}));
-                return {scopedLinks, globalLinks: globalLinks.slice(0,40), countTexts: countTexts.slice(0,10)};
-            })()
-        """)
-        import json as _json
-        with open(_os.path.join(_dbg_dir, "page1_pagination.json"), "w", encoding="utf-8") as _f:
-            _json.dump(_pag_info, _f, indent=2)
-        print(f"[SNAP-DEBUG] Scoped pagination links: {_pag_info.get('scopedLinks')}")
-        print(f"[SNAP-DEBUG] Count texts found: {_pag_info.get('countTexts')}")
-    except Exception as _de:
-        print(f"[SNAP-DEBUG] dump error: {_de}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _collect() -> list[dict]:
-        # Context guard: skip if we've navigated away from the customer page
-        if not _on_customer_page():
-            log(f"Context guard: drifted to {page.url} — skipping", 0.0)
-            return []
-        # Scope extraction to #snapshots_tab to avoid picking up ticket links
-        _tab_html = page.evaluate(
-            "(() => { const el = document.querySelector('#snapshots_tab'); return el ? el.innerHTML : ''; })()"
-        ) or ""
-        if _tab_html:
-            return [r for r in _extract_snapshot_rows(_tab_html) if r["snap_id"] not in seen_ids]
-        # Fallback to full page if tab panel not found
-        return [r for r in _extract_snapshot_rows(page.content()) if r["snap_id"] not in seen_ids]
-
-    new_rows = _collect()
-    for r in new_rows:
-        all_snaps.append(r)
-        seen_ids.add(r["snap_id"])
-    log(f"Page 1: {len(new_rows)} snapshots", 0.06)
-
-    # Scope the "Showing X of Y" search to the snapshots tab only
-    _snap_tab_html = page.evaluate(
-        "(() => { const el = document.querySelector('#snapshots_tab'); return el ? el.innerHTML : ''; })()"
-    ) or ""
-    m_total = re.search(r"Showing\s+\d+\s+of\s+(\d+)\s+matching", _snap_tab_html, re.I)
-    if not m_total:
-        # Fallback: try full page but log a warning
-        m_total = re.search(r"Showing\s+\d+\s+of\s+(\d+)\s+matching", page.content(), re.I)
-        if m_total:
-            print(f"[SNAP-DEBUG] WARNING: total count from full page (not scoped): {m_total.group(1)}")
-    total_snaps = int(m_total.group(1)) if m_total else None
-    per_page = max(len(new_rows), 1)
-    total_pages = _math.ceil(total_snaps / per_page) if total_snaps else 9999
-    if total_snaps:
-        log(f"Total: {total_snaps} snapshots → {total_pages} pages", 0.07)
-
-    def _current_snap_ids() -> set:
-        """Return the set of snap_id values visible in #snapshots_tab."""
-        _html = page.evaluate(
-            "(() => { const el = document.querySelector('#snapshots_tab'); return el ? el.innerHTML : ''; })()"
-        ) or ""
-        return {r["snap_id"] for r in _extract_snapshot_rows(_html)}
-
-    page_num = 1
-    while page_num < total_pages:
-        if max_pages and page_num >= max_pages:
-            break
-        next_num = page_num + 1
-        pct = min(0.07 + 0.88 * (page_num / max(total_pages, 1)), 0.94)
-        # Only look for pagination inside #snapshots_tab
-        btn = page.locator("#snapshots_tab ul.pagination li a").filter(
-            has_text=re.compile(rf"^\s*{next_num}\s*$")
-        )
-        if btn.count() == 0:
-            log(f"No button for page {next_num} in snapshots tab — done at page {page_num}", 0.95)
-            break
-        log(f"Clicking page {next_num}…", pct)
-        try:
-            page.evaluate(
-                "document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],"
-                ".modal-backdrop').forEach(e=>e.remove())"
-            )
-            prev_ids = _current_snap_ids()
-            # JS click scoped strictly to #snapshots_tab pagination
-            clicked = page.evaluate(
-                """(n) => {
-                    const scope = document.querySelector('#snapshots_tab');
-                    if (!scope) return false;
-                    const btn = Array.from(scope.querySelectorAll('ul.pagination li a'))
-                        .find(a => a.textContent.trim() === String(n));
-                    if (btn) { btn.click(); return true; }
-                    return false;
-                }""",
-                next_num,
-            )
-            if not clicked:
-                btn.first.click(force=True, timeout=8_000)
-            # Wait for the snapshot row set inside #snapshots_tab to change
-            for _ in range(20):
-                page.wait_for_timeout(500)
-                if _current_snap_ids() != prev_ids:
-                    break
-            new_rows = _collect()
-            for r in new_rows:
-                all_snaps.append(r)
-                seen_ids.add(r["snap_id"])
-            log(f"Page {next_num}: +{len(new_rows)} → {len(all_snaps)} total", pct)
-            page_num = next_num
-            time.sleep(0.3)
-        except Exception as exc:
-            log(f"Page {next_num} error: {exc}", pct)
-            break
-
-    return all_snaps
-
-
-def query_supportal_analytics(statement: str, cookie: str | None) -> list[dict]:
-    """Send a SQL++ statement to the Supportal analytics endpoint.
-
-    Uses POST /api/support360/query with JSON body {statement, scope: "v1"}.
-    The endpoint requires the same session cookie used for HTML scraping.
-    """
-    url = f"{BASE_URL}/api/support360/query"
-    headers = {
-        "User-Agent": UA,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-
-    resp = requests.post(
-        url,
-        json={"statement": statement, "scope": "v1"},
-        headers=headers,
-        timeout=60,
-        verify=False,
-    )
-
-    resp.raise_for_status()
-    body = resp.text.strip()
-    if not body:
-        raise ValueError(
-            f"Analytics endpoint returned HTTP {resp.status_code} with empty body. "
-            "Session cookie is likely missing or expired — paste a fresh cookie "
-            "in the Authentication tab and try again."
-        )
-    if body.lstrip().startswith("<"):
-        snippet = body[:200].replace("\n", " ")
-        raise ValueError(
-            f"Analytics endpoint returned HTML (HTTP {resp.status_code}). "
-            f"Session cookie is missing or expired. Response: {snippet!r}"
-        )
-    try:
-        payload = resp.json()
-    except Exception:
-        snippet = body[:300].replace("\n", " ")
-        raise ValueError(
-            f"Analytics endpoint returned non-JSON (HTTP {resp.status_code}): {snippet!r}"
-        )
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        raise ValueError(f"Unexpected analytics response type: {type(payload).__name__}: {str(payload)[:200]}")
-    rows = payload.get("results") or payload.get("rows") or []
-    if not isinstance(rows, list):
-        raise ValueError(f"Unexpected analytics response shape: {list(payload.keys())}")
-    return rows
-
-
-def fetch_snapshots_via_analytics(
-    customer_name: str,
-    cookie: str | None,
-    limit: int = 200,
-    progress_cb: Callable[[str, float], None] | None = None,
-) -> list[dict]:
-    """Fetch snapshot listing + Zendesk ticket IDs via the Supportal analytics API.
-
-    Much faster than Playwright scraping — one SQL++ query returns all snapshots
-    for the customer with their associated ticket IDs in a single round-trip.
-
-    Returns snapshot dicts compatible with the rest of the app (same keys as the
-    Playwright scraper, topology fields left empty since they require detail pages).
-    """
-    def _log(msg: str, pct: float = 0.0):
-        print(f"[SNAP-ANALYTICS] {msg}")
-        if progress_cb:
-            progress_cb(msg, pct)
-
-    customer_name = customer_name.strip().strip('"\'')
-    _log(f"Querying analytics for customer: {customer_name!r}", 0.05)
-
-    def _make_statement(name_expr: str) -> str:
-        return f"""
-SELECT
-    REPLACE(META(sn).id, "Snapshot::", "") AS snap_id,
-    sn.`timestamp`                         AS date,
-    sn.`uuid`                              AS cluster_uuid,
-    cl.`ui_name`                           AS cluster_name,
-    cu.`name`                              AS organization,
-    sn.`zendesk`                           AS ticket_ids
-FROM snapshot sn
-JOIN cluster cl ON META(cl).id = ("Cluster::" || sn.`uuid`)
-JOIN customer cu ON META(cu).id = ("Customer::" || cl.`customer`)
-WHERE {name_expr}
-ORDER BY sn.`timestamp` DESC
-LIMIT {int(limit)}
-""".strip()
-
-    # Exact match first
-    rows = query_supportal_analytics(
-        _make_statement(f"cu.`name` = {json.dumps(customer_name)}"), cookie
-    )
-    # If no results, retry with case-insensitive LIKE match
-    if not rows:
-        _log(f"No exact match for {customer_name!r} — retrying with LOWER() match …", 0.1)
-        rows = query_supportal_analytics(
-            _make_statement(f"LOWER(cu.`name`) = {json.dumps(customer_name.lower())}"), cookie
-        )
-    # If still nothing, try LIKE prefix
-    if not rows:
-        like_val = customer_name.lower().replace("%", "\\%").replace("_", "\\_") + "%"
-        _log(f"No case-insensitive match — retrying with LIKE {like_val!r} …", 0.15)
-        rows = query_supportal_analytics(
-            _make_statement(f"LOWER(cu.`name`) LIKE {json.dumps(like_val)}"), cookie
-        )
-
-    if not rows:
-        raise ValueError(
-            f"No snapshots found for customer {customer_name!r} in the analytics database. "
-            "Check the customer name matches Supportal exactly, and that the session cookie is valid."
-        )
-    _log(f"Analytics returned {len(rows)} snapshot records.", 0.5)
-
-    now_iso = (
-        datetime.datetime.now(datetime.timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    results: list[dict] = []
-    for row in rows:
-        snap_id = row.get("snap_id") or ""
-        cluster_uuid = row.get("cluster_uuid") or (snap_id.split("::")[0] if "::" in snap_id else "")
-        ticket_ids_raw = row.get("ticket_ids") or []
-        # zendesk field is array of integers; convert to strings to match app convention
-        ticket_ids = [str(t) for t in ticket_ids_raw if t]
-        results.append({
-            "snap_id":            snap_id,
-            "cluster_id":         cluster_uuid,
-            "url":                f"{BASE_URL}/snapshot/{urllib.parse.quote(snap_id, safe='')}",
-            "date":               row.get("date") or "",
-            "organization":       row.get("organization") or customer_name,
-            "customer_url":       f"{BASE_URL}/customer/{urllib.parse.quote(customer_name, safe='')}",
-            "cluster_name":       row.get("cluster_name") or "",
-            "cluster_uuid":       cluster_uuid,
-            "capella_cluster_id": "",
-            "topology":           {},
-            "ticket_ids":         ticket_ids,
-            "scraped_at":         now_iso,
-            # Topology detail fields empty — fetch full topology separately if needed
-            "bad_count":          0,
-            "warn_count":         0,
-            "bad_items":          [],
-            "warn_items":         [],
-            "cb_version":         "",
-            "node_count":         0,
-            "bucket_names":       [],
-            "auto_failover_seconds": None,
-            "ram_per_node_mib":   None,
-            "bucket_count":       0,
-            "server_groups":      [],
-        })
-
-    _log(f"Done — {len(results)} snapshots with ticket IDs.", 1.0)
-    return results
-
-
-def fetch_ticket_clusters_via_analytics(
-    ticket_ids: list[str],
-    cookie: str | None,
-) -> dict[str, list[str]]:
-    """Query Analytics API for cluster UI names linked to each ticket via snapshots.
-    Returns {ticket_id: [cluster_ui_name, ...]}."""
-    if not ticket_ids:
-        return {}
-    id_list = ", ".join(json.dumps(str(tid)) for tid in ticket_ids[:500])
-    statement = (
-        "SELECT DISTINCT t_id, cl.ui_name AS cluster_ui_name "
-        "FROM snapshot sn "
-        "UNNEST sn.`zendesk` AS t_id "
-        "JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.`uuid`) "
-        f"WHERE t_id IN [{id_list}]"
-    )
-    rows = query_supportal_analytics(statement, cookie)
-    result: dict[str, list[str]] = {}
-    for row in rows:
-        tid   = str(row.get("t_id") or "").strip()
-        cname = (row.get("cluster_ui_name") or "").strip()
-        if not tid or not cname:
-            continue
-        if tid not in result:
-            result[tid] = []
-        if cname not in result[tid]:
-            result[tid].append(cname)
-    return result
-
-
-def enrich_ticket_apps_via_analytics(
-    customer_name: str,
-    cookie: str | None,
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    llm_provider: str = "",
-    llm_model: str = "",
-    llm_api_key: str = "",
-    llm_base_url: str = "",
-    progress_cb: Callable[[str, float], None] | None = None,
-) -> tuple[int, int]:
-    """Enrich application labels for tickets missing them.
-
-    Two-stage approach:
-    1. Analytics API: query which clusters (ui_name) are linked to each ticket via
-       snapshots. Match ui_name against known app aliases.
-    2. LLM fallback: for tickets still unlabeled after stage 1, send a batch prompt
-       asking the LLM to extract the app name from each ticket subject. AmEx encodes
-       the application name directly in the subject (e.g. "Enterprise Wallet - Unable
-       to process transactions" → "Enterprise Wallet").
-
-    Writes results to score.analytics_app_labels and score.analytics_cluster_names
-    on each updated CB ticket document.
-
-    Returns (enriched_count, error_count).
-    """
-    def _log(msg: str, pct: float = 0.0):
-        print(f"[APP-ENRICH] {msg}")
-        if progress_cb:
-            progress_cb(msg, pct)
-
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed")
-
-    from couchbase.cluster import Cluster
-    from couchbase.options import ClusterOptions, QueryOptions
-    from couchbase.auth import PasswordAuthenticator
-
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    col = cluster.bucket(bucket).scope(scope).collection(collection)
-    ks  = f"`{bucket}`.`{scope}`.`{collection}`"
-
-    # Load tickets — only id, subject, and score fields needed
-    _cust_filter = ""
-    if customer_name and customer_name.lower() != "all customers":
-        _esc = customer_name.replace("'", "\\'")
-        _cust_filter = f" AND LOWER(t.organization) LIKE '%{_esc.lower()}%'"
-
-    _log(f"Loading tickets for {customer_name!r}…", 0.02)
-    q = (
-        f"SELECT META(t).id AS _key, t.ticket_id, t.subject, t.organization, "
-        f"t.score.cluster_names AS _cluster_names, "
-        f"t.score.analytics_app_labels AS _existing_labels "
-        f"FROM {ks} AS t "
-        f"WHERE t.ticket_id IS NOT MISSING{_cust_filter} LIMIT 5000"
-    )
-    try:
-        rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
-    except Exception as exc:
-        cluster.close()
-        raise RuntimeError(f"CB query failed: {exc}") from exc
-
-    _c2a = _get_cluster_to_app()
-
-    def _has_label(row: dict) -> bool:
-        if row.get("_existing_labels"):
-            return True
-        for cname in (row.get("_cluster_names") or []):
-            if _c2a.get((cname or "").lower()):
-                return True
-        return False
-
-    needs = [r for r in rows if not _has_label(r)]
-    _log(f"{len(needs)}/{len(rows)} tickets need app label enrichment.", 0.05)
-
-    if not needs:
-        _log("All tickets already have app labels.", 1.0)
-        cluster.close()
-        return 0, 0
-
-    ticket_ids_str = [str(r["ticket_id"]) for r in needs if r.get("ticket_id")]
-
-    # ── Stage 1: Analytics API ────────────────────────────────────────────────
-    _log(f"Stage 1: querying Analytics API for {len(ticket_ids_str)} tickets…", 0.1)
-    analytics_map: dict[str, list[str]] = {}
-    _batch = 200
-    for i in range(0, len(ticket_ids_str), _batch):
-        chunk = ticket_ids_str[i:i + _batch]
-        pct = 0.1 + 0.3 * (i / len(ticket_ids_str))
-        _log(f"  Analytics batch {i // _batch + 1}…", pct)
-        try:
-            analytics_map.update(fetch_ticket_clusters_via_analytics(chunk, cookie))
-        except Exception as exc:
-            _log(f"  Analytics batch error: {exc}", pct)
-
-    _log(f"Analytics returned cluster info for {len(analytics_map)} tickets.", 0.4)
-
-    # Map ui_name → app alias using known alias keys (longest match first)
-    _known_apps = sorted(_get_app_cluster_aliases().keys(), key=len, reverse=True)
-
-    def _ui_name_to_app(ui_name: str) -> str | None:
-        ui_lc = ui_name.lower()
-        for app in _known_apps:
-            if app in ui_lc:
-                return app
-        return None
-
-    # ── Stage 2: LLM subject extraction for remaining unlabeled tickets ───────
-    # Build list of tickets that stage 1 didn't resolve
-    stage1_resolved: set[str] = set()
-    for tid, ui_names in analytics_map.items():
-        if any(_ui_name_to_app(u) for u in ui_names):
-            stage1_resolved.add(tid)
-
-    still_needs_llm = [r for r in needs if str(r.get("ticket_id") or "") not in stage1_resolved]
-    llm_labels: dict[str, str] = {}
-
-    if still_needs_llm and llm_provider and llm_model:
-        _log(f"Stage 2: LLM extraction for {len(still_needs_llm)} remaining tickets…", 0.45)
-        _BATCH_LLM = 40
-        for i in range(0, len(still_needs_llm), _BATCH_LLM):
-            chunk = still_needs_llm[i:i + _BATCH_LLM]
-            pct = 0.45 + 0.3 * (i / len(still_needs_llm))
-            _log(f"  LLM batch {i // _BATCH_LLM + 1}/{(len(still_needs_llm)-1)//_BATCH_LLM + 1}…", pct)
-            lines = "\n".join(
-                f'- #{r["ticket_id"]}: "{(r.get("subject") or "").strip()}"'
-                for r in chunk
-            )
-            prompt = (
-                "You are analyzing support tickets. For each ticket below, extract the "
-                "application or product name from the subject line. Return a JSON array "
-                "where each element is {\"ticket_id\": \"<id>\", \"app_label\": \"<name>\"} "
-                "or {\"ticket_id\": \"<id>\", \"app_label\": null} if no specific application "
-                "is identifiable. Use only the information in the subject — do not invent names. "
-                "Common patterns: app names appear at the start of the subject before a dash or "
-                "colon, e.g. 'Enterprise Wallet - issue' → 'Enterprise Wallet', "
-                "'DQF Application timeout' → 'DQF', 'Griffin-Tier 0 cluster' → 'Griffin'.\n\n"
-                f"Tickets:\n{lines}\n\n"
-                "Return ONLY the JSON array, no other text."
-            )
-            try:
-                raw = call_llm(
-                    [{"role": "user", "content": prompt}],
-                    llm_provider, llm_model, llm_api_key, llm_base_url,
-                    max_tokens=1024,
-                )
-                # Parse JSON — strip markdown fences if present
-                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-                parsed = json.loads(raw)
-                for item in (parsed if isinstance(parsed, list) else []):
-                    tid_v = str(item.get("ticket_id") or "").strip()
-                    lbl_v = (item.get("app_label") or "").strip()
-                    if tid_v and lbl_v and lbl_v.lower() not in ("null", "none", "unknown", "n/a"):
-                        llm_labels[tid_v] = lbl_v
-            except Exception as exc:
-                _log(f"  LLM batch error: {exc}", pct)
-
-        _log(f"LLM extracted labels for {len(llm_labels)} tickets.", 0.75)
-    elif still_needs_llm:
-        _log(f"Stage 2 skipped ({len(still_needs_llm)} tickets remain unlabeled — no LLM configured).", 0.45)
-
-    # ── Write results to CB ───────────────────────────────────────────────────
-    enriched = errors = 0
-    total = len(needs)
-    for i, row in enumerate(needs):
-        tid      = str(row.get("ticket_id") or "")
-        doc_key  = row.get("_key") or f"ticket::{tid}"
-        pct      = 0.75 + 0.23 * (i / total)
-
-        ui_names = analytics_map.get(tid, [])
-        inferred: list[str] = []
-
-        # Stage 1 result
-        for uname in ui_names:
-            lbl = _ui_name_to_app(uname)
-            if lbl and lbl not in inferred:
-                inferred.append(lbl)
-        # If no alias match from ui_names, store ui_names themselves as labels
-        if not inferred and ui_names:
-            for uname in ui_names:
-                clean = uname.strip()
-                if clean and clean not in inferred:
-                    inferred.append(clean)
-
-        # Stage 2 result
-        if not inferred and tid in llm_labels:
-            inferred = [llm_labels[tid]]
-
-        if not inferred:
-            continue
-
-        _log(f"  [{i+1}/{total}] #{tid} → {inferred}", pct)
-        try:
-            result = col.get(doc_key)
-            doc    = result.content_as[dict]
-            _score = doc.get("score") or {}
-            _score["analytics_app_labels"]    = inferred
-            if ui_names:
-                _score["analytics_cluster_names"] = ui_names
-            doc["score"] = _score
-            col.replace(doc_key, doc)
-            enriched += 1
-        except Exception as exc:
-            errors += 1
-            _log(f"  Error updating #{tid}: {exc}", pct)
-
-    cluster.close()
-    _log(f"Done — {enriched} labels written, {errors} errors.", 1.0)
-    return enriched, errors
-
-
-def scrape_snapshots_from_stubs(
-    stubs: list[dict],
-    cookie: str | None,
-    max_detail_workers: int,
-    progress_cb: Callable[[str, float], None],
-) -> list[dict]:
-    """
-    Fetch full topology for a list of analytics-fetched snapshot stubs.
-
-    Each stub must have at least ``snap_id``.  This skips listing-page
-    enumeration entirely — the snap_ids are already known from the analytics
-    API so we go straight to the Playwright detail-fetch phase.
-
-    Returns a list of fully-populated snapshot dicts (same schema as
-    ``scrape_snapshots_for_customer``).
-    """
-    import concurrent.futures
-
-    def log(msg: str, pct: float):
-        print(f"[SNAP-DIRECT] {msg}")
-        progress_cb(msg, pct)
-
-    if not stubs:
-        log("No stubs to scrape.", 1.0)
-        return []
-
-    total = len(stubs)
-    log(f"Direct-scraping topology for {total} snapshots…", 0.0)
-
-    results: list[dict] = []
-    done_n = [0]
-    errors_n = [0]
-    lock = threading.Lock()
-
-    def _fetch_one(stub: dict) -> None:
-        snap_id = stub.get("snap_id", "")
-        if not snap_id:
-            return
-        try:
-            topo = fetch_snapshot_topology(snap_id, cookie)
-            now_iso = (
-                datetime.datetime.now(datetime.timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-            doc = {
-                "snap_id":            snap_id,
-                "cluster_id":         snap_id.split("::")[0],
-                "url":                f"{BASE_URL}/snapshot/{urllib.parse.quote(snap_id, safe='')}",
-                "date":               stub.get("date"),
-                "organization":       stub.get("organization", ""),
-                "customer_url":       "",
-                "cluster_name":       topo.get("cluster_name") or stub.get("cluster_name") or "",
-                "cluster_uuid":       topo.get("cluster_uuid") or stub.get("cluster_uuid") or "",
-                "capella_cluster_id": topo.get("capella_cluster_id") or "",
-                "topology":           topo,
-                "ticket_ids":         stub.get("ticket_ids") or [],
-                "scraped_at":         now_iso,
-                "bad_count":          topo.get("bad_count", 0),
-                "warn_count":         topo.get("warn_count", 0),
-                "bad_items":          topo.get("bad_items") or [],
-                "warn_items":         topo.get("warn_items") or [],
-                "cb_version":         topo.get("cb_version") or "",
-                "node_count":         topo.get("total_nodes") or 0,
-                "bucket_names":       topo.get("bucket_names") or [],
-                "auto_failover_seconds": topo.get("auto_failover_seconds"),
-                "ram_per_node_mib":   topo.get("ram_per_node_mib"),
-                "bucket_count":       topo.get("bucket_count", 0),
-                "server_groups":      topo.get("server_groups") or [],
-            }
-            with lock:
-                done_n[0] += 1
-                results.append(doc)
-                pct = done_n[0] / total
-                log(f"[{done_n[0]}/{total}] {snap_id[:16]}… bad={doc['bad_count']} warn={doc['warn_count']}", pct)
-        except Exception as exc:
-            with lock:
-                done_n[0] += 1
-                errors_n[0] += 1
-                log(f"[{done_n[0]}/{total}] Error {snap_id[:16]}…: {exc}",
-                    done_n[0] / total)
-
-    workers = max(1, min(max_detail_workers, total))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(_fetch_one, stubs))
-
-    log(f"Done — {len(results)} scraped, {errors_n[0]} errors.", 1.0)
-    return results
-
-
 def scrape_snapshots_for_customer(
     customer: str,
     cookie: Optional[str],
@@ -19340,31 +17564,29 @@ def scrape_snapshots_for_customer(
         print(f"[SNAP] {msg}")
         progress_cb(msg, pct)
 
-    # ── Phase 1: enumerate listing ─────────────────────────────────────────
+    # ── Phase 1: enumerate listing via REST API ────────────────────────────
     log("Enumerating snapshot listing…", 0.0)
-    parsed_cookies = []
-    if cookie:
-        for part in cookie.split(";"):
-            part = part.strip()
-            if "=" in part:
-                name, _, value = part.partition("=")
-                parsed_cookies.append({"name": name.strip(), "value": value.strip(), "url": BASE_URL})
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
-        if parsed_cookies:
-            ctx.add_cookies(parsed_cookies)
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
-        try:
-            summaries = _scrape_snapshot_listing_playwright(
-                page, customer_url, max_listing_pages,
-                lambda m, p: log(m, p * 0.4),
-            )
-        finally:
-            ctx.close()
-            browser.close()
+    org_name = customer
+    if customer.startswith("http"):
+        _path_parts = urllib.parse.urlparse(customer).path.strip("/").split("/")
+        if len(_path_parts) >= 2 and _path_parts[0] == "customer":
+            org_name = urllib.parse.unquote(_path_parts[1])
+    raw_snaps = _get_customer_snapshot_listing_api(org_name, _make_api_session(cookie)) if cookie else []
+    summaries: list[dict] = []
+    for _snap in raw_snaps:
+        _sid = _snap.get("snap_id") or _snap.get("id") or _snap.get("uid")
+        if not _sid:
+            _enc = _snap.get("encoded_uid", "")
+            if _enc:
+                _sid = urllib.parse.unquote(_enc)
+        if _sid:
+            summaries.append({
+                "snap_id":      _sid,
+                "url":          _snap.get("url") or f"{BASE_URL}/snapshot/{urllib.parse.quote(_sid, safe='')}",
+                "date":         _snap.get("date") or _snap.get("created_at"),
+                "cluster_name": _snap.get("cluster_name") or _snap.get("name") or "",
+                "ticket_ids":   _snap.get("ticket_ids") or [],
+            })
 
     new_summaries = [s for s in summaries if s["snap_id"] not in skip_ids]
     log(f"Listing: {len(summaries)} snapshots found, {len(new_summaries)} new", 0.40)
@@ -19870,7 +18092,8 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
             }
         ci = index[cid]
 
-        name = (snap.get("cluster_name") or "").strip()
+        _cn = snap.get("cluster_name") or ""
+        name = (_cn[0] if isinstance(_cn, list) else _cn).strip() if _cn else ""
         if name and name not in ci["cluster_names"]:
             ci["cluster_names"].append(name)
 
@@ -19889,7 +18112,8 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
             if ci["node_count_last"] is None:   # first (=newest) wins when sorted desc
                 ci["node_count_last"] = nc
 
-        ver = (snap.get("cb_version") or "").strip()
+        _ver = snap.get("cb_version") or ""
+        ver = (_ver[0] if isinstance(_ver, list) else _ver).strip() if _ver else ""
         if ver and ver not in ci["version_history"]:
             ci["version_history"].append(ver)
 
@@ -20708,6 +18932,85 @@ def backfill_analytics_fields(
             ticket["cb_version"]    = extract_ticket_version(ticket)
             ticket["feature_area"]  = classify_ticket_feature(ticket)
             ticket["ticket_origin"] = classify_ticket_origin(ticket)
+            col.upsert(doc_key, ticket)
+            updated += 1
+        except Exception as exc:
+            errors += 1
+            progress_cb(f"Error on {doc_key}: {exc}", i / total)
+            continue
+        if i % 50 == 0 or i == total:
+            progress_cb(f"Backfilled {i}/{total} …", i / total)
+
+    cluster.close()
+    return updated, errors
+
+
+def backfill_missing_cbse_fields(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    progress_cb: Callable[[str, float], None],
+) -> tuple[int, int]:
+    """
+    Find tickets where `cbses` or `jira_issues` is MISSING (never written, not null).
+    For each ticket, derive cbses from ticket_fields.CBSE if present; otherwise write
+    null so the field is no longer MISSING. Returns (updated, errors).
+    """
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    col       = scope_obj.collection(collection)
+    fqn       = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    progress_cb("Querying for tickets with MISSING cbses/jira_issues …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, * FROM {fqn} "
+        f"WHERE META().id LIKE 'ticket::%' "
+        f"AND (cbses IS MISSING OR jira_issues IS MISSING)",
+        QueryOptions(timeout=timedelta(seconds=120)),
+    ))
+
+    total   = len(rows)
+    updated = errors = 0
+
+    if total == 0:
+        progress_cb("No tickets with MISSING cbses/jira_issues found.", 1.0)
+        cluster.close()
+        return 0, 0
+
+    progress_cb(f"Found {total} tickets to backfill …", 0.0)
+
+    for i, row in enumerate(rows, 1):
+        doc_key = row.get("doc_key") or row.get(collection, {}).get("doc_key")
+        ticket  = row.get(collection) or {k: v for k, v in row.items() if k != "doc_key"}
+        if not doc_key or not ticket:
+            errors += 1
+            continue
+        try:
+            if "cbses" not in ticket:
+                tf       = ticket.get("ticket_fields") or {}
+                cbse_raw = tf.get("CBSE") or tf.get("cbse") or ""
+                if cbse_raw and str(cbse_raw).strip():
+                    cbses = [
+                        c.strip().upper()
+                        for c in re.split(r"[,\s]+", str(cbse_raw))
+                        if c.strip()
+                    ]
+                    ticket["cbses"] = cbses if cbses else None
+                else:
+                    ticket["cbses"] = None
+
+            if "jira_issues" not in ticket:
+                ticket["jira_issues"] = None
+
             col.upsert(doc_key, ticket)
             updated += 1
         except Exception as exc:
