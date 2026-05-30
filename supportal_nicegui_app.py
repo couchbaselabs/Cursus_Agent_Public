@@ -5979,19 +5979,44 @@ def main_page():
                                                     ui.label(f"[{_atype} parse error]").classes("text-red-500 text-xs")
                                                     continue
                                                 if _atype == "echart":
-                                                    _cuid = f"agchart-{abs(hash(_araw)):x}"
+                                                    _cuid   = f"agchart-{abs(hash(_araw)):x}"
                                                     _ctitle = ((_ap.get("title") or {}).get("text") or "chart").replace(" ", "_")
-                                                    with ui.element("div").classes(f"w-full {_cuid} mt-2"):
-                                                        ui.echart(_ap).classes("w-full").style("height:320px")
-                                                    ui.button(
-                                                        "PNG", icon="image",
-                                                        on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
-                                                            f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
-                                                            f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
-                                                            f"if(!inst)return;var img=inst.getDataURL({{type:'png',pixelRatio:2,backgroundColor:'#fff'}});"
-                                                            f"var a=document.createElement('a');a.href=img;a.download='{fn}.png';a.click();}})();"
-                                                        ),
-                                                    ).props("flat dense size=sm color=blue-grey").classes("mt-1").tooltip("Download PNG")
+                                                    _cheight = int(_ap.get("_height") or 320)
+                                                    _cdesc   = _ap.get("_description") or ""
+                                                    # Strip private keys before passing to ECharts
+                                                    _ec_opt  = {k: v for k, v in _ap.items() if not k.startswith("_")}
+                                                    _expanded = [False]  # mutable cell for expand toggle
+                                                    with ui.element("div").classes(f"w-full {_cuid} mt-2") as _chart_div:
+                                                        _chart_el = ui.echart(_ec_opt).classes("w-full").style(f"height:{_cheight}px")
+                                                    if _cdesc:
+                                                        ui.markdown(_cdesc).classes("text-xs text-gray-500 mt-1 italic")
+                                                    with ui.row().classes("gap-1 mt-1"):
+                                                        ui.button(
+                                                            "PNG", icon="image",
+                                                            on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
+                                                                f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
+                                                                f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
+                                                                f"if(!inst)return;var img=inst.getDataURL({{type:'png',pixelRatio:2,backgroundColor:'#fff'}});"
+                                                                f"var a=document.createElement('a');a.href=img;a.download='{fn}.png';a.click();}})();"
+                                                            ),
+                                                        ).props("flat dense size=sm color=blue-grey").tooltip("Download PNG")
+                                                        ui.button(
+                                                            "SVG", icon="image",
+                                                            on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
+                                                                f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
+                                                                f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
+                                                                f"if(!inst)return;var svg=inst.getDataURL({{type:'svg',backgroundColor:'#fff'}});"
+                                                                f"var a=document.createElement('a');a.href=svg;a.download='{fn}.svg';a.click();}})();"
+                                                            ),
+                                                        ).props("flat dense size=sm color=blue-grey").tooltip("Download SVG")
+                                                        def _toggle_expand(_el=_chart_el, _h=_cheight, _exp=_expanded):
+                                                            _exp[0] = not _exp[0]
+                                                            new_h = (_h * 2) if _exp[0] else _h
+                                                            _el.style(f"height:{new_h}px")
+                                                        ui.button(
+                                                            icon="fullscreen",
+                                                            on_click=_toggle_expand,
+                                                        ).props("flat dense size=sm color=blue-grey").tooltip("Expand / collapse")
                                                 elif _atype == "table":
                                                     import html as _hmod
                                                     _tcols = _ap.get("columns") or []
@@ -6476,9 +6501,14 @@ def main_page():
                                         "Use stale_hours=0 to force-refresh all regardless of age.\n"
                                         "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true.\n"
                                         "- generate_chart: MANDATORY when the user asks for any chart, graph, or "
-                                        "visualization. Call this tool — do NOT describe a chart in text or say 'here is "
-                                        "a bar chart:' followed by a text description. The tool renders a real interactive "
-                                        "chart in the UI. Supported types: bar, horizontal_bar, line, pie, donut. "
+                                        "visualization. Call this tool — do NOT describe a chart in text. "
+                                        "Supported types: bar, horizontal_bar, line, area, stacked_bar, scatter, combo, "
+                                        "pie, donut, gauge, treemap, funnel. "
+                                        "TYPE SELECTION: use area/line for trends over time; gauge for a single KPI; "
+                                        "stacked_bar for part-of-whole; horizontal_bar for ranked lists; "
+                                        "scatter for correlations; combo to overlay bars+line; treemap for hierarchy. "
+                                        "Extra params: height (px), stacked, show_labels, description (insight caption), "
+                                        "color_scheme (default/warm/cool/traffic/couchbase/monochrome). "
                                         "Also call proactively when comparing counts across categories.\n"
                                         "- generate_table: MANDATORY when the user asks for a table, spreadsheet, or "
                                         "exportable data. Call this tool — do NOT render a markdown table. Always call "
@@ -6558,7 +6588,8 @@ def main_page():
                                     # Some models describe charts in text instead of calling
                                     # generate_chart. Detect this and force one more tool-call round.
                                     _CHART_KWS = ("chart", "graph", "bar chart", "pie chart",
-                                                  "line chart", "plot", "visuali")
+                                                  "line chart", "area chart", "scatter", "treemap",
+                                                  "funnel", "gauge", "stacked", "plot", "visuali")
                                     _wants_chart = any(kw in question.lower() for kw in _CHART_KWS)
                                     if _wants_chart and "```echart" not in (answer or ""):
                                         chat_status.set_text("Agent — generating chart …")
@@ -6937,6 +6968,183 @@ def main_page():
                                 ui.button(icon="download", on_click=_copy_last_response).props(
                                     "flat round dense color=grey"
                                 ).tooltip("Copy last response as Markdown")
+
+                        # ── AFTER v1.5.0: Quick Dashboard (pre-built CB metrics) ──────────
+                        with ui.expansion("Quick Dashboard", icon="dashboard").classes("w-full mt-3 border rounded"):
+                            _dash_status  = ui.label("").classes("text-xs text-gray-400")
+                            _dash_area    = ui.column().classes("w-full gap-3 mt-2")
+
+                            async def _refresh_dashboard():
+                                _dash_status.set_text("Loading …")
+                                _dash_area.clear()
+                                try:
+                                    _cb_args_dash = (
+                                        cb_url_input.value.strip(),
+                                        cb_bucket_input.value.strip(),
+                                        cb_user_input.value.strip(),
+                                        cb_pass_input.value,
+                                        cb_tls_toggle.value,
+                                        cb_scope_input.value.strip() or "_default",
+                                        cb_collection_input.value.strip() or "tickets",
+                                    )
+                                    _cust_dash = (main_cust_input.value or "").strip()
+
+                                    def _load_dash():
+                                        from collections import Counter
+                                        import datetime as _dt
+                                        _cb_url, _bkt, _usr, _pwd, _tls, _sc, _col = _cb_args_dash
+                                        if not _CB_AVAILABLE:
+                                            raise RuntimeError("Couchbase SDK not installed")
+                                        _conn = _cb_conn_str(_cb_url, _tls)
+                                        cl_   = Cluster(_conn, ClusterOptions(PasswordAuthenticator(_usr, _pwd)))
+                                        cl_.wait_until_ready(timedelta(seconds=10))
+
+                                        _org_filter = f"AND LOWER(t.organization) LIKE '%{_cust_dash.lower()}%'" if _cust_dash else ""
+
+                                        def _q(sql, **kw):
+                                            from couchbase.options import QueryOptions as _QO
+                                            return list(cl_.query(sql, _QO(named_parameters=kw)))
+
+                                        # Priority counts
+                                        pri = Counter()
+                                        for r in _q(f"SELECT t.priority, COUNT(*) AS n FROM `{_bkt}`.`{_sc}`.`{_col}` t WHERE t.type='ticket' {_org_filter} GROUP BY t.priority"):
+                                            pri[(r.get("priority") or "unknown").capitalize()] = r.get("n", 0)
+
+                                        # Status counts
+                                        sta = Counter()
+                                        for r in _q(f"SELECT t.status, COUNT(*) AS n FROM `{_bkt}`.`{_sc}`.`{_col}` t WHERE t.type='ticket' {_org_filter} GROUP BY t.status"):
+                                            sta[(r.get("status") or "unknown").capitalize()] = r.get("n", 0)
+
+                                        # Monthly trend (last 18 months)
+                                        trend: Counter = Counter()
+                                        for r in _q(f"SELECT SUBSTR(t.created,0,7) AS mo, COUNT(*) AS n FROM `{_bkt}`.`{_sc}`.`{_col}` t WHERE t.type='ticket' AND t.created IS NOT NULL {_org_filter} GROUP BY SUBSTR(t.created,0,7)"):
+                                            mo = r.get("mo") or ""
+                                            if mo:
+                                                trend[mo] = r.get("n", 0)
+                                        trend_keys = sorted(trend.keys())[-18:]
+
+                                        # Top 10 orgs by count
+                                        orgs: list = []
+                                        for r in _q(f"SELECT t.organization AS org, COUNT(*) AS n FROM `{_bkt}`.`{_sc}`.`{_col}` t WHERE t.type='ticket' {_org_filter} GROUP BY t.organization ORDER BY n DESC LIMIT 10"):
+                                            orgs.append((r.get("org") or "?", r.get("n", 0)))
+
+                                        # Open vs resolved
+                                        open_c    = sum(v for k, v in sta.items() if k.lower() in ("open", "pending", "new", "hold"))
+                                        closed_c  = sum(v for k, v in sta.items() if k.lower() in ("solved", "closed"))
+                                        other_c   = sum(sta.values()) - open_c - closed_c
+
+                                        # Avg resolution days
+                                        res_rows = _q(
+                                            f"SELECT t.created, t.closed_at FROM `{_bkt}`.`{_sc}`.`{_col}` t "
+                                            f"WHERE t.type='ticket' AND t.closed_at IS NOT NULL AND t.created IS NOT NULL {_org_filter} LIMIT 500"
+                                        )
+                                        days_list = []
+                                        for r in res_rows:
+                                            try:
+                                                c = _dt.datetime.fromisoformat(r["created"][:19])
+                                                x = _dt.datetime.fromisoformat(r["closed_at"][:19])
+                                                d = (x - c).days
+                                                if 0 <= d <= 365:
+                                                    days_list.append(d)
+                                            except Exception:
+                                                pass
+                                        avg_days = round(sum(days_list) / len(days_list), 1) if days_list else 0
+
+                                        return dict(pri=pri, sta=sta, trend=trend, trend_keys=trend_keys,
+                                                    orgs=orgs, open_c=open_c, closed_c=closed_c, other_c=other_c,
+                                                    avg_days=avg_days, total=sum(pri.values()))
+
+                                    d = await run.io_bound(_load_dash)
+                                    _dash_status.set_text(f"{d['total']} tickets" + (f" · {_cust_dash}" if _cust_dash else " · all customers"))
+                                    _PAL = ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6","#06B6D4","#F97316","#6B7280"]
+
+                                    with _dash_area:
+                                        with ui.row().classes("w-full gap-3 flex-wrap"):
+                                            # Chart 1: Priority breakdown (bar)
+                                            with ui.card().classes("flex-1 min-w-64"):
+                                                ui.label("By Priority").classes("text-xs font-semibold text-gray-500 mb-1")
+                                                _pk = sorted(d["pri"].keys())
+                                                ui.echart({
+                                                    "color": ["#EF4444","#F97316","#F59E0B","#3B82F6","#6B7280"],
+                                                    "tooltip": {"trigger": "axis"},
+                                                    "xAxis": {"type": "category", "data": _pk},
+                                                    "yAxis": {"type": "value"},
+                                                    "series": [{"type": "bar", "data": [d["pri"][k] for k in _pk],
+                                                                "label": {"show": True, "position": "top"}}],
+                                                }).classes("w-full").style("height:220px")
+
+                                            # Chart 2: Open vs Resolved (donut)
+                                            with ui.card().classes("flex-1 min-w-64"):
+                                                ui.label("Open vs Resolved").classes("text-xs font-semibold text-gray-500 mb-1")
+                                                _ovr = [{"name": "Open", "value": d["open_c"]},
+                                                        {"name": "Resolved", "value": d["closed_c"]},
+                                                        {"name": "Other", "value": d["other_c"]}]
+                                                ui.echart({
+                                                    "color": ["#F59E0B","#22C55E","#6B7280"],
+                                                    "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+                                                    "series": [{"type": "pie", "radius": ["40%","70%"],
+                                                                "data": _ovr, "label": {"formatter": "{b}: {c}"}}],
+                                                }).classes("w-full").style("height:220px")
+
+                                            # Chart 3: Avg resolution — gauge
+                                            with ui.card().classes("flex-1 min-w-64"):
+                                                ui.label("Avg Resolution Time").classes("text-xs font-semibold text-gray-500 mb-1")
+                                                _gmax = max(30, d["avg_days"] * 2) if d["avg_days"] else 30
+                                                ui.echart({
+                                                    "series": [{"type": "gauge", "min": 0, "max": _gmax,
+                                                                "detail": {"formatter": "{value} days", "fontSize": 16},
+                                                                "data": [{"value": d["avg_days"], "name": "Avg"}],
+                                                                "axisLine": {"lineStyle": {"width": 18, "color": [
+                                                                    [0.3,"#22C55E"],[0.7,"#F59E0B"],[1.0,"#EF4444"]]}}}],
+                                                }).classes("w-full").style("height:220px")
+
+                                        # Chart 4: Trend over time (area)
+                                        with ui.card().classes("w-full"):
+                                            ui.label("Ticket Volume Trend").classes("text-xs font-semibold text-gray-500 mb-1")
+                                            ui.echart({
+                                                "color": _PAL,
+                                                "tooltip": {"trigger": "axis"},
+                                                "xAxis": {"type": "category", "data": d["trend_keys"],
+                                                          "axisLabel": {"rotate": 35, "fontSize": 10}},
+                                                "yAxis": {"type": "value"},
+                                                "series": [{"type": "line", "data": [d["trend"][k] for k in d["trend_keys"]],
+                                                            "smooth": True, "areaStyle": {"opacity": 0.25}}],
+                                            }).classes("w-full").style("height:240px")
+
+                                        with ui.row().classes("w-full gap-3 flex-wrap"):
+                                            # Chart 5: By Status (horizontal_bar)
+                                            with ui.card().classes("flex-1 min-w-72"):
+                                                ui.label("By Status").classes("text-xs font-semibold text-gray-500 mb-1")
+                                                _sk = sorted(d["sta"].keys(), key=lambda k: d["sta"][k], reverse=True)
+                                                ui.echart({
+                                                    "color": _PAL,
+                                                    "tooltip": {"trigger": "axis"},
+                                                    "grid": {"left": "22%"},
+                                                    "xAxis": {"type": "value"},
+                                                    "yAxis": {"type": "category", "data": _sk},
+                                                    "series": [{"type": "bar", "data": [d["sta"][k] for k in _sk],
+                                                                "label": {"show": True, "position": "right"}}],
+                                                }).classes("w-full").style("height:240px")
+
+                                            # Chart 6: Top customers (horizontal_bar)
+                                            with ui.card().classes("flex-1 min-w-72"):
+                                                ui.label("Top Customers").classes("text-xs font-semibold text-gray-500 mb-1")
+                                                _on = [o[0][:28] for o in d["orgs"]]
+                                                _ov = [o[1] for o in d["orgs"]]
+                                                ui.echart({
+                                                    "color": _PAL,
+                                                    "tooltip": {"trigger": "axis"},
+                                                    "grid": {"left": "34%"},
+                                                    "xAxis": {"type": "value"},
+                                                    "yAxis": {"type": "category", "data": _on},
+                                                    "series": [{"type": "bar", "data": _ov,
+                                                                "label": {"show": True, "position": "right"}}],
+                                                }).classes("w-full").style("height:240px")
+
+                                except Exception as exc:
+                                    _dash_status.set_text(f"Dashboard error: {_classify_agent_error(exc)}")
+
+                            ui.button("Refresh", icon="refresh", on_click=_refresh_dashboard).props("flat size=sm color=primary")
 
             with ui.tab_panel(tab_scoring):
                 with ui.column().classes("w-full gap-0"):
@@ -15304,9 +15512,13 @@ _AGENT_TOOLS: list[dict] = [
             "name": "generate_chart",
             "description": (
                 "Renders a real interactive chart in the chat UI. "
-                "MUST be called whenever the user asks for a chart, graph, bar chart, "
-                "pie chart, or any visualization — never substitute with text. "
-                "Supported types: bar, horizontal_bar, line, pie, donut. "
+                "MUST be called whenever the user asks for a chart, graph, or visualization — never substitute with text. "
+                "TYPE GUIDE: bar=counts by category; horizontal_bar=ranked lists (long labels); "
+                "line=trend over time; area=cumulative/filled trend; stacked_bar=part-of-whole breakdown; "
+                "scatter=correlation (x vs y); combo=bar+line overlay; pie=proportions (<6 slices); "
+                "donut=proportions with center space; gauge=single KPI value (0–100 or custom scale); "
+                "treemap=hierarchical proportions; funnel=stage/pipeline flow. "
+                "For time-series data prefer area or line. For a single number prefer gauge. "
                 "For multi-series data pass series instead of labels+values."
             ),
             "parameters": {
@@ -15314,14 +15526,16 @@ _AGENT_TOOLS: list[dict] = [
                 "properties": {
                     "chart_type": {
                         "type": "string",
-                        "enum": ["bar", "horizontal_bar", "line", "pie", "donut"],
-                        "description": "Chart type.",
+                        "enum": ["bar", "horizontal_bar", "line", "area", "stacked_bar",
+                                 "scatter", "combo", "pie", "donut", "gauge", "treemap", "funnel"],
+                        "description": "Chart type — see tool description for guidance.",
                     },
                     "title": {"type": "string", "description": "Chart title."},
+                    "description": {"type": "string", "description": "Optional caption rendered below the chart (1-2 sentences of insight)."},
                     "labels": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Category labels (x-axis for bar/line, slice names for pie).",
+                        "description": "Category labels (x-axis for bar/line, slice names for pie/donut/funnel).",
                     },
                     "values": {
                         "type": "array",
@@ -15330,17 +15544,40 @@ _AGENT_TOOLS: list[dict] = [
                     },
                     "series": {
                         "type": "array",
-                        "description": "Multi-series data. Each item: {name, data: [numbers]}.",
+                        "description": "Multi-series data. Each item: {name, data: [numbers], chart_type?: 'bar'|'line', right_axis?: bool}.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
                                 "data": {"type": "array", "items": {"type": "number"}},
+                                "chart_type": {"type": "string", "description": "Per-series type for combo charts (bar or line)."},
+                                "right_axis": {"type": "boolean", "description": "Plot on secondary y-axis (combo only)."},
                             },
                         },
                     },
-                    "x_label": {"type": "string", "description": "X-axis label (bar/line only)."},
-                    "y_label": {"type": "string", "description": "Y-axis label (bar/line only)."},
+                    "data_points": {
+                        "type": "array",
+                        "description": "Scatter chart data. Each item: {x: number, y: number, name?: string}.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "number"}, "y": {"type": "number"}, "name": {"type": "string"},
+                            },
+                        },
+                    },
+                    "x_label": {"type": "string", "description": "X-axis label."},
+                    "y_label": {"type": "string", "description": "Y-axis label."},
+                    "value":     {"type": "number", "description": "Gauge: the single value to display."},
+                    "min_value": {"type": "number", "description": "Gauge: scale minimum (default 0)."},
+                    "max_value": {"type": "number", "description": "Gauge: scale maximum (default 100)."},
+                    "height":    {"type": "integer", "description": "Chart height in px (default 320, range 200-700)."},
+                    "stacked":   {"type": "boolean", "description": "Stack bar series (shorthand for stacked_bar)."},
+                    "show_labels": {"type": "boolean", "description": "Show data value labels on bars/slices."},
+                    "color_scheme": {
+                        "type": "string",
+                        "enum": ["default", "warm", "cool", "traffic", "couchbase", "monochrome"],
+                        "description": "Color palette. traffic=green/yellow/red for severity; couchbase=brand colors.",
+                    },
                 },
                 "required": ["chart_type", "title"],
             },
@@ -15740,71 +15977,174 @@ _ARTIFACT_RE = re.compile(r"```(echart|table)\n(.*?)\n```", re.DOTALL)
 
 def _build_agent_echart_option(args: dict) -> dict:
     """Build an ECharts option dict from generate_chart tool arguments."""
-    chart_type = (args.get("chart_type") or "bar").lower()
-    title      = args.get("title") or ""
-    labels     = args.get("labels") or []
-    values     = args.get("values") or []
-    series     = args.get("series") or []
-    x_label    = args.get("x_label") or ""
-    y_label    = args.get("y_label") or ""
+    chart_type   = (args.get("chart_type") or "bar").lower()
+    title        = args.get("title") or ""
+    labels       = args.get("labels") or []
+    values       = args.get("values") or []
+    series       = args.get("series") or []
+    x_label      = args.get("x_label") or ""
+    y_label      = args.get("y_label") or ""
+    height       = max(200, min(700, int(args.get("height") or 320)))
+    stacked      = bool(args.get("stacked"))
+    show_labels  = bool(args.get("show_labels"))
+    description  = args.get("description") or ""
+    color_scheme = (args.get("color_scheme") or "default").lower()
 
-    _CB_PALETTE = ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6",
-                   "#06B6D4","#F97316","#84CC16","#EC4899","#6B7280"]
+    _PALETTES: dict = {
+        "default":    ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6","#06B6D4","#F97316","#84CC16","#EC4899","#6B7280"],
+        "warm":       ["#EF4444","#F97316","#F59E0B","#EAB308","#84CC16","#22C55E","#F43F5E","#FB7185","#FBBF24","#A3E635"],
+        "cool":       ["#06B6D4","#3B82F6","#8B5CF6","#A855F7","#EC4899","#10B981","#0EA5E9","#6366F1","#7C3AED","#14B8A6"],
+        "traffic":    ["#22C55E","#F59E0B","#EF4444","#84CC16","#FBBF24","#F87171"],
+        "couchbase":  ["#EA2328","#F59E0B","#3B82F6","#10B981","#8B5CF6","#06B6D4","#F97316","#6B7280"],
+        "monochrome": ["#1e3a8a","#1d4ed8","#2563eb","#3b82f6","#60a5fa","#93c5fd","#bfdbfe","#dbeafe"],
+    }
+    _PAL = _PALETTES.get(color_scheme, _PALETTES["default"])
 
-    if chart_type in ("pie", "donut"):
-        if series:
-            data = [{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
-        else:
-            data = [{"name": l, "value": v} for l, v in zip(labels, values)]
-        radius = ["40%", "70%"] if chart_type == "donut" else "60%"
+    # ── Gauge ──────────────────────────────────────────────────────────────────
+    if chart_type == "gauge":
+        gval = float(args.get("value") or (values[0] if values else 0))
+        gmin = float(args.get("min_value") or 0)
+        gmax = float(args.get("max_value") or 100)
+        return {
+            "title":   {"text": title, "left": "center", "top": "bottom"},
+            "series":  [{
+                "type": "gauge", "min": gmin, "max": gmax,
+                "detail": {"formatter": "{value}", "fontSize": 22, "color": "#1d4ed8"},
+                "data": [{"value": round(gval, 2), "name": title}],
+                "axisLine": {"lineStyle": {"width": 22, "color": [
+                    [0.3, "#22C55E"], [0.7, "#F59E0B"], [1.0, "#EF4444"],
+                ]}},
+                "pointer": {"itemStyle": {"color": "auto"}},
+                "axisTick": {"distance": -22, "length": 6, "lineStyle": {"color": "#fff", "width": 2}},
+                "splitLine": {"distance": -22, "length": 14, "lineStyle": {"color": "#fff", "width": 3}},
+                "axisLabel": {"color": "inherit", "distance": 28, "fontSize": 11},
+            }],
+            "_height": height, "_description": description,
+        }
+
+    # ── Treemap ─────────────────────────────────────────────────────────────────
+    if chart_type == "treemap":
+        tree_data = (args.get("data_points")
+                     or [{"name": l, "value": v} for l, v in zip(labels, values)])
+        return {
+            "title":  {"text": title, "left": "center"},
+            "color":  _PAL,
+            "series": [{"type": "treemap", "data": tree_data,
+                        "label": {"show": True, "formatter": "{b}: {c}"},
+                        "emphasis": {"label": {"fontSize": 14}}}],
+            "_height": height, "_description": description,
+        }
+
+    # ── Funnel ──────────────────────────────────────────────────────────────────
+    if chart_type == "funnel":
+        funnel_data = ([{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
+                       if series else [{"name": l, "value": v} for l, v in zip(labels, values)])
         return {
             "title":   {"text": title, "left": "center"},
             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
             "legend":  {"orient": "vertical", "left": "left"},
-            "color":   _CB_PALETTE,
-            "series":  [{"type": "pie", "radius": radius, "data": data,
-                         "label": {"formatter": "{b}: {c}"}}],
+            "color":   _PAL,
+            "series":  [{"type": "funnel", "data": funnel_data,
+                         "label": {"position": "inside", "formatter": "{b}: {c}"}}],
+            "_height": height, "_description": description,
         }
 
-    ec_type = "line" if chart_type == "line" else "bar"
+    # ── Scatter ─────────────────────────────────────────────────────────────────
+    if chart_type == "scatter":
+        pts = (args.get("data_points")
+               or [{"x": i, "y": v, "name": l} for i, (l, v) in enumerate(zip(labels, values))])
+        return {
+            "title":   {"text": title},
+            "tooltip": {"trigger": "item"},
+            "color":   _PAL,
+            "xAxis":   {"type": "value", "name": x_label or "X", "scale": True},
+            "yAxis":   {"type": "value", "name": y_label or "Y", "scale": True},
+            "series":  [{"type": "scatter", "symbolSize": 12,
+                         "data": [[p.get("x", 0), p.get("y", 0)] for p in pts],
+                         "label": {"show": show_labels, "formatter": "function(p){return p.data[0]+', '+p.data[1];}"}}],
+            "_height": height, "_description": description,
+        }
+
+    # ── Pie / Donut ─────────────────────────────────────────────────────────────
+    if chart_type in ("pie", "donut"):
+        pie_data = ([{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
+                    if series else [{"name": l, "value": v} for l, v in zip(labels, values)])
+        radius   = ["40%", "70%"] if chart_type == "donut" else "60%"
+        lbl_opt  = {"formatter": "{b}: {c} ({d}%)"} if show_labels else {"show": False}
+        return {
+            "title":   {"text": title, "left": "center"},
+            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+            "legend":  {"orient": "vertical", "left": "left"},
+            "color":   _PAL,
+            "series":  [{"type": "pie", "radius": radius, "data": pie_data, "label": lbl_opt}],
+            "_height": height, "_description": description,
+        }
+
+    # ── Bar / Line / Area / Stacked bar / Combo ──────────────────────────────────
+    _is_combo    = chart_type == "combo"
+    _is_stacked  = stacked or chart_type == "stacked_bar"
+    _default_type = "line" if chart_type in ("line", "area") else "bar"
+
+    def _mk_series(s_name, s_data, s_ctype=None):
+        st = s_ctype or _default_type
+        es: dict = {"name": s_name, "type": st, "data": s_data}
+        if st == "line" or chart_type == "area":
+            es["smooth"] = True
+        if chart_type == "area":
+            es["areaStyle"] = {"opacity": 0.25}
+        if _is_stacked:
+            es["stack"] = "total"
+            if show_labels:
+                es["label"] = {"show": True, "position": "inside"}
+        elif show_labels:
+            es["label"] = {"show": True, "position": "top"}
+        return es
+
     if series:
-        ec_series = [{"name": s["name"], "type": ec_type, "data": s.get("data") or []}
-                     for s in series]
+        ec_series = [
+            _mk_series(s["name"], s.get("data") or [], s.get("chart_type") if _is_combo else None)
+            for s in series
+        ]
         legend_data = [s["name"] for s in series]
+        has_right = _is_combo and any(s.get("right_axis") for s in series)
+        if has_right:
+            for i, s in enumerate(series):
+                if s.get("right_axis"):
+                    ec_series[i]["yAxisIndex"] = 1
     else:
-        ec_series = [{"type": ec_type, "data": values}]
+        ec_series   = [_mk_series("", values)]
         legend_data = []
+        has_right   = False
 
-    cat_axis = {"type": "category", "data": labels}
+    cat_axis: dict = {"type": "category", "data": labels}
     val_axis: dict = {"type": "value"}
-    if x_label: cat_axis["name"] = x_label       # type: ignore[index]
+    if x_label: cat_axis["name"] = x_label
     if y_label: val_axis["name"] = y_label
-
-    smooth = chart_type == "line"
-    for s in ec_series:
-        if smooth:
-            s["smooth"] = True
 
     if chart_type == "horizontal_bar":
         return {
             "title":   {"text": title},
             "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
             "legend":  {"data": legend_data} if legend_data else {},
-            "color":   _CB_PALETTE,
-            "grid":    {"left": "20%"},
+            "color":   _PAL,
+            "grid":    {"left": "22%", "right": "6%"},
             "xAxis":   val_axis,
             "yAxis":   cat_axis,
             "series":  ec_series,
+            "_height": height, "_description": description,
         }
-    return {
+
+    base: dict = {
         "title":   {"text": title},
         "tooltip": {"trigger": "axis"},
         "legend":  {"data": legend_data} if legend_data else {},
-        "color":   _CB_PALETTE,
+        "color":   _PAL,
         "xAxis":   cat_axis,
-        "yAxis":   val_axis,
+        "yAxis":   [val_axis, {"type": "value"}] if has_right else val_axis,
         "series":  ec_series,
+        "_height": height, "_description": description,
     }
+    return base
 
 
 def _agent_filters_from_args(args: dict) -> dict:
