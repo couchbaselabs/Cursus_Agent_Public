@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.3.10"
+__version__ = "1.4.0"
 
 import asyncio
 import threading
@@ -6461,7 +6461,14 @@ def main_page():
                                         "- generate_table: MANDATORY when the user asks for a table, spreadsheet, or "
                                         "exportable data. Call this tool — do NOT render a markdown table. Always call "
                                         "generate_table BEFORE your final summary text so the table appears above your "
-                                        "explanation. Produces real CSV and Excel download buttons."
+                                        "explanation. Produces real CSV and Excel download buttons.\n"
+                                        "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
+                                        "- vector_search: semantic/similarity search — use when keyword filters won't capture the concept.\n"
+                                        "- get_cluster_health: summary of all clusters for a customer from stored snapshots.\n"
+                                        "- fetch_snapshots: pull snapshot listing from Analytics API → saves stubs to CB. Fast.\n"
+                                        "- backfill_snapshot_topology: enrich CB snapshot stubs with CB version, nodes, bad/warn. Call after fetch_snapshots.\n"
+                                        "- scrape_customer_tickets: scrape fresh tickets from Supportal (capped at 50). Use when tickets are missing.\n"
+                                        "- score_ticket: LLM-score a single ticket for stars, temperature, complexity."
                                     )
                                     if _cust_agent and _cust_agent.lower() != "all customers":
                                         _agent_sys += (
@@ -6484,6 +6491,15 @@ def main_page():
                                             _agent_msgs.append(_h)
                                     _agent_msgs.append({"role": "user", "content": question})
                                     chat_status.set_text("Agent — planning tool calls …")
+                                    _emb_p, _emb_m, _emb_k, _emb_u, _emb_d, _ = _get_embed_config()
+                                    _agent_ctx = {
+                                        "provider": provider, "model": model,
+                                        "api_key": api_key, "base_url": base_url,
+                                        "emb_provider": _emb_p, "emb_model": _emb_m,
+                                        "emb_api_key": _emb_k, "emb_base_url": _emb_u,
+                                        "emb_dims": _emb_d,
+                                        "cookie": (cookie_input.value or "").strip() or _get_profile_cookie(),
+                                    }
                                     answer = await run.io_bound(
                                         call_llm_with_tools,
                                         _agent_msgs,
@@ -6493,6 +6509,7 @@ def main_page():
                                         8192,
                                         5,
                                         _cust_agent,
+                                        _agent_ctx,
                                     )
                                     # ── Chart enforcement ─────────────────────────────────────────
                                     # Some models describe charts in text instead of calling
@@ -6518,7 +6535,7 @@ def main_page():
                                                 _AGENT_TOOLS,
                                                 *_cb_agent,
                                                 provider, model, api_key, base_url,
-                                                2048, 2, _cust_agent,
+                                                2048, 2, _cust_agent, _agent_ctx,
                                             )
                                             if _chart_ans and "```echart" in _chart_ans:
                                                 # Strip placeholder text from original answer then
@@ -15397,6 +15414,151 @@ _AGENT_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "vector_search",
+            "description": (
+                "Semantic / similarity search over tickets using vector embeddings. "
+                "Use this when the user wants to find tickets related to a concept, error message, "
+                "or symptom — even if exact keywords don't match. "
+                "Complements query_tickets (keyword/filter) with meaning-based retrieval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language description of what to find, e.g. 'memory eviction issues on data nodes'.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 10, max 30).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_cluster_health",
+            "description": (
+                "Return a cluster health summary for a customer using stored snapshot topology data. "
+                "Shows active clusters, CB versions, node counts, bad/warn item counts, and deprecation status. "
+                "Use this when the user asks about cluster state, infrastructure health, or version distribution."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name.",
+                    },
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_snapshots",
+            "description": (
+                "Fetch snapshot listing for a customer from the Supportal Analytics API and save stubs to Couchbase. "
+                "This is a fast single-query operation that returns snapshot IDs and associated ticket IDs. "
+                "Topology detail (CB version, node layout) is NOT fetched — call backfill_snapshot_topology after this. "
+                "Use when the user says 'get snapshots', 'refresh snapshot list', or before checking cluster health."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max snapshots to fetch (default 100).",
+                    },
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "backfill_snapshot_topology",
+            "description": (
+                "Fetch full cluster topology (CB version, nodes, services, bad/warn items) for snapshot stubs "
+                "stored in Couchbase that are missing topology detail. "
+                "Call this after fetch_snapshots to enrich the stubs. "
+                "Processes up to max_stubs snapshots per call to keep response time reasonable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name.",
+                    },
+                    "max_stubs": {
+                        "type": "integer",
+                        "description": "Max stubs to enrich in this call (default 10, max 25).",
+                    },
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scrape_customer_tickets",
+            "description": (
+                "Scrape fresh tickets for a customer directly from Supportal and save them to Couchbase. "
+                "Use when the user wants to pull new tickets that aren't in the local DB yet, or do a fresh scrape. "
+                "Capped at max_tickets per call to stay fast. For refreshing existing stale tickets use rescrape_customer_tickets instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name as it appears in Supportal.",
+                    },
+                    "max_tickets": {
+                        "type": "integer",
+                        "description": "Max tickets to scrape (default 25, max 50).",
+                    },
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "score_ticket",
+            "description": (
+                "Run LLM scoring on a single ticket to generate stars (1-5), temperature (cold/warm/hot), "
+                "complexity, resolution_quality, and communication_clarity scores. "
+                "Use when the user asks about ticket quality, complexity, or when a ticket has no scores yet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "The numeric ticket ID to score.",
+                    },
+                },
+                "required": ["ticket_id"],
+            },
+        },
+    },
 ]
 
 
@@ -15512,8 +15674,16 @@ def _execute_agent_tool(
     cb_url: str, bucket: str, username: str, password: str,
     use_tls: bool, scope: str, collection: str,
     default_customer: str = "",
+    ctx: dict | None = None,
 ) -> str:
-    """Execute an agent tool call and return a string result for the LLM."""
+    """Execute an agent tool call and return a string result for the LLM.
+
+    ctx carries LLM/embedding/cookie config for tools that need to call out:
+      provider, model, api_key, base_url,
+      emb_provider, emb_model, emb_api_key, emb_base_url, emb_dims,
+      cookie
+    """
+    ctx = ctx or {}
     if name == "query_tickets":
         limit = min(int(args.get("limit") or 50), 200)
         filters = _agent_filters_from_args(args)
@@ -16102,6 +16272,287 @@ LIMIT {limit}
             payload["description"] = description
         return "```table\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
 
+    elif name == "vector_search":
+        query = (args.get("query") or "").strip()
+        if not query:
+            return "Error: query is required."
+        limit = min(int(args.get("limit") or 10), 30)
+        emb_p   = ctx.get("emb_provider", "ollama")
+        emb_m   = ctx.get("emb_model", "nomic-embed-text")
+        emb_k   = ctx.get("emb_api_key", "")
+        emb_u   = ctx.get("emb_base_url", "http://localhost:11434")
+        emb_d   = int(ctx.get("emb_dims") or 1024)
+        try:
+            qvec = embed_text(query, emb_p, emb_m, emb_k, emb_u, emb_d)
+        except Exception as exc:
+            return f"Embedding failed — check embedding provider config: {exc}"
+        try:
+            keys = vector_search_cb(qvec, cb_url, bucket, username, password, use_tls, scope, collection, top_k=limit)
+        except Exception as exc:
+            return f"Vector search failed: {exc}"
+        if not keys:
+            return "No semantically similar tickets found."
+        ticket_keys = [k for k in keys if k.startswith("ticket::")]
+        tickets = fetch_tickets_by_keys(ticket_keys, cb_url, bucket, username, password, use_tls, scope, collection)
+        if not tickets:
+            return "Vector search returned results but could not fetch ticket documents."
+        lines = [
+            f"**Semantic search results for:** *{query}*\n",
+            "| Ticket ID | Organization | Subject | Status | Priority | CB Version |",
+            "|-----------|-------------|---------|--------|----------|------------|",
+        ]
+        for t in tickets:
+            topo = t.get("snapshot_topology") or {}
+            cbv = topo.get("cb_version") or ""
+            subj = (t.get("subject") or "")[:55].replace("|", "/")
+            lines.append(
+                f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
+                f"| {t.get('status','')} | {t.get('priority','')} | {cbv} |"
+            )
+        return "\n".join(lines) + f"\n\n**{len(tickets)} results**"
+
+    elif name == "get_cluster_health":
+        org = (args.get("organization") or default_customer or "").strip()
+        if not org:
+            return "Error: organization is required."
+        # Load snapshots for this org from CB
+        try:
+            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            from couchbase.options import QueryOptions as _QO
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _snap_ks = f"`{bucket}`.`{scope}`.`snapshots`"
+            _rows = list(_cluster.query(
+                f"SELECT s.* FROM {_snap_ks} AS s "
+                f"WHERE LOWER(s.organization) LIKE $org "
+                f"ORDER BY s.date DESC LIMIT 500",
+                _QO(named_parameters={"org": f"%{org.lower()}%"}, timeout=timedelta(seconds=30)),
+            ))
+            _cluster.close()
+        except Exception as exc:
+            return f"Failed to load snapshots from Couchbase: {exc}"
+        if not _rows:
+            return (
+                f"No snapshots found for '{org}' in Couchbase. "
+                "Use fetch_snapshots to pull them from the Analytics API first."
+            )
+        tickets = tool_query_tickets(
+            {"organization": org}, cb_url, bucket, username, password, use_tls, scope, collection, limit=500,
+        )
+        health = build_cluster_health_data(_rows, tickets)
+        ci = health.get("cluster_index") or {}
+        if not ci:
+            return f"Snapshot data found ({len(_rows)} snapshots) but cluster index could not be built."
+        lines = [f"**Cluster health for {org}** — {len(_rows)} snapshots, {len(ci)} clusters\n"]
+        lines.append("| Cluster | CB Version | Nodes | Last Seen | Bad | Warn | Status |")
+        lines.append("|---------|------------|-------|-----------|-----|------|--------|")
+        for cid, c in sorted(ci.items(), key=lambda x: x[1].get("last_seen") or "", reverse=True):
+            name = c.get("cluster_name") or cid[:12]
+            ver  = (c.get("version_history") or [""])[-1] or "unknown"
+            nodes = c.get("node_count") or "?"
+            last  = (c.get("last_seen") or "")[:10]
+            bad   = c.get("bad_count", 0)
+            warn  = c.get("warn_count", 0)
+            status = "Deprecated" if c.get("is_deprecated") else ("Active" if c.get("is_active") else "Inactive")
+            lines.append(f"| {name} | {ver} | {nodes} | {last} | {bad} | {warn} | {status} |")
+        return "\n".join(lines)
+
+    elif name == "fetch_snapshots":
+        org   = (args.get("organization") or default_customer or "").strip()
+        limit = min(int(args.get("limit") or 100), 500)
+        if not org:
+            return "Error: organization is required."
+        cookie = ctx.get("cookie") or _get_profile_cookie()
+        if not cookie:
+            return "No session cookie available — paste a cookie in the Configuration tab first."
+        try:
+            stubs = fetch_snapshots_via_analytics(org, cookie, limit=limit)
+        except Exception as exc:
+            return f"fetch_snapshots failed: {exc}"
+        if not stubs:
+            return f"No snapshots found for '{org}' in the Analytics API."
+        # Save stubs to CB
+        _saved = 0
+        try:
+            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _col = _cluster.bucket(bucket).scope(scope).collection("snapshots")
+            for s in stubs:
+                try:
+                    _col.upsert(f"snapshot::{s['snap_id']}", s)
+                    _saved += 1
+                except Exception:
+                    pass
+            _cluster.close()
+        except Exception as exc:
+            return (
+                f"Fetched {len(stubs)} snapshot stubs from Analytics API but CB save failed: {exc}. "
+                "Check your Couchbase connection."
+            )
+        return (
+            f"Fetched and saved **{_saved} snapshot stubs** for '{org}'. "
+            f"Topology detail is not yet loaded — call backfill_snapshot_topology to enrich them."
+        )
+
+    elif name == "backfill_snapshot_topology":
+        org       = (args.get("organization") or default_customer or "").strip()
+        max_stubs = min(int(args.get("max_stubs") or 10), 25)
+        if not org:
+            return "Error: organization is required."
+        cookie = ctx.get("cookie") or _get_profile_cookie()
+        if not cookie:
+            return "No session cookie available — paste a cookie in the Configuration tab first."
+        # Load incomplete stubs from CB
+        try:
+            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            from couchbase.options import QueryOptions as _QO
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _snap_ks = f"`{bucket}`.`{scope}`.`snapshots`"
+            _incomplete = list(_cluster.query(
+                f"SELECT s.* FROM {_snap_ks} AS s "
+                f"WHERE LOWER(s.organization) LIKE $org "
+                f"AND (s.cb_version IS MISSING OR s.cb_version = '' OR s.cb_version IS NULL) "
+                f"ORDER BY s.date DESC LIMIT {max_stubs}",
+                _QO(named_parameters={"org": f"%{org.lower()}%"}, timeout=timedelta(seconds=30)),
+            ))
+            _cluster.close()
+        except Exception as exc:
+            return f"Failed to load incomplete snapshots from CB: {exc}"
+        if not _incomplete:
+            return f"No incomplete snapshot stubs found for '{org}' — topology already looks complete, or no snapshots exist. Try fetch_snapshots first."
+        def _noop_prog(msg, pct): pass
+        try:
+            enriched = scrape_snapshots_from_stubs(_incomplete, cookie, max_detail_workers=4, progress_cb=_noop_prog)
+        except Exception as exc:
+            return f"Topology backfill failed: {exc}"
+        # Save enriched docs back to CB
+        _saved = 0
+        try:
+            from couchbase.cluster import Cluster as _Cl2, ClusterOptions as _CO2
+            from couchbase.auth import PasswordAuthenticator as _PA2
+            _conn2 = _cb_conn_str(cb_url, use_tls)
+            _cl2 = _Cl2(_conn2, _CO2(_PA2(username, password)))
+            _cl2.wait_until_ready(timedelta(seconds=15))
+            _col2 = _cl2.bucket(bucket).scope(scope).collection("snapshots")
+            for s in enriched:
+                try:
+                    _col2.upsert(f"snapshot::{s['snap_id']}", s)
+                    _saved += 1
+                except Exception:
+                    pass
+            _cl2.close()
+        except Exception as exc:
+            return f"Enriched {len(enriched)} stubs but CB save failed: {exc}"
+        bad_total  = sum(s.get("bad_count", 0) for s in enriched)
+        warn_total = sum(s.get("warn_count", 0) for s in enriched)
+        return (
+            f"Topology backfill complete — **{_saved}/{len(_incomplete)} stubs enriched**. "
+            f"Total bad items: {bad_total}, warn items: {warn_total}. "
+            f"Call get_cluster_health to see the full summary."
+        )
+
+    elif name == "scrape_customer_tickets":
+        org         = (args.get("organization") or default_customer or "").strip()
+        max_tickets = min(int(args.get("max_tickets") or 25), 50)
+        if not org:
+            return "Error: organization is required."
+        cookie = ctx.get("cookie") or _get_profile_cookie()
+        if not cookie:
+            return "No session cookie available — paste a cookie in the Configuration tab first."
+        def _noop_prog(msg, pct): pass
+        try:
+            scraped = scrape_with_cookie(
+                org, cookie,
+                progress_cb=_noop_prog,
+                max_tickets=max_tickets,
+            )
+        except Exception as exc:
+            return f"Scrape failed: {exc}"
+        if not scraped:
+            return f"Scrape returned no tickets for '{org}'. Check the customer name matches Supportal exactly."
+        # Save to CB
+        _saved = 0
+        try:
+            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _col = _cluster.bucket(bucket).scope(scope).collection(collection)
+            for t in scraped:
+                tid = t.get("ticket_id")
+                if not tid:
+                    continue
+                try:
+                    _col.upsert(f"ticket::{tid}", {**t, "type": "ticket", "last_scraped_at": int(time.time())})
+                    _saved += 1
+                except Exception:
+                    pass
+            _cluster.close()
+        except Exception as exc:
+            return f"Scraped {len(scraped)} tickets but CB save failed: {exc}"
+        return (
+            f"Scraped and saved **{_saved} tickets** for '{org}' "
+            f"(limit was {max_tickets}). Use query_tickets to explore them."
+        )
+
+    elif name == "score_ticket":
+        ticket_id = str(args.get("ticket_id") or "").strip()
+        if not ticket_id:
+            return "Error: ticket_id is required."
+        tickets = fetch_tickets_by_keys(
+            [f"ticket::{ticket_id}"], cb_url, bucket, username, password, use_tls, scope, collection,
+        )
+        if not tickets:
+            return f"Ticket {ticket_id} not found in Couchbase."
+        t = tickets[0]
+        provider = ctx.get("provider", "claude")
+        model    = ctx.get("model", "claude-sonnet-4-6")
+        api_key  = ctx.get("api_key", "")
+        base_url = ctx.get("base_url", "")
+        try:
+            scored = score_tickets_batch([t], provider, model, api_key, base_url)
+        except Exception as exc:
+            return f"Scoring failed: {exc}"
+        if not scored:
+            return f"Scoring returned no results for ticket {ticket_id}."
+        s = scored[0]
+        # Save scores back to CB
+        try:
+            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _col = _cluster.bucket(bucket).scope(scope).collection(collection)
+            try:
+                existing = _col.get(f"ticket::{ticket_id}").content_as[dict]
+                existing.update({k: v for k, v in s.items() if v is not None})
+                _col.upsert(f"ticket::{ticket_id}", existing)
+            except Exception:
+                pass
+            _cluster.close()
+        except Exception:
+            pass
+        lines = [f"**Score results for ticket {ticket_id}**\n"]
+        for field in ("stars", "temperature", "complexity", "resolution_quality",
+                      "response_timeliness", "communication_clarity"):
+            val = s.get(field)
+            if val is not None:
+                lines.append(f"- **{field}**: {val}")
+        summary = s.get("interaction_summary") or s.get("summary") or ""
+        if summary:
+            lines.append(f"\n**Summary:** {summary[:500]}")
+        return "\n".join(lines)
+
     else:
         return f"Unknown tool: {name}"
 
@@ -16196,6 +16647,7 @@ def call_llm_with_tools(
     max_tokens: int = 8192,
     max_rounds: int = 5,
     default_customer: str = "",
+    ctx: dict | None = None,
 ) -> str:
     """
     Agentic tool-calling loop. Sends messages + tools to the LLM, executes
@@ -16305,7 +16757,7 @@ def call_llm_with_tools(
                         _tc_result = _execute_agent_tool(
                             _tc_name, _tc_args,
                             cb_url, bucket, username, password, use_tls, scope, collection,
-                            default_customer=default_customer,
+                            default_customer=default_customer, ctx=ctx,
                         )
                         print(f"[agent] text-call result length={len(_tc_result)}")
                         _collect_artifact(_tc_result)
@@ -16344,7 +16796,7 @@ def call_llm_with_tools(
                     result = _execute_agent_tool(
                         _fn.name, _args,
                         cb_url, bucket, username, password, use_tls, scope, collection,
-                        default_customer=default_customer,
+                        default_customer=default_customer, ctx=ctx,
                     )
                     print(f"[agent] tool result length={len(result)}")
                     _collect_artifact(result)
@@ -16409,7 +16861,7 @@ def call_llm_with_tools(
                 result = _execute_agent_tool(
                     tb.name, _args,
                     cb_url, bucket, username, password, use_tls, scope, collection,
-                    default_customer=default_customer,
+                    default_customer=default_customer, ctx=ctx,
                 )
                 _collect_artifact(result)
                 tool_results.append({

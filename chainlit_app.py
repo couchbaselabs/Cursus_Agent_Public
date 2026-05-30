@@ -223,6 +223,13 @@ def _system_prompt(customer: str) -> str:
         "Call this tool — do NOT describe a chart in text.\n"
         "- generate_table: MANDATORY when the user asks for a table or exportable data. "
         "Call this tool — do NOT render markdown tables.\n"
+        "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
+        "- vector_search: semantic/similarity search — finds tickets by meaning, not just keywords.\n"
+        "- get_cluster_health: cluster health summary from stored snapshots (versions, nodes, bad/warn).\n"
+        "- fetch_snapshots: pull snapshot listing from Analytics API and save stubs to CB.\n"
+        "- backfill_snapshot_topology: enrich snapshot stubs with topology detail. Call after fetch_snapshots.\n"
+        "- scrape_customer_tickets: scrape fresh tickets from Supportal (capped). Use when tickets are missing.\n"
+        "- score_ticket: LLM-score a single ticket for stars, temperature, complexity.\n"
     )
     if customer and customer.lower() != "all customers":
         prompt += (
@@ -568,6 +575,18 @@ async def on_message(message: cl.Message):
 
     provider, model, api_key, base_url = _llm_config(profile, overrides)
     cb = _cb_args(profile)
+    agent_ctx = {
+        "provider": provider, "model": model,
+        "api_key": api_key, "base_url": base_url,
+        "emb_provider": profile.get("emb_provider", "ollama"),
+        "emb_model":    profile.get("emb_ollama_model") or profile.get("emb_lms_model") or
+                        profile.get("emb_gemini_model") or profile.get("emb_openai_model") or "nomic-embed-text",
+        "emb_api_key":  profile.get("emb_gemini_key") or profile.get("emb_openai_key") or "",
+        "emb_base_url": profile.get("emb_ollama_url") or profile.get("emb_lms_url") or "",
+        "emb_dims":     int(profile.get("emb_ollama_dims") or profile.get("emb_lms_dims") or
+                            profile.get("emb_gemini_dims") or profile.get("emb_openai_dims") or 1024),
+        "cookie":       profile.get("cookie") or "",
+    }
 
     msgs = [{"role": "system", "content": _system_prompt(customer)}]
     msgs.extend(history[-10:])
@@ -584,7 +603,7 @@ async def on_message(message: cl.Message):
                     msgs, app._AGENT_TOOLS,
                     *cb,
                     provider, model, api_key, base_url,
-                    8192, 5, customer,
+                    8192, 5, customer, agent_ctx,
                 ),
             )
             step.output = "Done."
