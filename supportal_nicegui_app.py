@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.3.8"
+__version__ = "1.3.9"
 
 import asyncio
 import threading
@@ -1754,31 +1754,142 @@ def _make_api_session(cookie: str) -> requests.Session:
 
 
 def query_supportal_analytics(statement: str, cookie: str | None = None) -> list[dict]:
-    """POST /v2/analytics/query with a SQL++ statement; returns result rows as dicts."""
+    """POST /api/support360/query with a SQL++ statement; returns result rows as dicts."""
     if not cookie:
         cookie = _get_profile_cookie()
     if not cookie:
         raise RuntimeError("No session cookie — log in first.")
-    sess = _make_api_session(cookie)
+    url = f"{BASE_URL}/api/support360/query"
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Cookie": cookie,
+    }
     try:
-        r = sess.get(
-            f"{BASE_URL}/v2/analytics/query",
-            params={"statement": statement},
+        resp = requests.post(
+            url,
+            json={"statement": statement, "scope": "v1"},
+            headers=headers,
             timeout=60,
+            verify=False,
         )
     except Exception as exc:
         raise RuntimeError(f"Analytics request failed: {exc}") from exc
-    if r.status_code != 200:
-        raise RuntimeError(f"Analytics HTTP {r.status_code}: {r.text[:400]}")
+    resp.raise_for_status()
+    body = resp.text.strip()
+    if not body:
+        raise ValueError(
+            f"Analytics endpoint returned HTTP {resp.status_code} with empty body. "
+            "Session cookie is likely missing or expired."
+        )
+    if body.lstrip().startswith("<"):
+        snippet = body[:200].replace("\n", " ")
+        raise ValueError(
+            f"Analytics endpoint returned HTML (HTTP {resp.status_code}). "
+            f"Session cookie is missing or expired. Response: {snippet!r}"
+        )
     try:
-        body = r.json()
+        payload = resp.json()
     except Exception:
-        raise RuntimeError(f"Analytics non-JSON response: {r.text[:300]}")
-    status = body.get("status")
-    if status and status != "success":
-        errors = body.get("errors") or body.get("error") or []
-        raise RuntimeError(f"Analytics error ({status}): {errors}")
-    return body.get("results", []) or []
+        raise ValueError(f"Analytics non-JSON response: {body[:300]}")
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    rows = payload.get("results") or payload.get("rows") or []
+    if not isinstance(rows, list):
+        raise ValueError(f"Unexpected analytics response shape: {list(payload.keys())}")
+    return rows
+
+
+def fetch_snapshots_via_analytics(
+    customer_name: str,
+    cookie: str | None,
+    limit: int = 200,
+    progress_cb: Callable[[str, float], None] | None = None,
+) -> list[dict]:
+    """Fetch snapshot listing + Zendesk ticket IDs via the Supportal analytics API.
+
+    Tries exact match, then case-insensitive, then LIKE prefix — so partial or
+    differently-cased customer names still resolve.
+    """
+    def _log(msg: str, pct: float = 0.0):
+        print(f"[SNAP-ANALYTICS] {msg}")
+        if progress_cb:
+            progress_cb(msg, pct)
+
+    customer_name = customer_name.strip().strip('"\'')
+    _log(f"Querying analytics for customer: {customer_name!r}", 0.05)
+
+    def _make_statement(name_expr: str) -> str:
+        return (
+            "SELECT "
+            "REPLACE(META(sn).id, \"Snapshot::\", \"\") AS snap_id, "
+            "sn.`timestamp` AS date, "
+            "sn.`uuid` AS cluster_uuid, "
+            "cl.`ui_name` AS cluster_name, "
+            "cu.`name` AS organization, "
+            "sn.`zendesk` AS ticket_ids "
+            "FROM snapshot sn "
+            "JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.`uuid`) "
+            "JOIN customer cu ON META(cu).id = (\"Customer::\" || cl.`customer`) "
+            f"WHERE {name_expr} "
+            "ORDER BY sn.`timestamp` DESC "
+            f"LIMIT {int(limit)}"
+        )
+
+    rows = query_supportal_analytics(
+        _make_statement(f"cu.`name` = {json.dumps(customer_name)}"), cookie
+    )
+    if not rows:
+        _log(f"No exact match for {customer_name!r} — retrying with LOWER() match …", 0.1)
+        rows = query_supportal_analytics(
+            _make_statement(f"LOWER(cu.`name`) = {json.dumps(customer_name.lower())}"), cookie
+        )
+    if not rows:
+        like_val = customer_name.lower().replace("%", "\\%").replace("_", "\\_") + "%"
+        _log(f"No case-insensitive match — retrying with LIKE {like_val!r} …", 0.15)
+        rows = query_supportal_analytics(
+            _make_statement(f"LOWER(cu.`name`) LIKE {json.dumps(like_val)}"), cookie
+        )
+
+    if not rows:
+        raise ValueError(
+            f"No snapshots found for customer {customer_name!r} in the analytics database. "
+            "Check the customer name matches Supportal exactly and that the session cookie is valid."
+        )
+    _log(f"Analytics returned {len(rows)} snapshot records.", 0.5)
+
+    import datetime as _dt
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    results: list[dict] = []
+    for row in rows:
+        snap_id = row.get("snap_id") or ""
+        cluster_uuid = row.get("cluster_uuid") or (snap_id.split("::")[0] if "::" in snap_id else "")
+        ticket_ids = [str(t) for t in (row.get("ticket_ids") or []) if t]
+        enc = urllib.parse.quote(snap_id, safe="")
+        results.append({
+            "snap_id":            snap_id,
+            "cluster_id":         cluster_uuid,
+            "url":                f"{BASE_URL}/snapshot/{enc}",
+            "date":               row.get("date") or "",
+            "organization":       row.get("organization") or customer_name,
+            "customer_url":       f"{BASE_URL}/customer/{urllib.parse.quote(customer_name, safe='')}",
+            "cluster_name":       row.get("cluster_name") or "",
+            "cluster_uuid":       cluster_uuid,
+            "capella_cluster_id": "",
+            "topology":           {},
+            "ticket_ids":         ticket_ids,
+            "scraped_at":         now_iso,
+            "bad_count": 0, "warn_count": 0, "bad_items": [], "warn_items": [],
+            "cb_version": "", "node_count": 0, "bucket_names": [],
+            "auto_failover_seconds": None, "ram_per_node_mib": None,
+            "bucket_count": 0, "server_groups": [],
+        })
+
+    _log(f"Done — {len(results)} snapshots with ticket IDs.", 1.0)
+    return results
 
 
 def fetch_ticket_api(ticket_id: str, session: requests.Session) -> dict:
@@ -9471,61 +9582,10 @@ def main_page():
                                 limit = int(ch_analytics_limit.value or 200)
                                 cookie = (cookie_input.value or "").strip() or _get_profile_cookie()
 
-                                def _fetch_snap_listing():
-                                    """Query Supportal Analytics V1 SQL++ for snapshot listing."""
-                                    if not cookie:
-                                        return []
-                                    # Resolve canonical customer name via redirect (slug may differ from display name)
-                                    org = cust_name
-                                    try:
-                                        sess_tmp = _make_api_session(cookie)
-                                        head = sess_tmp.get(f"{BASE_URL}/customer/{urllib.parse.quote(org, safe='')}", timeout=15, allow_redirects=True)
-                                        m = re.search(r"/customer/([^/?#]+)", head.url)
-                                        if m:
-                                            org = urllib.parse.unquote(m.group(1))
-                                    except Exception:
-                                        pass
-                                    # SQL++ across: snapshot (Snapshot::{uuid}::{idx}),
-                                    #               cluster  (Cluster::{uuid}),
-                                    #               customer (Customer::{name})
-                                    statement = (
-                                        "SELECT META(sn).id AS snapshot_key, "
-                                        "sn.`uuid` AS cluster_uuid, sn.`timestamp`, "
-                                        "sn.`zendesk` AS ticket_ids, cl.`ui_name` AS cluster_name "
-                                        "FROM snapshot sn "
-                                        "JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.`uuid`) "
-                                        "JOIN customer cu ON META(cu).id = (\"Customer::\" || cl.`customer`) "
-                                        f"WHERE cu.`name` = {json.dumps(org)} "
-                                        "ORDER BY sn.`timestamp` DESC "
-                                        f"LIMIT {limit}"
-                                    )
-                                    _prog(f"Querying Analytics V1 for {org!r}…", 0.2)
-                                    try:
-                                        rows = query_supportal_analytics(statement, cookie)
-                                    except Exception as exc:
-                                        _prog(f"Analytics error: {exc}", 0.5)
-                                        print(f"[Analytics] query error for {org!r}: {exc}")
-                                        return []
-                                    _prog(f"Analytics: {len(rows)} rows returned", 0.6)
-                                    snaps = []
-                                    for row in rows:
-                                        snapshot_key = row.get("snapshot_key", "")
-                                        # Strip "Snapshot::" prefix → hex32::N
-                                        snap_id = snapshot_key.removeprefix("Snapshot::") if snapshot_key else ""
-                                        if not snap_id:
-                                            continue
-                                        enc = urllib.parse.quote(snap_id, safe="")
-                                        snaps.append({
-                                            "snap_id":      snap_id,
-                                            "url":          f"{BASE_URL}/snapshot/{enc}",
-                                            "date":         row.get("timestamp"),
-                                            "cluster_name": row.get("cluster_name") or "",
-                                            "organization": org,
-                                            "ticket_ids":   row.get("ticket_ids") or [],
-                                        })
-                                    return snaps
-
-                                new_snaps = await run.io_bound(_fetch_snap_listing)
+                                new_snaps = await run.io_bound(
+                                    fetch_snapshots_via_analytics,
+                                    cust_name, cookie, limit, _prog,
+                                )
                                 # Merge with existing — skip snap_ids already present
                                 existing_ids = {s.get("snap_id", "") for s in ch_snap_state["snapshots"]}
                                 added = [s for s in new_snaps if s.get("snap_id", "") not in existing_ids]
