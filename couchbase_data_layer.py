@@ -175,16 +175,23 @@ class CouchbaseDataLayer(BaseDataLayer):
                 doc = self._col(_THREADS).get(f"thread::{thread_id}").content_as[dict]
             except Exception:
                 return None
-            steps = self._q(
+            raw_steps = self._q(
                 f"SELECT s.* FROM `{self._bucket_name}`.`{_SCOPE}`.`{_STEPS}` s "
                 f"WHERE s.threadId = $tid ORDER BY s.createdAt ASC",
                 tid=thread_id,
             )
-            elements = self._q(
+            raw_elements = self._q(
                 f"SELECT e.* FROM `{self._bucket_name}`.`{_SCOPE}`.`{_ELEMENTS}` e "
                 f"WHERE e.threadId = $tid",
                 tid=thread_id,
             )
+            # Filter out null rows and steps missing required fields that would
+            # cause "Cannot destructure property" errors in the Chainlit frontend.
+            steps = [
+                s for s in raw_steps
+                if isinstance(s, dict) and s.get("id") and s.get("type") not in ("run",)
+            ]
+            elements = [e for e in raw_elements if isinstance(e, dict) and e.get("id")]
             return ThreadDict(
                 id=doc["id"],
                 createdAt=doc["createdAt"],

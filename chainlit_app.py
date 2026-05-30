@@ -460,7 +460,9 @@ async def on_resume(thread: dict):
 
     # Fall back to step-based reconstruction if shared store is empty
     if not history:
-        for step in thread.get("steps", []):
+        for step in (thread.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
             stype   = step.get("type", "")
             content = step.get("output", "")
             if stype == "user_message" and content:
@@ -472,6 +474,8 @@ async def on_resume(thread: dict):
     cl.user_session.set("customer", customer)
     cl.user_session.set("overrides", overrides)
     cl.user_session.set("history", history)
+    # Mark as named so on_message doesn't clobber an existing thread name
+    cl.user_session.set("thread_named", True)
 
     # Re-display any charts/tables that were saved during this thread
     await _restore_assets(thread.get("id", ""))
@@ -588,40 +592,11 @@ async def on_message(message: cl.Message):
         "cookie":       profile.get("cookie") or "",
     }
 
-    msgs = [{"role": "system", "content": _system_prompt(customer)}]
-    msgs.extend(history[-10:])
-    msgs.append({"role": "user", "content": message.content})
-
-    answer = ""
-    async with cl.Step(name="Agent", type="run", show_input=False) as step:
-        step.output = f"Running with {provider} / {model} …"
-        loop = asyncio.get_event_loop()
-        try:
-            answer = await loop.run_in_executor(
-                None,
-                lambda: app.call_llm_with_tools(
-                    msgs, app._AGENT_TOOLS,
-                    *cb,
-                    provider, model, api_key, base_url,
-                    8192, 5, customer, agent_ctx,
-                ),
-            )
-            step.output = "Done."
-        except Exception as exc:
-            step.output = f"Error: {exc}"
-            await cl.Message(content=f"Agent error: {exc}", author="Supportal").send()
-            return
-
-    history.append({"role": "user",      "content": message.content})
-    history.append({"role": "assistant", "content": answer})
-    cl.user_session.set("history", history)
-
-    # Persist to shared history so NiceGUI chat sees the same conversation
-    profile = cl.user_session.get("profile") or _load_cb_settings()
-    await _save_shared_history(customer, history, profile)
-
-    # Name the thread from the first user message (prefix with customer if set)
-    if len(history) == 2:
+    # Name the thread from the first user message, before the agent call so it
+    # persists even if the agent errors out. Use a session flag instead of
+    # checking history length — history may already have items from shared store.
+    if not cl.user_session.get("thread_named"):
+        cl.user_session.set("thread_named", True)
         prefix = f"[{customer}] " if customer else ""
         thread_name = (prefix + message.content[:60].replace("\n", " ")).strip()
         dl = cl_data.get_data_layer()
@@ -630,6 +605,37 @@ async def on_message(message: cl.Message):
                 await dl.update_thread(cl.context.session.thread_id, name=thread_name)
             except Exception:
                 pass
+
+    msgs = [{"role": "system", "content": _system_prompt(customer)}]
+    msgs.extend(history[-10:])
+    msgs.append({"role": "user", "content": message.content})
+
+    # Run the agent in a thread executor. We intentionally do NOT wrap this in
+    # cl.Step — run-type steps stored in Couchbase cause a JS destructuring error
+    # in the frontend when the thread is later resumed.
+    loop = asyncio.get_event_loop()
+    answer = ""
+    try:
+        answer = await loop.run_in_executor(
+            None,
+            lambda: app.call_llm_with_tools(
+                msgs, app._AGENT_TOOLS,
+                *cb,
+                provider, model, api_key, base_url,
+                8192, 5, customer, agent_ctx,
+            ),
+        )
+    except Exception as exc:
+        await cl.Message(content=f"Agent error: {exc}", author="Supportal").send()
+        return
+
+    history.append({"role": "user",      "content": message.content})
+    history.append({"role": "assistant", "content": answer})
+    cl.user_session.set("history", history)
+
+    # Persist to shared history so NiceGUI chat sees the same conversation
+    profile = cl.user_session.get("profile") or _load_cb_settings()
+    await _save_shared_history(customer, history, profile)
 
     clean_text, elements, raw_artifacts = _parse_artifacts(answer)
 
