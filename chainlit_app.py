@@ -517,6 +517,11 @@ async def on_start():
             description="Leave blank to use the key saved in your NiceGUI profile.",
             initial="",
         ),
+        cl.input_widget.Slider(  # AFTER v1.5.0: history depth control
+            id="agent_context_depth", label="History depth",
+            description="Number of prior messages included in each agent call (default 10).",
+            initial=10, min=2, max=40, step=2,
+        ),
     ]).send()
 
     cl.user_session.set("profile", profile)
@@ -551,9 +556,10 @@ async def on_start():
 async def on_settings_update(settings: dict):
     customer  = (settings.get("customer") or "").strip()
     overrides = {
-        "provider": settings.get("provider") or "",
-        "model":    (settings.get("model") or "").strip(),
-        "api_key":  (settings.get("api_key") or "").strip(),
+        "provider":            settings.get("provider") or "",
+        "model":               (settings.get("model") or "").strip(),
+        "api_key":             (settings.get("api_key") or "").strip(),
+        "agent_context_depth": int(settings.get("agent_context_depth") or 10),  # AFTER v1.5.0
     }
     old_customer = cl.user_session.get("customer", "")
     cl.user_session.set("customer", customer)
@@ -617,14 +623,29 @@ async def on_message(message: cl.Message):
             except Exception:
                 pass
 
+    # AFTER v1.5.0: history depth — configurable via settings, default 10
+    _ctx_depth = int(overrides.get("agent_context_depth") or profile.get("agent_context_depth") or 10)
     msgs = [{"role": "system", "content": _system_prompt(customer)}]
-    msgs.extend(history[-10:])
+    msgs.extend(history[-_ctx_depth:])
     msgs.append({"role": "user", "content": message.content})
+
+    # AFTER v1.5.0: live tool-call status message
+    # We update this message as each tool fires so users see progress.
+    # It stays visible after the agent finishes as a tool trace.
+    loop = asyncio.get_event_loop()
+    _tool_log: list[str] = []
+    status_msg = await cl.Message(content="⏳ Agent starting…", author="Supportal").send()
+
+    def _cl_status_cb(tool_name: str):
+        _tool_log.append(tool_name)
+        async def _update():
+            status_msg.content = "🔧 " + " → ".join(f"`{t}`" for t in _tool_log) + " …"
+            await status_msg.update()
+        asyncio.run_coroutine_threadsafe(_update(), loop)
 
     # Run the agent in a thread executor. We intentionally do NOT wrap this in
     # cl.Step — run-type steps stored in Couchbase cause a JS destructuring error
     # in the frontend when the thread is later resumed.
-    loop = asyncio.get_event_loop()
     answer = ""
     try:
         answer = await loop.run_in_executor(
@@ -634,10 +655,23 @@ async def on_message(message: cl.Message):
                 *cb,
                 provider, model, api_key, base_url,
                 8192, 5, customer, agent_ctx,
+                _cl_status_cb,   # AFTER v1.5.0: live tool status
             ),
         )
+        # Update status to show completed tool trace
+        if _tool_log:
+            status_msg.content = "✅ " + " → ".join(f"`{t}`" for t in _tool_log)
+        else:
+            status_msg.content = "✅ Done"
+        await status_msg.update()
+
     except Exception as exc:
-        await cl.Message(content=f"Agent error: {exc}", author="Supportal").send()
+        # AFTER v1.5.0: friendly error + retry action
+        _friendly = app._classify_agent_error(exc)
+        status_msg.content = f"❌ {_friendly}"
+        await status_msg.update()
+        retry_action = cl.Action(name="retry", value=message.content, label="Retry", description="Re-run the same question")
+        await cl.Message(content=_friendly, actions=[retry_action], author="Supportal").send()
         return
 
     cl.user_session.set("_session_log", agent_ctx.get("_session_log", {}))  # AFTER v1.5.0
@@ -655,4 +689,29 @@ async def on_message(message: cl.Message):
     # Persist charts / tables to CB so they survive session restarts
     await _save_assets(cl.context.session.thread_id, message.content, raw_artifacts)
 
-    await cl.Message(content=clean_text, elements=elements, author="Supportal").send()
+    # AFTER v1.5.0: follow-up suggestion chips as Actions
+    _sugs = await loop.run_in_executor(
+        None,
+        lambda: app._generate_followup_suggestions(
+            message.content, answer, provider, model, api_key, base_url
+        ),
+    )
+    _actions = [
+        cl.Action(name="followup", value=s, label=s, description="Ask this follow-up")
+        for s in _sugs
+    ]
+    await cl.Message(content=clean_text, elements=elements, actions=_actions, author="Supportal").send()
+
+
+@cl.action_callback("retry")
+async def on_retry(action: cl.Action):
+    """Re-run the original question when the user clicks Retry after an error."""
+    fake_msg = cl.Message(content=action.value, author="User")
+    await on_message(fake_msg)
+
+
+@cl.action_callback("followup")
+async def on_followup(action: cl.Action):
+    """Send a follow-up suggestion as a new user message."""
+    fake_msg = cl.Message(content=action.value, author="User")
+    await on_message(fake_msg)

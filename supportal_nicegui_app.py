@@ -3105,6 +3105,9 @@ def main_page():
         "chat_session_id":  str(uuid.uuid4()),  # unique ID for current conversation session
         "chat_session_turns": [],       # [(question, answer, ts, ticket_ids)] for session storage
         "prior_session_block": "",      # fetched once on first turn; injected into every system prompt
+        # AFTER v1.5.0: chat flow
+        "last_suggestions": [],         # follow-up question chips rendered after last assistant message
+        "_session_log":     {},         # tool call tally carried across turns
     }
 
     # ── Restore from server-level state (survives page refresh) ─────────────
@@ -3114,6 +3117,7 @@ def main_page():
         state["customer_name"] = _SERVER_STATE["customer_name"]
 
     _cancel = threading.Event()   # set() to request cancellation of the active operation
+    _agent_cancel = threading.Event()  # AFTER v1.5.0: cancel for in-flight agent runs
 
     # ── Header ──────────────────────────────────────────────────────────────
     with ui.header().classes("bg-blue-900 text-white items-center px-6 py-3 shadow-md"):
@@ -5920,6 +5924,13 @@ def main_page():
                                     "Improves answer quality for small models (Gemma, Phi, Mistral) at the cost of "
                                     "3× more LLM calls. Recommended for complex aggregation, ranking, or trend questions."
                                 )
+                            # AFTER v1.5.0: history depth for agent mode
+                            agent_ctx_depth_input = ui.number(
+                                "History depth", value=10, min=2, max=40, step=2,
+                            ).classes("w-36").tooltip(
+                                "Number of prior chat messages included in each agent call. "
+                                "Lower = faster/cheaper; higher = better context for follow-ups."
+                            )
 
                         def _update_chat_mode_visibility():
                             mode = chat_mode_select.value
@@ -5928,6 +5939,7 @@ def main_page():
                             batch_parallel_input.set_visibility(mode == "Batch Map-Reduce")
                             compact_context_toggle.set_visibility(mode != "Agent")
                             deep_reason_toggle.set_visibility(mode != "Agent")
+                            agent_ctx_depth_input.set_visibility(mode == "Agent")  # AFTER v1.5.0
 
                         chat_mode_select.on("update:model-value", lambda _: _update_chat_mode_visibility())
                         _update_chat_mode_visibility()
@@ -6029,6 +6041,16 @@ def main_page():
                                                     f"navigator.clipboard.writeText({json.dumps(txt)})"
                                                 ),
                                             ).props("flat round dense color=gray").classes("mt-2 opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
+                                # AFTER v1.5.0: follow-up suggestion chips after last assistant message
+                                _suggestions = state.get("last_suggestions", [])
+                                if _suggestions and state["chat_history"] and state["chat_history"][-1]["role"] == "assistant":
+                                    with ui.row().classes("flex-wrap gap-1 mt-1 pl-2"):
+                                        ui.label("Follow up:").classes("text-xs text-gray-400 self-center")
+                                        for _sug in _suggestions:
+                                            async def _ask_suggestion(sug=_sug):
+                                                chat_input.value = sug
+                                                await _send_chat()
+                                            ui.chip(_sug, on_click=_ask_suggestion).props("outline color=primary").classes("text-xs cursor-pointer")
                             # Scroll to bottom
                             ui.run_javascript(
                                 "var el = document.querySelector('.chat-log-scroll');"
@@ -6493,7 +6515,8 @@ def main_page():
                                     if state.get("prior_session_block"):
                                         _agent_sys += "\n" + state["prior_session_block"]
                                     _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
-                                    for _h in state["chat_history"][-(10):-1]:
+                                    _ctx_depth = int(agent_ctx_depth_input.value or 10)  # AFTER v1.5.0
+                                    for _h in state["chat_history"][-(_ctx_depth):-1]:
                                         if _h["role"] in ("user", "assistant"):
                                             _agent_msgs.append(_h)
                                     _agent_msgs.append({"role": "user", "content": question})
@@ -6510,6 +6533,12 @@ def main_page():
                                         "_session_log": state.get("_session_log", {}),
                                     }
                                     # ── BEFORE v1.5.0: no _session_log key in _agent_ctx ──────
+                                    _agent_cancel.clear()
+                                    btn_stop_agent.set_visibility(True)
+
+                                    def _ng_status_cb(_tn, _cs=chat_status):
+                                        _cs.set_text(f"Agent — calling {_tn} …")
+
                                     answer = await run.io_bound(
                                         call_llm_with_tools,
                                         _agent_msgs,
@@ -6520,7 +6549,10 @@ def main_page():
                                         5,
                                         _cust_agent,
                                         _agent_ctx,
+                                        _ng_status_cb,
+                                        _agent_cancel,
                                     )
+                                    btn_stop_agent.set_visibility(False)
                                     state["_session_log"] = _agent_ctx.get("_session_log", {})  # AFTER v1.5.0
                                     # ── Chart enforcement ─────────────────────────────────────────
                                     # Some models describe charts in text instead of calling
@@ -6560,10 +6592,20 @@ def main_page():
                                             print(f"[chart enforcement] failed: {_cef}")
                                     # ─────────────────────────────────────────────────────────────
                                     state["chat_history"].append({"role": "assistant", "content": answer})
+                                    state["last_suggestions"] = []  # clear while rendering
                                     _render_chat()
                                     chat_status.set_text("Agent mode complete.")
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                                     state["chat_session_turns"].append((question, answer, _ts_now, []))
+                                    # AFTER v1.5.0: generate follow-up suggestions asynchronously
+                                    async def _gen_suggestions(_q=question, _a=answer, _p=provider, _m=model, _k=api_key, _bu=base_url):
+                                        sugs = await run.io_bound(
+                                            _generate_followup_suggestions, _q, _a, _p, _m, _k, _bu
+                                        )
+                                        if sugs:
+                                            state["last_suggestions"] = sugs
+                                            _render_chat()
+                                    asyncio.ensure_future(_gen_suggestions())
 
                                 else:  # Hybrid Search
                                     _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
@@ -6799,14 +6841,17 @@ def main_page():
                                         )
 
                             except Exception as exc:
-                                chat_status.set_text(f"Error: {exc}")
-                                ui.notify(str(exc), type="negative")
+                                _friendly = _classify_agent_error(exc)  # AFTER v1.5.0
+                                chat_status.set_text(f"Error: {_friendly}")
+                                ui.notify(_friendly, type="negative")
                                 # Remove the user message if we failed completely
                                 if state["chat_history"] and state["chat_history"][-1]["role"] == "user":
                                     state["chat_history"].pop()
+                                state["last_suggestions"] = []
                                 _render_chat()
                             finally:
                                 btn_send.set_enabled(True)
+                                btn_stop_agent.set_visibility(False)
                                 # Persist history if last exchange completed successfully
                                 if (_CB_AVAILABLE and state.get("chat_history")
                                         and state["chat_history"][-1]["role"] == "assistant"):
@@ -6835,6 +6880,8 @@ def main_page():
                             state["chat_session_turns"].clear()
                             state["chat_session_id"] = str(uuid.uuid4())
                             state["prior_session_block"] = ""   # re-fetch on next session's first turn
+                            state["last_suggestions"] = []      # AFTER v1.5.0
+                            state["_session_log"] = {}          # AFTER v1.5.0: reset tool tally
                             _render_chat()
                             chat_status.set_text("")
 
@@ -6860,6 +6907,13 @@ def main_page():
                                     .props("color=primary round dense")
                                     .tooltip("Send (Enter)")
                                 )
+                                # AFTER v1.5.0: stop in-flight agent run
+                                btn_stop_agent = (
+                                    ui.button(icon="stop_circle", on_click=lambda: _agent_cancel.set())
+                                    .props("color=red round dense")
+                                    .tooltip("Stop agent")
+                                )
+                                btn_stop_agent.set_visibility(False)
                                 btn_clear = (
                                     ui.button(icon="delete_sweep", on_click=_clear_chat)
                                     .props("flat round dense color=grey")
@@ -16986,6 +17040,10 @@ def call_llm_with_tools(
     max_rounds: int = 5,
     default_customer: str = "",
     ctx: dict | None = None,
+    # ── AFTER v1.5.0: live status + interrupt ────────────────────────────────
+    status_callback=None,    # callable(tool_name: str) — fired before each tool execution
+    cancel_event=None,       # threading.Event — checked at start of each round; raises on set
+    # ── BEFORE v1.5.0: no status_callback or cancel_event params ─────────────
 ) -> str:
     """
     Agentic tool-calling loop. Sends messages + tools to the LLM, executes
@@ -17024,6 +17082,17 @@ def call_llm_with_tools(
                 out.append(_m)
         return out
     # ── BEFORE v1.5.0: no session log, ctx was caller-supplied or None ────────
+
+    def _check_cancel():
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Agent run cancelled by user.")
+
+    def _notify_tool(tool_name: str):
+        if status_callback:
+            try:
+                status_callback(tool_name)
+            except Exception:
+                pass
 
     # ── Artifact stash shared by all provider paths ──────────────────────────
     # generate_chart / generate_table return echart/table fenced blocks.
@@ -17084,6 +17153,7 @@ def call_llm_with_tools(
 
         try:
             for _round in range(max_rounds):
+                _check_cancel()
                 print(f"[agent] round={_round} msgs={len(_msgs)} tools_active={not _tool_calls_made}")
                 # Per LMStudio docs: after tool results are in the history,
                 # send the final request WITHOUT tools so the model writes
@@ -17117,6 +17187,7 @@ def call_llm_with_tools(
                     _msgs.append({"role": "assistant", "content": _raw_content})
                     for _tc_name, _tc_args in _text_calls:
                         _tc_args = _normalise_tool_args(_tc_name, _tc_args)
+                        _notify_tool(_tc_name)
                         print(f"[agent] text-call executing tool={_tc_name!r} args_keys={list(_tc_args.keys())}")
                         _tc_result = _execute_agent_tool(
                             _tc_name, _tc_args,
@@ -17157,6 +17228,7 @@ def call_llm_with_tools(
                         _args = _json.loads(_fn.arguments or "{}")
                     except _json.JSONDecodeError:
                         _args = {}
+                    _notify_tool(_fn.name)
                     print(f"[agent] executing tool={_fn.name!r} args={_args}")
                     result = _execute_agent_tool(
                         _fn.name, _args,
@@ -17206,6 +17278,7 @@ def call_llm_with_tools(
         _conv = [m for m in _msgs_injected if m["role"] != "system"]
 
         for _round in range(max_rounds):
+            _check_cancel()
             resp = _ant_client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
@@ -17224,6 +17297,7 @@ def call_llm_with_tools(
             tool_results = []
             for tb in tool_use_blocks:
                 _args = tb.input if isinstance(tb.input, dict) else {}
+                _notify_tool(tb.name)
                 print(f"[agent/claude] tool={tb.name} args={_args}")
                 result = _execute_agent_tool(
                     tb.name, _args,
@@ -17247,6 +17321,67 @@ def call_llm_with_tools(
     else:
         # Bedrock or unknown — strip tools and fall back to plain call_llm
         return call_llm(messages, provider, model, api_key, base_url, max_tokens)
+
+
+# ── AFTER v1.5.0: agent chat-flow helpers ────────────────────────────────────
+
+_AGENT_ERROR_HINTS: list[tuple] = [
+    # (match_str_lower, friendly_message)
+    ("incorrect api key",     "Invalid API key — check your LLM settings."),
+    ("authentication",        "Authentication failed — check your API key."),
+    ("rate limit",            "Rate limit reached — wait a moment and try again."),
+    ("quota",                 "API quota exceeded — check your provider usage limits."),
+    ("connection refused",    "Can't reach the LLM server — is it running?"),
+    ("name or service not known", "LLM server hostname not found — check the base URL in settings."),
+    ("tool use",              "This model doesn't support function calling. In LMStudio: select model → Server tab → enable 'Tool Use' → restart server."),
+    ("function calling",      "Function calling not supported by this model. Enable it in your LLM server settings."),
+    ("cancelled by user",     "Agent run was cancelled."),
+    ("max tool-calling",      "Agent reached its step limit without a final answer — try a more specific question."),
+    ("context length",        "The conversation is too long for this model's context window — start a new chat or reduce history depth."),
+]
+
+def _classify_agent_error(exc: Exception) -> str:
+    """Map a raw exception to a user-friendly message + hint."""
+    raw = str(exc).lower()
+    for keyword, friendly in _AGENT_ERROR_HINTS:
+        if keyword in raw:
+            return friendly
+    return f"Agent error: {exc}"
+
+
+def _generate_followup_suggestions(
+    question: str, answer: str,
+    provider: str, model: str, api_key: str, base_url: str,
+    max_suggestions: int = 3,
+) -> list[str]:
+    """
+    Ask the LLM for short follow-up question suggestions given the Q&A pair.
+    Returns a list of strings (empty on any failure).
+    """
+    import json as _j
+    prompt = (
+        f"Given this question and answer, suggest {max_suggestions} short follow-up questions "
+        f"a user might ask next. Output ONLY a JSON array of strings, nothing else.\n\n"
+        f"Question: {question[:300]}\n\nAnswer: {answer[:600]}"
+    )
+    try:
+        raw = call_llm(
+            [{"role": "user", "content": prompt}],
+            provider, model, api_key, base_url,
+            max_tokens=256,
+        )
+        # Strip markdown fences if present
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        suggestions = _j.loads(raw.strip())
+        if isinstance(suggestions, list):
+            return [str(s).strip() for s in suggestions[:max_suggestions] if s]
+    except Exception:
+        pass
+    return []
 
 
 # ─────────────────────────── Phase 3: Scoring & Analytics ────────────────────
