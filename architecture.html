@@ -240,9 +240,10 @@ body {
   text-align: center;
   white-space: nowrap;
 }
-.tt-local { background: #F0FDF4; color: #065F46; border: 1px solid #6EE7B7; }
-.tt-live  { background: #FFF7ED; color: #92400E; border: 1px solid #FCD34D; }
+.tt-local  { background: #F0FDF4; color: #065F46; border: 1px solid #6EE7B7; }
+.tt-live   { background: #FFF7ED; color: #92400E; border: 1px solid #FCD34D; }
 .tt-action { background: #EFF6FF; color: #1D4ED8; border: 1px solid #93C5FD; }
+.tt-ingest { background: #FAF5FF; color: #6B21A8; border: 1px solid #C4B5FD; }
 
 /* ── Shared history banner ────────────────────────────────────────── */
 .shared-banner {
@@ -299,7 +300,7 @@ body {
 
 <div class="page-title">
   <h1>Supportal AI Agent — Application Architecture</h1>
-  <p>Two-UI AI platform for Couchbase support ticket analysis · REST API scraping, embedding, agent tooling, and chat history</p>
+  <p>Two-UI AI platform for Couchbase support ticket analysis · REST API scraping, embedding, agent tooling, and chat history · v1.4.0</p>
 </div>
 
 <div class="diagram">
@@ -516,11 +517,12 @@ body {
       <div class="box-title">
         <span class="ico">🖥</span> NiceGUI App
         <span class="port-badge">localhost:8765</span>
+        <span style="font-size:11px;color:#047857;font-weight:500">config screen for agent</span>
       </div>
 
       <div class="section-label">Main tabs</div>
       <ul class="items">
-        <li><strong>Configuration</strong> — profiles, CB connection, auth, embedding &amp; AI model settings</li>
+        <li><strong>Configuration</strong> — profiles, CB connection, auth, embedding &amp; AI model settings; serves as config layer for both UIs</li>
         <li><strong>Scraping</strong> — tickets (cookie/headful) &amp; snapshots (listing/analytics/topology)</li>
         <li><strong>Results</strong> — ticket table with filters, sorting, CSV/Excel export</li>
         <li><strong>Chat</strong> — multi-turn agent with ECharts visualisations &amp; table downloads</li>
@@ -530,7 +532,7 @@ body {
 
       <!-- Agent tools -->
       <div class="tools-panel">
-        <div class="tl">Agent tools (shared with Chainlit)</div>
+        <div class="tl">Agent tools (shared with Chainlit) — v1.4.0: 17 tools</div>
         <div class="tool-grid">
           <span class="tool-tag tt-local">query_tickets</span>
           <span class="tool-tag tt-local">count_tickets</span>
@@ -539,15 +541,22 @@ body {
           <span class="tool-tag tt-local">check_data_freshness</span>
           <span class="tool-tag tt-local">rescrape_ticket</span>
           <span class="tool-tag tt-local">rescrape_customer_tickets</span>
+          <span class="tool-tag tt-local">vector_search</span>
+          <span class="tool-tag tt-local">get_cluster_health</span>
           <span class="tool-tag tt-live">list_supportal_customers</span>
           <span class="tool-tag tt-live">query_supportal</span>
+          <span class="tool-tag tt-ingest">fetch_snapshots</span>
+          <span class="tool-tag tt-ingest">backfill_snapshot_topology</span>
+          <span class="tool-tag tt-ingest">scrape_customer_tickets</span>
+          <span class="tool-tag tt-action">score_ticket</span>
           <span class="tool-tag tt-action">generate_chart</span>
           <span class="tool-tag tt-action">generate_table</span>
         </div>
-        <div style="margin-top:6px;display:flex;gap:10px;font-size:10px;color:#64748B;">
-          <span>🟢 LOCAL — hits Couchbase</span>
-          <span>🟡 LIVE — hits Supportal Analytics API</span>
-          <span>🔵 OUTPUT — renders artifact</span>
+        <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:8px 14px;font-size:10px;color:#64748B;">
+          <span>🟢 LOCAL — queries Couchbase</span>
+          <span>🟡 LIVE — hits Supportal API</span>
+          <span>🟣 INGEST — fetches from Supportal → writes to CB</span>
+          <span>🔵 ACTION — runs LLM / renders artifact</span>
         </div>
       </div>
     </div>
@@ -569,10 +578,11 @@ body {
 
       <div class="section-label">AI agent</div>
       <ul class="items">
-        <li>Same tool suite as NiceGUI (LOCAL + LIVE + OUTPUT)</li>
+        <li>Same 17-tool suite as NiceGUI (LOCAL + LIVE + INGEST + ACTION)</li>
         <li>Tool-calling loop up to 5 turns per message</li>
         <li>DATA SOURCE ROUTING — local vs Supportal based on query intent</li>
         <li>SCOPING RULE — customer-scoped with discovery exceptions</li>
+        <li>LLM/embedding/cookie config passed via <span class="inline-code">ctx</span> dict from active profile</li>
       </ul>
 
       <div class="section-label">Persistence</div>
@@ -604,16 +614,16 @@ body {
 
 <!-- Legend -->
 <div class="legend">
-  <div class="legend-item"><div class="legend-dot" style="background:#F59E0B"></div>External data source</div>
-  <div class="legend-item"><div class="legend-dot" style="background:#EA580C"></div>REST API scraping / ingestion</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#F59E0B"></div>External data source (Supportal / Zendesk)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#EA580C"></div>REST API scraping / ingestion layer</div>
   <div class="legend-item"><div class="legend-dot" style="background:#E11D48"></div>Couchbase data store</div>
   <div class="legend-item"><div class="legend-dot" style="background:#2563EB"></div>LLM inference layer</div>
-  <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>NiceGUI app (main UI)</div>
-  <div class="legend-item"><div class="legend-dot" style="background:#0D9488"></div>Chainlit chat (secondary UI)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>NiceGUI app — config screen &amp; admin UI</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#0D9488"></div>Chainlit chat — primary conversational UI</div>
 </div>
 
 <div class="footnote">
-  Supportal AI Agent · architecture diagram · updated 2026-05-26 (branch: supportal_api_enabled)
+  Supportal AI Agent · architecture diagram · updated 2026-05-30 · v1.4.0 (branch: supportal_api_enabled) · 17 agent tools
 </div>
 
 </body>
