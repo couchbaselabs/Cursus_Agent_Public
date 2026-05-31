@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 import asyncio
 import threading
@@ -1458,26 +1458,42 @@ def parse_ticket_detail(html: str, url: str) -> dict:
     # ── First comment as description ──────────────────────────────────────────
     description = comments[0]["body"] if comments else None
 
+    # ── Last comment timestamp → last_comment_at ──────────────────────────────
+    # Most recent comment is the most meaningful "last activity" indicator.
+    # Also try ticket_fields for an explicit "Updated" or "Last Updated" entry.
+    last_comment_at: str | None = None
+    for c in reversed(comments):
+        ts = c.get("timestamp")
+        if ts:
+            last_comment_at = ts
+            break
+    if not last_comment_at:
+        for _k in ("Updated", "Last_Updated", "Last_Comment", "Last_Reply", "updated"):
+            if ticket_fields.get(_k):
+                last_comment_at = ticket_fields[_k]
+                break
+
     return {
-        "ticket_id":     ticket_id,
-        "url":           url,
-        "subject":       subject,
-        "status":        status,
-        "priority":      priority,
-        "requester":     requester,
-        "assignee":      assignee,
-        "organization":  organization,
-        "ticket_group":  ticket_group,
-        "created":       created,
-        "tags":          tags_text,
-        "escalations":   escalations_text,
-        "cbses":         cbses if cbses else None,
-        "jira_issues":   jira_issues if jira_issues else None,
-        "snapshots":     snapshots_text,
-        "ticket_fields": ticket_fields if ticket_fields else None,
-        "description":   description,
-        "comment_count": len(comments),
-        "comments":      comments if comments else None,
+        "ticket_id":       ticket_id,
+        "url":             url,
+        "subject":         subject,
+        "status":          status,
+        "priority":        priority,
+        "requester":       requester,
+        "assignee":        assignee,
+        "organization":    organization,
+        "ticket_group":    ticket_group,
+        "created":         created,
+        "last_comment_at": last_comment_at,
+        "tags":            tags_text,
+        "escalations":     escalations_text,
+        "cbses":           cbses if cbses else None,
+        "jira_issues":     jira_issues if jira_issues else None,
+        "snapshots":       snapshots_text,
+        "ticket_fields":   ticket_fields if ticket_fields else None,
+        "description":     description,
+        "comment_count":   len(comments),
+        "comments":        comments if comments else None,
     }
 
 
@@ -1549,27 +1565,42 @@ def parse_ticket_from_api(body: dict, ticket_id: str) -> dict:
             "body":      c.get("body"),
         })
 
+    # ── Last comment timestamp → last_comment_at ──────────────────────────────
+    last_comment_at: str | None = None
+    for c in reversed(comments):
+        ts = c.get("timestamp")
+        if ts:
+            last_comment_at = ts
+            break
+    if not last_comment_at:
+        for _k in ("Updated", "Last_Updated", "Last_Comment", "Last_Reply", "updated"):
+            if ticket_fields.get(_k):
+                last_comment_at = ticket_fields[_k]
+                break
+
     url = f"{BASE_URL}/zendesk/ticket/{ticket_id}"
     return {
-        "ticket_id":     str(ticket.get("id", ticket_id)),
-        "url":           url,
-        "subject":       ticket.get("subject"),
-        "status":        ticket.get("status"),
-        "priority":      priority,
-        "requester":     ticket.get("requester"),
-        "assignee":      ticket.get("assignee"),
-        "organization":  ticket.get("organization"),
-        "ticket_group":  ticket.get("group"),
-        "created":       ticket.get("created_at"),
-        "tags":          tags_text,
-        "escalations":   escalations_text,
-        "cbses":         cbses if cbses else None,
-        "jira_issues":   jira_issues if jira_issues else None,
-        "snapshots":     snapshots_text,
-        "ticket_fields": ticket_fields if ticket_fields else None,
-        "description":   ticket.get("description"),
-        "comment_count": len(comments),
-        "comments":      comments if comments else None,
+        "ticket_id":       str(ticket.get("id", ticket_id)),
+        "url":             url,
+        "subject":         ticket.get("subject"),
+        "status":          ticket.get("status"),
+        "priority":        priority,
+        "requester":       ticket.get("requester"),
+        "assignee":        ticket.get("assignee"),
+        "organization":    ticket.get("organization"),
+        "ticket_group":    ticket.get("group"),
+        "created":         ticket.get("created_at"),
+        "updated":         ticket.get("updated_at"),
+        "last_comment_at": last_comment_at,
+        "tags":            tags_text,
+        "escalations":     escalations_text,
+        "cbses":           cbses if cbses else None,
+        "jira_issues":     jira_issues if jira_issues else None,
+        "snapshots":       snapshots_text,
+        "ticket_fields":   ticket_fields if ticket_fields else None,
+        "description":     ticket.get("description"),
+        "comment_count":   len(comments),
+        "comments":        comments if comments else None,
     }
 
 
@@ -17619,8 +17650,8 @@ def _execute_agent_tool(
             return f"No tickets found matching the given filters.{_ingest_hint}"
         _now_epoch = time.time()
         lines = [
-            "| Ticket ID | Organization | Subject | Status | Priority | Created | Updated | Data Age | CBSEs | Jira |",
-            "|-----------|-------------|---------|--------|----------|---------|---------|----------|-------|------|",
+            "| Ticket ID | Organization | Subject | Status | Priority | Created | Last Reply | Data Age | CBSEs | Jira |",
+            "|-----------|-------------|---------|--------|----------|---------|------------|----------|-------|------|",
         ]
         for t in tickets:
             cbses = ", ".join(t.get("cbses") or []) or "—"
@@ -17629,11 +17660,13 @@ def _execute_agent_tool(
             _lsa = t.get("last_scraped_at") or 0
             _age_h = (_now_epoch - _lsa) / 3600 if _lsa else None
             _age_str = f"{_age_h:.0f}h ago" if _age_h is not None else "unknown"
-            _updated = (t.get("updated") or t.get("updated_at") or "")[:10] or "—"
+            _last_reply = (
+                t.get("last_comment_at") or t.get("updated") or t.get("updated_at") or ""
+            )[:10] or "—"
             lines.append(
                 f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
                 f"| {t.get('status','')} | {t.get('priority','')} "
-                f"| {(t.get('created') or '')[:10]} | {_updated} | {_age_str} | {cbses} | {jiras} |"
+                f"| {(t.get('created') or '')[:10]} | {_last_reply} | {_age_str} | {cbses} | {jiras} |"
             )
         return "\n".join(lines) + f"\n\n**Total: {len(tickets)} tickets**"
 
