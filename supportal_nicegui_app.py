@@ -4020,7 +4020,7 @@ def main_page():
                                                 llm_provider, llm_model, llm_api_key, llm_base_url,
                                                 int(score_batch_input.value or 20),
                                                 (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", ""),
-                                                using_browser,
+                                                False,
                                                 _make_step_prog("validate"),
                                                 _cancel,
                                                 data,
