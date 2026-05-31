@@ -6158,10 +6158,23 @@ def main_page():
                                                         ui.badge(_tc, color="blue-grey").classes("text-xs font-mono opacity-70")
                                             # Copy + timestamp row
                                             with ui.row().classes("items-center gap-2 mt-1"):
+                                                def _make_copy_js(txt: str) -> str:
+                                                    t = json.dumps(txt)
+                                                    return (
+                                                        f"(function(){{var t={t};"
+                                                        "if(navigator.clipboard&&navigator.clipboard.writeText){"
+                                                        "navigator.clipboard.writeText(t).catch(function(){var e=document.createElement('textarea');"
+                                                        "e.value=t;e.style.cssText='position:fixed;opacity:0';"
+                                                        "document.body.appendChild(e);e.select();document.execCommand('copy');document.body.removeChild(e);});"
+                                                        "}else{var e=document.createElement('textarea');"
+                                                        "e.value=t;e.style.cssText='position:fixed;opacity:0';"
+                                                        "document.body.appendChild(e);e.select();document.execCommand('copy');document.body.removeChild(e);"
+                                                        "}})();"
+                                                    )
                                                 ui.button(
                                                     icon="content_copy",
                                                     on_click=lambda e, txt=_content: ui.run_javascript(
-                                                        f"navigator.clipboard.writeText({json.dumps(txt)})"
+                                                        _make_copy_js(txt)
                                                     ),
                                                 ).props("flat round dense color=gray").classes("opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
                                                 if _msg_ts:
@@ -7109,8 +7122,17 @@ def main_page():
                                         None,
                                     )
                                     if last:
+                                        _t = json.dumps(last)
                                         await ui.run_javascript(
-                                            f"navigator.clipboard.writeText({json.dumps(last)})"
+                                            f"(function(){{var t={_t};"
+                                            "if(navigator.clipboard&&navigator.clipboard.writeText){"
+                                            "navigator.clipboard.writeText(t).catch(function(){var e=document.createElement('textarea');"
+                                            "e.value=t;e.style.cssText='position:fixed;opacity:0';"
+                                            "document.body.appendChild(e);e.select();document.execCommand('copy');document.body.removeChild(e);});"
+                                            "}else{var e=document.createElement('textarea');"
+                                            "e.value=t;e.style.cssText='position:fixed;opacity:0';"
+                                            "document.body.appendChild(e);e.select();document.execCommand('copy');document.body.removeChild(e);"
+                                            "}})();"
                                         )
                                         ui.notify("Copied to clipboard", type="positive", timeout=2000)
                                     else:
@@ -18129,6 +18151,8 @@ LIMIT {limit}
         incl_cluster    = bool(args.get("include_cluster"))
         snap_collection = ctx.get("snap_collection", "snapshots")
         try:
+            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator        # type: ignore
             conn = _cb_conn_str(cb_url, use_tls)
             cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
             cl_.wait_until_ready(timedelta(seconds=10))
