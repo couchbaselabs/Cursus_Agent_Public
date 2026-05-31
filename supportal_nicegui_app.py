@@ -10798,14 +10798,15 @@ def main_page():
                         _assets_area = ui.column().classes("w-full gap-2 mt-3")
 
                         def _render_asset_card(row: dict) -> None:
-                            _aid    = row.get("id", "")
-                            _atype  = row.get("asset_type", "report")
-                            _atitle = row.get("title") or row.get("filename") or "Untitled"
-                            _aorg   = row.get("org") or ""
-                            _ats    = row.get("created_at") or 0
-                            _afname = row.get("filename") or f"{_atitle}.{_atype}"
-                            _amime  = row.get("mime_type") or _ASSET_MIME.get(_atype, "text/plain")
-                            _aicon  = _ASSET_ICONS.get(_atype, "description")
+                            _aid       = row.get("id", "")
+                            _atype     = row.get("asset_type", "report")
+                            _atitle    = row.get("title") or row.get("filename") or "Untitled"
+                            _aorg      = row.get("org") or ""
+                            _ats       = row.get("created_at") or 0
+                            _afname    = row.get("filename") or f"{_atitle}.{_atype}"
+                            _amime     = row.get("mime_type") or _ASSET_MIME.get(_atype, "text/plain")
+                            _aicon     = _ASSET_ICONS.get(_atype, "description")
+                            _athumb    = row.get("thumbnail") or ""
                             import datetime as _dtt
                             _ts_str = (
                                 _dtt.datetime.fromtimestamp(_ats).strftime("%Y-%m-%d %H:%M")
@@ -10822,9 +10823,36 @@ def main_page():
                                     cb_scope_input.value.strip() or "_default",
                                 )
 
-                            with ui.card().classes("w-full py-2 px-3"):
-                                with ui.row().classes("w-full items-center gap-2"):
-                                    ui.icon(_aicon, color="blue-grey").classes("text-2xl shrink-0")
+                            with ui.card().classes("w-full overflow-hidden"):
+                                # ── Thumbnail strip ────────────────────────────────────
+                                if _athumb:
+                                    if _atype in ("chart", "echart"):
+                                        try:
+                                            _topt = json.loads(_athumb)
+                                            ui.echart(_topt).classes("w-full pointer-events-none").style(
+                                                "height:110px;border-bottom:1px solid #e5e7eb"
+                                            )
+                                        except Exception:
+                                            pass
+                                    else:
+                                        # Text snippet preview
+                                        _snip = _athumb[:220].replace("\n", " ").strip()
+                                        with ui.element("div").classes(
+                                            "w-full px-3 py-2 bg-gray-50 border-b border-gray-200"
+                                        ).style("height:56px;overflow:hidden"):
+                                            ui.label(_snip).classes(
+                                                "font-mono text-xs text-gray-500 break-all"
+                                            ).style(
+                                                "line-height:1.4;"
+                                                "display:-webkit-box;"
+                                                "-webkit-line-clamp:3;"
+                                                "-webkit-box-orient:vertical;"
+                                                "overflow:hidden"
+                                            ).tooltip(_snip)
+
+                                # ── Metadata + actions row ─────────────────────────────
+                                with ui.row().classes("w-full items-center gap-2 px-3 py-2"):
+                                    ui.icon(_aicon, color="blue-grey").classes("text-xl shrink-0")
                                     with ui.column().classes("flex-1 gap-0 min-w-0"):
                                         ui.label(_atitle).classes(
                                             "text-sm font-semibold leading-tight truncate"
@@ -18854,6 +18882,30 @@ def _generate_customer_report(
 
 # ── Assets persistence ────────────────────────────────────────────────────────
 
+def _make_asset_thumbnail(asset_type: str, content: str) -> str:
+    """
+    Generate a compact thumbnail representation stored alongside the asset.
+    Charts → stripped ECharts JSON (series/axes/color only, no decorations).
+    Text types → first 280 characters of raw content.
+    """
+    if asset_type in ("chart", "echart"):
+        try:
+            opt   = json.loads(content)
+            thumb = {k: opt[k] for k in ("series", "xAxis", "yAxis", "color", "radiusAxis", "angleAxis") if k in opt}
+            thumb["animation"] = False
+            thumb["grid"]      = [{"left": 2, "right": 2, "top": 2, "bottom": 2, "containLabel": False}]
+            # Strip labels, tooltips, and text from every series so the thumbnail stays clean
+            for s in (thumb.get("series") or []):
+                s.pop("label", None)
+                s.pop("emphasis", None)
+            return json.dumps(thumb)
+        except Exception:
+            return ""
+    # Text types: plain snippet (strip markdown fences / leading whitespace)
+    snippet = content.strip()[:280]
+    return snippet
+
+
 def _ensure_assets_collection(cluster, bucket_name: str, scope: str) -> None:
     """Create the `assets` collection inside scope if it does not already exist."""
     try:
@@ -18895,6 +18947,7 @@ def _save_asset_to_cb(
         "title":      title,
         "filename":   fname,
         "content":    content,
+        "thumbnail":  _make_asset_thumbnail(asset_type, content),
         "org":        org,
         "session_id": session_id,
         "created_at": int(_time.time()),
@@ -18927,7 +18980,7 @@ def _list_assets_from_cb(
         params["asset_type"] = asset_type
     rows = list(cl_.query(
         f"SELECT a.id, a.asset_type, a.title, a.filename, a.org, "
-        f"a.session_id, a.created_at, a.mime_type, a.size_bytes "
+        f"a.session_id, a.created_at, a.mime_type, a.size_bytes, a.thumbnail "
         f"FROM `{bucket}`.`{scope}`.`assets` a "
         f"WHERE {' AND '.join(wheres)} ORDER BY a.created_at DESC LIMIT {limit}",
         _QO(named_parameters=params),
