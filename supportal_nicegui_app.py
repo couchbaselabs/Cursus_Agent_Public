@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import asyncio
 import threading
@@ -3120,9 +3120,22 @@ def main_page():
     _agent_cancel = threading.Event()  # AFTER v1.5.0: cancel for in-flight agent runs
 
     # ── Header ──────────────────────────────────────────────────────────────
-    with ui.header().classes("bg-blue-900 text-white items-center px-6 py-3 shadow-md"):
-        ui.label(f"Couchbase Supportal Scraper").classes("text-xl font-bold")
-        ui.label(f"v{__version__}").classes("text-sm font-mono text-blue-300 ml-2")
+    with ui.header().classes("bg-blue-900 text-white items-center px-6 py-3 shadow-md gap-3"):
+        ui.label("Couchbase Supportal").classes("text-xl font-bold tracking-tight")
+        ui.label(f"v{__version__}").classes(
+            "text-xs font-mono bg-blue-700 text-blue-200 px-2 py-0.5 rounded"
+        )
+        ui.space()
+        # Active customer chip — updated whenever customer changes
+        _hdr_cust = ui.label("").classes(
+            "text-sm font-medium bg-blue-800 text-blue-100 px-3 py-0.5 rounded-full hidden"
+        )
+        # CB connectivity dot — green when URL is set, grey when not
+        with ui.row().classes("items-center gap-1"):
+            _cb_dot = ui.element("div").classes(
+                "w-2.5 h-2.5 rounded-full bg-gray-400"
+            ).tooltip("Couchbase: not configured")
+            ui.label("CB").classes("text-xs text-blue-300 font-mono")
 
     # ── Reconnect banner — shown when page loads while an op is running ─────
     _reconnect_banner = ui.notify(
@@ -3377,6 +3390,8 @@ def main_page():
                                 )
 
                                 state["results"] = data
+                                _results_empty.set_visibility(False)
+                                _results_card.set_visibility(True)
                                 # Save old customer's history, then load new customer's
                                 _old_cust = state.get("customer_name", "")
                                 if _CB_AVAILABLE and state.get("chat_history") and _old_cust != customer:
@@ -4139,8 +4154,18 @@ def main_page():
                         ui.icon("business").classes("text-indigo-400")
                         results_banner = ui.label("No customer loaded").classes("text-sm font-semibold text-indigo-700 flex-1")
 
+                    # ── Results empty state ───────────────────────────────────────────────
+                    with ui.column().classes("w-full items-center gap-3 py-12 text-center") as _results_empty:
+                        ui.icon("search_off", size="4rem").classes("text-gray-200")
+                        ui.label("No tickets loaded").classes("text-lg font-medium text-gray-400")
+                        ui.label("Scrape a customer or load tickets from Couchbase to get started.").classes("text-xs text-gray-400")
+                        ui.button("Go to Scraping", icon="search", on_click=lambda: main_tabs.set_value(tab_scrape)).props("outline color=primary size=sm")
+                    _has_results = bool(state["results"])
+                    _results_empty.set_visibility(not _has_results)
+
                     # ── Results card ──────────────────────────────────────────────────────
-                    with ui.card().classes("w-full"):
+                    with ui.card().classes("w-full") as _results_card:
+                        _results_card.set_visibility(_has_results)
                         ui.label("Results").classes("text-base font-semibold mb-1")
 
                         columns = [
@@ -4802,6 +4827,8 @@ def main_page():
                                     _prog,
                                 )
                                 state["results"] = tickets
+                                _results_empty.set_visibility(False)
+                                _results_card.set_visibility(True)
                                 cb_cust = (cb_load_filter.value or "").strip() or "All Customers"
                                 _old_cust2 = state.get("customer_name", "")
                                 if _CB_AVAILABLE and state.get("chat_history") and _old_cust2 != cb_cust:
@@ -5948,7 +5975,24 @@ def main_page():
                         # Conversation display
                         ui.separator().classes("mt-3")
                         chat_log = ui.column().classes("w-full gap-2 mt-2 min-h-48 max-h-128 overflow-y-auto")
-                        chat_status = ui.label("").classes("text-xs text-gray-400 mt-1 min-h-4")
+                        # ── Agent status pill ─────────────────────────────────────────────
+                        with ui.row().classes("items-center gap-2 mt-1 min-h-6") as _status_row:
+                            _status_spinner = ui.spinner("dots", size="xs", color="primary")
+                            _status_spinner.set_visibility(False)
+                            chat_status = ui.label("").classes(
+                                "text-xs text-gray-400 font-mono transition-all"
+                            )
+                        _status_row.classes("hidden")  # hide until there's something to show
+
+                        def _set_chat_status(text: str, running: bool = False):
+                            if text:
+                                _status_row.classes(remove="hidden")
+                                chat_status.set_text(text)
+                                _status_spinner.set_visibility(running)
+                            else:
+                                _status_row.classes(add="hidden")
+                                chat_status.set_text("")
+                                _status_spinner.set_visibility(False)
 
                         # Live streaming display — visible only while Ollama/LMStudio generates
                         with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2") as _stream_row:
@@ -5958,12 +6002,25 @@ def main_page():
                         def _render_chat():
                             chat_log.clear()
                             with chat_log:
+                                if not state["chat_history"]:
+                                    # ── Empty state ───────────────────────────────────────────
+                                    with ui.column().classes("w-full items-center gap-3 py-12 text-center"):
+                                        ui.icon("chat_bubble_outline", size="4rem").classes("text-gray-200")
+                                        ui.label("Ask anything about your tickets").classes("text-lg font-medium text-gray-400")
+                                        ui.label(
+                                            'Try: "What are the top open P1s?" · "Health score for Amex" · "SLA compliance this month"'
+                                        ).classes("text-xs text-gray-400 max-w-md")
+                                    return
                                 for msg in state["chat_history"]:
+                                    _msg_ts = msg.get("ts", "")
                                     if msg["role"] == "user":
-                                        with ui.chat_message(name="You", sent=True).props("bg-color=blue-6 text-color=white"):
+                                        with ui.chat_message(name="You", sent=True).props("bg-color=primary text-color=white"):
                                             ui.label(msg["content"]).classes("text-sm whitespace-pre-wrap")
+                                            if _msg_ts:
+                                                ui.label(_msg_ts).classes("text-xs opacity-50 text-right mt-1")
                                     elif msg["role"] == "assistant":
                                         _content = msg["content"]
+                                        _msg_tools = msg.get("tools", [])
                                         with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2"):
                                             # Render text + artifact (echart/table) blocks interleaved
                                             _last_pos = 0
@@ -6094,16 +6151,28 @@ def main_page():
                                             _post = _content[_last_pos:].strip()
                                             if _post or not _has_artifact:
                                                 ui.markdown(_post or _content).classes("prose prose-sm max-w-none")
-                                            # Copy button — writes raw markdown to clipboard
-                                            ui.button(
-                                                icon="content_copy",
-                                                on_click=lambda e, txt=_content: ui.run_javascript(
-                                                    f"navigator.clipboard.writeText({json.dumps(txt)})"
-                                                ),
-                                            ).props("flat round dense color=gray").classes("mt-2 opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
+                                            # Tool call chip strip — compact inline trace
+                                            if _msg_tools:
+                                                with ui.row().classes("flex-wrap gap-1 mt-2"):
+                                                    for _tc in _msg_tools:
+                                                        ui.badge(_tc, color="blue-grey").classes("text-xs font-mono opacity-70")
+                                            # Copy + timestamp row
+                                            with ui.row().classes("items-center gap-2 mt-1"):
+                                                ui.button(
+                                                    icon="content_copy",
+                                                    on_click=lambda e, txt=_content: ui.run_javascript(
+                                                        f"navigator.clipboard.writeText({json.dumps(txt)})"
+                                                    ),
+                                                ).props("flat round dense color=gray").classes("opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
+                                                if _msg_ts:
+                                                    ui.label(_msg_ts).classes("text-xs text-gray-300")
                                 # AFTER v1.5.0: follow-up suggestion chips after last assistant message
+                                _is_last_assistant = (
+                                    bool(state["chat_history"])
+                                    and state["chat_history"][-1]["role"] == "assistant"
+                                )
                                 _suggestions = state.get("last_suggestions", [])
-                                if _suggestions and state["chat_history"] and state["chat_history"][-1]["role"] == "assistant":
+                                if _suggestions and _is_last_assistant:
                                     with ui.row().classes("flex-wrap gap-1 mt-1 pl-2"):
                                         ui.label("Follow up:").classes("text-xs text-gray-400 self-center")
                                         for _sug in _suggestions:
@@ -6111,6 +6180,26 @@ def main_page():
                                                 chat_input.value = sug
                                                 await _send_chat()
                                             ui.chip(_sug, on_click=_ask_suggestion).props("outline color=primary").classes("text-xs cursor-pointer")
+                                # ── Post-response common action chips ─────────────────────
+                                if _is_last_assistant:
+                                    _org_chip = (main_cust_input.value or "").strip()
+                                    _chip_label = f" ({_org_chip[:20]})" if _org_chip else ""
+                                    _QUICK_ACTIONS = [
+                                        ("new_releases",   f"What's new{_chip_label}?",       f"What's new for {_org_chip} in the last 24 hours?" if _org_chip else "What's new in the last 24 hours?"),
+                                        ("monitor_heart",  f"Health score{_chip_label}",       f"Get the health score for {_org_chip}" if _org_chip else "Get health scores for all customers"),
+                                        ("gavel",          f"SLA status{_chip_label}",         f"Check SLA compliance for {_org_chip}" if _org_chip else "Check SLA compliance"),
+                                        ("priority_high",  "Open P1/P2s",                      f"Show me all open critical and high priority tickets{' for ' + _org_chip if _org_chip else ''}"),
+                                        ("summarize",      "Generate report",                   f"Generate a customer report for {_org_chip}" if _org_chip else "Generate a portfolio status report"),
+                                    ]
+                                    with ui.row().classes("flex-wrap gap-1 mt-2 pl-2 border-t border-gray-100 pt-2"):
+                                        ui.label("Actions:").classes("text-xs text-gray-300 self-center")
+                                        for _qi, _ql, _qq in _QUICK_ACTIONS:
+                                            async def _fire_action(q=_qq):
+                                                chat_input.value = q
+                                                await _send_chat()
+                                            ui.chip(
+                                                _ql, icon=_qi, on_click=_fire_action
+                                            ).props("outline color=blue-grey dense").classes("text-xs cursor-pointer")
                             # Scroll to bottom
                             ui.run_javascript(
                                 "var el = document.querySelector('.chat-log-scroll');"
@@ -6213,9 +6302,10 @@ def main_page():
 
                             chat_input.value = ""
                             chat_input.update()
-                            state["chat_history"].append({"role": "user", "content": question})
+                            _msg_ts_now = time.strftime("%H:%M", time.localtime())
+                            state["chat_history"].append({"role": "user", "content": question, "ts": _msg_ts_now})
                             _render_chat()
-                            chat_status.set_text("Retrieving relevant tickets …")
+                            _set_chat_status("Retrieving relevant tickets …", running=True)
                             btn_send.set_enabled(False)
 
                             provider, model, api_key, base_url = _get_llm_config()
@@ -6286,7 +6376,7 @@ def main_page():
                                         compact_context_toggle.value,
                                         b_workers,
                                     )
-                                    state["chat_history"].append({"role": "assistant", "content": answer})
+                                    state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                     _render_chat()
                                     chat_status.set_text(f"Batch map-reduce complete — {len(state['results'])} tickets analysed.")
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -6353,7 +6443,7 @@ def main_page():
                                             question, context_tickets, _today_str, _stats_block,
                                             provider, model, api_key, base_url, _dr_prog,
                                         )
-                                        state["chat_history"].append({"role": "assistant", "content": answer})
+                                        state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                         _render_chat()
                                         chat_status.set_text(
                                             f"Deep Reasoning complete — {len(context_tickets)} tickets analysed."
@@ -6364,7 +6454,7 @@ def main_page():
                                             answer, n_tok, elapsed, rate = await _call_llm_streaming(
                                                 messages, provider, model, api_key, base_url
                                             )
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
+                                            state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                             _render_chat()
                                             chat_status.set_text(
                                                 f"{len(context_tickets)} tickets as context — "
@@ -6372,7 +6462,7 @@ def main_page():
                                             )
                                         else:
                                             answer = await run.io_bound(call_llm, messages, provider, model, api_key, base_url, 8192)
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
+                                            state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                             _render_chat()
                                             chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
                                     # Record turn for session storage
@@ -6480,7 +6570,7 @@ def main_page():
                                             chat_status.set_text(
                                                 f"Retrieve+Rerank: {len(rr_tickets)} candidates | {rr_notes}"
                                             )
-                                    state["chat_history"].append({"role": "assistant", "content": answer})
+                                    state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                     _render_chat()
                                     _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                                     _turn_tids = [str(t.get("ticket_id","")) for t in (rr_tickets or []) if t.get("ticket_id")]
@@ -6609,9 +6699,11 @@ def main_page():
                                     # ── BEFORE v1.5.0: no _session_log key in _agent_ctx ──────
                                     _agent_cancel.clear()
                                     btn_stop_agent.set_visibility(True)
+                                    _turn_tools: list[str] = []
 
-                                    def _ng_status_cb(_tn, _cs=chat_status):
-                                        _cs.set_text(f"Agent — calling {_tn} …")
+                                    def _ng_status_cb(_tn):
+                                        _turn_tools.append(_tn)
+                                        _set_chat_status(f"Agent — {_tn} …", running=True)
 
                                     answer = await run.io_bound(
                                         call_llm_with_tools,
@@ -6666,11 +6758,15 @@ def main_page():
                                         except Exception as _cef:
                                             print(f"[chart enforcement] failed: {_cef}")
                                     # ─────────────────────────────────────────────────────────────
-                                    state["chat_history"].append({"role": "assistant", "content": answer})
+                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                    state["chat_history"].append({
+                                        "role": "assistant", "content": answer,
+                                        "ts": time.strftime("%H:%M", time.localtime()),
+                                        "tools": list(dict.fromkeys(_turn_tools)),
+                                    })
                                     state["last_suggestions"] = []  # clear while rendering
                                     _render_chat()
-                                    chat_status.set_text("Agent mode complete.")
-                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                    _set_chat_status("Agent complete.", running=False)
                                     state["chat_session_turns"].append((question, answer, _ts_now, []))
                                     # AFTER v1.5.0: generate follow-up suggestions asynchronously
                                     async def _gen_suggestions(_q=question, _a=answer, _p=provider, _m=model, _k=api_key, _bu=base_url):
@@ -6867,7 +6963,7 @@ def main_page():
                                             question, context_tickets, _today_str, _stats_block,
                                             provider, model, api_key, base_url, _dr_prog_vs,
                                         )
-                                        state["chat_history"].append({"role": "assistant", "content": answer})
+                                        state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                         _render_chat()
                                         chat_status.set_text(
                                             f"Deep Reasoning complete — {len(context_tickets)} tickets analysed."
@@ -6878,7 +6974,7 @@ def main_page():
                                             answer, n_tok, elapsed, rate = await _call_llm_streaming(
                                                 messages, provider, model, api_key, base_url
                                             )
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
+                                            state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                             _render_chat()
                                             chat_status.set_text(
                                                 f"{len(context_tickets)} tickets as context — "
@@ -6886,7 +6982,7 @@ def main_page():
                                             )
                                         else:
                                             answer = await run.io_bound(call_llm, messages, provider, model, api_key, base_url)
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
+                                            state["chat_history"].append({"role": "assistant", "content": answer, "ts": time.strftime("%H:%M", time.localtime())})
                                             _render_chat()
                                             chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
                                     # Record turn for session storage
@@ -7266,10 +7362,15 @@ def main_page():
                         scoring_banner = ui.label("No customer loaded").classes("text-sm font-semibold text-indigo-700 flex-1")
 
                     def _set_customer_banner(name: str) -> None:
-                        """Update both tab banners whenever the active customer changes."""
+                        """Update both tab banners and the header chip whenever the active customer changes."""
                         text = f"Viewing: {name}"
                         results_banner.set_text(text)
                         scoring_banner.set_text(text)
+                        if name and name.lower() not in ("", "all customers"):
+                            _hdr_cust.set_text(f"▸ {name}")
+                            _hdr_cust.classes(remove="hidden")
+                        else:
+                            _hdr_cust.classes(add="hidden")
 
                     # Populate banners from any already-loaded state (e.g. page refresh)
                     if state.get("customer_name"):
@@ -10743,6 +10844,9 @@ def main_page():
                             dir_table.rows = rows
                             dir_table.update()
                             dir_status.set_text(f"{len(rows)} customer(s) found.")
+                            # Update Customers tab badge
+                            tab_custs._props["label"] = f"Customers ({len(rows)})"
+                            tab_custs.update()
                         except Exception as exc:
                             dir_status.set_text(f"Error: {exc}")
                             ui.notify(str(exc), type="negative")
@@ -11390,6 +11494,17 @@ def _cb_load_settings(
                 pass
 
     ui.timer(2.0, _poll_op_status)
+
+    def _poll_cb_status():
+        _url = cb_url_input.value.strip() if cb_url_input else ""
+        if _CB_AVAILABLE and _url:
+            _cb_dot.classes(remove="bg-gray-400 bg-red-400").classes(add="bg-green-400")
+            _cb_dot.tooltip(f"Couchbase: {_url}")
+        else:
+            _cb_dot.classes(remove="bg-green-400 bg-red-400").classes(add="bg-gray-400")
+            _cb_dot.tooltip("Couchbase: not configured")
+
+    ui.timer(3.0, _poll_cb_status)
 
 
 # ─────────────────────────── Customer inventory document ─────────────────────
