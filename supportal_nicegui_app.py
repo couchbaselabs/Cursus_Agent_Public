@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import asyncio
 import threading
@@ -3169,6 +3169,7 @@ def main_page():
             tab_chat     = ui.tab("Chat",               icon="chat")
             tab_scoring  = ui.tab("Scoring & Analysis", icon="analytics")
             tab_custs    = ui.tab("Customers",          icon="people")
+            tab_assets   = ui.tab("Assets",             icon="folder")
         with ui.tab_panels(main_tabs, value=tab_config).classes("w-full pt-4"):
 
             with ui.tab_panel(tab_scrape):
@@ -5978,6 +5979,40 @@ def main_page():
                                                 except Exception:
                                                     ui.label(f"[{_atype} parse error]").classes("text-red-500 text-xs")
                                                     continue
+                                                # ── Auto-save artifact to Assets tab ──────────────────────
+                                                _ahash = hashlib.sha256(f"{_atype}::{_araw}".encode()).hexdigest()[:16]
+                                                if _ahash not in state.setdefault("assets_saved", set()):
+                                                    state["assets_saved"].add(_ahash)
+                                                    if _CB_AVAILABLE and cb_url_input.value.strip():
+                                                        if _atype == "echart":
+                                                            _as_title = ((_ap.get("title") or {}).get("text") or "Chart")
+                                                            _as_type  = "chart"
+                                                            _as_content = _araw
+                                                        else:  # table
+                                                            import csv as _csv_m, io as _csv_io
+                                                            _buf = _csv_io.StringIO()
+                                                            _cw  = _csv_m.writer(_buf)
+                                                            _cw.writerow(_ap.get("columns") or [])
+                                                            _cw.writerows(_ap.get("rows") or [])
+                                                            _as_title   = _ap.get("title") or "Table"
+                                                            _as_type    = "table"
+                                                            _as_content = _buf.getvalue()
+                                                        import threading as _thr_r
+                                                        _thr_r.Thread(
+                                                            target=_save_asset_to_cb,
+                                                            args=(
+                                                                cb_url_input.value.strip(),
+                                                                cb_bucket_input.value.strip(),
+                                                                cb_user_input.value.strip(),
+                                                                cb_pass_input.value,
+                                                                cb_tls_toggle.value,
+                                                                cb_scope_input.value.strip() or "_default",
+                                                                _as_type, _as_title, _as_content,
+                                                                state.get("chat_session_id", ""),
+                                                                state.get("customer_name", ""),
+                                                            ),
+                                                            daemon=True,
+                                                        ).start()
                                                 if _atype == "echart":
                                                     _cuid   = f"agchart-{abs(hash(_araw)):x}"
                                                     _ctitle = ((_ap.get("title") or {}).get("text") or "chart").replace(" ", "_")
@@ -10725,6 +10760,228 @@ def main_page():
 
                     btn_dir_refresh.on_click(lambda: asyncio.ensure_future(_dir_load()))
                     dir_table.on("rowclick", _dir_pick)
+
+            # ══════════════════════════════════════════════════════════════════
+            # Assets tab — persistent artifacts (charts, reports, CSV, JSON…)
+            # ══════════════════════════════════════════════════════════════════
+            with ui.tab_panel(tab_assets):
+                with ui.column().classes("w-full gap-4 p-4"):
+                    with ui.card().classes("w-full"):
+                        # ── Header ────────────────────────────────────────────────────
+                        with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                            ui.icon("folder", color="amber").classes("text-2xl")
+                            ui.label("Assets").classes("text-base font-semibold flex-1")
+                            _assets_status = ui.label("").classes("text-xs text-gray-400")
+                            _btn_assets_refresh = ui.button(
+                                "Refresh", icon="refresh"
+                            ).props("outline size=sm color=primary")
+
+                        ui.label(
+                            "Charts and reports generated during chat are auto-saved here. "
+                            "Ask the agent to 'save this as an asset' for any text content."
+                        ).classes("text-xs text-gray-400 mt-1 mb-2")
+
+                        # ── Filter row ────────────────────────────────────────────────
+                        with ui.row().classes("w-full gap-3 mt-1 flex-wrap items-end"):
+                            _af_org = ui.input(
+                                "Filter by org", placeholder="all"
+                            ).props("dense outlined clearable").classes("w-48")
+                            _af_type = ui.select(
+                                ["all", "chart", "report", "table", "csv", "json", "js", "html"],
+                                value="all", label="Type",
+                            ).props("dense outlined").classes("w-36")
+                            _af_search = ui.input(
+                                "Search title", placeholder="keyword"
+                            ).props("dense outlined clearable").classes("w-48")
+
+                        # ── Asset list ────────────────────────────────────────────────
+                        _assets_area = ui.column().classes("w-full gap-2 mt-3")
+
+                        def _render_asset_card(row: dict) -> None:
+                            _aid    = row.get("id", "")
+                            _atype  = row.get("asset_type", "report")
+                            _atitle = row.get("title") or row.get("filename") or "Untitled"
+                            _aorg   = row.get("org") or ""
+                            _ats    = row.get("created_at") or 0
+                            _afname = row.get("filename") or f"{_atitle}.{_atype}"
+                            _amime  = row.get("mime_type") or _ASSET_MIME.get(_atype, "text/plain")
+                            _aicon  = _ASSET_ICONS.get(_atype, "description")
+                            import datetime as _dtt
+                            _ts_str = (
+                                _dtt.datetime.fromtimestamp(_ats).strftime("%Y-%m-%d %H:%M")
+                                if _ats else "—"
+                            )
+
+                            def _cb_args_assets():
+                                return (
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                )
+
+                            with ui.card().classes("w-full py-2 px-3"):
+                                with ui.row().classes("w-full items-center gap-2"):
+                                    ui.icon(_aicon, color="blue-grey").classes("text-2xl shrink-0")
+                                    with ui.column().classes("flex-1 gap-0 min-w-0"):
+                                        ui.label(_atitle).classes(
+                                            "text-sm font-semibold leading-tight truncate"
+                                        )
+                                        with ui.row().classes("gap-2 items-center flex-wrap"):
+                                            if _aorg:
+                                                ui.badge(_aorg[:28]).props(
+                                                    "color=teal outline"
+                                                ).classes("text-xs")
+                                            ui.badge(_atype).props(
+                                                "color=blue-grey"
+                                            ).classes("text-xs")
+                                            ui.label(_ts_str).classes("text-xs text-gray-400")
+
+                                    # ── Per-asset actions ──────────────────────────
+                                    with ui.row().classes("gap-1 shrink-0"):
+                                        async def _preview(aid=_aid, atype=_atype, atitle=_atitle):
+                                            doc = await run.io_bound(
+                                                _get_asset_content_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            content = doc.get("content", "")
+                                            with ui.dialog() as _dlg, ui.card().classes(
+                                                "w-full max-w-4xl max-h-screen overflow-auto"
+                                            ):
+                                                with ui.row().classes("w-full items-center sticky top-0 bg-white z-10 pb-2"):
+                                                    ui.label(atitle).classes("text-base font-semibold flex-1")
+                                                    ui.button(icon="close", on_click=_dlg.close).props("flat round dense")
+                                                if atype in ("chart", "echart"):
+                                                    try:
+                                                        _opt = json.loads(content)
+                                                        _opt_c = {k: v for k, v in _opt.items() if not k.startswith("_")}
+                                                        ui.echart(_opt_c).classes("w-full").style("height:380px")
+                                                    except Exception:
+                                                        ui.code(content, language="json").classes("w-full")
+                                                elif atype == "report":
+                                                    ui.markdown(content).classes("prose prose-sm max-w-none")
+                                                elif atype in ("csv", "table"):
+                                                    import csv as _cv2, io as _io2
+                                                    import html as _hm2
+                                                    _rdr = list(_cv2.reader(_io2.StringIO(content)))
+                                                    if _rdr:
+                                                        _th2 = "".join(
+                                                            f'<th class="border border-gray-300 px-2 py-1 bg-gray-100 text-xs font-semibold">{_hm2.escape(str(c))}</th>'
+                                                            for c in _rdr[0]
+                                                        )
+                                                        _tb2 = "".join(
+                                                            "<tr>" + "".join(
+                                                                f'<td class="border border-gray-300 px-2 py-1 text-xs">{_hm2.escape(str(c))}</td>'
+                                                                for c in r
+                                                            ) + "</tr>"
+                                                            for r in _rdr[1:]
+                                                        )
+                                                        ui.html(
+                                                            f'<div class="overflow-x-auto"><table class="border-collapse">'
+                                                            f'<thead><tr>{_th2}</tr></thead><tbody>{_tb2}</tbody></table></div>'
+                                                        )
+                                                else:
+                                                    _lang = {"json": "json", "js": "javascript", "javascript": "javascript", "html": "html"}.get(atype, "text")
+                                                    ui.code(content, language=_lang).classes("w-full")
+                                            _dlg.open()
+
+                                        ui.button(icon="visibility", on_click=_preview).props(
+                                            "flat round dense color=primary"
+                                        ).tooltip("Preview")
+
+                                        async def _download(aid=_aid, afname=_afname, amime=_amime):
+                                            doc = await run.io_bound(
+                                                _get_asset_content_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            ui.download(
+                                                doc.get("content", "").encode(), afname, amime
+                                            )
+
+                                        ui.button(icon="download", on_click=_download).props(
+                                            "flat round dense color=green"
+                                        ).tooltip("Download")
+
+                                        async def _print_asset(aid=_aid, atitle=_atitle, atype=_atype):
+                                            doc = await run.io_bound(
+                                                _get_asset_content_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            content = doc.get("content", "")
+                                            _esc_content = json.dumps(content)
+                                            _esc_title   = json.dumps(atitle)
+                                            await ui.run_javascript(f"""
+(function() {{
+  var w = window.open('', '_blank');
+  var c = {_esc_content};
+  var t = {_esc_title};
+  w.document.write('<html><head><title>' + t + '</title>');
+  w.document.write('<style>body{{font-family:system-ui,sans-serif;padding:2rem;max-width:960px;margin:auto;line-height:1.6}}');
+  w.document.write('pre{{background:#f5f5f5;padding:1rem;border-radius:4px;overflow-x:auto;font-size:12px}}');
+  w.document.write('table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 8px;font-size:12px}}');
+  w.document.write('h1,h2,h3{{margin-top:1.5rem}}</style></head><body>');
+  w.document.write('<h2>' + t + '</h2><pre>' + c.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>');
+  w.document.write('</body></html>');
+  w.document.close();
+  setTimeout(function(){{w.print();}}, 400);
+}})();
+""")
+
+                                        ui.button(icon="print", on_click=_print_asset).props(
+                                            "flat round dense color=blue-grey"
+                                        ).tooltip("Print / Save as PDF")
+
+                                        async def _delete(aid=_aid):
+                                            ok = await run.io_bound(
+                                                _delete_asset_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            if ok:
+                                                ui.notify("Asset deleted.", type="positive")
+                                                await _load_assets()
+                                            else:
+                                                ui.notify("Delete failed.", type="warning")
+
+                                        ui.button(icon="delete_outline", on_click=_delete).props(
+                                            "flat round dense color=red"
+                                        ).tooltip("Delete")
+
+                        async def _load_assets():
+                            _org_f  = (_af_org.value or "").strip()
+                            _type_f = _af_type.value if _af_type.value != "all" else ""
+                            _srch   = (_af_search.value or "").strip().lower()
+                            _assets_status.set_text("Loading…")
+                            _assets_area.clear()
+                            if not (_CB_AVAILABLE and cb_url_input.value.strip()):
+                                _assets_status.set_text("Couchbase not configured.")
+                                return
+                            try:
+                                rows = await run.io_bound(
+                                    _list_assets_from_cb,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    _org_f, _type_f,
+                                )
+                                if _srch:
+                                    rows = [r for r in rows if _srch in (r.get("title") or "").lower()]
+                                _assets_status.set_text(f"{len(rows)} asset(s)")
+                                with _assets_area:
+                                    if not rows:
+                                        ui.label(
+                                            "No assets yet. Charts and reports from chat are saved here automatically."
+                                        ).classes("text-sm text-gray-400 mt-4 text-center w-full")
+                                    else:
+                                        for _row in rows:
+                                            _render_asset_card(_row)
+                            except Exception as _exc:
+                                _assets_status.set_text(f"Error: {_classify_agent_error(_exc)}")
+
+                        _btn_assets_refresh.on_click(lambda: asyncio.ensure_future(_load_assets()))
+                        _af_org.on("change", lambda: asyncio.ensure_future(_load_assets()))
+                        _af_type.on("update:model-value", lambda: asyncio.ensure_future(_load_assets()))
+                        _af_search.on("change", lambda: asyncio.ensure_future(_load_assets()))
 
     # ── Settings profile logic ───────────────────────────────────────────────
     def _tab_name(tab_val) -> str:
@@ -16213,6 +16470,32 @@ _AGENT_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_artifact",
+            "description": (
+                "Save any content as a named, retrievable asset persisted to Couchbase. "
+                "Assets appear in the Assets tab and can be downloaded, printed, or previewed later. "
+                "Use for reports, CSV exports, JSON data, JavaScript snippets, or HTML documents. "
+                "Charts are auto-saved from echart blocks; call this for text-based artifacts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title":      {"type": "string",  "description": "Human-readable title for the asset."},
+                    "asset_type": {
+                        "type": "string",
+                        "enum": ["report", "csv", "json", "js", "html"],
+                        "description": "Content type — determines icon, preview renderer, and download extension.",
+                    },
+                    "content":  {"type": "string", "description": "Full text content to save."},
+                    "filename": {"type": "string", "description": "Optional filename with extension (e.g. 'amex_report.md')."},
+                },
+                "required": ["title", "asset_type", "content"],
+            },
+        },
+    },
 ]
 
 
@@ -16224,6 +16507,31 @@ _SUPPORTAL_CUSTOMER_URL = "https://supportal.couchbase.com/customer/{customer}"
 # responses and rendered as live ECharts elements or HTML tables with download
 # buttons by _render_chat.
 _ARTIFACT_RE = re.compile(r"```(echart|table)\n(.*?)\n```", re.DOTALL)
+
+# Asset types auto-detected in responses for background-save to the Assets tab
+_CODE_ASSET_RE = re.compile(r"```(csv|json|javascript|js|html)\n(.*?)\n```", re.DOTALL)
+
+_ASSET_MIME: dict[str, str] = {
+    "chart":      "application/json",
+    "report":     "text/markdown",
+    "table":      "text/csv",
+    "csv":        "text/csv",
+    "json":       "application/json",
+    "js":         "text/javascript",
+    "javascript": "text/javascript",
+    "html":       "text/html",
+}
+
+_ASSET_ICONS: dict[str, str] = {
+    "chart":      "bar_chart",
+    "report":     "article",
+    "table":      "table_chart",
+    "csv":        "grid_on",
+    "json":       "data_object",
+    "js":         "javascript",
+    "javascript": "javascript",
+    "html":       "html",
+}
 
 
 def _build_agent_echart_option(args: dict) -> dict:
@@ -17697,12 +18005,44 @@ LIMIT {limit}
         if not _org:
             return "Error: organization is required."
         try:
-            return _generate_customer_report(
+            _report_md = _generate_customer_report(
                 _org, cb_url, bucket, username, password,
                 use_tls, scope, collection,
             )
+            # Auto-persist as an asset so it appears in the Assets tab
+            try:
+                import threading as _thr
+                _thr.Thread(
+                    target=_save_asset_to_cb,
+                    args=(cb_url, bucket, username, password, use_tls, scope,
+                          "report", f"{_org} Report", _report_md,
+                          ctx.get("session_id", ""), _org, f"{_org.lower().replace(' ','_')}_report.md"),
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
+            return _report_md
         except Exception as exc:
             return f"Report generation error: {exc}"
+
+    elif name == "save_artifact":
+        _title    = (args.get("title") or "untitled").strip()
+        _atype    = args.get("asset_type", "report")
+        _content  = args.get("content", "")
+        _filename = args.get("filename", "")
+        _org      = default_customer or ""
+        if not _content:
+            return "Error: content is required."
+        try:
+            aid = _save_asset_to_cb(
+                cb_url, bucket, username, password, use_tls, scope,
+                _atype, _title, _content,
+                session_id=ctx.get("session_id", ""),
+                org=_org, filename=_filename,
+            )
+            return f"Asset saved: **{_title}** (ID: `{aid}`). View it in the **Assets** tab."
+        except Exception as exc:
+            return f"Failed to save asset: {exc}"
 
     else:
         return f"Unknown tool: {name}"
@@ -18510,6 +18850,125 @@ def _generate_customer_report(
             lines.append(f"- [{t.get('ticket_id','')}] {(t.get('subject') or '')[:70]}")
 
     return "\n".join(lines)
+
+
+# ── Assets persistence ────────────────────────────────────────────────────────
+
+def _ensure_assets_collection(cluster, bucket_name: str, scope: str) -> None:
+    """Create the `assets` collection inside scope if it does not already exist."""
+    try:
+        from couchbase.management.collections import CollectionSpec
+        cm = cluster.bucket(bucket_name).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if "assets" not in existing.get(scope, set()):
+            cm.create_collection(CollectionSpec("assets", scope_name=scope))
+            try:
+                cluster.query(
+                    f"CREATE PRIMARY INDEX IF NOT EXISTS ON `{bucket_name}`.`{scope}`.`assets`"
+                ).execute()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _save_asset_to_cb(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+    asset_type: str, title: str, content: str,
+    session_id: str = "", org: str = "", filename: str = "",
+) -> str:
+    """Persist an artifact to the CB assets collection. Returns the asset ID."""
+    import time as _time
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_ = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+    _ensure_assets_collection(cl_, bucket, scope)
+    aid   = str(uuid.uuid4())
+    ext   = {"chart": "json", "report": "md", "table": "csv", "csv": "csv",
+              "json": "json", "js": "js", "javascript": "js", "html": "html"}.get(asset_type, "txt")
+    fname = filename or f"{title.lower().replace(' ', '_')}.{ext}"
+    doc   = {
+        "id":         aid,
+        "type":       "asset",
+        "asset_type": asset_type,
+        "title":      title,
+        "filename":   fname,
+        "content":    content,
+        "org":        org,
+        "session_id": session_id,
+        "created_at": int(_time.time()),
+        "mime_type":  _ASSET_MIME.get(asset_type, "text/plain"),
+        "size_bytes": len(content.encode()),
+    }
+    cl_.bucket(bucket).scope(scope).collection("assets").upsert(f"asset::{aid}", doc)
+    cl_.close()
+    return aid
+
+
+def _list_assets_from_cb(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+    org: str = "", asset_type: str = "", limit: int = 200,
+) -> list[dict]:
+    """List saved assets from CB, newest first."""
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+    _ensure_assets_collection(cl_, bucket, scope)
+    from couchbase.options import QueryOptions as _QO
+    wheres: list[str] = ["a.type='asset'"]
+    params: dict      = {}
+    if org:
+        wheres.append("LOWER(a.org) LIKE $org")
+        params["org"] = f"%{org.lower()}%"
+    if asset_type:
+        wheres.append("a.asset_type = $asset_type")
+        params["asset_type"] = asset_type
+    rows = list(cl_.query(
+        f"SELECT a.id, a.asset_type, a.title, a.filename, a.org, "
+        f"a.session_id, a.created_at, a.mime_type, a.size_bytes "
+        f"FROM `{bucket}`.`{scope}`.`assets` a "
+        f"WHERE {' AND '.join(wheres)} ORDER BY a.created_at DESC LIMIT {limit}",
+        _QO(named_parameters=params),
+    ))
+    cl_.close()
+    return rows
+
+
+def _get_asset_content_from_cb(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, asset_id: str,
+) -> dict:
+    """Fetch full asset document including content field."""
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+    try:
+        return cl_.bucket(bucket).scope(scope).collection("assets").get(
+            f"asset::{asset_id}"
+        ).content_as[dict]
+    except Exception:
+        return {}
+    finally:
+        cl_.close()
+
+
+def _delete_asset_from_cb(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, asset_id: str,
+) -> bool:
+    """Delete a single asset document. Returns True on success."""
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+    try:
+        cl_.bucket(bucket).scope(scope).collection("assets").remove(f"asset::{asset_id}")
+        return True
+    except Exception:
+        return False
+    finally:
+        cl_.close()
 
 
 # ─────────────────────────── Phase 3: Scoring & Analytics ────────────────────
