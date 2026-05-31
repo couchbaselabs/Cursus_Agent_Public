@@ -2176,6 +2176,64 @@ def search_customers_via_analytics(
     return results
 
 
+def resolve_customer_name(
+    query: str,
+    cookie: str | None,
+    cb_url: str = "",
+    cb_bucket: str = "supportal",
+    cb_user: str = "",
+    cb_pass: str = "",
+    cb_tls: bool = False,
+    cb_scope: str = "_default",
+    cb_collection: str = "tickets",
+    limit: int = 10,
+) -> list[dict]:
+    """
+    Find Supportal customer names matching a partial/fuzzy query.
+    Chains three sources and deduplicates by normalized name:
+      1. Analytics SQL++ LIKE '%query%'   — Supportal's live customer list
+      2. Local Couchbase LIKE '%query%'   — customers already scraped
+      3. Supportal UI search API          — keyword-search fallback
+    Returns list of {display_name, url, source} sorted by source quality.
+    """
+    all_hits: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(name: str, source: str) -> None:
+        key = name.strip().lower()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        url = f"{BASE_URL}/customer/{urllib.parse.quote(name.strip(), safe='')}"
+        all_hits.append({"display_name": name.strip(), "url": url, "source": source})
+
+    # 1 — Analytics LIKE (most complete, authoritative)
+    if cookie:
+        try:
+            for h in search_customers_via_analytics(query, cookie, limit):
+                _add(h.get("display_name") or h.get("slug") or "", "Analytics")
+        except Exception:
+            pass
+
+    # 2 — Local CB LIKE (works offline / no cookie needed)
+    if _CB_AVAILABLE and cb_url and cb_user:
+        try:
+            for org in search_orgs_from_cb(cb_url, cb_bucket, cb_user, cb_pass, cb_tls, cb_scope, cb_collection, query, limit):
+                _add(org, "Local DB")
+        except Exception:
+            pass
+
+    # 3 — Supportal UI search (good for short-name lookups, requires cookie)
+    if cookie and len(all_hits) < 3:
+        try:
+            for h in search_customers_on_supportal(query, cookie, limit):
+                _add(h.get("display_name") or h.get("slug") or "", "Supportal")
+        except Exception:
+            pass
+
+    return all_hits[:limit]
+
+
 def _find_tickets_tab_url(html: str, current_url: str) -> Optional[str]:
     """
     Find the Tickets tab link on a customer page.
@@ -6808,6 +6866,20 @@ def main_page():
                                         "- fleet_version_distribution: CB version spread across all clusters fleet-wide.\n"
                                         "- fleet_cbse_impact: which CBSEs affect the most customers (ranked by blast radius)."
                                     )
+                                    if not _cust_agent or _cust_agent.lower() == "all customers":
+                                        _agent_sys += (
+                                            "\n\nNO CUSTOMER CONFIGURED — follow this flow:\n"
+                                            "1. When the user mentions any company, account, or customer name, "
+                                            "call search_customer_names({\"query\": \"<fragment>\"}) immediately.\n"
+                                            "2. Present the ranked matches to the user and ask them to confirm "
+                                            "which one they mean (e.g. '1. NetDocuments Inc, 2. NetDocuments Ltd — which one?').\n"
+                                            "3. Once confirmed, use that exact name as customer=<name> in every "
+                                            "subsequent tool call (query_tickets, get_customer_health_score, etc.) "
+                                            "for the rest of this conversation.\n"
+                                            "4. If no match is found, suggest the user go to the Scraping tab to "
+                                            "add the customer, or call scrape_customer_tickets to pull fresh data.\n"
+                                            "Do NOT attempt to query tickets or health scores before a customer is confirmed."
+                                        )
                                     if _cust_agent and _cust_agent.lower() != "all customers":
                                         _agent_sys += (
                                             f"\n\nSCOPING RULE: Customer is scoped to \"{_cust_agent}\". "
@@ -6816,7 +6888,7 @@ def main_page():
                                             f"FLEET TOOL EXEMPTIONS — the following tools are ALWAYS cross-org and must NEVER "
                                             f"have a customer or organization filter added:\n"
                                             f"  query_fleet_tickets, list_at_risk_clusters, fleet_version_distribution, "
-                                            f"fleet_cbse_impact, get_portfolio_status, list_organizations\n"
+                                            f"fleet_cbse_impact, get_portfolio_status, list_organizations, search_customer_names\n"
                                             f"DISCOVERY EXCEPTIONS (cross-customer queries are allowed ONLY for):\n"
                                             f"  1. Any FLEET TOOL EXEMPTION listed above.\n"
                                             f"  2. Discovering what customers exist ('what orgs are in the system', "
@@ -16337,6 +16409,34 @@ _AGENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "search_customer_names",
+            "description": (
+                "Search for Supportal customer names matching a partial or fuzzy query. "
+                "Use this when NO customer is currently configured and the user mentions a "
+                "company name — call this first to find the exact match, then confirm with "
+                "the user before proceeding. Also useful for 'is X a customer?', 'find "
+                "customers named like Y', or resolving ambiguous company names. "
+                "Searches Analytics (live), local Couchbase, and Supportal search in order."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Partial or full customer name to search for.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_table",
             "description": (
                 "Renders a real data table in the chat UI with CSV and Excel download buttons. "
@@ -17714,6 +17814,33 @@ LIMIT {limit}
         lines = [f"**{len(rows)} organizations in Couchbase:**", ""]
         for r in rows:
             lines.append(f"- **{r['organization']}** ({r['ticket_count']} ticket{'s' if r['ticket_count'] != 1 else ''})")
+        return "\n".join(lines)
+
+    elif name == "search_customer_names":
+        _query = (args.get("query") or "").strip()
+        _limit = min(int(args.get("limit") or 10), 20)
+        if not _query:
+            return "Error: query is required."
+        _cookie = ctx.get("cookie") or _get_profile_cookie()
+        hits = resolve_customer_name(
+            _query,
+            cookie=_cookie,
+            cb_url=cb_url, cb_bucket=bucket, cb_user=username,
+            cb_pass=password, cb_tls=use_tls, cb_scope=scope,
+            cb_collection=collection, limit=_limit,
+        )
+        if not hits:
+            return (
+                f"No customers found matching '{_query}'. "
+                "Try a shorter fragment, check spelling, or use list_supportal_customers to browse all."
+            )
+        lines = [f"**{len(hits)} customer(s) matching '{_query}':**\n"]
+        for i, h in enumerate(hits, 1):
+            lines.append(f"{i}. **{h['display_name']}** *(source: {h['source']})*")
+        lines.append(
+            "\nAsk the user which one they mean, then use that exact name as "
+            "`customer=` in all subsequent tool calls for this conversation."
+        )
         return "\n".join(lines)
 
     elif name == "generate_chart":
