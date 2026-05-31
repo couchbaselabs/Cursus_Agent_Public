@@ -282,6 +282,53 @@ def poll_lmstudio_model_info(base_url: str) -> dict:
     return result
 
 
+def lmstudio_load_model(base_url: str, model_id: str) -> bool:
+    """Ask LMStudio to load a specific model via POST /api/v0/models/load."""
+    base = base_url.rstrip("/")
+    try:
+        resp = requests.post(
+            f"{base}/api/v0/models/load",
+            json={"identifier": model_id},
+            timeout=10, verify=False,
+        )
+        return resp.ok
+    except Exception:
+        return False
+
+
+def lmstudio_ensure_model_loaded(base_url: str, desired_model: str, timeout_s: int = 30) -> str:
+    """
+    Ensure a model is loaded in LMStudio before making an inference call.
+    Returns the loaded model id, or empty string if no model could be loaded.
+    If no model is loaded, requests a load of desired_model and waits up to timeout_s.
+    """
+    info = poll_lmstudio_model_info(base_url)
+    loaded = [m for m in info.get("models", []) if m.get("state") == "loaded"]
+    if loaded:
+        return loaded[0].get("id") or loaded[0].get("identifier") or desired_model
+
+    # Nothing loaded — try to load desired_model (or first available)
+    target = desired_model
+    if not target:
+        available = info.get("models", [])
+        target = (available[0].get("id") or available[0].get("identifier") or "") if available else ""
+    if not target:
+        return ""
+
+    print(f"[LMStudio] No model loaded — requesting load of '{target}'")
+    lmstudio_load_model(base_url, target)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(2)
+        info = poll_lmstudio_model_info(base_url)
+        loaded = [m for m in info.get("models", []) if m.get("state") == "loaded"]
+        if loaded:
+            print(f"[LMStudio] Model loaded: {loaded[0].get('id','?')}")
+            return loaded[0].get("id") or target
+    print(f"[LMStudio] Timed out waiting for model load after {timeout_s}s")
+    return ""
+
+
 # ── RAG chat cache helpers ────────────────────────────────────────────────────
 
 def _chat_cache_key(prefix: str, *parts: str) -> str:
@@ -6091,6 +6138,32 @@ def main_page():
 
             with ui.tab_panel(tab_chat):
                 with ui.column().classes("w-full gap-6"):
+
+                    # ── Load user profile once on tab render ─────────────────────────────
+                    async def _load_profile_into_state():
+                        if state.get("_user_profile") is not None:
+                            return  # already loaded this session
+                        _pu = cb_user_input.value.strip() or "default"
+                        if _CB_AVAILABLE and cb_url_input.value.strip():
+                            try:
+                                p = await run.io_bound(
+                                    _load_customer_profile,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip() or "supportal",
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    _pu,
+                                )
+                                state["_user_profile"] = p
+                            except Exception:
+                                state["_user_profile"] = {}
+                        else:
+                            state["_user_profile"] = {}
+                        _render_chat()  # refresh empty state to show top-customer chips
+
+                    ui.timer(1.0, _load_profile_into_state, once=True)
+
                     # ── Phase 2: Chat / RAG ──────────────────────────────────────────────
                     with ui.card().classes("w-full"):
                         ui.label("Chat with Tickets (RAG)").classes("text-base font-semibold")
@@ -6193,6 +6266,26 @@ def main_page():
                                         ui.label(
                                             'Try: "What are the top open P1s?" · "Health score for Amex" · "SLA compliance this month"'
                                         ).classes("text-xs text-gray-400 max-w-md")
+                                        # Briefing shortcut — only shown when profile has top customers
+                                        _p_names = [
+                                            c["name"] for c in
+                                            (state.get("_user_profile", {}).get("top_customers") or [])
+                                            if c.get("is_valid", True)
+                                        ][:5]
+                                        if _p_names:
+                                            with ui.column().classes("items-center gap-1 mt-2"):
+                                                ui.label("Your top accounts:").classes("text-xs text-gray-400")
+                                                with ui.row().classes("flex-wrap gap-1 justify-center"):
+                                                    for _pn in _p_names:
+                                                        async def _ask_briefing_cust(n=_pn):
+                                                            chat_input.value = f"What's the status of {n}?"
+                                                            await _send_chat()
+                                                        ui.chip(_pn, on_click=_ask_briefing_cust).props("outline color=teal dense").classes("text-xs")
+                                            async def _run_briefing():
+                                                chat_input.value = "What should I know today across my accounts?"
+                                                await _send_chat()
+                                            ui.button("Morning Briefing", icon="wb_sunny", on_click=_run_briefing)\
+                                              .props("outline color=orange dense size=sm").classes("mt-1")
                                     return
                                 for msg in state["chat_history"]:
                                     _msg_ts = msg.get("ts", "")
@@ -6897,6 +6990,37 @@ def main_page():
                                             f"the user names explicitly.\n"
                                             f"For all analysis, trends, ticket details, and comparisons: stay scoped to \"{_cust_agent}\"."
                                         )
+                                    # ── Profile: load top customers, inject into prompt ──────
+                                    _profile_user = (cb_user_input.value.strip() or "default")
+                                    _user_profile: dict = {}
+                                    _top_cust_names: list[str] = []
+                                    if _CB_AVAILABLE and cb_url_input.value.strip():
+                                        try:
+                                            _user_profile = await run.io_bound(
+                                                _load_customer_profile,
+                                                cb_url_input.value.strip(),
+                                                cb_bucket_input.value.strip() or "supportal",
+                                                cb_user_input.value.strip(),
+                                                cb_pass_input.value,
+                                                cb_tls_toggle.value,
+                                                _profile_user,
+                                            )
+                                            _top_cust_names = [
+                                                c["name"] for c in
+                                                (_user_profile.get("top_customers") or [])
+                                                if c.get("is_valid", True) and c.get("name")
+                                            ][:5]
+                                        except Exception:
+                                            pass
+                                    if _top_cust_names:
+                                        _agent_sys += (
+                                            f"\n\nUSER PROFILE — top accounts by recent activity: "
+                                            + ", ".join(f'"{n}"' for n in _top_cust_names)
+                                            + ". When the user asks an open-ended status question "
+                                            "with no specific customer, use get_briefing to check "
+                                            "these accounts. When the user asks 'what should I know "
+                                            "today?' or 'any urgent issues?', call get_briefing immediately."
+                                        )
                                     if state.get("prior_session_block"):
                                         _agent_sys += "\n" + state["prior_session_block"]
                                     _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
@@ -6916,6 +7040,7 @@ def main_page():
                                         "emb_dims": _emb_d,
                                         "cookie": (cookie_input.value or "").strip() or _get_profile_cookie(),
                                         "_session_log": state.get("_session_log", {}),
+                                        "profile_user": _profile_user,
                                     }
                                     # ── BEFORE v1.5.0: no _session_log key in _agent_ctx ──────
                                     _agent_cancel.clear()
@@ -11806,6 +11931,194 @@ def list_orgs_from_cb(
     return sorted({str(r).strip() for r in rows if r and str(r).strip()})
 
 
+# ─────────────────────────── User profile / JARVIS helpers ───────────────────
+
+_PROFILE_SCOPE      = "chat"
+_PROFILE_COLLECTION = "profiles"
+
+
+def _ensure_profiles_collection(cluster, bucket_name: str) -> None:
+    try:
+        from couchbase.management.collections import CollectionSpec
+        cm = cluster.bucket(bucket_name).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if _PROFILE_SCOPE not in existing:
+            cm.create_scope(_PROFILE_SCOPE)
+            existing[_PROFILE_SCOPE] = set()
+        if _PROFILE_COLLECTION not in existing[_PROFILE_SCOPE]:
+            cm.create_collection(CollectionSpec(_PROFILE_COLLECTION, scope_name=_PROFILE_SCOPE))
+        cluster.query(
+            f"CREATE PRIMARY INDEX IF NOT EXISTS "
+            f"ON `{bucket_name}`.`{_PROFILE_SCOPE}`.`{_PROFILE_COLLECTION}`"
+        ).execute()
+    except Exception:
+        pass
+
+
+def _load_customer_profile(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, profile_user: str,
+) -> dict:
+    """Load profile doc for profile_user; returns empty profile if missing."""
+    _empty = {"username": profile_user, "top_customers": [], "alert_thresholds": {
+        "new_p1": True, "score_drop_pts": 10, "stale_hours": 12,
+    }, "last_validated_at": 0, "updated_at": 0}
+    if not _CB_AVAILABLE or not cb_url:
+        return _empty
+    try:
+        from couchbase.cluster import Cluster, ClusterOptions
+        from couchbase.auth import PasswordAuthenticator
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        _ensure_profiles_collection(cl, bucket)
+        try:
+            doc = cl.bucket(bucket).scope(_PROFILE_SCOPE).collection(_PROFILE_COLLECTION)\
+                    .get(f"profile::{profile_user}").content_as[dict]
+        except Exception:
+            doc = _empty
+        cl.close()
+        return doc
+    except Exception:
+        return _empty
+
+
+def _record_customer_access(
+    org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, profile_user: str,
+) -> None:
+    """Increment access_count and update last_accessed_at for org in the user profile."""
+    if not _CB_AVAILABLE or not cb_url or not org:
+        return
+    try:
+        import math
+        from couchbase.cluster import Cluster, ClusterOptions
+        from couchbase.auth import PasswordAuthenticator
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        _ensure_profiles_collection(cl, bucket)
+        col = cl.bucket(bucket).scope(_PROFILE_SCOPE).collection(_PROFILE_COLLECTION)
+        key = f"profile::{profile_user}"
+        now = int(time.time())
+        try:
+            doc = col.get(key).content_as[dict]
+        except Exception:
+            doc = {"username": profile_user, "top_customers": [], "alert_thresholds": {
+                "new_p1": True, "score_drop_pts": 10, "stale_hours": 12,
+            }, "last_validated_at": 0, "updated_at": 0}
+        customers = doc.get("top_customers") or []
+        entry = next((c for c in customers if (c.get("name") or "").lower() == org.lower()), None)
+        if entry:
+            entry["access_count"] = (entry.get("access_count") or 0) + 1
+            entry["last_accessed_at"] = now
+        else:
+            customers.append({
+                "name": org, "access_count": 1,
+                "last_accessed_at": now, "validated_at": 0, "is_valid": True,
+            })
+        # Keep top 20 by recency-weighted score; score = count / (1 + days_since_access)
+        def _score(c: dict) -> float:
+            days = max(0, (now - (c.get("last_accessed_at") or 0)) / 86400)
+            return (c.get("access_count") or 1) / (1.0 + days)
+        customers.sort(key=_score, reverse=True)
+        doc["top_customers"] = customers[:20]
+        doc["updated_at"] = now
+        col.upsert(key, doc)
+        cl.close()
+    except Exception:
+        pass
+
+
+def _validate_customer_profile(
+    profile: dict,
+    cookie: str | None,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, profile_user: str,
+) -> dict:
+    """
+    Re-check each top customer name against Analytics LIKE search.
+    Only runs if last_validated_at is > 24h ago. Updates is_valid flag in place.
+    """
+    now = int(time.time())
+    if now - (profile.get("last_validated_at") or 0) < 86400:
+        return profile  # fresh enough
+    customers = profile.get("top_customers") or []
+    for entry in customers:
+        name = entry.get("name") or ""
+        if not name:
+            continue
+        try:
+            hits = resolve_customer_name(name, cookie=cookie,
+                                         cb_url=cb_url, cb_bucket=bucket,
+                                         cb_user=username, cb_pass=password,
+                                         cb_tls=use_tls, limit=3)
+            exact = any((h.get("display_name") or "").lower() == name.lower() for h in hits)
+            entry["is_valid"] = exact or bool(hits)
+            entry["validated_at"] = now
+        except Exception:
+            pass
+    profile["last_validated_at"] = now
+    # Persist the updated validation flags
+    if _CB_AVAILABLE and cb_url:
+        try:
+            from couchbase.cluster import Cluster, ClusterOptions
+            from couchbase.auth import PasswordAuthenticator
+            conn = _cb_conn_str(cb_url, use_tls)
+            cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+            cl.wait_until_ready(timedelta(seconds=10))
+            cl.bucket(bucket).scope(_PROFILE_SCOPE).collection(_PROFILE_COLLECTION)\
+              .upsert(f"profile::{profile_user}", profile)
+            cl.close()
+        except Exception:
+            pass
+    return profile
+
+
+def _get_briefing_data(
+    top_customers: list[dict],
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    stale_hours: float = 12.0,
+) -> list[dict]:
+    """
+    Lightweight health snapshot for each customer in top_customers.
+    Returns list of {name, score, grade, open_p1, open_p2, hours_stale, alert}.
+    Uses only local CB — no scraping.
+    """
+    results = []
+    for entry in top_customers:
+        if not entry.get("is_valid", True):
+            continue
+        org = entry.get("name") or ""
+        if not org:
+            continue
+        try:
+            h = _compute_health_score(org, cb_url, bucket, username, password,
+                                      use_tls, scope, collection)
+            stale = h.get("hours_since_scraped", 0)
+            alert = (
+                h.get("open_p1", 0) > 0
+                or h.get("score", 100) < 40
+                or stale > stale_hours
+            )
+            results.append({
+                "name":         org,
+                "score":        h.get("score", 0),
+                "grade":        h.get("grade", "?"),
+                "open_p1":      h.get("open_p1", 0),
+                "open_p2":      h.get("open_p2", 0),
+                "hours_stale":  round(stale, 1),
+                "alert":        alert,
+            })
+        except Exception:
+            results.append({"name": org, "score": -1, "grade": "?",
+                            "open_p1": 0, "open_p2": 0, "hours_stale": 0, "alert": False})
+    results.sort(key=lambda x: (not x["alert"], x["score"]))
+    return results
+
+
 def search_orgs_from_cb(
     cb_url: str,
     bucket: str,
@@ -16418,6 +16731,29 @@ _AGENT_TOOLS: list[dict] = [
                 "customers named like Y', or resolving ambiguous company names. "
                 "Searches Analytics (live), local Couchbase, and Supportal search in order."
             ),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_briefing",
+            "description": (
+                "Return a proactive briefing across the user's top accounts — health scores, "
+                "open P1/P2 counts, and data staleness. Call this for 'what should I know today?', "
+                "'morning briefing', 'what's going on across my accounts?', 'any urgent issues?', "
+                "or any open-ended status request with no specific customer. "
+                "Uses the user's access profile to know which accounts to check — no customer name needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "top_n": {
+                        "type": "integer",
+                        "description": "How many top customers to include (default 5, max 10).",
+                    },
+                },
+                "required": [],
+            },
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -17226,9 +17562,28 @@ def _execute_agent_tool(
     """
     ctx = ctx or {}
     # ── v1.5.0: session log tracks tools called this conversation ────────────
-    # Populated here; injected into the LLM system prompt in call_llm_with_tools
-    # so the model avoids redundant re-calls across multiple messages.
     _slog: dict = ctx.setdefault("_session_log", {})
+
+    # ── 3.5: record customer access for profile tracking ─────────────────────
+    _CUSTOMER_SCOPED_TOOLS = {
+        "query_tickets", "count_tickets", "get_ticket", "vector_search",
+        "get_customer_health_score", "check_sla_compliance", "get_digest",
+        "generate_customer_report", "rescrape_customer_tickets",
+        "scrape_customer_tickets", "get_cluster_health", "check_data_freshness",
+    }
+    if name in _CUSTOMER_SCOPED_TOOLS:
+        _tracked_org = (
+            args.get("organization") or args.get("customer") or
+            args.get("org") or default_customer or ""
+        ).strip()
+        if _tracked_org and cb_url and username:
+            import threading as _thr_profile
+            _thr_profile.Thread(
+                target=_record_customer_access,
+                args=(_tracked_org, cb_url, bucket, username, password,
+                      use_tls, ctx.get("profile_user", "default")),
+                daemon=True,
+            ).start()
 
     if name == "query_tickets":
         limit = min(int(args.get("limit") or 50), 200)
@@ -17840,6 +18195,55 @@ LIMIT {limit}
         lines.append(
             "\nAsk the user which one they mean, then use that exact name as "
             "`customer=` in all subsequent tool calls for this conversation."
+        )
+        return "\n".join(lines)
+
+    elif name == "get_briefing":
+        _top_n    = min(int(args.get("top_n") or 5), 10)
+        _pu       = ctx.get("profile_user", "default")
+        _stale_h  = 12.0
+        try:
+            _profile = _load_customer_profile(cb_url, bucket, username, password, use_tls, _pu)
+            _stale_h = float((_profile.get("alert_thresholds") or {}).get("stale_hours") or 12)
+            _top = [c for c in (_profile.get("top_customers") or [])
+                    if c.get("is_valid", True)][:_top_n]
+        except Exception:
+            _top = []
+        if not _top:
+            return (
+                "No customer profile found yet — I don't know which accounts you care about. "
+                "Start by asking about specific customers; I'll learn your top accounts over time. "
+                "Or use `list_organizations` to see what's in the local database."
+            )
+        _snap = _get_briefing_data(
+            _top, cb_url, bucket, username, password,
+            use_tls, scope, collection, stale_hours=_stale_h,
+        )
+        alerts = [r for r in _snap if r["alert"]]
+        ok     = [r for r in _snap if not r["alert"]]
+        lines  = [f"## Account Briefing — {len(_snap)} accounts\n"]
+        if alerts:
+            lines.append("### ⚠ Needs Attention")
+            for r in alerts:
+                flags = []
+                if r["open_p1"] > 0:
+                    flags.append(f"{r['open_p1']} open P1")
+                if r["score"] < 40:
+                    flags.append(f"health {r['score']}/100")
+                if r["hours_stale"] > _stale_h:
+                    flags.append(f"data {r['hours_stale']}h old")
+                lines.append(f"- **{r['name']}** — {', '.join(flags)}")
+        if ok:
+            lines.append("\n### ✅ Looking Good")
+            for r in ok:
+                lines.append(
+                    f"- **{r['name']}** — score {r['score']} ({r['grade']})"
+                    + (f", {r['open_p2']} open P2" if r["open_p2"] > 0 else "")
+                    + (f", data {r['hours_stale']}h old" if r["hours_stale"] > 0 else "")
+                )
+        lines.append(
+            f"\n*Briefing covers your top {len(_snap)} accounts by recent activity. "
+            "Ask me to drill into any account for details.*"
         )
         return "\n".join(lines)
 
@@ -18862,6 +19266,14 @@ def call_llm_with_tools(
         import openai as _oai
         print(f"[agent] base_url={_base!r}  → will POST to {_base}/chat/completions")
         client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
+
+        # LMStudio: ensure a model is loaded before the first round
+        if provider == "lmstudio":
+            _lms_base = _base.rstrip("/v1").rstrip("/")
+            _loaded_id = lmstudio_ensure_model_loaded(_lms_base, model or "", timeout_s=45)
+            if _loaded_id and _loaded_id != model:
+                print(f"[LMStudio] Using loaded model '{_loaded_id}' (requested '{model}')")
+                model = _loaded_id  # use the actually-loaded model name in API calls
 
         def _safe_choice(r):
             """Return the first choice or raise with a clear diagnostic."""

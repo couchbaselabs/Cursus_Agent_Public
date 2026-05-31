@@ -683,7 +683,7 @@ async def on_message(message: cl.Message):
         _friendly = app._classify_agent_error(exc)
         status_msg.content = f"❌ {_friendly}"
         await status_msg.update()
-        retry_action = cl.Action(name="retry", value=message.content, label="Retry", description="Re-run the same question")
+        retry_action = cl.Action(name="retry", value=message.content, payload={"value": message.content}, label="Retry", description="Re-run the same question")
         await cl.Message(content=_friendly, actions=[retry_action], author="Supportal").send()
         return
 
@@ -710,7 +710,7 @@ async def on_message(message: cl.Message):
         ),
     )
     _actions = [
-        cl.Action(name="followup", value=s, label=s, description="Ask this follow-up")
+        cl.Action(name="followup", value=s, payload={"value": s}, label=s, description="Ask this follow-up")
         for s in _sugs
     ]
     await cl.Message(content=clean_text, elements=elements, actions=_actions, author="Supportal").send()
