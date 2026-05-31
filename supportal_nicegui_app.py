@@ -3880,6 +3880,13 @@ def main_page():
                                         await _step_activate("embed")
                                         try:
                                             emb_provider, emb_model, emb_api_key, emb_base_url, emb_dims, emb_num_ctx = _get_embed_config()
+                                            # Ensure LMStudio embedding model is loaded before embedding
+                                            if emb_provider == "lmstudio":
+                                                _emb_lms_base = (emb_base_url or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                                                _loaded = await run.io_bound(lmstudio_ensure_model_loaded, _emb_lms_base, emb_model, 45)
+                                                if _loaded and _loaded != emb_model:
+                                                    progress_label.set_text(f"LMStudio: using loaded model '{_loaded}' for embeddings")
+                                                    emb_model = _loaded
                                             done_emb, errs_emb = await run.io_bound(
                                                 embed_all_tickets,
                                                 data,
@@ -17612,8 +17619,8 @@ def _execute_agent_tool(
             return f"No tickets found matching the given filters.{_ingest_hint}"
         _now_epoch = time.time()
         lines = [
-            "| Ticket ID | Organization | Subject | Status | Priority | Created | Last Scraped | CBSEs | Jira |",
-            "|-----------|-------------|---------|--------|----------|---------|-------------|-------|------|",
+            "| Ticket ID | Organization | Subject | Status | Priority | Created | Updated | Data Age | CBSEs | Jira |",
+            "|-----------|-------------|---------|--------|----------|---------|---------|----------|-------|------|",
         ]
         for t in tickets:
             cbses = ", ".join(t.get("cbses") or []) or "—"
@@ -17622,10 +17629,11 @@ def _execute_agent_tool(
             _lsa = t.get("last_scraped_at") or 0
             _age_h = (_now_epoch - _lsa) / 3600 if _lsa else None
             _age_str = f"{_age_h:.0f}h ago" if _age_h is not None else "unknown"
+            _updated = (t.get("updated") or t.get("updated_at") or "")[:10] or "—"
             lines.append(
                 f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
                 f"| {t.get('status','')} | {t.get('priority','')} "
-                f"| {(t.get('created') or '')[:10]} | {_age_str} | {cbses} | {jiras} |"
+                f"| {(t.get('created') or '')[:10]} | {_updated} | {_age_str} | {cbses} | {jiras} |"
             )
         return "\n".join(lines) + f"\n\n**Total: {len(tickets)} tickets**"
 
@@ -18520,10 +18528,55 @@ LIMIT {limit}
             _cluster.close()
         except Exception as exc:
             return f"Scraped {len(scraped)} tickets but CB save failed: {exc}"
-        return (
-            f"Scraped and saved **{_saved} tickets** for '{org}' "
-            f"(limit was {max_tickets}). Use query_tickets to explore them."
-        )
+
+        _pipeline_notes: list[str] = [f"Scraped and saved **{_saved} tickets** for '{org}'."]
+
+        # ── Auto-embed using ctx embedding config ──────────────────────────────
+        emb_p = ctx.get("emb_provider", "")
+        emb_m = ctx.get("emb_model", "")
+        emb_k = ctx.get("emb_api_key", "")
+        emb_u = ctx.get("emb_base_url", "")
+        emb_d = int(ctx.get("emb_dims") or 0)
+        if emb_p and emb_m and emb_d:
+            # Ensure LMStudio embedding model is loaded
+            if emb_p == "lmstudio":
+                _emb_lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                lmstudio_ensure_model_loaded(_emb_lms_base, emb_m, timeout_s=45)
+            try:
+                _saved_data = [{**t, "type": "ticket", "last_scraped_at": int(time.time())} for t in scraped]
+                _done_emb, _errs_emb = embed_all_tickets(
+                    _saved_data, cb_url, bucket, username, password,
+                    use_tls, scope, collection,
+                    emb_p, emb_m, emb_k, emb_u, emb_d,
+                    lambda msg, pct: None,
+                )
+                _pipeline_notes.append(
+                    f"Embedded **{_done_emb}** tickets"
+                    + (f" ({_errs_emb} errors)" if _errs_emb else "") + "."
+                )
+            except Exception as _emb_exc:
+                _pipeline_notes.append(f"Embedding skipped: {_emb_exc}")
+
+        # ── Auto-score using ctx LLM config ────────────────────────────────────
+        _s_provider = ctx.get("provider", "")
+        _s_model    = ctx.get("model", "")
+        _s_api_key  = ctx.get("api_key", "")
+        _s_base_url = ctx.get("base_url", "")
+        if _s_provider and _s_model and _saved > 0:
+            try:
+                _score_data = [{**t, "type": "ticket"} for t in scraped[:_saved]]
+                _scores = score_tickets_batch(
+                    _score_data[:10],  # cap at 10 per tool call
+                    _s_provider, _s_model, _s_api_key, _s_base_url,
+                    cb_url, bucket, username, password, use_tls, scope, collection,
+                    save_to_cb=True,
+                )
+                _pipeline_notes.append(f"Scored **{len(_scores)}** tickets.")
+            except Exception as _sc_exc:
+                _pipeline_notes.append(f"Scoring skipped: {_sc_exc}")
+
+        _pipeline_notes.append("Use query_tickets to explore them.")
+        return "\n".join(_pipeline_notes)
 
     elif name == "score_ticket":
         ticket_id = str(args.get("ticket_id") or "").strip()
