@@ -2139,6 +2139,43 @@ def search_customers_on_supportal(
     return results
 
 
+def search_customers_via_analytics(
+    query: str,
+    cookie: str | None,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Search Supportal customer names via the Analytics SQL++ endpoint using
+    a LIKE '%query%' pattern. This catches partial / imprecise names that the
+    UI search API (/search/.../data) misses.
+    Returns list of {slug, display_name, url, source}.
+    """
+    if not query.strip() or not cookie:
+        return []
+    like_val = f"%{query.strip().lower().replace('%', '\\%').replace('_', '\\_')}%"
+    try:
+        rows = query_supportal_analytics(
+            f"SELECT DISTINCT cu.`name` AS display_name "
+            f"FROM customer cu "
+            f"WHERE LOWER(cu.`name`) LIKE {json.dumps(like_val)} "
+            f"ORDER BY cu.`name` LIMIT {int(limit)}",
+            cookie,
+        )
+    except Exception as exc:
+        print(f"[CUST-SEARCH-ANALYTICS] {exc}")
+        return []
+    results: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = (row.get("display_name") or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        url = f"{BASE_URL}/customer/{urllib.parse.quote(name, safe='')}"
+        results.append({"slug": name, "display_name": name, "url": url, "source": "Analytics"})
+    return results
+
+
 def _find_tickets_tab_url(html: str, current_url: str) -> Optional[str]:
     """
     Find the Tickets tab link on a customer page.
@@ -3251,6 +3288,7 @@ def main_page():
                                 columns=[
                                     {"name": "display_name", "label": "Display Name",  "field": "display_name", "align": "left"},
                                     {"name": "slug",         "label": "Slug / URL key", "field": "slug",         "align": "left"},
+                                    {"name": "source",       "label": "Source",         "field": "source",       "align": "left"},
                                 ],
                                 rows=[],
                                 row_key="slug",
@@ -3272,15 +3310,64 @@ def main_page():
                                 return
                             cust_search_status.set_text("Searching…")
                             cust_search_table.rows = []
-                            cookie = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                            _ck = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
                             try:
-                                hits = await run.io_bound(
-                                    search_customers_on_supportal, q, cookie or None
-                                )
-                                cust_search_table.rows = hits
+                                all_hits: list[dict] = []
+                                seen_slugs: set[str] = set()
+
+                                # 1 — Supportal UI search API
+                                try:
+                                    for h in await run.io_bound(search_customers_on_supportal, q, _ck or None):
+                                        _k = (h.get("slug") or "").lower()
+                                        if _k not in seen_slugs:
+                                            seen_slugs.add(_k)
+                                            h.setdefault("source", "Supportal")
+                                            all_hits.append(h)
+                                except Exception:
+                                    pass
+
+                                # 2 — Analytics LIKE '%q%' (catches partial / fuzzy names)
+                                if _ck:
+                                    cust_search_status.set_text("Searching analytics…")
+                                    try:
+                                        for h in await run.io_bound(search_customers_via_analytics, q, _ck):
+                                            _k = (h.get("slug") or "").lower()
+                                            if _k not in seen_slugs:
+                                                seen_slugs.add(_k)
+                                                all_hits.append(h)
+                                    except Exception:
+                                        pass
+
+                                # 3 — Local Couchbase LIKE '%q%' (already-scraped customers)
+                                _cb_url  = cb_url_input.value.strip()
+                                _cb_user = cb_user_input.value.strip()
+                                if _CB_AVAILABLE and _cb_url and _cb_user:
+                                    cust_search_status.set_text("Checking local database…")
+                                    try:
+                                        _local_orgs = await run.io_bound(
+                                            search_orgs_from_cb,
+                                            _cb_url,
+                                            cb_bucket_input.value.strip() or "supportal",
+                                            _cb_user,
+                                            cb_pass_input.value,
+                                            cb_tls_toggle.value,
+                                            cb_scope_input.value.strip() or "_default",
+                                            cb_collection_input.value.strip() or "tickets",
+                                            q,
+                                        )
+                                        for _org in _local_orgs:
+                                            _k = _org.lower()
+                                            if _k not in seen_slugs:
+                                                seen_slugs.add(_k)
+                                                _url = f"{BASE_URL}/customer/{urllib.parse.quote(_org, safe='')}"
+                                                all_hits.append({"slug": _org, "display_name": _org, "url": _url, "source": "Local DB"})
+                                    except Exception:
+                                        pass
+
+                                cust_search_table.rows = all_hits
                                 cust_search_table.update()
                                 cust_search_status.set_text(
-                                    f"{len(hits)} result(s)" if hits else "No customers found."
+                                    f"{len(all_hits)} result(s)" if all_hits else "No customers found."
                                 )
                             except Exception as exc:
                                 cust_search_status.set_text(f"Search error: {exc}")
@@ -3323,19 +3410,57 @@ def main_page():
                             if not cookie:
                                 cookie = _browser_state.get("cookie_string", "") or _get_profile_cookie()
 
-                            # Auto-resolve plain name to exact Supportal slug via search API
-                            if cookie and not customer_input.value.strip().startswith("http"):
-                                progress_label.set_text(f"Searching Supportal for '{customer}'…")
-                                _hits = await run.io_bound(
-                                    search_customers_on_supportal, customer, cookie, 10
-                                )
-                                if _hits:
-                                    _best = _hits[0]
-                                    customer      = _best.get("slug") or customer
-                                    _resolved_url = _best.get("url")  or _resolved_url
+                            # Auto-resolve plain name to exact Supportal slug
+                            if not customer_input.value.strip().startswith("http"):
+                                _best_hit: dict | None = None
+
+                                # 1 — Supportal UI search
+                                if cookie:
+                                    progress_label.set_text(f"Searching Supportal for '{customer}'…")
+                                    try:
+                                        _ui_hits = await run.io_bound(search_customers_on_supportal, customer, cookie, 10)
+                                        if _ui_hits:
+                                            _best_hit = _ui_hits[0]
+                                    except Exception:
+                                        pass
+
+                                # 2 — Analytics LIKE fallback
+                                if not _best_hit and cookie:
+                                    progress_label.set_text(f"UI search empty — trying analytics for '{customer}'…")
+                                    try:
+                                        _an_hits = await run.io_bound(search_customers_via_analytics, customer, cookie, 10)
+                                        if _an_hits:
+                                            _best_hit = _an_hits[0]
+                                    except Exception:
+                                        pass
+
+                                # 3 — Local Couchbase LIKE fallback
+                                if not _best_hit and _CB_AVAILABLE and cb_url_input.value.strip() and cb_user_input.value.strip():
+                                    progress_label.set_text(f"Checking local database for '{customer}'…")
+                                    try:
+                                        _local_orgs = await run.io_bound(
+                                            search_orgs_from_cb,
+                                            cb_url_input.value.strip(),
+                                            cb_bucket_input.value.strip() or "supportal",
+                                            cb_user_input.value.strip(),
+                                            cb_pass_input.value,
+                                            cb_tls_toggle.value,
+                                            cb_scope_input.value.strip() or "_default",
+                                            cb_collection_input.value.strip() or "tickets",
+                                            customer,
+                                        )
+                                        if _local_orgs:
+                                            _local_url = f"{BASE_URL}/customer/{urllib.parse.quote(_local_orgs[0], safe='')}"
+                                            _best_hit = {"slug": _local_orgs[0], "display_name": _local_orgs[0], "url": _local_url}
+                                    except Exception:
+                                        pass
+
+                                if _best_hit:
+                                    customer      = _best_hit.get("slug") or customer
+                                    _resolved_url = _best_hit.get("url")  or _resolved_url
                                     customer_input.set_value(_resolved_url)
                                     progress_label.set_text(
-                                        f"Resolved '{_best.get('display_name', customer)}' → {_resolved_url}"
+                                        f"Resolved '{_best_hit.get('display_name', customer)}' → {_resolved_url}"
                                     )
                                     print(f"[SCRAPE] auto-resolved to slug={customer!r} url={_resolved_url}")
                             if not cookie:
