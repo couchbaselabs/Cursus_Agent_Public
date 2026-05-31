@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 import asyncio
 import threading
@@ -4667,7 +4667,7 @@ def main_page():
                     with ui.tabs().classes("w-full bg-white border-b border-gray-200") as config_sub_tabs:
                         cfg_auth      = ui.tab("Authentication",       icon="lock")
                         cfg_cb        = ui.tab("Couchbase",            icon="storage")
-                        cfg_embed     = ui.tab("Embedding Operations", icon="model_training")
+                        cfg_embed     = ui.tab("Data Operations", icon="model_training")
                         cfg_chat_mem  = ui.tab("Chat & Memory",        icon="memory")
                         cfg_analytics = ui.tab("Analytics",            icon="tune")
                         cfg_ai        = ui.tab("AI Models",            icon="smart_toy")
@@ -5158,7 +5158,7 @@ def main_page():
 
                     with ui.tab_panel(cfg_embed):
                         with ui.row().classes("items-center justify-between w-full"):
-                            ui.label("Embedding Operations").classes("text-base font-semibold")
+                            ui.label("Data Operations").classes("text-base font-semibold")
                             ui.label("Configure embedding provider in the AI Models tab").classes("text-xs text-gray-400")
 
                         def _get_embed_config() -> tuple[str, str, str, str, int, int | None]:
@@ -5449,6 +5449,42 @@ def main_page():
                             finally:
                                 btn_backfill_cbse.set_enabled(True)
 
+                        async def _do_backfill_last_reply():
+                            btn_backfill_last_reply.set_enabled(False)
+                            emb_status.set_text("Backfilling last_comment_at from stored comments …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_lr(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog_lr(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_lr(msg, pct), loop)
+
+                            try:
+                                updated, errs = await run.io_bound(
+                                    backfill_last_comment_at,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    _prog_lr,
+                                )
+                                msg = f"Last Reply backfill complete — {updated} tickets updated, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"Last Reply backfill error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_backfill_last_reply.set_enabled(True)
+
                         with ui.row().classes("items-center gap-4 mt-2"):
                             summarize_force_cb = ui.checkbox("Force re-summarize (overwrite existing)", value=False)
 
@@ -5457,8 +5493,9 @@ def main_page():
                             btn_embed_snaps = ui.button("Embed All Snapshots",       on_click=_do_embed_snaps_from_cb,    icon="hub").props("outline color=indigo")
                             btn_summarize   = ui.button("Summarize Tickets",         on_click=_do_summarize,              icon="summarize").props("outline color=teal")
                             btn_create_idx  = ui.button("Create Vector Index",       on_click=_do_create_index,           icon="manage_search").props("outline color=secondary")
-                            btn_backfill      = ui.button("Backfill Analytics Fields", on_click=_do_backfill,          icon="auto_fix_high").props("outline color=brown")
-                            btn_backfill_cbse = ui.button("Backfill Missing CBSEs",    on_click=_do_backfill_cbse,     icon="bug_report").props("outline color=deep-orange")
+                            btn_backfill           = ui.button("Backfill Analytics Fields", on_click=_do_backfill,              icon="auto_fix_high").props("outline color=brown")
+                            btn_backfill_cbse      = ui.button("Backfill Missing CBSEs",    on_click=_do_backfill_cbse,         icon="bug_report").props("outline color=deep-orange")
+                            btn_backfill_last_reply = ui.button("Backfill Last Reply Dates", on_click=_do_backfill_last_reply,  icon="chat_bubble_outline").props("outline color=purple")
                             btn_stop_embed    = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
                             btn_stop_embed.set_enabled(False)
                         btn_embed.set_enabled(_CB_AVAILABLE)
@@ -16943,6 +16980,28 @@ _AGENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "backfill_last_comment_at",
+            "description": (
+                "Backfill the last_comment_at field on existing ticket documents in Couchbase by deriving it "
+                "from the stored comments array. Run this once after upgrading to populate the 'Last Reply' "
+                "column in query_tickets output without needing to re-scrape. "
+                "Skips tickets that already have the field set."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Limit backfill to a specific org (optional — omit to backfill all tickets).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "scrape_customer_tickets",
             "description": (
                 "Scrape fresh tickets for a customer directly from Supportal and save them to Couchbase. "
@@ -17696,11 +17755,12 @@ def _execute_agent_tool(
         _age_h = (time.time() - _lsa) / 3600 if _lsa else None
         _age_str = f"{_age_h:.1f} hours ago" if _age_h is not None else "unknown"
         _supportal_url = _SUPPORTAL_TICKET_URL.format(ticket_id=_tid)
+        _last_reply = (t.get("last_comment_at") or t.get("updated") or t.get("updated_at") or "")[:19] or "—"
         parts = [
             f"**Ticket {_tid}** — {t.get('subject','')}",
             f"Organization: {t.get('organization','')}",
             f"Status: {t.get('status','')} | Priority: {t.get('priority','')}",
-            f"Created: {t.get('created','')} | Closed: {t.get('closed','')}",
+            f"Created: {t.get('created','')} | Last Reply: {_last_reply} | Closed: {t.get('closed','')}",
             f"Requester: {t.get('requester','')}",
             f"**Data freshness:** last scraped {_age_str}",
             f"**Live verification:** {_supportal_url}",
@@ -18519,6 +18579,22 @@ LIMIT {limit}
             f"Topology backfill complete — **{_saved}/{len(_incomplete)} stubs enriched**. "
             f"Total bad items: {bad_total}, warn items: {warn_total}. "
             f"Call get_cluster_health to see the full summary."
+        )
+
+    elif name == "backfill_last_comment_at":
+        _bf_org = (args.get("organization") or "").strip()
+        def _noop_prog(msg, pct): pass
+        try:
+            _bf_updated, _bf_errs = backfill_last_comment_at(
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                _noop_prog, org_filter=_bf_org,
+            )
+        except Exception as exc:
+            return f"Backfill failed: {exc}"
+        scope_desc = f" for '{_bf_org}'" if _bf_org else " across all tickets"
+        return (
+            f"Backfill complete{scope_desc} — **{_bf_updated} tickets updated**, {_bf_errs} errors. "
+            f"The 'Last Reply' column in query_tickets will now show conversation timestamps."
         )
 
     elif name == "scrape_customer_tickets":
@@ -23000,6 +23076,89 @@ def backfill_missing_cbse_fields(
             progress_cb(f"Error on {doc_key}: {exc}", i / total)
             continue
         if i % 50 == 0 or i == total:
+            progress_cb(f"Backfilled {i}/{total} …", i / total)
+
+    cluster.close()
+    return updated, errors
+
+
+def backfill_last_comment_at(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    progress_cb: Callable[[str, float], None],
+    org_filter: str = "",
+) -> tuple[int, int]:
+    """
+    Derive last_comment_at from the stored comments array for tickets that are
+    missing the field. Falls back to ticket_fields Updated/Last_Updated entries
+    for tickets with no comments. Returns (updated, errors).
+    """
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str  = _cb_conn_str(cb_url, use_tls)
+    cluster   = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    col       = scope_obj.collection(collection)
+    fqn       = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    org_clause = ""
+    params: list = []
+    if org_filter.strip():
+        org_clause = " AND LOWER(TOSTRING(t.organization)) LIKE $1"
+        params.append(f"%{org_filter.strip().lower()}%")
+
+    progress_cb("Querying for tickets missing last_comment_at …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, t.* FROM {fqn} AS t "
+        f"WHERE META().id LIKE 'ticket::%' "
+        f"AND t.last_comment_at IS MISSING{org_clause}",
+        QueryOptions(positional_parameters=params, timeout=timedelta(seconds=120)),
+    ))
+
+    total   = len(rows)
+    updated = errors = 0
+
+    if total == 0:
+        progress_cb("All tickets already have last_comment_at — nothing to do.", 1.0)
+        cluster.close()
+        return 0, 0
+
+    progress_cb(f"Found {total} tickets to backfill …", 0.0)
+
+    for i, row in enumerate(rows, 1):
+        doc_key = row.get("doc_key")
+        ticket  = {k: v for k, v in row.items() if k != "doc_key"}
+        if not doc_key or not ticket.get("ticket_id"):
+            errors += 1
+            continue
+        try:
+            last_comment_at: str | None = None
+            for c in reversed(ticket.get("comments") or []):
+                ts = c.get("timestamp") if isinstance(c, dict) else None
+                if ts:
+                    last_comment_at = ts
+                    break
+            if not last_comment_at:
+                tf = ticket.get("ticket_fields") or {}
+                for _k in ("Updated", "Last_Updated", "Last_Comment", "Last_Reply", "updated"):
+                    if tf.get(_k):
+                        last_comment_at = tf[_k]
+                        break
+            ticket["last_comment_at"] = last_comment_at
+            col.upsert(doc_key, ticket)
+            updated += 1
+        except Exception as exc:
+            errors += 1
+            progress_cb(f"Error on {doc_key}: {exc}", i / total)
+            continue
+        if i % 100 == 0 or i == total:
             progress_cb(f"Backfilled {i}/{total} …", i / total)
 
     cluster.close()
