@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.2"
+__version__ = "1.9.3"
 
 import asyncio
 import threading
@@ -1014,6 +1014,11 @@ _OP_STATUS: dict = {
     "progress": 0.0,
     "done":     True,
 }
+
+# Background scrape job registry — keyed by short job_id (6-char hex).
+# Kept in insertion order; trimmed to MAX_SCRAPE_JOBS entries.
+_SCRAPE_JOBS: dict[str, dict] = {}
+_MAX_SCRAPE_JOBS = 20
 
 # Browser-login state — populated by login_browser.py subprocess.
 _browser_state: dict = {
@@ -17002,6 +17007,28 @@ _AGENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "get_scrape_status",
+            "description": (
+                "Check the status of background scrape/rescrape jobs. "
+                "Call this when the user asks about scrape progress, how many tickets have been processed, "
+                "how many are left, or whether a scrape is still running. "
+                "Returns a summary of all recent jobs with progress counts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Specific job ID to check (optional — omit to see all recent jobs).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "scrape_customer_tickets",
             "description": (
                 "Scrape fresh tickets for a customer directly from Supportal and save them to Couchbase. "
@@ -17642,6 +17669,282 @@ def _agent_filters_from_args(args: dict) -> dict:
     return filters
 
 
+def _make_scrape_job(org: str, mode: str) -> dict:
+    """Create a new scrape job record, register it, and return it."""
+    import secrets
+    job_id = secrets.token_hex(3)  # 6-char hex, e.g. "a3f9c1"
+    job: dict = {
+        "job_id":       job_id,
+        "org":          org,
+        "mode":         mode,          # "scrape" | "rescrape"
+        "phase":        "queued",      # queued → scraping → saving → embedding → scoring → done
+        "status":       "running",     # running | done | error
+        "total":        None,          # total tickets to process (set once known)
+        "processed":    0,             # tickets processed so far
+        "saved":        0,
+        "embedded":     0,
+        "scored":       0,
+        "errors":       0,
+        "last_message": "Queued…",
+        "started_at":   time.time(),
+        "finished_at":  None,
+    }
+    _SCRAPE_JOBS[job_id] = job
+    # Trim to MAX
+    if len(_SCRAPE_JOBS) > _MAX_SCRAPE_JOBS:
+        oldest = next(iter(_SCRAPE_JOBS))
+        del _SCRAPE_JOBS[oldest]
+    return job
+
+
+def _run_scrape_job_bg(
+    job: dict,
+    org: str,
+    cookie: str,
+    max_tickets: int,
+    cb_params: dict,
+    emb_params: dict,
+    score_params: dict,
+) -> None:
+    """Background worker for scrape_customer_tickets. Runs full scrape→save→embed→score pipeline."""
+    cb_url    = cb_params["url"]
+    bucket    = cb_params["bucket"]
+    username  = cb_params["username"]
+    password  = cb_params["password"]
+    use_tls   = cb_params["use_tls"]
+    scope     = cb_params["scope"]
+    collection = cb_params["collection"]
+
+    def _set_op(msg: str, pct: float, done: bool = False):
+        job["last_message"] = msg
+        _OP_STATUS["op"]       = "scrape"
+        _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+        _OP_STATUS["progress"] = pct
+        _OP_STATUS["done"]     = done
+
+    try:
+        # ── Phase 1: scrape ─────────────────────────────────────────────────
+        job["phase"] = "scraping"
+        _set_op(f"Scraping tickets for '{org}'…", 0.0)
+
+        def _scrape_prog(msg: str, pct: float):
+            job["last_message"] = msg
+            _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+            _OP_STATUS["progress"] = pct * 0.4   # scrape = 0–40%
+            m = re.search(r"(\d+)\s*/\s*(\d+)", msg)
+            if m:
+                job["processed"] = int(m.group(1))
+                job["total"]     = int(m.group(2))
+
+        scraped = scrape_with_cookie(org, cookie, progress_cb=_scrape_prog, max_tickets=max_tickets)
+        job["total"]     = len(scraped)
+        job["processed"] = len(scraped)
+        _set_op(f"Scraped {len(scraped)} tickets — saving to Couchbase…", 0.40)
+
+        # ── Phase 2: save ───────────────────────────────────────────────────
+        job["phase"] = "saving"
+        _saved = 0
+        now_epoch = int(time.time())
+        try:
+            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _col = _cluster.bucket(bucket).scope(scope).collection(collection)
+            for t in scraped:
+                tid = t.get("ticket_id")
+                if not tid:
+                    continue
+                try:
+                    _col.upsert(f"ticket::{tid}", {**t, "type": "ticket", "last_scraped_at": now_epoch})
+                    _saved += 1
+                except Exception:
+                    job["errors"] += 1
+            _cluster.close()
+        except Exception as exc:
+            job["errors"] += 1
+            job["last_message"] = f"CB save failed: {exc}"
+        job["saved"] = _saved
+        _set_op(f"Saved {_saved} tickets — embedding…", 0.55)
+
+        # ── Phase 3: embed ──────────────────────────────────────────────────
+        emb_p = emb_params.get("provider", "")
+        emb_m = emb_params.get("model", "")
+        emb_k = emb_params.get("api_key", "")
+        emb_u = emb_params.get("base_url", "")
+        emb_d = int(emb_params.get("dims") or 0)
+        if emb_p and emb_m and emb_d and _saved > 0:
+            job["phase"] = "embedding"
+            if emb_p == "lmstudio":
+                _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45)
+            try:
+                _saved_data = [{**t, "type": "ticket", "last_scraped_at": now_epoch} for t in scraped]
+
+                def _emb_prog(msg: str, pct: float):
+                    job["last_message"] = msg
+                    _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+                    _OP_STATUS["progress"] = 0.55 + pct * 0.30  # embed = 55–85%
+
+                _done_emb, _errs_emb = embed_all_tickets(
+                    _saved_data, cb_url, bucket, username, password,
+                    use_tls, scope, collection,
+                    emb_p, emb_m, emb_k, emb_u, emb_d,
+                    _emb_prog,
+                )
+                job["embedded"] = _done_emb
+                job["errors"]  += _errs_emb
+            except Exception as exc:
+                job["last_message"] = f"Embedding failed: {exc}"
+                job["errors"] += 1
+        _set_op(f"Embedded {job['embedded']} tickets — scoring…", 0.85)
+
+        # ── Phase 4: score ──────────────────────────────────────────────────
+        s_prov = score_params.get("provider", "")
+        s_mod  = score_params.get("model", "")
+        s_key  = score_params.get("api_key", "")
+        s_url  = score_params.get("base_url", "")
+        if s_prov and s_mod and _saved > 0:
+            job["phase"] = "scoring"
+            try:
+                _score_data = [{**t, "type": "ticket"} for t in scraped[:_saved]]
+                _scores = score_tickets_batch(
+                    _score_data[:10],
+                    s_prov, s_mod, s_key, s_url,
+                    cb_url, bucket, username, password, use_tls, scope, collection,
+                    save_to_cb=True,
+                )
+                job["scored"] = len(_scores)
+            except Exception as exc:
+                job["last_message"] = f"Scoring failed: {exc}"
+                job["errors"] += 1
+
+        # ── Done ────────────────────────────────────────────────────────────
+        job["status"]       = "done"
+        job["phase"]        = None
+        job["finished_at"]  = time.time()
+        summary = (
+            f"Done — {job['saved']} scraped, {job['embedded']} embedded, "
+            f"{job['scored']} scored"
+            + (f", {job['errors']} errors" if job["errors"] else "")
+        )
+        job["last_message"] = summary
+        _set_op(summary, 1.0, done=True)
+
+    except Exception as exc:
+        job["status"]      = "error"
+        job["phase"]       = None
+        job["finished_at"] = time.time()
+        job["last_message"] = f"Fatal error: {exc}"
+        job["errors"] += 1
+        _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
+
+
+def _run_rescrape_job_bg(
+    job: dict,
+    org: str,
+    to_scrape: list[dict],
+    cookie: str,
+    cb_params: dict,
+) -> None:
+    """Background worker for rescrape_customer_tickets. Refreshes individual ticket docs."""
+    cb_url    = cb_params["url"]
+    bucket    = cb_params["bucket"]
+    username  = cb_params["username"]
+    password  = cb_params["password"]
+    use_tls   = cb_params["use_tls"]
+    scope     = cb_params["scope"]
+    collection = cb_params["collection"]
+
+    total = len(to_scrape)
+    job["total"] = total
+
+    def _set_op(msg: str, pct: float, done: bool = False):
+        job["last_message"] = msg
+        _OP_STATUS["op"]       = "scrape"
+        _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+        _OP_STATUS["progress"] = pct
+        _OP_STATUS["done"]     = done
+
+    try:
+        job["phase"] = "scraping"
+        _set_op(f"Rescraping 0/{total} tickets for '{org}'…", 0.0)
+
+        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn_str  = _cb_conn_str(cb_url, use_tls)
+        _bcluster = _Cl(conn_str, _CO(_PA(username, password)))
+        _bcluster.wait_until_ready(timedelta(seconds=10))
+        _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
+
+        ok = skipped = errors = 0
+        for i, t in enumerate(to_scrape, 1):
+            tid = str(t.get("ticket_id") or "").strip()
+            if not tid:
+                skipped += 1
+                job["processed"] = i
+                continue
+            try:
+                _sess  = _make_api_session(cookie)
+                fresh  = fetch_ticket_api(tid, _sess)
+                if not fresh or not fresh.get("ticket_id"):
+                    skipped += 1
+                    job["processed"] = i
+                    continue
+                fresh["last_scraped_at"] = int(time.time())
+                fresh["type"]            = "ticket"
+                fresh["cb_version"]      = extract_ticket_version(fresh)
+                fresh["feature_area"]    = classify_ticket_feature(fresh)
+                fresh["ticket_origin"]   = classify_ticket_origin(fresh)
+                doc_key = f"ticket::{tid}"
+                try:
+                    existing = _bcol.get(doc_key).content_as[dict]
+                    merged   = {**existing}
+                    for k, v in fresh.items():
+                        if v not in (None, "", [], {}):
+                            merged[k] = v
+                        elif k not in merged:
+                            merged[k] = v
+                    _bcol.upsert(doc_key, merged)
+                except Exception:
+                    _bcol.upsert(doc_key, fresh)
+                ok += 1
+                job["saved"] = ok
+            except Exception as exc:
+                errors += 1
+                job["errors"] = errors
+            job["processed"] = i
+            pct = i / total
+            if i % 10 == 0 or i == total:
+                _set_op(f"Rescraping {i}/{total} for '{org}'…", pct)
+            time.sleep(0.35)
+
+        try:
+            _bcluster.close()
+        except Exception:
+            pass
+
+        job["status"]      = "done"
+        job["phase"]       = None
+        job["finished_at"] = time.time()
+        summary = (
+            f"Done — {ok}/{total} tickets updated"
+            + (f", {skipped} skipped" if skipped else "")
+            + (f", {errors} errors" if errors else "")
+        )
+        job["last_message"] = summary
+        _set_op(summary, 1.0, done=True)
+
+    except Exception as exc:
+        job["status"]      = "error"
+        job["phase"]       = None
+        job["finished_at"] = time.time()
+        job["last_message"] = f"Fatal error: {exc}"
+        job["errors"] += 1
+        _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
+
+
 def _execute_agent_tool(
     name: str,
     args: dict,
@@ -17903,104 +18206,49 @@ def _execute_agent_tool(
         if not cookie:
             return "No session cookie in saved profile — paste a fresh cookie in the Auth tab."
 
-        # Gather candidate ticket IDs from CB
-        filters: dict = {}
+        # Gather candidate ticket IDs from CB synchronously (fast query, no scraping yet)
+        _rs_filters: dict = {}
         if cust and cust.lower() != "all customers":
-            filters["organization"] = cust
+            _rs_filters["organization"] = cust
         if status_filt:
-            filters["status"] = status_filt
+            _rs_filters["status"] = status_filt
 
         candidates = tool_query_tickets(
-            filters, cb_url, bucket, username, password,
+            _rs_filters, cb_url, bucket, username, password,
             use_tls, scope, collection, limit=max_tix * 4,
         )
         if not candidates:
             return f"No tickets found in Couchbase for {cust or 'all customers'}."
 
-        # Filter to stale tickets
-        now_epoch = time.time()
+        now_epoch    = time.time()
         stale_cutoff = now_epoch - stale_hours * 3600
-        if stale_hours > 0:
-            to_scrape = [
-                t for t in candidates
-                if (t.get("last_scraped_at") or 0) < stale_cutoff
-            ]
-        else:
-            to_scrape = list(candidates)
+        to_scrape    = (
+            [t for t in candidates if (t.get("last_scraped_at") or 0) < stale_cutoff]
+            if stale_hours > 0 else list(candidates)
+        )[:max_tix]
 
-        to_scrape = to_scrape[:max_tix]
         if not to_scrape:
             return (
                 f"All {len(candidates)} tickets for {cust or 'all customers'} "
                 f"were scraped within the last {stale_hours:.0f} hours — nothing to update."
             )
 
-        # Connect to CB once for all writes
-        try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
-            from couchbase.auth import PasswordAuthenticator        # type: ignore
-            from datetime import timedelta
-            conn_str = _cb_conn_str(cb_url, use_tls)
-            _bcluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-            _bcluster.wait_until_ready(timedelta(seconds=10))
-            _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
-        except Exception as exc:
-            return f"Couchbase connection failed: {exc}"
-
-        ok = skipped = errors = 0
-        error_samples: list[str] = []
-
-        for t in to_scrape:
-            tid = str(t.get("ticket_id") or "").strip()
-            if not tid:
-                skipped += 1
-                continue
-            try:
-                _sess = _make_api_session(cookie)
-                fresh = fetch_ticket_api(tid, _sess)
-                if not fresh or not fresh.get("ticket_id"):
-                    skipped += 1
-                    continue
-                fresh["last_scraped_at"] = int(time.time())
-                fresh["type"] = "ticket"
-                fresh["cb_version"]    = extract_ticket_version(fresh)
-                fresh["feature_area"]  = classify_ticket_feature(fresh)
-                fresh["ticket_origin"] = classify_ticket_origin(fresh)
-                doc_key = f"ticket::{tid}"
-                try:
-                    existing = _bcol.get(doc_key).content_as[dict]
-                    merged = {**existing}
-                    for k, v in fresh.items():
-                        if v not in (None, "", [], {}):
-                            merged[k] = v
-                        elif k not in merged:
-                            merged[k] = v  # new key — write even if null
-                    _bcol.upsert(doc_key, merged)
-                except Exception:
-                    _bcol.upsert(doc_key, fresh)
-                ok += 1
-            except Exception as exc:
-                errors += 1
-                if len(error_samples) < 3:
-                    error_samples.append(f"  ticket {tid}: {exc}")
-            time.sleep(0.35)  # ~3 req/s — stay well under rate limits
-
-        try:
-            _bcluster.close()
-        except Exception:
-            pass
-
-        parts = [
-            f"Bulk rescrape complete for **{cust or 'all customers'}**.",
-            f"- Scraped: {ok} tickets updated",
-            f"- Skipped: {skipped} (no ticket ID)",
-            f"- Errors:  {errors}",
-        ]
-        if error_samples:
-            parts.append("Sample errors:\n" + "\n".join(error_samples))
-        if errors and cookie:
-            parts.append("If errors persist the session cookie may have expired — paste a fresh one in the Auth tab.")
-        return "\n".join(parts)
+        _job = _make_scrape_job(cust or "all customers", "rescrape")
+        threading.Thread(
+            target=_run_rescrape_job_bg,
+            args=(
+                _job, cust or "all customers", to_scrape, cookie,
+                {"url": cb_url, "bucket": bucket, "username": username, "password": password,
+                 "use_tls": use_tls, "scope": scope, "collection": collection},
+            ),
+            daemon=True,
+        ).start()
+        return (
+            f"Started rescrape job **{_job['job_id']}** for '{cust or 'all customers'}' "
+            f"({len(to_scrape)} tickets, stale > {stale_hours:.0f}h). "
+            f"Running in the background at ~3 req/s. "
+            f"Ask me 'what's the scrape status?' or call get_scrape_status to check progress."
+        )
 
     elif name == "rescrape_ticket":
         ticket_id = str(args.get("ticket_id") or "").strip()
@@ -18581,6 +18829,47 @@ LIMIT {limit}
             f"Call get_cluster_health to see the full summary."
         )
 
+    elif name == "get_scrape_status":
+        _filter_jid = (args.get("job_id") or "").strip().lower()
+        if not _SCRAPE_JOBS:
+            return "No scrape jobs have been started in this session."
+        jobs_to_show = (
+            [_SCRAPE_JOBS[_filter_jid]] if _filter_jid and _filter_jid in _SCRAPE_JOBS
+            else list(reversed(list(_SCRAPE_JOBS.values())))[:10]
+        )
+        if _filter_jid and _filter_jid not in _SCRAPE_JOBS:
+            return f"Job '{_filter_jid}' not found. Recent job IDs: {', '.join(list(_SCRAPE_JOBS)[-5:])}."
+        _now = time.time()
+        lines: list[str] = []
+        running = [j for j in jobs_to_show if j["status"] == "running"]
+        done    = [j for j in jobs_to_show if j["status"] != "running"]
+        if running:
+            lines.append("## Active Jobs\n")
+            for j in running:
+                elapsed = int(_now - j["started_at"])
+                proc    = j.get("processed") or 0
+                total   = j.get("total")
+                pct_str = f" ({proc/total:.0%})" if total else ""
+                lines.append(
+                    f"**Job {j['job_id']}** — {j['org']} ({j['mode']}) — **RUNNING**\n"
+                    f"  Phase: {j['phase'] or '—'}\n"
+                    f"  Progress: {proc}/{total or '?'} tickets{pct_str}\n"
+                    f"  Elapsed: {elapsed}s\n"
+                    f"  Last: {j['last_message']}\n"
+                )
+        if done:
+            lines.append("## Recent Jobs\n")
+            for j in done:
+                duration = int((j.get("finished_at") or _now) - j["started_at"])
+                ago      = int(_now - (j.get("finished_at") or _now))
+                icon     = "✅" if j["status"] == "done" else "❌"
+                lines.append(
+                    f"**Job {j['job_id']}** — {j['org']} ({j['mode']}) — {icon} {j['status'].upper()}\n"
+                    f"  {j['last_message']}\n"
+                    f"  Duration: {duration}s | Finished: {ago}s ago\n"
+                )
+        return "\n".join(lines).strip()
+
     elif name == "backfill_last_comment_at":
         _bf_org = (args.get("organization") or "").strip()
         def _noop_prog(msg, pct): pass
@@ -18605,87 +18894,26 @@ LIMIT {limit}
         cookie = ctx.get("cookie") or _get_profile_cookie()
         if not cookie:
             return "No session cookie available — paste a cookie in the Configuration tab first."
-        def _noop_prog(msg, pct): pass
-        try:
-            scraped = scrape_with_cookie(
-                org, cookie,
-                progress_cb=_noop_prog,
-                max_tickets=max_tickets,
-            )
-        except Exception as exc:
-            return f"Scrape failed: {exc}"
-        if not scraped:
-            return f"Scrape returned no tickets for '{org}'. Check the customer name matches Supportal exactly."
-        # Save to CB
-        _saved = 0
-        try:
-            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
-            from couchbase.auth import PasswordAuthenticator as _PA
-            _conn = _cb_conn_str(cb_url, use_tls)
-            _cluster = _Cl(_conn, _CO(_PA(username, password)))
-            _cluster.wait_until_ready(timedelta(seconds=15))
-            _col = _cluster.bucket(bucket).scope(scope).collection(collection)
-            for t in scraped:
-                tid = t.get("ticket_id")
-                if not tid:
-                    continue
-                try:
-                    _col.upsert(f"ticket::{tid}", {**t, "type": "ticket", "last_scraped_at": int(time.time())})
-                    _saved += 1
-                except Exception:
-                    pass
-            _cluster.close()
-        except Exception as exc:
-            return f"Scraped {len(scraped)} tickets but CB save failed: {exc}"
-
-        _pipeline_notes: list[str] = [f"Scraped and saved **{_saved} tickets** for '{org}'."]
-
-        # ── Auto-embed using ctx embedding config ──────────────────────────────
-        emb_p = ctx.get("emb_provider", "")
-        emb_m = ctx.get("emb_model", "")
-        emb_k = ctx.get("emb_api_key", "")
-        emb_u = ctx.get("emb_base_url", "")
-        emb_d = int(ctx.get("emb_dims") or 0)
-        if emb_p and emb_m and emb_d:
-            # Ensure LMStudio embedding model is loaded
-            if emb_p == "lmstudio":
-                _emb_lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
-                lmstudio_ensure_model_loaded(_emb_lms_base, emb_m, timeout_s=45)
-            try:
-                _saved_data = [{**t, "type": "ticket", "last_scraped_at": int(time.time())} for t in scraped]
-                _done_emb, _errs_emb = embed_all_tickets(
-                    _saved_data, cb_url, bucket, username, password,
-                    use_tls, scope, collection,
-                    emb_p, emb_m, emb_k, emb_u, emb_d,
-                    lambda msg, pct: None,
-                )
-                _pipeline_notes.append(
-                    f"Embedded **{_done_emb}** tickets"
-                    + (f" ({_errs_emb} errors)" if _errs_emb else "") + "."
-                )
-            except Exception as _emb_exc:
-                _pipeline_notes.append(f"Embedding skipped: {_emb_exc}")
-
-        # ── Auto-score using ctx LLM config ────────────────────────────────────
-        _s_provider = ctx.get("provider", "")
-        _s_model    = ctx.get("model", "")
-        _s_api_key  = ctx.get("api_key", "")
-        _s_base_url = ctx.get("base_url", "")
-        if _s_provider and _s_model and _saved > 0:
-            try:
-                _score_data = [{**t, "type": "ticket"} for t in scraped[:_saved]]
-                _scores = score_tickets_batch(
-                    _score_data[:10],  # cap at 10 per tool call
-                    _s_provider, _s_model, _s_api_key, _s_base_url,
-                    cb_url, bucket, username, password, use_tls, scope, collection,
-                    save_to_cb=True,
-                )
-                _pipeline_notes.append(f"Scored **{len(_scores)}** tickets.")
-            except Exception as _sc_exc:
-                _pipeline_notes.append(f"Scoring skipped: {_sc_exc}")
-
-        _pipeline_notes.append("Use query_tickets to explore them.")
-        return "\n".join(_pipeline_notes)
+        _job = _make_scrape_job(org, "scrape")
+        threading.Thread(
+            target=_run_scrape_job_bg,
+            args=(
+                _job, org, cookie, max_tickets,
+                {"url": cb_url, "bucket": bucket, "username": username, "password": password,
+                 "use_tls": use_tls, "scope": scope, "collection": collection},
+                {"provider": ctx.get("emb_provider",""), "model": ctx.get("emb_model",""),
+                 "api_key": ctx.get("emb_api_key",""), "base_url": ctx.get("emb_base_url",""),
+                 "dims": ctx.get("emb_dims", 0)},
+                {"provider": ctx.get("provider",""), "model": ctx.get("model",""),
+                 "api_key": ctx.get("api_key",""), "base_url": ctx.get("base_url","")},
+            ),
+            daemon=True,
+        ).start()
+        return (
+            f"Started scrape job **{_job['job_id']}** for '{org}' (up to {max_tickets} tickets). "
+            f"The pipeline runs in the background — scraping, saving, embedding, and scoring. "
+            f"Ask me 'what's the scrape status?' at any time, or call get_scrape_status."
+        )
 
     elif name == "score_ticket":
         ticket_id = str(args.get("ticket_id") or "").strip()
