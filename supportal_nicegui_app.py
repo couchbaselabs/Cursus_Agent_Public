@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 import asyncio
 import threading
@@ -6657,19 +6657,30 @@ def main_page():
                                         "- get_customer_health_score: 0-100 composite score (P1s, escalations, resolution, freshness). "
                                         "Call for any 'how is X doing', 'status of X', 'health of X' question.\n"
                                         "- check_sla_compliance: SLA compliance % by priority for a customer.\n"
-                                        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions.\n"
+                                        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions. "
+                                        "Always cross-org; never filter by current customer.\n"
                                         "- get_digest: what's new/changed for a customer in the last N hours.\n"
                                         "- tag_ticket: apply tags to a ticket (e.g. 'performance', 'upgrade').\n"
                                         "- save_query / list_saved_queries: bookmark and recall queries.\n"
-                                        "- generate_customer_report: full markdown report (health + SLA + open tickets + digest)."
+                                        "- generate_customer_report: full markdown report (health + SLA + open tickets + digest).\n"
+                                        "FLEET TOOLS (Phase 3) — always cross-org, never filtered by current customer:\n"
+                                        "- query_fleet_tickets: aggregate ticket counts across ALL orgs. Use for 'which customers have the most P1s', "
+                                        "'fleet-wide ticket breakdown', 'which orgs have open criticals'.\n"
+                                        "- list_at_risk_clusters: clusters with elevated bad/warn items and NO open ticket — leading indicators.\n"
+                                        "- fleet_version_distribution: CB version spread across all clusters fleet-wide.\n"
+                                        "- fleet_cbse_impact: which CBSEs affect the most customers (ranked by blast radius)."
                                     )
                                     if _cust_agent and _cust_agent.lower() != "all customers":
                                         _agent_sys += (
                                             f"\n\nSCOPING RULE: Customer is scoped to \"{_cust_agent}\". "
                                             f"You MUST include customer=\"{_cust_agent}\" in every query_tickets and "
                                             f"count_tickets call. Never ask the user for the customer name — it is already set.\n"
+                                            f"FLEET TOOL EXEMPTIONS — the following tools are ALWAYS cross-org and must NEVER "
+                                            f"have a customer or organization filter added:\n"
+                                            f"  query_fleet_tickets, list_at_risk_clusters, fleet_version_distribution, "
+                                            f"fleet_cbse_impact, get_portfolio_status, list_organizations\n"
                                             f"DISCOVERY EXCEPTIONS (cross-customer queries are allowed ONLY for):\n"
-                                            f"  1. list_organizations — always exempt, always runs across all customers.\n"
+                                            f"  1. Any FLEET TOOL EXEMPTION listed above.\n"
                                             f"  2. Discovering what customers exist ('what orgs are in the system', "
                                             f"'what other customers are there', 'update the customer list').\n"
                                             f"  3. Getting a basic ticket count or summary for a specific other customer "
@@ -16503,14 +16514,89 @@ _AGENT_TOOLS: list[dict] = [
             "name": "get_portfolio_status",
             "description": (
                 "Return a ranked status overview of ALL customers — health scores, open P1 counts, "
-                "data freshness. Use for 'status of all my accounts', 'which customers need attention', "
-                "'who has open P1s', 'show me the fleet'. "
+                "data freshness, and cluster bad-item ratio. Use for 'status of all my accounts', "
+                "'which customers need attention', 'who has open P1s', 'show me the fleet'. "
                 "Returns a list sorted by urgency (critical first)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "description": "Max customers to return (default 20)."},
+                    "limit":          {"type": "integer", "description": "Max customers to return (default 20)."},
+                    "include_cluster":{"type": "boolean", "description": "Include cluster bad-item breakdown per org (default false — slower)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_fleet_tickets",
+            "description": (
+                "Aggregate ticket counts across ALL customers grouped by a chosen dimension. "
+                "Use for fleet-wide questions: 'how many open tickets by priority?', "
+                "'which org has the most tickets?', 'ticket breakdown by CB version', "
+                "'which CBSEs appear most?'. Never requires an org filter."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_by":      {"type": "string", "enum": ["organization", "priority", "status", "cb_version", "cbse"], "description": "Dimension to group by."},
+                    "status_filter": {"type": "string", "enum": ["open", "solved", "all"],   "description": "Ticket status scope (default: open)."},
+                    "limit":         {"type": "integer", "description": "Max rows to return (default 30)."},
+                },
+                "required": ["group_by"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_at_risk_clusters",
+            "description": (
+                "Return clusters with elevated bad or warn item counts that have NO linked open ticket — "
+                "the leading indicator for tickets that haven't been opened yet. "
+                "Risk score = bad_items × 3 + warn_items. "
+                "Use for: 'which clusters are likely to generate a ticket?', 'leading indicators', "
+                "'at-risk clusters', 'proactive alerts'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bad_threshold":  {"type": "integer", "description": "Minimum bad_items to include (default 0 = any)."},
+                    "warn_threshold": {"type": "integer", "description": "Minimum warn_items to include (default 3)."},
+                    "limit":          {"type": "integer", "description": "Max clusters to return (default 25)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fleet_version_distribution",
+            "description": (
+                "Return the distribution of Couchbase versions across all clusters in the fleet. "
+                "Use for: 'what CB versions are in the wild?', 'how many clusters on 7.6?', "
+                "'version spread', 'upgrade coverage'."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fleet_cbse_impact",
+            "description": (
+                "Rank known CBSEs (Couchbase Support Escalations) by the number of unique customer "
+                "orgs affected — blast radius. "
+                "Use for: 'which CBSE is hitting the most customers?', 'most impactful bugs', "
+                "'CBSE blast radius', 'cross-customer bug analysis'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max CBSEs to return (default 20)."},
                 },
                 "required": [],
             },
@@ -18039,40 +18125,169 @@ LIMIT {limit}
             return f"SLA compliance error: {exc}"
 
     elif name == "get_portfolio_status":
-        limit = min(int(args.get("limit") or 20), 50)
+        limit           = min(int(args.get("limit") or 20), 50)
+        incl_cluster    = bool(args.get("include_cluster"))
+        snap_collection = ctx.get("snap_collection", "snapshots")
         try:
             conn = _cb_conn_str(cb_url, use_tls)
             cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
             cl_.wait_until_ready(timedelta(seconds=10))
-            from couchbase.options import QueryOptions as _PfQO
             orgs_rows = list(cl_.query(
                 f"SELECT DISTINCT t.organization FROM `{bucket}`.`{scope}`.`{collection}` t "
                 f"WHERE t.type='ticket' AND t.organization IS NOT NULL LIMIT {limit * 2}",
             ))
+            cl_.close()
             orgs = [r.get("organization") for r in orgs_rows if r.get("organization")][:limit]
             results = []
             for org in orgs:
                 try:
-                    h = _compute_health_score(org, cb_url, bucket, username, password,
-                                               use_tls, scope, collection)
+                    if incl_cluster:
+                        h = _compute_health_score_with_cluster(
+                            org, cb_url, bucket, username, password,
+                            use_tls, scope, collection, snap_collection)
+                    else:
+                        h = _compute_health_score(org, cb_url, bucket, username, password,
+                                                   use_tls, scope, collection)
                     results.append(h)
                 except Exception:
                     pass
             results.sort(key=lambda x: x["score"])
-            lines = [
-                "## Portfolio Status (ranked by urgency)\n",
-                "| Customer | Score | Grade | Open P1 | Open P2 | Esc% | Data Age |",
-                "|---|---|---|---|---|---|---|",
-            ]
-            for h in results:
-                lines.append(
-                    f"| {h['organization']} | {h['score']} | {h['grade']} "
-                    f"| {h['open_p1']} | {h['open_p2']} "
-                    f"| {h['escalation_rate_pct']}% | {h['hours_since_scraped']}h |"
-                )
+            if incl_cluster:
+                lines = [
+                    "## Portfolio Status (ranked by urgency)\n",
+                    "| Customer | Score | Grade | Open P1 | Open P2 | Esc% | Clusters | Bad Ratio | Data Age |",
+                    "|---|---|---|---|---|---|---|---|---|",
+                ]
+                for h in results:
+                    lines.append(
+                        f"| {h['organization']} | {h['score']} | {h['grade']} "
+                        f"| {h['open_p1']} | {h['open_p2']} | {h['escalation_rate_pct']}% "
+                        f"| {h.get('cluster_count', '—')} | {h.get('cluster_bad_ratio', '—')} "
+                        f"| {h['hours_since_scraped']}h |"
+                    )
+            else:
+                lines = [
+                    "## Portfolio Status (ranked by urgency)\n",
+                    "| Customer | Score | Grade | Open P1 | Open P2 | Esc% | Data Age |",
+                    "|---|---|---|---|---|---|---|",
+                ]
+                for h in results:
+                    lines.append(
+                        f"| {h['organization']} | {h['score']} | {h['grade']} "
+                        f"| {h['open_p1']} | {h['open_p2']} "
+                        f"| {h['escalation_rate_pct']}% | {h['hours_since_scraped']}h |"
+                    )
             return "\n".join(lines)
         except Exception as exc:
             return f"Portfolio error: {exc}"
+
+    elif name == "query_fleet_tickets":
+        _group_by      = args.get("group_by", "organization")
+        _status_filter = args.get("status_filter", "open")
+        _limit         = min(int(args.get("limit") or 30), 100)
+        try:
+            rows = _query_fleet_tickets(
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                group_by=_group_by, status_filter=_status_filter, limit=_limit,
+            )
+            if not rows:
+                return f"No tickets found (group_by={_group_by}, status={_status_filter})."
+            _status_label = {"open": "open", "solved": "resolved", "all": "all"}.get(_status_filter, _status_filter)
+            if _group_by == "cbse":
+                lines = [
+                    f"## Fleet Tickets by CBSE ({_status_label})\n",
+                    "| CBSE | Tickets | Orgs Affected |",
+                    "|---|---|---|",
+                ]
+                for r in rows:
+                    lines.append(f"| {r.get('label','?')} | {r.get('ticket_count',0)} | {r.get('org_count',0)} |")
+            else:
+                lines = [
+                    f"## Fleet Tickets by {_group_by.replace('_',' ').title()} ({_status_label})\n",
+                    "| Label | Tickets | P1 | P2 |",
+                    "|---|---|---|---|",
+                ]
+                for r in rows:
+                    lines.append(
+                        f"| {r.get('label','?')} | {r.get('ticket_count',0)} "
+                        f"| {r.get('p1_count',0)} | {r.get('p2_count',0)} |"
+                    )
+            lines.append(f"\n*{len(rows)} rows · grouped by {_group_by} · filter: {_status_filter}*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Fleet query error: {exc}"
+
+    elif name == "list_at_risk_clusters":
+        _bad_t  = int(args.get("bad_threshold")  or 0)
+        _warn_t = int(args.get("warn_threshold") or 3)
+        _lim    = min(int(args.get("limit") or 25), 100)
+        snap_collection = ctx.get("snap_collection", "snapshots")
+        try:
+            rows = _list_at_risk_clusters(
+                cb_url, bucket, username, password, use_tls, scope,
+                snap_collection=snap_collection, ticket_collection=collection,
+                bad_threshold=_bad_t, warn_threshold=_warn_t, limit=_lim,
+            )
+            if not rows:
+                return "No at-risk clusters found matching the thresholds — fleet looks clean."
+            lines = [
+                f"## At-Risk Clusters (bad > {_bad_t} OR warn > {_warn_t}, no open ticket)\n",
+                "| Cluster | Org | CB Version | Bad Items | Warn Items | Risk Score |",
+                "|---|---|---|---|---|---|",
+            ]
+            for r in rows:
+                lines.append(
+                    f"| {r.get('cluster_name','?')} | {r.get('organization','?')} "
+                    f"| {r.get('cb_version','?')} | {r.get('bad_items',0)} "
+                    f"| {r.get('warn_items',0)} | **{r.get('risk_score',0)}** |"
+                )
+            lines.append(f"\n*{len(rows)} clusters · risk score = bad×3 + warn*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"At-risk cluster query error: {exc}"
+
+    elif name == "fleet_version_distribution":
+        snap_collection = ctx.get("snap_collection", "snapshots")
+        try:
+            rows = _fleet_version_distribution(
+                cb_url, bucket, username, password, use_tls, scope, snap_collection,
+            )
+            if not rows:
+                return "No snapshot version data found."
+            lines = [
+                "## Fleet CB Version Distribution\n",
+                "| CB Version | Clusters | Orgs |",
+                "|---|---|---|",
+            ]
+            for r in rows:
+                lines.append(f"| {r.get('version','?')} | {r.get('cluster_count',0)} | {r.get('org_count',0)} |")
+            total_c = sum(r.get("cluster_count", 0) for r in rows)
+            lines.append(f"\n*{len(rows)} distinct versions across {total_c} clusters*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Version distribution error: {exc}"
+
+    elif name == "fleet_cbse_impact":
+        _lim = min(int(args.get("limit") or 20), 50)
+        try:
+            rows = _fleet_cbse_impact(
+                cb_url, bucket, username, password, use_tls, scope, collection, limit=_lim,
+            )
+            if not rows:
+                return "No CBSE data found in ticket records."
+            lines = [
+                "## Fleet CBSE Blast Radius (ranked by orgs affected)\n",
+                "| CBSE | Orgs Affected | Tickets |",
+                "|---|---|---|",
+            ]
+            for r in rows:
+                lines.append(
+                    f"| {r.get('cbse','?')} | {r.get('org_count',0)} | {r.get('ticket_count',0)} |"
+                )
+            lines.append(f"\n*{len(rows)} CBSEs found across all tickets*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"CBSE impact query error: {exc}"
 
     elif name == "tag_ticket":
         tid  = str(args.get("ticket_id") or "").strip()
@@ -19137,6 +19352,150 @@ def _delete_asset_from_cb(
         return False
     finally:
         cl_.close()
+
+
+# ── Phase 3.1: Fleet Analysis helpers ────────────────────────────────────────
+
+def _fleet_query(cb_url, bucket, username, password, use_tls, scope, sql, **params):
+    """Run a N1QL query against the fleet and return rows."""
+    conn = _cb_conn_str(cb_url, use_tls)
+    cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    cl_.wait_until_ready(timedelta(seconds=10))
+    from couchbase.options import QueryOptions as _FQO
+    rows = list(cl_.query(sql, _FQO(named_parameters=params) if params else _FQO()))
+    cl_.close()
+    return rows
+
+
+def _query_fleet_tickets(
+    cb_url, bucket, username, password, use_tls, scope, collection,
+    group_by="organization", status_filter="open", limit=30,
+):
+    """
+    Aggregate ticket counts across all orgs.
+    group_by: organization | priority | status | cb_version | cbse
+    status_filter: open | all | solved
+    """
+    _status_clause = {
+        "open":   "AND t.status NOT IN ['solved','closed']",
+        "solved": "AND t.status IN ['solved','closed']",
+        "all":    "",
+    }.get(status_filter, "")
+
+    _group_field = {
+        "organization": "t.organization",
+        "priority":     "t.priority",
+        "status":       "t.status",
+        "cb_version":   "t.cb_version",
+        "cbse":         "UNNEST(t.cbses) AS cbse_id",
+    }.get(group_by, "t.organization")
+
+    if group_by == "cbse":
+        sql = (
+            f"SELECT cbse_id AS label, COUNT(*) AS ticket_count, "
+            f"COUNT(DISTINCT t.organization) AS org_count "
+            f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+            f"UNNEST t.cbses AS cbse_id "
+            f"WHERE t.type='ticket' AND cbse_id IS NOT NULL {_status_clause} "
+            f"GROUP BY cbse_id ORDER BY org_count DESC, ticket_count DESC LIMIT {limit}"
+        )
+    else:
+        sql = (
+            f"SELECT {_group_field} AS label, "
+            f"COUNT(*) AS ticket_count, "
+            f"SUM(CASE WHEN t.priority='critical' THEN 1 ELSE 0 END) AS p1_count, "
+            f"SUM(CASE WHEN t.priority='high' THEN 1 ELSE 0 END) AS p2_count "
+            f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+            f"WHERE t.type='ticket' {_status_clause} AND {_group_field} IS NOT NULL "
+            f"GROUP BY {_group_field} ORDER BY ticket_count DESC LIMIT {limit}"
+        )
+    return _fleet_query(cb_url, bucket, username, password, use_tls, scope, sql)
+
+
+def _list_at_risk_clusters(
+    cb_url, bucket, username, password, use_tls, scope, snap_collection="snapshots",
+    ticket_collection="tickets", bad_threshold=0, warn_threshold=3, limit=25,
+):
+    """
+    Return clusters with elevated bad/warn item counts that have no linked open ticket.
+    Risk score = bad_items * 3 + warn_items.
+    """
+    sql = (
+        f"SELECT s.cluster_name, s.organization, s.cb_version, "
+        f"s.bad_items, s.warn_items, s.last_scraped_at, "
+        f"(s.bad_items * 3 + s.warn_items) AS risk_score "
+        f"FROM `{bucket}`.`{scope}`.`{snap_collection}` s "
+        f"WHERE s.type='snapshot' "
+        f"AND (s.bad_items > {bad_threshold} OR s.warn_items > {warn_threshold}) "
+        f"AND NOT EXISTS ("
+        f"  SELECT 1 FROM `{bucket}`.`{scope}`.`{ticket_collection}` t "
+        f"  WHERE t.type='ticket' "
+        f"  AND t.status NOT IN ['solved','closed'] "
+        f"  AND LOWER(t.organization) = LOWER(s.organization) "
+        f") "
+        f"ORDER BY risk_score DESC LIMIT {limit}"
+    )
+    return _fleet_query(cb_url, bucket, username, password, use_tls, scope, sql)
+
+
+def _fleet_version_distribution(
+    cb_url, bucket, username, password, use_tls, scope, snap_collection="snapshots",
+):
+    """Count snapshots grouped by CB version across the entire fleet."""
+    sql = (
+        f"SELECT s.cb_version AS version, "
+        f"COUNT(*) AS cluster_count, "
+        f"COUNT(DISTINCT s.organization) AS org_count "
+        f"FROM `{bucket}`.`{scope}`.`{snap_collection}` s "
+        f"WHERE s.type='snapshot' AND s.cb_version IS NOT NULL "
+        f"GROUP BY s.cb_version ORDER BY cluster_count DESC LIMIT 30"
+    )
+    return _fleet_query(cb_url, bucket, username, password, use_tls, scope, sql)
+
+
+def _fleet_cbse_impact(
+    cb_url, bucket, username, password, use_tls, scope, collection,
+    limit=20,
+):
+    """Rank CBSEs by number of unique orgs affected (blast radius)."""
+    sql = (
+        f"SELECT cbse_id AS cbse, "
+        f"COUNT(DISTINCT t.organization) AS org_count, "
+        f"COUNT(*) AS ticket_count "
+        f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+        f"UNNEST t.cbses AS cbse_id "
+        f"WHERE t.type='ticket' AND cbse_id IS NOT NULL "
+        f"GROUP BY cbse_id ORDER BY org_count DESC, ticket_count DESC LIMIT {limit}"
+    )
+    return _fleet_query(cb_url, bucket, username, password, use_tls, scope, sql)
+
+
+def _compute_health_score_with_cluster(
+    org, cb_url, bucket, username, password, use_tls, scope, collection,
+    snap_collection="snapshots",
+):
+    """
+    Extension of _compute_health_score that adds cluster bad_ratio dimension.
+    Returns the same dict as _compute_health_score plus cluster_bad_ratio and cluster_count.
+    """
+    h = _compute_health_score(org, cb_url, bucket, username, password,
+                               use_tls, scope, collection, snap_collection)
+    # Add per-cluster bad_ratio breakdown
+    try:
+        rows = _fleet_query(
+            cb_url, bucket, username, password, use_tls, scope,
+            f"SELECT s.cluster_name, s.bad_items, s.warn_items "
+            f"FROM `{bucket}`.`{scope}`.`{snap_collection}` s "
+            f"WHERE s.type='snapshot' AND LOWER(s.organization) LIKE $org "
+            f"ORDER BY s.bad_items DESC LIMIT 10",
+            org=f"%{org.lower()}%",
+        )
+        h["cluster_breakdown"] = rows
+        h["cluster_count"]     = len(rows)
+    except Exception:
+        h["cluster_breakdown"] = []
+        h["cluster_count"]     = 0
+    return h
 
 
 # ─────────────────────────── Phase 3: Scoring & Analytics ────────────────────
