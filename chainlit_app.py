@@ -553,9 +553,11 @@ async def on_start():
         except Exception:
             pass
 
+    _ver = getattr(_get_pipeline(), "__version__", "")
+    _ver_str = f" `v{_ver}`" if _ver else ""
     await cl.Message(
         content=(
-            "**Supportal Agent** — professional AI chat\n\n"
+            f"**Supportal Agent**{_ver_str} — professional AI chat\n\n"
             "Open the **⚙ Settings** panel to set your customer and LLM provider.\n"
             "Your Couchbase connection is loaded from the active NiceGUI profile automatically.\n\n"
             "Ask anything about your support tickets, request charts or tables, "
