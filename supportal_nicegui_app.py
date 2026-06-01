@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.5"
+__version__ = "1.9.6"
 
 import asyncio
 import threading
@@ -17783,7 +17783,7 @@ def _run_scrape_job_bg(
         _set_op(f"Saved {_saved} tickets — embedding…", 0.55)
 
         # ── Phase 3: embed ──────────────────────────────────────────────────
-        emb_p = emb_params.get("provider", "")
+        emb_p = emb_params.get("provider", "").lower().strip()
         emb_m = emb_params.get("model", "")
         emb_k = emb_params.get("api_key", "")
         emb_u = emb_params.get("base_url", "")
@@ -17951,7 +17951,7 @@ def _run_rescrape_job_bg(
             pass
 
         # ── Embed refreshed tickets ────────────────────────────────────────
-        emb_p = (emb_params or {}).get("provider", "")
+        emb_p = (emb_params or {}).get("provider", "").lower().strip()
         emb_m = (emb_params or {}).get("model", "")
         emb_k = (emb_params or {}).get("api_key", "")
         emb_u = (emb_params or {}).get("base_url", "")
@@ -17966,7 +17966,7 @@ def _run_rescrape_job_bg(
                 def _emb_prog(msg: str, pct: float):
                     job["last_message"] = msg
                     _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
-                    _OP_STATUS["progress"] = 0.82 + pct * 0.18
+                    _OP_STATUS["progress"] = 0.82 + pct * 0.15
 
                 _done_emb, _errs_emb = embed_all_tickets(
                     refreshed_tickets, cb_url, bucket, username, password,
@@ -17980,13 +17980,34 @@ def _run_rescrape_job_bg(
                 job["last_message"] = f"Embedding failed: {exc}"
                 job["errors"] += 1
 
+        # ── Score refreshed tickets ───────────────────────────────────────
+        s_prov = (emb_params or {}).get("score_provider", "").lower().strip()
+        s_mod  = (emb_params or {}).get("score_model", "")
+        s_key  = (emb_params or {}).get("score_api_key", "")
+        s_url  = (emb_params or {}).get("score_base_url", "")
+        if s_prov and s_mod and refreshed_tickets:
+            job["phase"] = "scoring"
+            _set_op(f"Scoring refreshed tickets…", 0.97)
+            try:
+                _scores = score_tickets_batch(
+                    refreshed_tickets[:10],
+                    s_prov, s_mod, s_key, s_url,
+                    cb_url, bucket, username, password, use_tls, scope, collection,
+                    save_to_cb=True,
+                )
+                job["scored"] = len(_scores)
+            except Exception as exc:
+                job["last_message"] = f"Scoring failed: {exc}"
+                job["errors"] += 1
+
         job["status"]      = "done"
         job["phase"]       = None
         job["finished_at"] = time.time()
         summary = (
-            f"Done — {ok}/{total} tickets updated, {job['embedded']} embedded"
+            f"Done — {ok}/{total} tickets updated, {job['embedded']} embedded, "
+            f"{job['scored']} scored"
             + (f", {skipped} skipped" if skipped else "")
-            + (f", {errors} errors" if errors else "")
+            + (f", {job['errors']} errors" if job["errors"] else "")
         )
         job["last_message"] = summary
         _set_op(summary, 1.0, done=True)
@@ -18297,7 +18318,9 @@ def _execute_agent_tool(
                  "use_tls": use_tls, "scope": scope, "collection": collection},
                 {"provider": ctx.get("emb_provider",""), "model": ctx.get("emb_model",""),
                  "api_key": ctx.get("emb_api_key",""), "base_url": ctx.get("emb_base_url",""),
-                 "dims": ctx.get("emb_dims", 0)},
+                 "dims": ctx.get("emb_dims", 0),
+                 "score_provider": ctx.get("provider",""), "score_model": ctx.get("model",""),
+                 "score_api_key": ctx.get("api_key",""), "score_base_url": ctx.get("base_url","")},
             ),
             daemon=True,
         ).start()
