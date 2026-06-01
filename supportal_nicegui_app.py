@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.6"
+__version__ = "1.9.7"
 
 import asyncio
 import threading
@@ -18467,9 +18467,47 @@ def _execute_agent_tool(
         except Exception as exc:
             print(f"[rescrape_ticket] CB upsert failed: {exc}")
 
+        # ── Embed + score the refreshed ticket ───────────────────────────────
+        _pipeline_notes: list[str] = []
+        if _saved:
+            emb_p = (ctx.get("emb_provider") or "").lower().strip()
+            emb_m = ctx.get("emb_model", "")
+            emb_k = ctx.get("emb_api_key", "")
+            emb_u = ctx.get("emb_base_url", "")
+            emb_d = int(ctx.get("emb_dims") or 0)
+            if emb_p and emb_m and emb_d:
+                if emb_p == "lmstudio":
+                    _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                    lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45)
+                try:
+                    _done_emb, _errs_emb = embed_all_tickets(
+                        [fresh], cb_url, bucket, username, password,
+                        use_tls, scope, collection,
+                        emb_p, emb_m, emb_k, emb_u, emb_d,
+                        lambda msg, pct: None,
+                    )
+                    _pipeline_notes.append(f"Embedded ✓" if _done_emb else "Embed skipped")
+                except Exception as _ee:
+                    _pipeline_notes.append(f"Embed failed: {_ee}")
+            s_prov = (ctx.get("provider") or "").lower().strip()
+            s_mod  = ctx.get("model", "")
+            s_key  = ctx.get("api_key", "")
+            s_url  = ctx.get("base_url", "")
+            if s_prov and s_mod:
+                try:
+                    _scores = score_tickets_batch(
+                        [fresh], s_prov, s_mod, s_key, s_url,
+                        cb_url, bucket, username, password, use_tls, scope, collection,
+                        save_to_cb=True,
+                    )
+                    _pipeline_notes.append(f"Scored ✓" if _scores else "Score skipped")
+                except Exception as _se:
+                    _pipeline_notes.append(f"Score failed: {_se}")
+
         _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+        _pipeline_str = " | " + " | ".join(_pipeline_notes) if _pipeline_notes else ""
         summary_lines = [
-            f"**Ticket {ticket_id} re-scraped from Supportal** {'(saved to CB ✓)' if _saved else '(CB save failed ✗)'}",
+            f"**Ticket {ticket_id} re-scraped from Supportal** {'(saved to CB ✓)' if _saved else '(CB save failed ✗)'}{_pipeline_str}",
             f"Status: {fresh.get('status','')} | Priority: {fresh.get('priority','')}",
             f"Subject: {fresh.get('subject','')}",
             f"Created: {fresh.get('created','')} | Closed: {fresh.get('closed','')}",
