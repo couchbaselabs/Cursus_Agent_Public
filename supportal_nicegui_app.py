@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.3"
+__version__ = "1.9.4"
 
 import asyncio
 import threading
@@ -17847,15 +17847,19 @@ def _run_rescrape_job_bg(
     to_scrape: list[dict],
     cookie: str,
     cb_params: dict,
+    emb_params: dict | None = None,
 ) -> None:
     """Background worker for rescrape_customer_tickets. Refreshes individual ticket docs."""
-    cb_url    = cb_params["url"]
-    bucket    = cb_params["bucket"]
-    username  = cb_params["username"]
-    password  = cb_params["password"]
-    use_tls   = cb_params["use_tls"]
-    scope     = cb_params["scope"]
+    from couchbase.options import GetOptions, UpsertOptions  # type: ignore
+
+    cb_url     = cb_params["url"]
+    bucket     = cb_params["bucket"]
+    username   = cb_params["username"]
+    password   = cb_params["password"]
+    use_tls    = cb_params["use_tls"]
+    scope      = cb_params["scope"]
     collection = cb_params["collection"]
+    _cb_op_timeout = timedelta(seconds=5)
 
     total = len(to_scrape)
     job["total"] = total
@@ -17878,7 +17882,11 @@ def _run_rescrape_job_bg(
         _bcluster.wait_until_ready(timedelta(seconds=10))
         _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
 
+        # Create session once — reused across all ticket fetches
+        _sess = _make_api_session(cookie)
+
         ok = skipped = errors = 0
+        refreshed_tickets: list[dict] = []
         for i, t in enumerate(to_scrape, 1):
             tid = str(t.get("ticket_id") or "").strip()
             if not tid:
@@ -17886,8 +17894,7 @@ def _run_rescrape_job_bg(
                 job["processed"] = i
                 continue
             try:
-                _sess  = _make_api_session(cookie)
-                fresh  = fetch_ticket_api(tid, _sess)
+                fresh = fetch_ticket_api(tid, _sess)
                 if not fresh or not fresh.get("ticket_id"):
                     skipped += 1
                     job["processed"] = i
@@ -17899,23 +17906,27 @@ def _run_rescrape_job_bg(
                 fresh["ticket_origin"]   = classify_ticket_origin(fresh)
                 doc_key = f"ticket::{tid}"
                 try:
-                    existing = _bcol.get(doc_key).content_as[dict]
-                    merged   = {**existing}
+                    existing = _bcol.get(
+                        doc_key, GetOptions(timeout=_cb_op_timeout)
+                    ).content_as[dict]
+                    merged = {**existing}
                     for k, v in fresh.items():
                         if v not in (None, "", [], {}):
                             merged[k] = v
                         elif k not in merged:
                             merged[k] = v
-                    _bcol.upsert(doc_key, merged)
+                    _bcol.upsert(doc_key, merged, UpsertOptions(timeout=_cb_op_timeout))
+                    refreshed_tickets.append(merged)
                 except Exception:
-                    _bcol.upsert(doc_key, fresh)
+                    _bcol.upsert(doc_key, fresh, UpsertOptions(timeout=_cb_op_timeout))
+                    refreshed_tickets.append(fresh)
                 ok += 1
                 job["saved"] = ok
             except Exception as exc:
                 errors += 1
                 job["errors"] = errors
             job["processed"] = i
-            pct = i / total
+            pct = i / total * 0.80   # scrape phase = 0–80%
             if i % 10 == 0 or i == total:
                 _set_op(f"Rescraping {i}/{total} for '{org}'…", pct)
             time.sleep(0.35)
@@ -17925,11 +17936,41 @@ def _run_rescrape_job_bg(
         except Exception:
             pass
 
+        # ── Embed refreshed tickets ────────────────────────────────────────
+        emb_p = (emb_params or {}).get("provider", "")
+        emb_m = (emb_params or {}).get("model", "")
+        emb_k = (emb_params or {}).get("api_key", "")
+        emb_u = (emb_params or {}).get("base_url", "")
+        emb_d = int((emb_params or {}).get("dims") or 0)
+        if emb_p and emb_m and emb_d and refreshed_tickets:
+            job["phase"] = "embedding"
+            _set_op(f"Embedding {len(refreshed_tickets)} refreshed tickets…", 0.82)
+            if emb_p == "lmstudio":
+                _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45)
+            try:
+                def _emb_prog(msg: str, pct: float):
+                    job["last_message"] = msg
+                    _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+                    _OP_STATUS["progress"] = 0.82 + pct * 0.18
+
+                _done_emb, _errs_emb = embed_all_tickets(
+                    refreshed_tickets, cb_url, bucket, username, password,
+                    use_tls, scope, collection,
+                    emb_p, emb_m, emb_k, emb_u, emb_d,
+                    _emb_prog,
+                )
+                job["embedded"] = _done_emb
+                job["errors"]  += _errs_emb
+            except Exception as exc:
+                job["last_message"] = f"Embedding failed: {exc}"
+                job["errors"] += 1
+
         job["status"]      = "done"
         job["phase"]       = None
         job["finished_at"] = time.time()
         summary = (
-            f"Done — {ok}/{total} tickets updated"
+            f"Done — {ok}/{total} tickets updated, {job['embedded']} embedded"
             + (f", {skipped} skipped" if skipped else "")
             + (f", {errors} errors" if errors else "")
         )
@@ -18240,6 +18281,9 @@ def _execute_agent_tool(
                 _job, cust or "all customers", to_scrape, cookie,
                 {"url": cb_url, "bucket": bucket, "username": username, "password": password,
                  "use_tls": use_tls, "scope": scope, "collection": collection},
+                {"provider": ctx.get("emb_provider",""), "model": ctx.get("emb_model",""),
+                 "api_key": ctx.get("emb_api_key",""), "base_url": ctx.get("emb_base_url",""),
+                 "dims": ctx.get("emb_dims", 0)},
             ),
             daemon=True,
         ).start()
