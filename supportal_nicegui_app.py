@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.4"
+__version__ = "1.9.5"
 
 import asyncio
 import threading
@@ -7103,6 +7103,20 @@ def main_page():
                                         )
                                     if state.get("prior_session_block"):
                                         _agent_sys += "\n" + state["prior_session_block"]
+                                    _agent_sys += (
+                                        "\n\nBACKGROUND JOBS — critical rules:\n"
+                                        "scrape_customer_tickets and rescrape_customer_tickets return IMMEDIATELY "
+                                        "after starting a background job. The pipeline (scrape → save → embed) "
+                                        "runs in a separate thread and you have NO way to watch it or be notified "
+                                        "when it finishes.\n"
+                                        "NEVER say 'I am monitoring', 'I will alert you', 'I will notify you when done', "
+                                        "or any similar phrase — you cannot do this.\n"
+                                        "ALWAYS tell the user: 'I cannot proactively notify you when the job finishes — "
+                                        "you will need to ask me for a status update.' Then suggest they ask "
+                                        "'what is the scrape status?' after a minute or two.\n"
+                                        "When get_scrape_status shows a job is still RUNNING, remind the user "
+                                        "that they need to ask again to get a fresh update."
+                                    )
                                     _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
                                     _ctx_depth = int(agent_ctx_depth_input.value or 10)  # AFTER v1.5.0
                                     for _h in state["chat_history"][-(_ctx_depth):-1]:
@@ -18291,7 +18305,8 @@ def _execute_agent_tool(
             f"Started rescrape job **{_job['job_id']}** for '{cust or 'all customers'}' "
             f"({len(to_scrape)} tickets, stale > {stale_hours:.0f}h). "
             f"Running in the background at ~3 req/s. "
-            f"Ask me 'what's the scrape status?' or call get_scrape_status to check progress."
+            f"**I cannot notify you when it finishes — you must ask me.** "
+            f"Ask 'what is the scrape status?' after a minute or two to check progress."
         )
 
     elif name == "rescrape_ticket":
@@ -18956,7 +18971,8 @@ LIMIT {limit}
         return (
             f"Started scrape job **{_job['job_id']}** for '{org}' (up to {max_tickets} tickets). "
             f"The pipeline runs in the background — scraping, saving, embedding, and scoring. "
-            f"Ask me 'what's the scrape status?' at any time, or call get_scrape_status."
+            f"**I cannot notify you when it finishes — you must ask me.** "
+            f"Ask 'what is the scrape status?' after a minute or two to check progress."
         )
 
     elif name == "score_ticket":
