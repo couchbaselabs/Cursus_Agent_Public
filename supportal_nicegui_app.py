@@ -26102,6 +26102,14 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
     from collections import Counter
     import datetime
 
+    def _sf(val) -> str:
+        """Safely coerce any topo/field value to a stripped string (guards against lists)."""
+        if not val:
+            return ""
+        if isinstance(val, list):
+            val = val[0] if val else ""
+        return str(val).strip()
+
     # Frequency over time — total and per origin
     month_by_origin: dict[str, Counter] = {
         "Customer-Initiated":   Counter(),
@@ -26182,23 +26190,25 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
     for t in tickets:
         ver = extract_ticket_version(t)
+        # Parse ticket_fields once per ticket (used for version fallback + cluster UUID)
+        tf = _parse_ticket_fields(t)
         if ver and ver != "Unknown":
             version_counts[ver] += 1
         else:
-            _tf_v = _parse_ticket_fields(t)
-            _cs   = (_tf_v.get("Couchbase_Server") or "").strip().lower()
-            if "Couchbase_Server" not in _tf_v:
+            _cs = (tf.get("Couchbase_Server") or "").strip().lower()
+            if "Couchbase_Server" not in tf:
                 _ver_admin_count += 1
             elif "end of life" in _cs:
                 _ver_eol_count += 1
             else:
                 _ver_blank_count += 1
 
-        # Collect cluster UUIDs from all available sources
+        # Collect cluster UUIDs from fast structured sources only.
+        # Source 3 (extract_cluster_snapshot_info over description+comments) is omitted here —
+        # it is O(n * comment_size) and produces many false positives for analytics charts.
         ticket_uuids: set = set()
 
         # Source 1: ticket_fields["Cluster ID"]
-        tf = _parse_ticket_fields(t)
         cf_uuid = (tf.get("Cluster_ID") or "").strip()
         if _uuid_re.match(cf_uuid):
             ticket_uuids.add(cf_uuid.lower())
@@ -26212,20 +26222,19 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
                     topo_d = json.loads(topo_raw)
                 except Exception:
                     topo_d = {}
-            # Prefer capella_cluster_id (matches Zendesk Cluster_ID format)
             for _uid_key in ("capella_cluster_id", "cluster_uuid"):
                 _uid_val = (topo_d.get(_uid_key) or "").strip()
                 if _uuid_re.match(_uid_val):
                     ticket_uuids.add(_uid_val.lower())
 
-        # Source 3: UUIDs parsed from comments/description/snapshots
-        info = extract_cluster_snapshot_info(t)
-        _snap_info_cache[str(t.get("ticket_id", ""))] = info  # reused in second loop
-        for cid in (info.get("cluster_ids") or []):
-            if _uuid_re.match(cid):
-                ticket_uuids.add(cid.lower())
-
         all_unique_cluster_uuids.update(ticket_uuids)
+
+        # Lightweight snapshot count — just count non-empty lines in the snapshots field
+        _snaps_raw = t.get("snapshots") or ""
+        if isinstance(_snaps_raw, list):
+            _snaps_raw = "\n".join(str(s) for s in _snaps_raw)
+        _snap_count = sum(1 for ln in str(_snaps_raw).splitlines() if ln.strip())
+        _snap_info_cache[str(t.get("ticket_id", ""))] = {"snapshot_count": _snap_count}
 
         # Map each UUID to the ticket's version (skip if no real version)
         if ver and ver != "Unknown":
@@ -26282,12 +26291,10 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
         tid = str(ticket.get("ticket_id", ""))
         score = scores.get(tid, {})
 
-        # Snapshot count: use score pre-computed value if available, else extract.
-        # Reuse cached result from the version loop above to avoid double-parsing.
+        # Snapshot count: score field first, then lightweight cache from first loop.
         s_count = score.get("snapshot_count") if score else None
         if s_count is None:
-            info    = _snap_info_cache.get(tid) or extract_cluster_snapshot_info(ticket)
-            s_count = info["snapshot_count"]
+            s_count = _snap_info_cache.get(tid, {}).get("snapshot_count", 0)
 
         # For analytics charts use ONLY authoritative sources — snapshot_topology
         # (from the nutshell API) and the structured ticket_fields "Cluster ID".
@@ -26306,7 +26313,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
         # Cluster name: only from snapshot_topology.cluster_name
         # Skip UUID-shaped values — those are IDs that leaked into the name field
-        cn = (topo.get("cluster_name") or "").strip()
+        cn = _sf(topo.get("cluster_name"))
         if cn and not re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-", cn, re.IGNORECASE):
             cluster_name_counts[cn] += 1
 
@@ -26314,8 +26321,8 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
         # Don't count cluster_uuid (CB internal 32-hex UUID, no dashes) — users don't
         # recognise it and it doesn't match Zendesk Cluster_ID format.
         tf = _parse_ticket_fields(ticket)
-        cid_field     = (tf.get("Cluster_ID") or "").strip()
-        capella_cid   = (topo.get("capella_cluster_id") or "").strip()
+        cid_field   = _sf(tf.get("Cluster_ID"))
+        capella_cid = _sf(topo.get("capella_cluster_id"))
         # De-duplicate: ticket_fields.Cluster_ID and capella_cluster_id are often
         # the same value; only count a given UUID once per ticket.
         _seen_cids: set = set()
@@ -26410,7 +26417,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
             bucket_dist_counts[str(int(bc))] += 1
 
         # Orchestrator hotspot (top 10)
-        orch = topo.get("orchestrator")
+        orch = _sf(topo.get("orchestrator"))
         if orch:
             orchestrator_counts[orch] += 1
 
@@ -26428,7 +26435,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
     for ticket in tickets:
         tf = _parse_ticket_fields(ticket)
-        raw_cbse = (tf.get("CBSE") or "").strip()
+        raw_cbse = _sf(tf.get("CBSE"))
         if not raw_cbse or not _cbse_re.search(raw_cbse):
             continue
         cbse_total += 1
