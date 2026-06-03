@@ -25950,10 +25950,10 @@ def build_cluster_timeline(tickets: list[dict], cluster_key: str) -> list[dict]:
         # cluster_uuid (internal CB hex UUID) is kept for dedup but not shown to users.
         tf = _parse_ticket_fields(ticket)
         identifiers = [
-            (topo.get("cluster_name") or "").lower(),
-            (topo.get("capella_cluster_id") or "").lower(),
-            (topo.get("cluster_uuid") or "").lower(),
-            (tf.get("Cluster_ID") or "").lower(),
+            _topo_str(topo.get("cluster_name")).lower(),
+            _topo_str(topo.get("capella_cluster_id")).lower(),
+            _topo_str(topo.get("cluster_uuid")).lower(),
+            _topo_str(tf.get("Cluster_ID")).lower(),
         ]
         if key_lower not in identifiers:
             continue
