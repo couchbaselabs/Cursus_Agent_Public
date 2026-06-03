@@ -8,7 +8,20 @@ This phase completes the original vision: a chat-first platform where the agent 
 
 ## Milestone 4.1 — MCP Tool Server
 
-Expose all Supportal agent tools as a proper MCP server so Claude Desktop and other MCP clients can use them natively.
+Expose all Supportal agent tools as a proper MCP server so Claude Desktop can be used as a lightweight alternative chat interface alongside Chainlit. The MCP server runs locally as a subprocess — no cloud dependency, no NiceGUI required.
+
+**Claude Desktop vs Chainlit trade-off:**
+
+| | Claude Desktop (via MCP) | Chainlit |
+|---|---|---|
+| Model | Anthropic Claude (full) | Any provider (Ollama, LMStudio, Gemini, etc.) |
+| Tool calling | Native MCP | Direct Python import |
+| Thread history | Claude Desktop's own | CB-persisted, sidebar |
+| Custom UI | None | Quick actions, charts, follow-up chips, assets |
+| Auth | None (local) | Username/password |
+| Best for | Quick ad-hoc queries, no setup | Full experience with history and visualisations |
+
+Both interfaces call the same underlying Supportal tool implementations — Claude Desktop is additive, not a replacement for Chainlit.
 
 ### Backlog
 
@@ -153,6 +166,40 @@ This milestone is the prerequisite for any future frontend swap (React, Lovable,
 
 ### Design note
 NiceGUI tabs (Scraping, Scoring, Fleet, Assets) remain fully functional as the power-user/admin interface. The goal is feature parity for the chat workflow, not replacement. Once 4.1 (MCP server) is complete, the Chainlit app can call tool implementations via the MCP client rather than importing them directly — that's the clean API boundary that would also enable a Lovable/React frontend later.
+
+---
+
+---
+
+## Milestone 4.7 — Salesforce Account Integration
+
+**Goal:** Users import their assigned book of business from Salesforce so the agent can blend support health data with account context (ARR, renewal date, CSM, contract tier). SFDC import is **additive** — manually entered orgs and ad-hoc queries on any account always work regardless of SF assignment.
+
+### Backlog
+
+| # | Item | Notes |
+|---|------|-------|
+| 4.7.1 | SFDC credentials in profile settings | SF username, password, security token, consumer key/secret; stored in NiceGUI profile alongside CB/LLM creds |
+| 4.7.2 | `fetch_sfdc_accounts(se_email)` | `simple-salesforce` SOQL query for accounts where Primary SE = current user; returns name, SF ID, ARR, renewal date, CSM, contract tier, SF health score |
+| 4.7.3 | Account validation UI | NiceGUI stepper: checklist of imported accounts; user confirms/excludes + maps SF account name → ticket org string (org_aliases) to handle name mismatches |
+| 4.7.4 | `accounts` CB collection | Store per-account doc keyed `accounts::SF_ACCOUNT_ID`; fields: sf_account_id, name, org_aliases, primary_se, csm, arr, renewal_date, contract_tier, sf_health_score, last_synced_at |
+| 4.7.5 | Org-alias resolution | When agent queries by org name, check org_aliases to find the canonical SF account; allows "Amex" → "American Express AZ" bridging |
+| 4.7.6 | Blended agent context | `get_customer_health_score` enriched with SF account fields when available; agent can answer "open P1s + renewal in 45 days + ARR $2M" in one turn |
+| 4.7.7 | `renewal_risk` portfolio dimension | Portfolio view surfaces accounts with open P1/P2 tickets AND renewal within 90 days |
+| 4.7.8 | `list_my_accounts` agent tool | Returns SFDC-imported accounts for the current SE; used by morning briefing and portfolio views as "my book of business" filter |
+| 4.7.9 | Onboarding wizard | NiceGUI stepper: Profile setup → SFDC import → Validate → Run pipeline → Chat. Chainlit fallback: if no accounts imported, prompt for SF email and run import conversationally |
+| 4.7.10 | SFDC re-sync | "Sync from Salesforce" button refreshes account list; detects added/removed accounts; does not clobber manually added orgs |
+
+### Acceptance criteria
+- User completes onboarding wizard from a fresh profile: sets CB + LLM creds, imports SF accounts, validates, pipeline runs, chat opens with morning briefing.
+- Agent answers "which of my accounts are up for renewal this quarter with open P1s?" correctly using blended data.
+- Querying an account not in SF book of business works normally from ticket data — no error, no gate.
+- Manual org additions survive a SFDC re-sync unchanged.
+
+### Design note
+`org_aliases` is the critical bridge between SF account names and ticket `organization` field values. The validation step must let users confirm or correct the auto-matched aliases before the pipeline runs. Store the mapping in the `accounts` doc so it survives re-syncs.
+
+SFDC field for "Primary SE" TBD — likely `AccountTeamMember.TeamMemberRole = 'Primary SE'` or a custom field `Primary_SE__c` directly on Account. Confirm before building 4.7.2.
 
 ---
 

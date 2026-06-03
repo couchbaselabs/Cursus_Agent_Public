@@ -185,12 +185,27 @@ class CouchbaseDataLayer(BaseDataLayer):
                 f"WHERE e.threadId = $tid",
                 tid=thread_id,
             )
-            # Filter out null rows and steps missing required fields that would
-            # cause "Cannot destructure property" errors in the Chainlit frontend.
-            steps = [
+            # Only surface user/assistant messages to the frontend.
+            # Tool calls, run wrappers, status messages, etc. are internal plumbing
+            # that the frontend can't render cleanly from stored state.
+            # socket.py already filters to "message"-type steps when rebuilding
+            # chat_context, so this matches that behaviour exactly.
+            _msg_steps = [
                 s for s in raw_steps
-                if isinstance(s, dict) and s.get("id") and s.get("type") not in ("run",)
+                if isinstance(s, dict) and s.get("id")
+                and "message" in (s.get("type") or "")
             ]
+            _kept_ids = {s["id"] for s in _msg_steps}
+            steps = []
+            for _s in _msg_steps:
+                row = dict(_s)
+                # Clear parentId that points to a filtered-out step (e.g. a run
+                # wrapper). The frontend's Pbe() silently drops a message whose
+                # parent isn't in the tree, so without this the assistant responses
+                # never appear.
+                if row.get("parentId") and row["parentId"] not in _kept_ids:
+                    row["parentId"] = None
+                steps.append(row)
             elements = [e for e in raw_elements if isinstance(e, dict) and e.get("id")]
             return ThreadDict(
                 id=doc["id"],

@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.9.7"
+__version__ = "2.0.2"
 
 import asyncio
 import threading
@@ -231,41 +231,51 @@ def poll_ollama_ps(base_url: str) -> dict:
 
 
 def poll_lmstudio_model_info(base_url: str) -> dict:
-    """Query LMStudio's extended API for loaded model info.
+    """Query LMStudio's /api/v1/models endpoint, falls back to /v1/models.
 
-    Tries /api/v0/models first (LMStudio ≥0.3), falls back to /v1/models.
+    LMStudio native format (returned by /api/v1/models):
+      {"models": [{
+        "type": "llm"|"embedding",
+        "key": "<model-key>",         # identifier to use in API calls
+        "loaded_instances": [...],    # non-empty when loaded
+        "max_context_length": N,
+        ...
+      }]}
+
     Returns a dict with keys:
-      models          : list of model info dicts
-      n_parallel      : parallel request count if exposed (None if not)
-      context_length  : context length of first loaded embedding model (None if unknown)
-      api_version     : "v0" | "v1" | None
+      models          : list of model info dicts (normalised)
+      n_parallel      : parallel request count (None if not found)
+      context_length  : context length of first loaded model (None if unknown)
+      api_version     : "v1" | None
     """
     base = base_url.rstrip("/")
     result: dict = {"models": [], "n_parallel": None, "context_length": None, "api_version": None}
 
-    # Try extended API first — exposes more fields
+    # LMStudio native API — richer data, different schema from OpenAI compat
     try:
-        resp = requests.get(f"{base}/api/v0/models", timeout=4, verify=False)
+        resp = requests.get(f"{base}/api/v1/models", timeout=4, verify=False)
         if resp.ok:
-            data = resp.json().get("data", [])
-            result["models"]      = data
-            result["api_version"] = "v0"
-            for m in data:
-                # LMStudio may expose n_parallel or num_parallel in model config
-                for key in ("n_parallel", "num_parallel", "parallel_requests",
-                            "concurrent_requests", "max_parallel"):
-                    if m.get(key) is not None:
-                        result["n_parallel"] = int(m[key])
-                        break
-                # Grab context length from first loaded embedding model
-                state = m.get("state", "")
-                mtype = m.get("type", "")
-                if result["context_length"] is None and state == "loaded":
-                    for ctx_key in ("context_length", "max_context_length",
-                                    "ctx_length", "n_ctx"):
-                        if m.get(ctx_key):
-                            result["context_length"] = int(m[ctx_key])
-                            break
+            body = resp.json()
+            # Native format uses "models" key; OpenAI compat uses "data"
+            if isinstance(body, list):
+                models = body
+            else:
+                models = body.get("models") or body.get("data") or []
+            result["models"]      = models
+            result["api_version"] = "v1"
+            for m in models:
+                instances = m.get("loaded_instances") or []
+                is_loaded = bool(instances)
+                if is_loaded:
+                    # n_parallel from instance config
+                    cfg = instances[0].get("config", {}) if instances else {}
+                    if result["n_parallel"] is None and cfg.get("parallel") is not None:
+                        result["n_parallel"] = int(cfg["parallel"])
+                    # context length from instance config or model-level field
+                    if result["context_length"] is None:
+                        ctx = cfg.get("context_length") or m.get("max_context_length")
+                        if ctx:
+                            result["context_length"] = int(ctx)
             return result
     except Exception:
         pass
@@ -283,49 +293,142 @@ def poll_lmstudio_model_info(base_url: str) -> dict:
 
 
 def lmstudio_load_model(base_url: str, model_id: str) -> bool:
-    """Ask LMStudio to load a specific model via POST /api/v0/models/load."""
+    """Ask LMStudio to load a specific model via POST /api/v1/models/load.
+
+    The endpoint may stream SSE events until loading completes — this can take
+    well over 10 seconds for large models.  We use stream=True and read only
+    the first non-empty line so we can validate the response code and check for
+    the fake-200 "Unexpected endpoint" body, then let the caller poll for
+    completion via GET /api/v1/models.
+
+    Returns True when the load request was accepted (even if still in progress).
+    """
     base = base_url.rstrip("/")
     try:
-        resp = requests.post(
-            f"{base}/api/v0/models/load",
-            json={"identifier": model_id},
-            timeout=10, verify=False,
-        )
-        return resp.ok
-    except Exception:
+        with requests.post(
+            f"{base}/api/v1/models/load",
+            json={"model": model_id},
+            stream=True,
+            timeout=(8, 15),   # (connect, first-chunk) — not total
+            verify=False,
+        ) as resp:
+            if not resp.ok:
+                body = resp.text or ""
+                print(f"[LMStudio] load POST {resp.status_code}: {body[:200]}")
+                return False
+            # Read just the first SSE line to detect fake-200 rejection
+            first_line = ""
+            for chunk in resp.iter_lines(decode_unicode=True):
+                if chunk:
+                    first_line = chunk
+                    break
+            if "unexpected endpoint" in first_line.lower() or "unexpected method" in first_line.lower():
+                print("[LMStudio] load endpoint not supported — load manually in LMStudio UI")
+                return False
+            print(f"[LMStudio] load accepted, SSE started: {first_line[:120]!r}")
+            return True
+    except requests.exceptions.ReadTimeout:
+        # Server accepted but is streaming — treat as success, caller polls
+        print("[LMStudio] load request streaming (ReadTimeout on first chunk — load in progress)")
+        return True
+    except Exception as exc:
+        print(f"[LMStudio] load request exception: {exc}")
         return False
 
 
-def lmstudio_ensure_model_loaded(base_url: str, desired_model: str, timeout_s: int = 30) -> str:
+def lmstudio_ensure_model_loaded(
+    base_url: str,
+    desired_model: str,
+    timeout_s: int = 30,
+    model_type: str | None = None,
+) -> str:
     """
-    Ensure a model is loaded in LMStudio before making an inference call.
-    Returns the loaded model id, or empty string if no model could be loaded.
-    If no model is loaded, requests a load of desired_model and waits up to timeout_s.
-    """
-    info = poll_lmstudio_model_info(base_url)
-    loaded = [m for m in info.get("models", []) if m.get("state") == "loaded"]
-    if loaded:
-        return loaded[0].get("id") or loaded[0].get("identifier") or desired_model
+    Ensure an appropriate model is loaded in LMStudio and return its ID.
 
-    # Nothing loaded — try to load desired_model (or first available)
+    model_type — "embeddings" to require an embedding model, "llm" to require
+                 a text-gen/VLM model, or None to accept any loaded model.
+                 Uses the model type field from the LMStudio API rather than
+                 fragile name matching, so it works regardless of how the user
+                 named their model in the app.
+
+    desired_model is used only as the load request target when nothing
+    appropriate is loaded; it is NOT used for matching.
+
+    Returns the actual model id to pass to the API, or "" if nothing loaded.
+    """
+    # LMStudio native API uses "embedding" (singular) and "llm" as type values.
+    # loaded_instances is a non-empty list when the model is loaded.
+    _EMB_TYPES = {"embedding", "embeddings"}
+    _LLM_TYPES = {"llm", "vlm"}
+
+    def _mid(m: dict) -> str:
+        # Native API uses "key"; OpenAI-compat uses "id"
+        return m.get("key") or m.get("id") or m.get("identifier") or ""
+
+    def _is_loaded(m: dict) -> bool:
+        # Native API: loaded_instances is non-empty when loaded
+        # OpenAI-compat: state == "loaded"
+        instances = m.get("loaded_instances")
+        if instances is not None:
+            return bool(instances)
+        return m.get("state") == "loaded"
+
+    def _type_ok(m: dict) -> bool:
+        if model_type == "embeddings":
+            return m.get("type") in _EMB_TYPES
+        if model_type == "llm":
+            return m.get("type") in _LLM_TYPES
+        return True  # no type constraint
+
+    info   = poll_lmstudio_model_info(base_url)
+    models = info.get("models", [])
+    loaded = [m for m in models if _is_loaded(m)]
+
+    print(
+        f"[LMStudio] ensure model_type={model_type!r}  "
+        f"total={len(models)}  loaded={[(_mid(m), m.get('type')) for m in loaded]}"
+    )
+
+    # Return the first loaded model of the right type — no name matching.
+    for m in loaded:
+        if _type_ok(m):
+            mid = _mid(m)
+            print(f"[LMStudio] Found loaded {model_type or 'model'}: {mid!r}")
+            return mid
+
+    # Nothing of the right type loaded — request a load.
+    # Prefer desired_model; fall back to first available of the right type.
     target = desired_model
     if not target:
-        available = info.get("models", [])
-        target = (available[0].get("id") or available[0].get("identifier") or "") if available else ""
+        candidates = [m for m in models if _type_ok(m)]
+        target = _mid(candidates[0]) if candidates else ""
     if not target:
+        print(f"[LMStudio] No candidates of type {model_type!r} in model list — cannot load")
         return ""
 
-    print(f"[LMStudio] No model loaded — requesting load of '{target}'")
-    lmstudio_load_model(base_url, target)
+    print(f"[LMStudio] Requesting load of '{target}' (type={model_type!r})…")
+    ok = lmstudio_load_model(base_url, target)
+    if not ok:
+        # Load endpoint not supported or rejected — no point polling
+        print(f"[LMStudio] Load not supported — load '{target}' manually in the LMStudio UI")
+        return ""
+
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         time.sleep(2)
         info = poll_lmstudio_model_info(base_url)
-        loaded = [m for m in info.get("models", []) if m.get("state") == "loaded"]
-        if loaded:
-            print(f"[LMStudio] Model loaded: {loaded[0].get('id','?')}")
-            return loaded[0].get("id") or target
-    print(f"[LMStudio] Timed out waiting for model load after {timeout_s}s")
+        type_matches = [
+            (_mid(m), _is_loaded(m))
+            for m in info.get("models", [])
+            if _type_ok(m)
+        ]
+        print(f"[LMStudio] poll  type_matches={type_matches}")
+        for m in info.get("models", []):
+            if _is_loaded(m) and _type_ok(m):
+                mid = _mid(m)
+                print(f"[LMStudio] Model now loaded: {mid!r}")
+                return mid
+    print(f"[LMStudio] Timed out after {timeout_s}s — still no loaded {model_type or 'model'}")
     return ""
 
 
@@ -2082,6 +2185,29 @@ def fetch_snapshot_topology_api(
             if isinstance(body, dict) and ("nutshell_beta_output" in body or "nutshell" in body):
                 parsed = _parse_structured_api_json(body)
                 if parsed.get("total_nodes") or parsed.get("cluster_uuid") or parsed.get("cluster_name"):
+                    # Nutshell checkers often omit hardware stats (cpus_per_node, ram_per_node_mib).
+                    # Fill them in from the summary API which has hardwareStats.cpuCores/memLimit.
+                    if parsed.get("cpus_per_node") is None or parsed.get("ram_per_node_mib") is None:
+                        try:
+                            _sr = session.get(f"{api_base}/nutshell/summary", timeout=15)
+                            if _sr.status_code == 200:
+                                _summ = _sr.json()
+                                _cbs = _summ.get("cbs") if isinstance(_summ.get("cbs"), dict) else None
+                                if _cbs:
+                                    _nodes = _cbs.get("nodes") or {}
+                                    _first = next(iter(_nodes.values()), {})
+                                    _hw = _first.get("hardwareStats") or {}
+                                    if parsed.get("cpus_per_node") is None and _hw.get("cpuCores"):
+                                        parsed["cpus_per_node"] = _hw["cpuCores"]
+                                    if parsed.get("ram_per_node_mib") is None:
+                                        _mem = _hw.get("memLimit")
+                                        if _mem:
+                                            parsed["ram_per_node_mib"] = round(_mem / (1024 * 1024))
+                                    if not parsed.get("os_name"):
+                                        _osd = _first.get("osDetails") or {}
+                                        parsed["os_name"] = _osd.get("name") or _osd.get("type")
+                        except Exception:
+                            pass
                     return parsed
     except Exception as exc:
         pass  # fall through to fallback
@@ -3919,9 +4045,10 @@ def main_page():
                                             # Ensure LMStudio embedding model is loaded before embedding
                                             if emb_provider == "lmstudio":
                                                 _emb_lms_base = (emb_base_url or "http://localhost:1234").rstrip("/v1").rstrip("/")
-                                                _loaded = await run.io_bound(lmstudio_ensure_model_loaded, _emb_lms_base, emb_model, 45)
-                                                if _loaded and _loaded != emb_model:
-                                                    progress_label.set_text(f"LMStudio: using loaded model '{_loaded}' for embeddings")
+                                                _loaded = await run.io_bound(lmstudio_ensure_model_loaded, _emb_lms_base, emb_model, 45, "embeddings")
+                                                if _loaded:
+                                                    if _loaded != emb_model:
+                                                        progress_label.set_text(f"LMStudio: using embedding model '{_loaded}'")
                                                     emb_model = _loaded
                                             done_emb, errs_emb = await run.io_bound(
                                                 embed_all_tickets,
@@ -6124,6 +6251,13 @@ def main_page():
                                         model   = lms_model_input.value or "local-model"
                                         api_key = ""
                                         base_url = emb_lms_url_input.value or "http://localhost:1234"
+                                        # Ensure the LLM model is loaded before testing
+                                        _lms_base = base_url.rstrip("/v1").rstrip("/")
+                                        _loaded = lmstudio_ensure_model_loaded(_lms_base, model, timeout_s=120, model_type="llm")
+                                        if _loaded:
+                                            model = _loaded
+                                        else:
+                                            return False, "no LLM/VLM model loaded in LMStudio — load one manually or enable autoload"
                                     else:  # ollama
                                         provider = "ollama"
                                         model   = ollama_chat_model_input.value or "llama3.2"
@@ -6133,11 +6267,13 @@ def main_page():
                                         {"role": "system", "content": "You are a test assistant."},
                                         {"role": "user",   "content": "Reply with just the word: OK"},
                                     ]
-                                    result = call_llm(msgs, provider, model, api_key, base_url, max_tokens=16)
+                                    # Use 128 tokens — 16 is too small for thinking-mode models
+                                    # (Qwen3/QwQ reasoning traces exhaust the budget before output)
+                                    result = call_llm(msgs, provider, model, api_key, base_url, max_tokens=128)
                                     if result and result.strip():
                                         short = result.strip()[:40].replace("\n", " ")
                                         return True, f"{provider}/{model}: \"{short}\""
-                                    return False, "empty response"
+                                    return False, "empty response — model may be in thinking mode; check LMStudio logs"
                                 except Exception as e:
                                     return False, str(e)
                             ok, detail = await run.io_bound(_chk_llm)
@@ -8022,6 +8158,20 @@ def main_page():
 
                             provider, model, api_key, base_url = _get_llm_config()
                             _warn_if_small_model(model)
+                            if provider == "lmstudio":
+                                _lms_base = (base_url or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                                score_status.set_text("Ensuring LMStudio model is loaded…")
+                                _lms_llm = await run.io_bound(lmstudio_ensure_model_loaded, _lms_base, model, 120, "llm")
+                                if _lms_llm:
+                                    if _lms_llm != model:
+                                        score_status.set_text(f"LMStudio: using '{_lms_llm}' for scoring")
+                                    model = _lms_llm
+                                else:
+                                    ui.notify("No LLM/VLM model loaded in LMStudio — load one in the LMStudio UI, then retry.", type="warning", timeout=8000)
+                                    btn_score.set_enabled(True)
+                                    btn_load_scores.set_enabled(True)
+                                    btn_stop_score.set_enabled(False)
+                                    return
                             try:
                                 scores = await run.io_bound(
                                     score_all_tickets,
@@ -8288,6 +8438,21 @@ def main_page():
                         chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
                         charts_area  = ui.column().classes("w-full gap-4 mt-3")
 
+                        # ── Chart drill-down panel ─────────────────────────────────────────
+                        # Shared panel — any chart click populates this; cleared on next click
+                        _drill_panel = ui.card().classes("w-full border border-blue-300 bg-blue-50 mt-2")
+                        with _drill_panel:
+                            with ui.row().classes("w-full items-center justify-between mb-1"):
+                                _drill_label = ui.label("").classes("text-sm font-semibold text-blue-800")
+                                ui.button(icon="close", on_click=lambda: _drill_panel.set_visibility(False)).props("flat round dense color=grey-6 size=sm")
+                            _drill_rows_area = ui.column().classes("w-full")
+                        _drill_panel.set_visibility(False)
+
+                        # Ticket detail dialog
+                        _ticket_dlg = ui.dialog().props("maximized=false").classes("q-pa-none")
+                        with _ticket_dlg, ui.card().classes("w-full").style("min-width:600px;max-width:900px;max-height:85vh;overflow-y:auto"):
+                            _ticket_dlg_body = ui.column().classes("w-full gap-3 p-4")
+
                         def _make_chart(container, cfg: dict, height: int = 380):
                             with container:
                                 ui.echart(cfg).classes("w-full").style(f"height:{height}px")
@@ -8424,13 +8589,148 @@ def main_page():
                                     f"Date filter: {_date_label} — {len(display_tickets)} of {_pre_filter} tickets"
                                 )
 
-                            data = build_analytics_data(display_tickets, display_scores)
+                            # ── Drill-down helpers (close over display_tickets) ───────────
+                            def _open_ticket_detail(ticket: dict):
+                                _ticket_dlg_body.clear()
+                                with _ticket_dlg_body:
+                                    tf = _parse_ticket_fields(ticket)
+                                    with ui.row().classes("w-full items-start justify-between gap-2"):
+                                        with ui.column().classes("flex-1 gap-0"):
+                                            ui.label(f"#{ticket.get('ticket_id')} · {ticket.get('organization','')}").classes("text-xs text-gray-400")
+                                            ui.label(ticket.get("subject") or "").classes("text-base font-semibold")
+                                        ui.button(icon="close", on_click=_ticket_dlg.close).props("flat round dense color=grey-6")
+                                    with ui.row().classes("gap-4 flex-wrap text-xs text-gray-500"):
+                                        for _lbl, _val in [
+                                            ("Priority",  (ticket.get("priority") or "—").upper()),
+                                            ("Status",    (ticket.get("status")   or "—").capitalize()),
+                                            ("Created",   (ticket.get("created")  or "")[:10]),
+                                            ("Version",   extract_ticket_version(ticket)),
+                                            ("Component", tf.get("Component") or "—"),
+                                        ]:
+                                            with ui.column().classes("gap-0"):
+                                                ui.label(_lbl).classes("text-xs text-gray-400")
+                                                ui.label(_val).classes("text-xs font-medium")
+                                    sc = state["scores"].get(str(ticket.get("ticket_id", ""))) or {}
+                                    if sc:
+                                        with ui.row().classes("gap-4 flex-wrap text-xs"):
+                                            for _lbl, _key in [("Stars","stars"),("Temp","temperature"),("Complexity","complexity")]:
+                                                if sc.get(_key):
+                                                    ui.badge(f"{_lbl}: {sc[_key]}").props("color=blue-grey-6")
+                                    desc = (ticket.get("description") or "").strip()
+                                    if desc:
+                                        ui.separator()
+                                        ui.label("Description").classes("text-xs font-semibold text-gray-500")
+                                        ui.label(desc[:3000]).classes("text-xs text-gray-700 whitespace-pre-wrap")
+                                    summ = (ticket.get("summary_text") or "").strip()
+                                    if summ:
+                                        ui.separator()
+                                        ui.label("AI Summary").classes("text-xs font-semibold text-gray-500")
+                                        ui.label(summ).classes("text-xs text-gray-700 whitespace-pre-wrap")
+                                    # ── Cluster topology from snapshot ────────────────────
+                                    _dtopo = ticket.get("snapshot_topology") or {}
+                                    if isinstance(_dtopo, str):
+                                        try:
+                                            _dtopo = json.loads(_dtopo)
+                                        except Exception:
+                                            _dtopo = {}
+                                    if isinstance(_dtopo, dict) and _dtopo and (
+                                        _dtopo.get("total_nodes") or _dtopo.get("cb_version") or _dtopo.get("cpus_per_node")
+                                    ):
+                                        ui.separator()
+                                        ui.label("Cluster Topology (snapshot)").classes("text-xs font-semibold text-gray-500")
+                                        _topo_chips = []
+                                        if _dtopo.get("cb_version"):
+                                            _topo_chips.append(("CB Version", _dtopo["cb_version"]))
+                                        if _dtopo.get("total_nodes"):
+                                            _topo_chips.append(("Nodes", str(_dtopo["total_nodes"])))
+                                        if _dtopo.get("cpus_per_node"):
+                                            _topo_chips.append(("CPUs/node", str(_dtopo["cpus_per_node"])))
+                                        if _dtopo.get("ram_used_per_node_mib") and _dtopo.get("ram_per_node_mib"):
+                                            _topo_chips.append(("RAM used/node", f"{_dtopo['ram_used_per_node_mib']}/{_dtopo['ram_per_node_mib']} MiB"))
+                                        elif _dtopo.get("ram_per_node_mib"):
+                                            _topo_chips.append(("RAM/node", f"{_dtopo['ram_per_node_mib']} MiB"))
+                                        if _dtopo.get("os_name"):
+                                            _topo_chips.append(("OS", _dtopo["os_name"]))
+                                        if _dtopo.get("n2n_encryption") is not None:
+                                            _topo_chips.append(("N2N Enc", _dtopo["n2n_encryption"]))
+                                        if _dtopo.get("data_quota_mib"):
+                                            _topo_chips.append(("Data Quota", f"{_dtopo['data_quota_mib']} MiB"))
+                                        if _dtopo.get("auto_failover_seconds") is not None:
+                                            _topo_chips.append(("Auto-failover", f"{_dtopo['auto_failover_seconds']}s"))
+                                        _svc_parts = []
+                                        for _sn, _sk in [("KV", "data_nodes"), ("Index", "index_nodes"),
+                                                         ("Query", "query_nodes"), ("FTS", "fts_nodes"),
+                                                         ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
+                                            if _dtopo.get(_sk):
+                                                _svc_parts.append(f"{_sn}×{_dtopo[_sk]}")
+                                        if _svc_parts:
+                                            _topo_chips.append(("Services", ", ".join(_svc_parts)))
+                                        if _dtopo.get("global_index_count") is not None:
+                                            _topo_chips.append(("GSI Indexes", str(_dtopo["global_index_count"])))
+                                        if _dtopo.get("fts_index_count") is not None:
+                                            _topo_chips.append(("FTS Indexes", str(_dtopo["fts_index_count"])))
+                                        if _dtopo.get("eventing_function_count") is not None:
+                                            _topo_chips.append(("Eventing Fns", str(_dtopo["eventing_function_count"])))
+                                        _dbc = _dtopo.get("bad_count") or len(_dtopo.get("bad_items") or [])
+                                        _dwc = _dtopo.get("warn_count") or len(_dtopo.get("warn_items") or [])
+                                        if _dbc or _dwc:
+                                            _topo_chips.append(("Health", f"{_dbc} bad / {_dwc} warn"))
+                                        with ui.row().classes("gap-2 flex-wrap mt-1"):
+                                            for _lbl, _val in _topo_chips:
+                                                with ui.column().classes("gap-0"):
+                                                    ui.label(_lbl).classes("text-xs text-gray-400")
+                                                    ui.label(_val).classes("text-xs font-medium")
+                                        _dbi = _dtopo.get("bad_items") or []
+                                        if _dbi:
+                                            ui.label(f"Bad checks: {', '.join(_dbi[:12])}").classes("text-xs text-red-600 mt-1")
+                                _ticket_dlg.open()
+
+                            def _show_drill(title: str, tickets: list[dict]):
+                                _drill_label.set_text(title)
+                                _drill_rows_area.clear()
+                                _drill_panel.set_visibility(True)
+                                if not tickets:
+                                    with _drill_rows_area:
+                                        ui.label("No matching tickets.").classes("text-sm text-gray-400 p-2")
+                                    return
+                                _sorted = sorted(tickets, key=lambda x: x.get("created") or "", reverse=True)[:200]
+                                _cols = [
+                                    {"name": "date",     "label": "Date",     "field": "date",     "align": "left", "sortable": True},
+                                    {"name": "id",       "label": "#",        "field": "id",       "align": "left"},
+                                    {"name": "priority", "label": "Pri",      "field": "priority", "align": "center", "sortable": True},
+                                    {"name": "status",   "label": "Status",   "field": "status",   "align": "left"},
+                                    {"name": "org",      "label": "Customer", "field": "org",      "align": "left"},
+                                    {"name": "subject",  "label": "Subject",  "field": "subject",  "align": "left"},
+                                ]
+                                _rows = [
+                                    {
+                                        "date":     (t.get("created") or "")[:10],
+                                        "id":       str(t.get("ticket_id", "")),
+                                        "priority": (t.get("priority") or "—").upper(),
+                                        "status":   (t.get("status")   or "—").capitalize(),
+                                        "org":      (t.get("organization") or "")[:35],
+                                        "subject":  (t.get("subject")   or "")[:90],
+                                        "_tid":     str(t.get("ticket_id", "")),
+                                    }
+                                    for t in _sorted
+                                ]
+                                _tid_map = {str(t.get("ticket_id","")): t for t in _sorted}
+                                with _drill_rows_area:
+                                    _dtbl = ui.table(columns=_cols, rows=_rows, row_key="id").classes("w-full text-xs").props("dense flat")
+                                    _dtbl.on("rowClick", lambda e: _open_ticket_detail(
+                                        _tid_map.get((e.args[1] if isinstance(e.args, list) else e.args.get("row", {})).get("_tid", ""), {})
+                                    ))
+
+                            # Run in a thread so the NiceGUI event loop isn't blocked
+                            # while processing large ticket sets (e.g. 1 000+ tickets).
+                            chart_status.set_text("Crunching analytics data …")
+                            data = await run.io_bound(build_analytics_data, display_tickets, display_scores)
 
                             with charts_area:
                                 # ── Row 1: Stacked volume by origin over time ─────────────
                                 if data["month_keys"]:
-                                    ui.echart({
-                                        "title":    {"text": "Ticket Volume Over Time by Origin", "subtext": "Drag to zoom"},
+                                    _mchart = ui.echart({
+                                        "title":    {"text": "Ticket Volume Over Time by Origin", "subtext": "Drag to zoom · Click bar to drill down"},
                                         "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                         "legend":   {"bottom": 0},
                                         "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
@@ -8444,64 +8744,108 @@ def main_page():
                                             {"name": "Proactive/Automated", "type": "bar", "stack": "total", "data": data["month_proactive"]},
                                         ],
                                     }).classes("w-full").style(f"height:{ch}px")
+                                    def _on_month_click(e, _dts=display_tickets):
+                                        mo = e.name or ""
+                                        if not mo:
+                                            return
+                                        _f = [t for t in _dts if _parse_created([t]) and _parse_created([t])[0] == mo]
+                                        _show_drill(f"{len(_f)} tickets — {mo}", _f)
+                                    _mchart.on_point_click(_on_month_click)
                                 else:
                                     ui.label("No parseable dates for frequency chart.").classes("text-sm text-gray-400")
 
                                 # ── Row 1b: Tickets per year ──────────────────────────────
                                 if data["year_keys"]:
                                     with ui.card().classes("w-full"):
-                                        ui.echart({
-                                            "title":   {"text": "Tickets per Year"},
+                                        _ychart = ui.echart({
+                                            "title":   {"text": "Tickets per Year", "subtext": "Click bar to drill down"},
                                             "tooltip": {"trigger": "axis"},
                                             "xAxis":   {"type": "category", "data": data["year_keys"], "name": "Year"},
                                             "yAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
                                             "color":   ["#039BE5"],
                                             "series":  [{"name": "Tickets", "type": "bar", "data": data["year_values"], "label": {"show": True, "position": "top"}}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_year_click(e, _dts=display_tickets):
+                                            yr = e.name or ""
+                                            if not yr:
+                                                return
+                                            _f = [t for t in _dts if (t.get("created") or "")[:4] == yr]
+                                            _show_drill(f"{len(_f)} tickets — {yr}", _f)
+                                        _ychart.on_point_click(_on_year_click)
 
                                 # ── Row 2: Priority + Status side by side ─────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Priority Distribution"},
+                                        _pchart = ui.echart({
+                                            "title":   {"text": "Priority Distribution", "subtext": "Click slice to drill down"},
                                             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                             "color":   ["#43A047","#FB8C00","#E53935","#8E24AA"],
                                             "series":  [{"name": "Tickets", "type": "pie", "radius": "62%", "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["priority_labels"], data["priority_values"])]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_priority_click(e, _dts=display_tickets):
+                                            pri = e.name or ""
+                                            if not pri:
+                                                return
+                                            _f = [t for t in _dts if (t.get("priority") or "unknown").capitalize() == pri]
+                                            _show_drill(f"{len(_f)} tickets — Priority: {pri}", _f)
+                                        _pchart.on_point_click(_on_priority_click)
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Status Breakdown"},
+                                        _schart = ui.echart({
+                                            "title":   {"text": "Status Breakdown", "subtext": "Click slice to drill down"},
                                             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                             "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["status_labels"], data["status_values"])]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_status_click(e, _dts=display_tickets):
+                                            st = e.name or ""
+                                            if not st:
+                                                return
+                                            _f = [t for t in _dts if (t.get("status") or "unknown").capitalize() == st]
+                                            _show_drill(f"{len(_f)} tickets — Status: {st}", _f)
+                                        _schart.on_point_click(_on_status_click)
 
                                 # ── Row 3: Comment distribution + Escalation rate ─────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
+                                        _comm_labels = data["comment_labels"]
                                         ui.echart({
                                             "title":   {"text": "Comment Count Distribution"},
                                             "tooltip": {"trigger": "axis"},
-                                            "xAxis":   {"type": "category", "data": data["comment_labels"]},
+                                            "xAxis":   {"type": "category", "data": _comm_labels},
                                             "yAxis":   {"type": "value", "name": "Tickets"},
                                             "color":   ["#00ACC1"],
                                             "series":  [{"name": "Tickets", "type": "bar", "data": data["comment_values"]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Escalation Rate"},
+                                        _eschart = ui.echart({
+                                            "title":   {"text": "Escalation Rate", "subtext": "Click slice to drill down"},
                                             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                             "color":   ["#E53935","#43A047"],
                                             "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["esc_labels"], data["esc_values"])]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_esc_click(e, _dts=display_tickets):
+                                            lbl = e.name or ""
+                                            if not lbl:
+                                                return
+                                            want_esc = lbl.lower().startswith("escalat")
+                                            _f = [t for t in _dts if bool(t.get("escalations")) == want_esc]
+                                            _show_drill(f"{len(_f)} tickets — {lbl}", _f)
+                                        _eschart.on_point_click(_on_esc_click)
 
                                 # ── Row 4: Ticket origin ──────────────────────────────────
                                 with ui.card().classes("w-full"):
-                                    ui.echart({
-                                        "title":   {"text": "Ticket Origin", "subtext": "How the ticket was opened"},
+                                    _origchart = ui.echart({
+                                        "title":   {"text": "Ticket Origin", "subtext": "How the ticket was opened · Click slice to drill down"},
                                         "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                         "color":   ["#1E88E5", "#FB8C00", "#6D4C41"],
                                         "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"formatter": "{b}: {c} ({d}%)", "fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["origin_labels"], data["origin_values"])]}],
                                     }).classes("w-full").style(f"height:{ch_sm}px")
+                                    def _on_origin_click(e, _dts=display_tickets):
+                                        orig = e.name or ""
+                                        if not orig:
+                                            return
+                                        _f = [t for t in _dts if classify_ticket_origin(t) == orig]
+                                        _show_drill(f"{len(_f)} tickets — Origin: {orig}", _f)
+                                    _origchart.on_point_click(_on_origin_click)
 
                                 # Proactive diagnostic breakdown
                                 if data["origin_values"][2] > 0:  # Proactive/Automated count
@@ -8529,23 +8873,86 @@ def main_page():
                                 # ── Row 5: Version + Feature area ─────────────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        if data["version_labels"]:
-                                            ui.echart({
-                                                "title":    {"text": "Tickets by Couchbase Version", "subtext": "Drag to zoom"},
-                                                "tooltip":  {"trigger": "axis"},
-                                                "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
-                                                "grid":     {"bottom": 60},
-                                                "xAxis":    {"type": "category", "data": data["version_labels"], "name": "Version", "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
-                                                "yAxis":    {"type": "value", "name": "Tickets"},
-                                                "color":    ["#0277BD"],
-                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["version_values"]}],
-                                            }).classes("w-full").style(f"height:{ch}px")
+                                        if data["version_breakdown"]:
+                                            _VER_COLORS = {
+                                                "version": "#0277BD",
+                                                "eol":     "#FF8F00",
+                                                "admin":   "#9E9E9E",
+                                                "blank":   "#78909C",
+                                            }
+                                            _vf_state = {"eol": True, "admin": True, "blank": True}
+
+                                            def _ver_chart_opts(_vf=_vf_state, _bd=data["version_breakdown"]):
+                                                shown = [
+                                                    (lbl, cnt, cat) for lbl, cnt, cat in _bd
+                                                    if cat == "version" or _vf.get(cat, True)
+                                                ]
+                                                return {
+                                                    "title":    {"text": "Tickets by Couchbase Version", "subtext": "Drag to zoom"},
+                                                    "tooltip":  {"trigger": "axis", "formatter": "{b}: {c} tickets"},
+                                                    "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                    "grid":     {"bottom": 60},
+                                                    "xAxis":    {"type": "category", "data": [l for l,_,_ in shown], "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                                    "yAxis":    {"type": "value", "name": "Tickets"},
+                                                    "series":   [{"name": "Tickets", "type": "bar", "data": [
+                                                        {"value": cnt, "itemStyle": {"color": _VER_COLORS.get(cat, "#0277BD")}}
+                                                        for _, cnt, cat in shown
+                                                    ]}],
+                                                }
+
+                                            _vchart = ui.echart(_ver_chart_opts()).classes("w-full").style(f"height:{ch}px")
+
+                                            def _refresh_vchart():
+                                                _vchart.options = _ver_chart_opts()
+                                                _vchart.update()
+
+                                            def _on_ver_click(e, _dts=display_tickets, _bd=data["version_breakdown"]):
+                                                lbl = e.name or ""
+                                                if not lbl:
+                                                    return
+                                                _cat = next((cat for l2, _, cat in _bd if l2 == lbl), "version")
+                                                if _cat == "version":
+                                                    _f = [t for t in _dts if extract_ticket_version(t) == lbl]
+                                                elif _cat == "eol":
+                                                    _f = [t for t in _dts if "end of life" in (_parse_ticket_fields(t).get("Couchbase_Server") or "").lower()]
+                                                elif _cat == "admin":
+                                                    _f = [t for t in _dts if "Couchbase_Server" not in _parse_ticket_fields(t)]
+                                                else:  # blank
+                                                    _f = [t for t in _dts if "Couchbase_Server" in _parse_ticket_fields(t) and not (_parse_ticket_fields(t).get("Couchbase_Server") or "").strip()]
+                                                _show_drill(f"{len(_f)} tickets — {lbl}", _f)
+                                            _vchart.on_point_click(_on_ver_click)
+
+                                            # Colour legend + filter checkboxes
+                                            with ui.row().classes("gap-4 items-center mt-1 flex-wrap"):
+                                                for _cat_lbl, _cat_key, _cat_clr, _cat_cnt in [
+                                                    ("Known version",       "version", "#0277BD", None),
+                                                    ("EOL",                 "eol",     "#FF8F00", data["version_eol_count"]),
+                                                    ("Admin/No-product",    "admin",   "#9E9E9E", data["version_admin_count"]),
+                                                    ("Version unspecified", "blank",   "#78909C", data["version_blank_count"]),
+                                                ]:
+                                                    if _cat_cnt is None or _cat_cnt > 0:
+                                                        with ui.row().classes("gap-1 items-center"):
+                                                            ui.element("div").style(
+                                                                f"width:10px;height:10px;border-radius:2px;background:{_cat_clr}"
+                                                            )
+                                                            if _cat_key == "version":
+                                                                ui.label(_cat_lbl).classes("text-xs text-gray-600")
+                                                            else:
+                                                                def _make_toggle(_k=_cat_key):
+                                                                    def _toggle(e):
+                                                                        _vf_state[_k] = e.args
+                                                                        _refresh_vchart()
+                                                                    return _toggle
+                                                                ui.checkbox(
+                                                                    f"{_cat_lbl} ({_cat_cnt})",
+                                                                    value=True,
+                                                                ).classes("text-xs").on("update:model-value", _make_toggle(_cat_key))
                                         else:
                                             ui.label("No version data found in ticket fields.").classes("text-sm text-gray-400 p-4")
                                     with ui.card().classes("flex-1"):
                                         if data["feature_labels"]:
-                                            ui.echart({
-                                                "title":    {"text": "Tickets by Feature Area", "subtext": "Drag to zoom"},
+                                            _fchart = ui.echart({
+                                                "title":    {"text": "Tickets by Feature Area", "subtext": "Drag to zoom · Click bar to drill down"},
                                                 "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                                 "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                                 "grid":     {"left": 170, "right": 60},
@@ -8554,6 +8961,13 @@ def main_page():
                                                 "color":    ["#00838F"],
                                                 "series":   [{"name": "Tickets", "type": "bar", "data": data["feature_values"]}],
                                             }).classes("w-full").style(f"height:{ch}px")
+                                            def _on_feature_click(e, _dts=display_tickets):
+                                                feat = e.name or ""
+                                                if not feat:
+                                                    return
+                                                _f = [t for t in _dts if classify_ticket_feature(t) == feat]
+                                                _show_drill(f"{len(_f)} tickets — Feature: {feat}", _f)
+                                            _fchart.on_point_click(_on_feature_click)
                                         else:
                                             ui.label("No component/feature data found.").classes("text-sm text-gray-400 p-4")
 
@@ -9830,17 +10244,64 @@ def main_page():
                                                 "series":  [{"name": "Tickets", "type": "pie", "radius": ["38%", "65%"], "label": {"formatter": "{b}: {d}%", "fontSize": 10}, "data": [{"name": l, "value": v} for l, v in zip(prof["feature_labels"], prof["feature_values"])]}],
                                             }).classes("w-full").style("height:280px")
 
-                                    if prof["version_labels"]:
+                                    if prof["version_breakdown"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "CB Version Distribution", "subtext": "From ticket fields + snapshots"},
-                                                "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-                                                "grid":    {"left": 100},
-                                                "xAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
-                                                "yAxis":   {"type": "category", "data": prof["version_labels"], "axisLabel": {"fontSize": 10}},
-                                                "color":   ["#0277BD"],
-                                                "series":  [{"name": "Tickets", "type": "bar", "data": prof["version_values"]}],
-                                            }).classes("w-full").style("height:280px")
+                                            _PROF_VER_COLORS = {
+                                                "version": "#0277BD",
+                                                "eol":     "#FF8F00",
+                                                "admin":   "#9E9E9E",
+                                                "blank":   "#78909C",
+                                            }
+                                            _pvf_state = {"eol": True, "admin": True, "blank": True}
+
+                                            def _prof_ver_opts(_vf=_pvf_state, _bd=prof["version_breakdown"]):
+                                                shown = [
+                                                    (lbl, cnt, cat) for lbl, cnt, cat in _bd
+                                                    if cat == "version" or _vf.get(cat, True)
+                                                ]
+                                                _h = max(280, len(shown) * 28 + 60)
+                                                return {
+                                                    "title":   {"text": "CB Version Distribution", "subtext": "From ticket fields + snapshots"},
+                                                    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}, "formatter": "{b}: {c} tickets"},
+                                                    "grid":    {"left": 160},
+                                                    "xAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                    "yAxis":   {"type": "category", "data": [l for l,_,_ in shown], "axisLabel": {"fontSize": 10}},
+                                                    "series":  [{"name": "Tickets", "type": "bar", "data": [
+                                                        {"value": cnt, "itemStyle": {"color": _PROF_VER_COLORS.get(cat, "#0277BD")}}
+                                                        for _, cnt, cat in shown
+                                                    ]}],
+                                                }
+
+                                            _pvchart = ui.echart(_prof_ver_opts()).classes("w-full").style("height:280px")
+
+                                            def _refresh_pvchart():
+                                                _pvchart.options = _prof_ver_opts()
+                                                _pvchart.update()
+
+                                            with ui.row().classes("gap-4 items-center mt-1 flex-wrap"):
+                                                for _pcat_lbl, _pcat_key, _pcat_clr, _pcat_cnt in [
+                                                    ("Known version",       "version", "#0277BD", None),
+                                                    ("EOL",                 "eol",     "#FF8F00", prof["version_eol_count"]),
+                                                    ("Admin/No-product",    "admin",   "#9E9E9E", prof["version_admin_count"]),
+                                                    ("Version unspecified", "blank",   "#78909C", prof["version_blank_count"]),
+                                                ]:
+                                                    if _pcat_cnt is None or _pcat_cnt > 0:
+                                                        with ui.row().classes("gap-1 items-center"):
+                                                            ui.element("div").style(
+                                                                f"width:10px;height:10px;border-radius:2px;background:{_pcat_clr}"
+                                                            )
+                                                            if _pcat_key == "version":
+                                                                ui.label(_pcat_lbl).classes("text-xs text-gray-600")
+                                                            else:
+                                                                def _make_ptoggle(_k=_pcat_key):
+                                                                    def _ptoggle(e):
+                                                                        _pvf_state[_k] = e.args
+                                                                        _refresh_pvchart()
+                                                                    return _ptoggle
+                                                                ui.checkbox(
+                                                                    f"{_pcat_lbl} ({_pcat_cnt})",
+                                                                    value=True,
+                                                                ).classes("text-xs").on("update:model-value", _make_ptoggle(_pcat_key))
 
                                 # ── Row 4: Satisfaction trend ─────────────────────────────
                                 if prof["stars_trend_keys"]:
@@ -11876,6 +12337,32 @@ def _cb_conn_str(cb_url: str, use_tls: bool) -> str:
     return f"{scheme}://{host}"
 
 
+def _cb_kv_get_multi(col, doc_ids: list[str], batch_size: int = 100) -> list[dict]:
+    """Batch-fetch full documents from a Collection by key using KV get_multi.
+
+    Preferred over SELECT * WHERE META().id IN [...] because KV bypasses the
+    query engine entirely — lower latency, no scan, no index required.
+
+    Returns documents in the same order as doc_ids; silently skips missing keys.
+    Use return_exceptions=True so one missing doc doesn't abort the whole batch.
+    """
+    from couchbase.options import GetMultiOptions  # type: ignore
+    docs_by_key: dict[str, dict] = {}
+    for i in range(0, len(doc_ids), batch_size):
+        batch = doc_ids[i : i + batch_size]
+        try:
+            result = col.get_multi(batch, GetMultiOptions(return_exceptions=True))
+            for key, res in result.results.items():
+                if not isinstance(res, Exception):
+                    try:
+                        docs_by_key[key] = res.content_as[dict]
+                    except Exception:
+                        pass
+        except Exception as exc:
+            print(f"[_cb_kv_get_multi] batch {i//batch_size} failed: {exc}")
+    return [docs_by_key[k] for k in doc_ids if k in docs_by_key]
+
+
 def _cb_save_settings(
     cb_url: str, bucket: str, username: str, password: str,
     use_tls: bool, scope: str, collection: str,
@@ -12257,7 +12744,11 @@ def load_tickets_for_orgs_from_cb(
     collection: str,
     progress_cb: Callable[[str, float], None],
 ) -> list[dict]:
-    """Load tickets for a specific set of org names — more efficient than loading all tickets."""
+    """Load tickets for a specific set of org names using ID-first + KV fetch.
+
+    N1QL gets the doc IDs (cheap — index-only scan on organization field).
+    KV get_multi fetches the full documents in batches (bypasses query engine).
+    """
     if not _CB_AVAILABLE or not orgs:
         return []
     conn_str = _cb_conn_str(cb_url, use_tls)
@@ -12266,13 +12757,15 @@ def load_tickets_for_orgs_from_cb(
     keyspace     = f"`{bucket}`.`{scope}`.`{collection}`"
     placeholders = ", ".join(f"${i + 1}" for i in range(len(orgs)))
     progress_cb(f"Querying {len(orgs)} customer(s) …", 0.1)
-    rows = list(cluster.query(
-        f"SELECT t.* FROM {keyspace} AS t WHERE t.organization IN [{placeholders}]",
-        QueryOptions(
-            positional_parameters=orgs,
-            timeout=timedelta(seconds=60),
-        ),
+    id_rows = list(cluster.query(
+        f"SELECT META(t).id AS id FROM {keyspace} AS t "
+        f"WHERE t.organization IN [{placeholders}]",
+        QueryOptions(positional_parameters=orgs, timeout=timedelta(seconds=60)),
     ))
+    doc_ids = [r["id"] for r in id_rows if r.get("id")]
+    progress_cb(f"Fetching {len(doc_ids)} ticket(s) via KV …", 0.5)
+    col  = cluster.bucket(bucket).scope(scope).collection(collection)
+    rows = _cb_kv_get_multi(col, doc_ids)
     cluster.close()
     progress_cb(f"Loaded {len(rows)} tickets.", 1.0)
     return rows
@@ -12315,24 +12808,32 @@ def load_tickets_from_cb(
     )
     keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
     _terms = [t.strip() for t in customer_filter.split(",") if t.strip()]
+    # Step 1: N1QL returns only META().id in sort order (cheap — index can cover this).
+    # The ORDER BY is preserved so KV results are re-assembled in priority order.
     if _terms:
         _clauses = " OR ".join(
             f"LOWER(t.organization) LIKE ${i+1}" for i in range(len(_terms))
         )
-        query = (f"SELECT t.* FROM {keyspace} AS t "
-                 f"WHERE t.ticket_id IS NOT MISSING "
-                 f"AND ({_clauses}) "
-                 f"ORDER BY {_order}")
-        opts  = QueryOptions(positional_parameters=[f"%{t.lower()}%" for t in _terms])
+        id_query = (f"SELECT META(t).id AS id FROM {keyspace} AS t "
+                    f"WHERE t.ticket_id IS NOT MISSING "
+                    f"AND ({_clauses}) "
+                    f"ORDER BY {_order}")
+        opts = QueryOptions(positional_parameters=[f"%{t.lower()}%" for t in _terms])
     else:
-        query  = (f"SELECT t.* FROM {keyspace} AS t "
-                  f"WHERE t.ticket_id IS NOT MISSING "
-                  f"ORDER BY {_order}")
-        opts   = QueryOptions()
+        id_query = (f"SELECT META(t).id AS id FROM {keyspace} AS t "
+                    f"WHERE t.ticket_id IS NOT MISSING "
+                    f"ORDER BY {_order}")
+        opts = QueryOptions()
 
     progress_cb("Running query …", 0.1)
-    result  = cluster.query(query, opts)
-    tickets = [row for row in result.rows()]
+    id_rows = list(cluster.query(id_query, opts))
+    doc_ids = [r["id"] for r in id_rows if r.get("id")]
+
+    # Step 2: Batch KV fetch — bypasses query engine, returns full docs by key.
+    # Preserves sort order from Step 1.
+    progress_cb(f"Fetching {len(doc_ids)} ticket(s) via KV …", 0.5)
+    col     = cluster.bucket(bucket).scope(scope).collection(collection)
+    tickets = _cb_kv_get_multi(col, doc_ids)
 
     # Enrich tickets with pre-computed summary_text from the summary collection.
     if summary_collection and tickets:
@@ -12371,7 +12872,8 @@ def fetch_tickets_by_keys(
     collection: str,
 ) -> list[dict]:
     """
-    Fetch ticket documents from Couchbase by their document keys using SQL++.
+    Fetch ticket documents from Couchbase by their document keys via KV get_multi.
+    KV bypasses the query engine — no index required, lower latency than N1QL SELECT *.
     Used as a fallback in vector search when state["results"] is empty.
     """
     if not _CB_AVAILABLE or not doc_keys:
@@ -12380,12 +12882,8 @@ def fetch_tickets_by_keys(
         conn_str = _cb_conn_str(cb_url, use_tls)
         cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
         cluster.wait_until_ready(timedelta(seconds=15))
-        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-        # USE KEYS is bucket-level only; use META().id IN for scoped collections
-        placeholders = ", ".join(f"${i+1}" for i in range(len(doc_keys)))
-        query  = f"SELECT t.* FROM {keyspace} AS t WHERE META(t).id IN [{placeholders}]"
-        result = cluster.query(query, QueryOptions(positional_parameters=doc_keys))
-        tickets = [row for row in result.rows()]
+        col = cluster.bucket(bucket).scope(scope).collection(collection)
+        tickets = _cb_kv_get_multi(col, list(doc_keys))
         cluster.close()
         _missing_req = [t.get("ticket_id") for t in tickets if not t.get("requester")]
         if _missing_req:
@@ -12645,8 +13143,67 @@ def build_embed_text(ticket: dict) -> str:
                 svc_parts.append(f"{svc}×{n}")
         if svc_parts:
             topo_lines.append(f"  Services: {', '.join(svc_parts)}")
+        if topo.get("cpus_per_node"):
+            topo_lines.append(f"  CPUs per Node: {topo['cpus_per_node']}")
+        if topo.get("ram_used_per_node_mib") and topo.get("ram_per_node_mib"):
+            topo_lines.append(f"  RAM Used per Node: {topo['ram_used_per_node_mib']} / {topo['ram_per_node_mib']} MiB")
+        elif topo.get("ram_used_per_node_mib"):
+            topo_lines.append(f"  RAM Used per Node: {topo['ram_used_per_node_mib']} MiB")
         if topo.get("os_name"):
             topo_lines.append(f"  OS: {topo['os_name']}")
+        if topo.get("n2n_encryption") is not None:
+            topo_lines.append(f"  N2N Encryption: {topo['n2n_encryption']}")
+        if topo.get("data_quota_mib"):
+            topo_lines.append(f"  Data Quota: {topo['data_quota_mib']} MiB")
+        if topo.get("disk_total_per_node_mib"):
+            _du = topo.get("disk_used_per_node_mib")
+            _disk_str = f"  Disk per Node: {topo['disk_total_per_node_mib']} MiB total"
+            if _du:
+                _disk_str += f", {_du} MiB used"
+            topo_lines.append(_disk_str)
+        if topo.get("swap_used_per_node_mib"):
+            topo_lines.append(f"  Swap Used per Node: {topo['swap_used_per_node_mib']} MiB")
+        if topo.get("data_size_mib"):
+            topo_lines.append(f"  Data Size (cluster): {topo['data_size_mib']} MiB")
+        if topo.get("total_items"):
+            topo_lines.append(f"  Total Items: {topo['total_items']:,}")
+        _bdets = topo.get("bucket_details") or []
+        if _bdets:
+            _blines = []
+            for _b in _bdets[:10]:
+                _bp = _b.get("name", "")
+                if _b.get("type"):
+                    _bp += f" ({_b['type']})"
+                if _b.get("quota_mb"):
+                    _bp += f" {_b['quota_mb']}MB quota"
+                if _b.get("replicas") is not None:
+                    _bp += f" {_b['replicas']}r"
+                if _b.get("storage_mode"):
+                    _bp += f" {_b['storage_mode']}"
+                if _b.get("compression"):
+                    _bp += f" compress={_b['compression']}"
+                if _b.get("items"):
+                    _bp += f" {_b['items']} items"
+                _blines.append(_bp)
+            topo_lines.append(f"  Buckets: {'; '.join(_blines)}")
+        if topo.get("global_index_count") is not None:
+            topo_lines.append(f"  Global Indexes: {topo['global_index_count']}")
+        if topo.get("fts_index_count") is not None:
+            topo_lines.append(f"  FTS Indexes: {topo['fts_index_count']}")
+        if topo.get("eventing_function_count") is not None:
+            topo_lines.append(f"  Eventing Functions: {topo['eventing_function_count']}")
+        _sc = topo.get("scopes_collections") or []
+        if _sc:
+            _sc_str = "; ".join(f"{s['bucket']}:{s['scopes']}s/{s['collections']}c" for s in _sc[:6])
+            topo_lines.append(f"  Scopes/Collections: {_sc_str}")
+        _bc = topo.get("bad_count") or len(topo.get("bad_items") or [])
+        _wc = topo.get("warn_count") or len(topo.get("warn_items") or [])
+        if _bc or _wc:
+            _health_str = f"  Health checks: {_bc} bad, {_wc} warn"
+            _bi = topo.get("bad_items") or []
+            if _bi:
+                _health_str += f" (bad: {', '.join(_bi[:8])})"
+            topo_lines.append(_health_str)
         if topo_lines:
             parts.append("Cluster Topology (snapshot):\n" + "\n".join(topo_lines))
 
@@ -16408,7 +16965,15 @@ def call_llm(
         if num_ctx and provider == "ollama":
             kwargs["extra_body"] = {"num_ctx": num_ctx}
         resp = client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content
+        _content = resp.choices[0].message.content
+        if isinstance(_content, list):
+            # Some models (e.g. Gemma 4 via LMStudio) return a list of content
+            # parts rather than a plain string. Extract and join all text parts.
+            _content = "".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in _content
+            )
+        return _content or ""
 
     elif provider == "bedrock":
         if not _BOTO3_AVAILABLE:
@@ -17792,7 +18357,9 @@ def _run_scrape_job_bg(
             job["phase"] = "embedding"
             if emb_p == "lmstudio":
                 _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
-                lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45)
+                _lms_emb_id = lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45, model_type="embeddings")
+                if _lms_emb_id:
+                    emb_m = _lms_emb_id
             try:
                 _saved_data = [{**t, "type": "ticket", "last_scraped_at": now_epoch} for t in scraped]
 
@@ -17961,7 +18528,9 @@ def _run_rescrape_job_bg(
             _set_op(f"Embedding {len(refreshed_tickets)} refreshed tickets…", 0.82)
             if emb_p == "lmstudio":
                 _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
-                lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45)
+                _lms_emb_id = lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45, model_type="embeddings")
+                if _lms_emb_id:
+                    emb_m = _lms_emb_id
             try:
                 def _emb_prog(msg: str, pct: float):
                     job["last_message"] = msg
@@ -18186,10 +18755,24 @@ def _execute_agent_tool(
             _bn = topo.get("bucket_names") or []
             if isinstance(_bn, list) and _bn:
                 topo_lines.append(f"  Bucket Names:    {', '.join(_bn[:10])}")
-            if topo.get("ram_per_node_mib"):
+            if topo.get("cpus_per_node"):
+                topo_lines.append(f"  CPUs/Node:       {topo['cpus_per_node']}")
+            if topo.get("ram_used_per_node_mib") and topo.get("ram_per_node_mib"):
+                topo_lines.append(f"  RAM/Node:        {topo['ram_used_per_node_mib']}/{topo['ram_per_node_mib']} MiB used/total")
+            elif topo.get("ram_per_node_mib"):
                 topo_lines.append(f"  RAM/Node:        {topo['ram_per_node_mib']} MiB")
             if topo.get("auto_failover_seconds") is not None:
                 topo_lines.append(f"  Auto-failover:   {topo['auto_failover_seconds']}s")
+            if topo.get("n2n_encryption") is not None:
+                topo_lines.append(f"  N2N Encryption:  {topo['n2n_encryption']}")
+            if topo.get("data_quota_mib"):
+                topo_lines.append(f"  Data Quota:      {topo['data_quota_mib']} MiB")
+            if topo.get("global_index_count") is not None:
+                topo_lines.append(f"  GSI Indexes:     {topo['global_index_count']}")
+            if topo.get("fts_index_count") is not None:
+                topo_lines.append(f"  FTS Indexes:     {topo['fts_index_count']}")
+            if topo.get("eventing_function_count") is not None:
+                topo_lines.append(f"  Eventing Fns:    {topo['eventing_function_count']}")
             bad  = topo.get("bad_items",  topo.get("bad_count",  0)) or 0
             warn = topo.get("warn_items", topo.get("warn_count", 0)) or 0
             if bad or warn:
@@ -18229,7 +18812,6 @@ def _execute_agent_tool(
             from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             from couchbase.options import QueryOptions  # type: ignore
-            from datetime import timedelta
             conn_str = _cb_conn_str(cb_url, use_tls)
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
             cluster.wait_until_ready(timedelta(seconds=10))
@@ -18390,7 +18972,6 @@ def _execute_agent_tool(
             try:
                 from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
                 from couchbase.auth import PasswordAuthenticator  # type: ignore
-                from datetime import timedelta
                 conn_str = _cb_conn_str(cb_url, use_tls)
                 cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
                 cluster.wait_until_ready(timedelta(seconds=10))
@@ -18443,7 +19024,6 @@ def _execute_agent_tool(
         try:
             from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
-            from datetime import timedelta
             conn_str = _cb_conn_str(cb_url, use_tls)
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
             cluster.wait_until_ready(timedelta(seconds=10))
@@ -18478,7 +19058,9 @@ def _execute_agent_tool(
             if emb_p and emb_m and emb_d:
                 if emb_p == "lmstudio":
                     _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
-                    lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45)
+                    _lms_emb_id = lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45, model_type="embeddings")
+                    if _lms_emb_id:
+                        emb_m = _lms_emb_id
                 try:
                     _done_emb, _errs_emb = embed_all_tickets(
                         [fresh], cb_url, bucket, username, password,
@@ -18616,7 +19198,6 @@ LIMIT {limit}
             from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             from couchbase.options import QueryOptions  # type: ignore
-            from datetime import timedelta
             conn_str = _cb_conn_str(cb_url, use_tls)
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
             cluster.wait_until_ready(timedelta(seconds=10))
@@ -18836,17 +19417,19 @@ LIMIT {limit}
         if not ci:
             return f"Snapshot data found ({len(_rows)} snapshots) but cluster index could not be built."
         lines = [f"**Cluster health for {org}** — {len(_rows)} snapshots, {len(ci)} clusters\n"]
-        lines.append("| Cluster | CB Version | Nodes | Last Seen | Bad | Warn | Status |")
-        lines.append("|---------|------------|-------|-----------|-----|------|--------|")
+        lines.append("| Cluster | CB Version | Nodes | CPUs/node | RAM/node | Last Seen | Bad | Warn | Status |")
+        lines.append("|---------|------------|-------|-----------|----------|-----------|-----|------|--------|")
         for cid, c in sorted(ci.items(), key=lambda x: x[1].get("last_seen") or "", reverse=True):
-            name = c.get("cluster_name") or cid[:12]
-            ver  = (c.get("version_history") or [""])[-1] or "unknown"
-            nodes = c.get("node_count") or "?"
+            name  = c.get("cluster_name") or cid[:12]
+            ver   = (c.get("version_history") or [""])[-1] or "unknown"
+            nodes = c.get("node_count_last") or c.get("node_count") or "?"
+            cpus  = c.get("cpus_per_node") or "?"
+            ram   = f"{c['ram_per_node_mib']} MiB" if c.get("ram_per_node_mib") else "?"
             last  = (c.get("last_seen") or "")[:10]
-            bad   = c.get("bad_count", 0)
-            warn  = c.get("warn_count", 0)
+            bad   = c.get("avg_bad", 0)
+            warn  = c.get("avg_warn", 0)
             status = "Deprecated" if c.get("is_deprecated") else ("Active" if c.get("is_active") else "Inactive")
-            lines.append(f"| {name} | {ver} | {nodes} | {last} | {bad} | {warn} | {status} |")
+            lines.append(f"| {name} | {ver} | {nodes} | {cpus} | {ram} | {last} | {bad} | {warn} | {status} |")
         return _auto_prefix + "\n".join(lines)
 
     elif name == "fetch_snapshots":
@@ -19781,10 +20364,11 @@ def call_llm_with_tools(
         # LMStudio: ensure a model is loaded before the first round
         if provider == "lmstudio":
             _lms_base = _base.rstrip("/v1").rstrip("/")
-            _loaded_id = lmstudio_ensure_model_loaded(_lms_base, model or "", timeout_s=45)
-            if _loaded_id and _loaded_id != model:
-                print(f"[LMStudio] Using loaded model '{_loaded_id}' (requested '{model}')")
-                model = _loaded_id  # use the actually-loaded model name in API calls
+            _loaded_id = lmstudio_ensure_model_loaded(_lms_base, model or "", timeout_s=120, model_type="llm")
+            if _loaded_id:
+                if _loaded_id != model:
+                    print(f"[LMStudio] Using loaded LLM '{_loaded_id}' (configured '{model}')")
+                model = _loaded_id
 
         def _safe_choice(r):
             """Return the first choice or raise with a clear diagnostic."""
@@ -20042,6 +20626,30 @@ def _generate_followup_suggestions(
 
 # ── Feature set helpers (v1.6.0) ─────────────────────────────────────────────
 
+# Priority synonym sets — Zendesk uses "critical"/"high" etc.; many orgs store
+# "P1"/"P2" directly.  Both must be recognised everywhere we filter by priority.
+_P1_VALS: frozenset[str] = frozenset({"critical", "urgent", "p1"})
+_P2_VALS: frozenset[str] = frozenset({"high", "p2"})
+_P3_VALS: frozenset[str] = frozenset({"normal", "medium", "p3"})
+_P4_VALS: frozenset[str] = frozenset({"low", "p4"})
+
+# Statuses that mean "not yet resolved" — pending counts as open.
+_OPEN_STATUSES: frozenset[str] = frozenset({"open", "pending", "new", "hold", "on-hold"})
+_CLOSED_STATUSES: frozenset[str] = frozenset({"solved", "closed"})
+
+def _canonical_priority(p: str) -> str:
+    """Map any priority alias to canonical form used by _SLA_HOURS."""
+    pl = (p or "").lower().strip()
+    if pl in _P1_VALS:
+        return "critical"
+    if pl in _P2_VALS:
+        return "high"
+    if pl in _P3_VALS:
+        return "normal"
+    if pl in _P4_VALS:
+        return "low"
+    return "unknown"
+
 _SLA_HOURS: dict[str, float] = {"critical": 4, "high": 24, "normal": 72, "low": 168, "unknown": 168}
 
 def _compute_health_score(
@@ -20071,10 +20679,12 @@ def _compute_health_score(
         f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org",
         org=_org_like,
     )
-    open_p1 = sum(1 for r in pri_rows if (r.get("priority") or "").lower() == "critical"
-                  and (r.get("status") or "").lower() not in ("solved", "closed"))
-    open_p2 = sum(1 for r in pri_rows if (r.get("priority") or "").lower() == "high"
-                  and (r.get("status") or "").lower() not in ("solved", "closed"))
+    open_p1 = sum(1 for r in pri_rows
+                  if (r.get("priority") or "").lower() in _P1_VALS
+                  and (r.get("status") or "").lower() not in _CLOSED_STATUSES)
+    open_p2 = sum(1 for r in pri_rows
+                  if (r.get("priority") or "").lower() in _P2_VALS
+                  and (r.get("status") or "").lower() not in _CLOSED_STATUSES)
     total   = len(pri_rows)
 
     # Escalation rate
@@ -20184,7 +20794,7 @@ def _compute_sla_compliance(
     from collections import defaultdict
     stats: dict = defaultdict(lambda: {"met": 0, "breached": 0, "total": 0, "avg_hours": []})
     for r in rows:
-        pri   = (r.get("priority") or "unknown").lower()
+        pri   = _canonical_priority(r.get("priority") or "unknown")
         limit = _SLA_HOURS.get(pri, 168)
         try:
             c = _dt.datetime.fromisoformat(r["created"][:19])
@@ -20360,7 +20970,11 @@ def _generate_customer_report(
         f"FROM `{bucket}`.`{scope}`.`{collection}` t "
         f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org "
         f"AND t.status NOT IN ['solved','closed'] "
-        f"ORDER BY CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, t.created DESC "
+        f"ORDER BY CASE LOWER(t.priority) "
+        f"WHEN 'critical' THEN 0 WHEN 'urgent' THEN 0 WHEN 'p1' THEN 0 "
+        f"WHEN 'high' THEN 1 WHEN 'p2' THEN 1 "
+        f"WHEN 'normal' THEN 2 WHEN 'medium' THEN 2 WHEN 'p3' THEN 2 "
+        f"ELSE 3 END, t.created DESC "
         f"LIMIT 20",
         org=_org_like,
     )
@@ -20576,8 +21190,8 @@ def _query_fleet_tickets(
     status_filter: open | all | solved
     """
     _status_clause = {
-        "open":   "AND t.status NOT IN ['solved','closed']",
-        "solved": "AND t.status IN ['solved','closed']",
+        "open":   "AND LOWER(t.status) NOT IN ['solved','closed']",
+        "solved": "AND LOWER(t.status) IN ['solved','closed']",
         "all":    "",
     }.get(status_filter, "")
 
@@ -20602,8 +21216,8 @@ def _query_fleet_tickets(
         sql = (
             f"SELECT {_group_field} AS label, "
             f"COUNT(*) AS ticket_count, "
-            f"SUM(CASE WHEN t.priority='critical' THEN 1 ELSE 0 END) AS p1_count, "
-            f"SUM(CASE WHEN t.priority='high' THEN 1 ELSE 0 END) AS p2_count "
+            f"SUM(CASE WHEN LOWER(t.priority) IN ['critical','urgent','p1'] THEN 1 ELSE 0 END) AS p1_count, "
+            f"SUM(CASE WHEN LOWER(t.priority) IN ['high','p2'] THEN 1 ELSE 0 END) AS p2_count "
             f"FROM `{bucket}`.`{scope}`.`{collection}` t "
             f"WHERE t.type='ticket' {_status_clause} AND {_group_field} IS NOT NULL "
             f"GROUP BY {_group_field} ORDER BY ticket_count DESC LIMIT {limit}"
@@ -20629,7 +21243,7 @@ def _list_at_risk_clusters(
         f"AND NOT EXISTS ("
         f"  SELECT 1 FROM `{bucket}`.`{scope}`.`{ticket_collection}` t "
         f"  WHERE t.type='ticket' "
-        f"  AND t.status NOT IN ['solved','closed'] "
+        f"  AND LOWER(t.status) NOT IN ['solved','closed'] "
         f"  AND LOWER(t.organization) = LOWER(s.organization) "
         f") "
         f"ORDER BY risk_score DESC LIMIT {limit}"
@@ -21350,10 +21964,19 @@ def _parse_structured_api_json(data: dict) -> dict:
         "data_nodes": 0, "query_nodes": 0, "index_nodes": 0,
         "fts_nodes": 0, "eventing_nodes": 0, "analytics_nodes": 0, "backup_nodes": 0,
         "cb_version": None, "ram_per_node_mib": None, "cpus_per_node": None,
-        "os_name": None, "bucket_count": 0, "bucket_names": [],
+        "ram_used_per_node_mib": None,
+        "os_name": None, "bucket_count": 0, "bucket_names": [], "bucket_details": [],
         "total_bucket_quota_mb": None, "server_groups": [],
         "auto_failover_seconds": None, "orchestrator": None,
-        "ldap_enabled": None, "bad_count": 0, "warn_count": 0, "raw_fields": {},
+        "ldap_enabled": None, "n2n_encryption": None, "data_quota_mib": None,
+        "bad_count": 0, "warn_count": 0,
+        "disk_total_per_node_mib": None, "disk_used_per_node_mib": None,
+        "swap_used_per_node_mib": None, "data_size_mib": None, "total_items": None,
+        "global_index_count": None, "global_index_names": [],
+        "fts_index_count": None, "fts_index_names": [],
+        "eventing_function_count": None, "eventing_function_names": [],
+        "scopes_collections": [],
+        "raw_fields": {},
     }
 
     # Resolve to a canonical results dict with "node" list and "cluster" list
@@ -21425,6 +22048,17 @@ def _parse_structured_api_json(data: dict) -> dict:
     if _orch:
         topo["orchestrator"] = str(_orch)
 
+    _n2n = _raw(cluster_checkers, "N2N Encryption")
+    if _n2n is not None:
+        topo["n2n_encryption"] = str(_n2n)
+
+    _dq = _raw(cluster_checkers, "Data Quota")
+    if _dq is not None:
+        try:
+            topo["data_quota_mib"] = int(float(str(_dq).replace(",", "").split()[0]))
+        except Exception:
+            pass
+
     # ── MDS from analysers ────────────────────────────────────────────────────
     mds = cluster_analysers.get("Multi-Dimensional Scaling", {})
     mds_raw = mds.get("raw", {}) if isinstance(mds, dict) else {}
@@ -21443,15 +22077,78 @@ def _parse_structured_api_json(data: dict) -> dict:
             if field:
                 topo[field] = len(svc_nodes) if isinstance(svc_nodes, list) else int(svc_nodes or 0)
 
-    # ── Bucket count ──────────────────────────────────────────────────────────
+    # ── Bucket count + details ────────────────────────────────────────────────
     bd = cluster_analysers.get("Bucket Details", {})
     bd_rows = bd.get("rows", []) if isinstance(bd, dict) else []
+    # API uses "headings" key; older format used "header" with dicts — try both
+    _bd_head_src = bd.get("headings") or bd.get("header") or []
+    bd_headers = []
+    for c in _bd_head_src:
+        if isinstance(c, dict):
+            bd_headers.append((c.get("content") or c.get("name") or "").lower())
+        elif isinstance(c, str):
+            bd_headers.append(c.lower())
+        else:
+            bd_headers.append("")
     if isinstance(bd_rows, list):
         topo["bucket_count"] = len(bd_rows)
-        topo["bucket_names"] = [
-            row[0]["content"] for row in bd_rows
-            if isinstance(row, list) and row and isinstance(row[0], dict) and row[0].get("content")
-        ]
+        topo["bucket_names"] = []
+        topo["bucket_details"] = []
+        for row in bd_rows:
+            if not (isinstance(row, list) and row):
+                continue
+            def _cell(i):
+                c = row[i] if i < len(row) else {}
+                return (c.get("content") or c.get("raw") or "") if isinstance(c, dict) else str(c) if c else ""
+            name = _cell(0)
+            if name:
+                topo["bucket_names"].append(name)
+            bdet: dict = {"name": name}
+            for idx, hdr in enumerate(bd_headers):
+                v = _cell(idx)
+                if not v or idx == 0:
+                    continue
+                if "type" in hdr:
+                    bdet["type"] = v
+                elif "quota" in hdr:
+                    try:
+                        bdet["quota_mb"] = int(v.replace(",", "").split()[0])
+                    except Exception:
+                        bdet["quota_mb"] = v
+                elif "replica" in hdr:
+                    try:
+                        bdet["replicas"] = int(v)
+                    except Exception:
+                        bdet["replicas"] = v
+                elif "mem used" in hdr or "mem_used" in hdr:
+                    bdet["mem_used"] = v
+                elif "compression" in hdr:
+                    bdet["compression"] = v
+                elif "eviction" in hdr:
+                    bdet["eviction"] = v
+                elif "storage" in hdr:
+                    bdet["storage_mode"] = v
+                elif "item" in hdr or "count" in hdr:
+                    bdet["items"] = v
+                elif "resident" in hdr:
+                    bdet["resident_ratio"] = v
+                elif "ttl" in hdr:
+                    bdet["max_ttl"] = v
+            # Positional fallback for common 5-column layout: name|type|quota|replicas|items
+            if "type" not in bdet and len(row) >= 2:
+                bdet["type"] = _cell(1)
+            if "quota_mb" not in bdet and len(row) >= 3:
+                try:
+                    bdet["quota_mb"] = int(_cell(2).replace(",", "").split()[0])
+                except Exception:
+                    pass
+            if "replicas" not in bdet and len(row) >= 4:
+                try:
+                    bdet["replicas"] = int(_cell(3))
+                except Exception:
+                    pass
+            if name:
+                topo["bucket_details"].append(bdet)
 
     # ── Server groups from analysers ──────────────────────────────────────────
     sg = cluster_analysers.get("Server Groups", {})
@@ -21466,14 +22163,87 @@ def _parse_structured_api_json(data: dict) -> dict:
         if groups:
             topo["server_groups"] = groups
 
+    def _analyser_rows_headings(a_dict: dict, key: str) -> tuple[list, list]:
+        """Return (rows, headings_lower) for a named analyser."""
+        a = a_dict.get(key, {})
+        if not isinstance(a, dict):
+            return [], []
+        rows = a.get("rows", [])
+        head_src = a.get("headings") or a.get("header") or []
+        hdrs = []
+        for c in head_src:
+            if isinstance(c, dict):
+                hdrs.append((c.get("content") or c.get("name") or "").lower())
+            elif isinstance(c, str):
+                hdrs.append(c.lower())
+            else:
+                hdrs.append("")
+        return rows if isinstance(rows, list) else [], hdrs
+
+    def _row_cell(row: list, idx: int) -> str:
+        c = row[idx] if idx < len(row) else {}
+        return (c.get("content") or c.get("raw") or "") if isinstance(c, dict) else str(c) if c else ""
+
+    # ── Global Indexes ────────────────────────────────────────────────────────
+    gi_rows, gi_hdrs = _analyser_rows_headings(cluster_analysers, "Global Indexes")
+    if gi_rows:
+        topo["global_index_count"] = len(gi_rows)
+        name_col = next((i for i, h in enumerate(gi_hdrs) if "name" in h), 2)
+        topo["global_index_names"] = [_row_cell(r, name_col) for r in gi_rows if isinstance(r, list) and _row_cell(r, name_col)]
+
+    # ── FTS Indexes ───────────────────────────────────────────────────────────
+    fi_rows, fi_hdrs = _analyser_rows_headings(cluster_analysers, "FTS Indexes")
+    if fi_rows:
+        topo["fts_index_count"] = len(fi_rows)
+        name_col = next((i for i, h in enumerate(fi_hdrs) if "name" in h), 1)
+        topo["fts_index_names"] = [_row_cell(r, name_col) for r in fi_rows if isinstance(r, list) and _row_cell(r, name_col)]
+
+    # ── Eventing Functions ────────────────────────────────────────────────────
+    ev_rows, ev_hdrs = _analyser_rows_headings(cluster_analysers, "Eventing Functions")
+    if ev_rows:
+        topo["eventing_function_count"] = len(ev_rows)
+        name_col = next((i for i, h in enumerate(ev_hdrs) if "function" in h or "name" in h), 1)
+        topo["eventing_function_names"] = [_row_cell(r, name_col) for r in ev_rows if isinstance(r, list) and _row_cell(r, name_col)]
+
+    # ── User Defined Scopes and Collections ───────────────────────────────────
+    sc_rows, sc_hdrs = _analyser_rows_headings(cluster_analysers, "User Defined Scopes and Collections")
+    if sc_rows:
+        bucket_col  = next((i for i, h in enumerate(sc_hdrs) if "bucket" in h), 0)
+        scopes_col  = next((i for i, h in enumerate(sc_hdrs) if "scope" in h and "count" in h), 1)
+        colls_col   = next((i for i, h in enumerate(sc_hdrs) if "collection" in h and "count" in h), 2)
+        for r in sc_rows:
+            if not isinstance(r, list):
+                continue
+            b = _row_cell(r, bucket_col)
+            sc = _row_cell(r, scopes_col)
+            cc = _row_cell(r, colls_col)
+            if b:
+                topo["scopes_collections"].append({"bucket": b, "scopes": sc, "collections": cc})
+
     # ── Node-level checkers ───────────────────────────────────────────────────
     node_list = results.get("node", [])
-    cb_versions: list[str] = []
-    ram_values:  list[int] = []
-    cpu_values:  list[int] = []
+    cb_versions:  list[str] = []
+    ram_values:   list[int] = []
+    cpu_values:   list[int] = []
+    disk_total_values: list[int] = []
+    disk_used_values:  list[int] = []
+    swap_used_values:  list[int] = []  # in kibibytes (raw checker unit)
+    ram_used_values:   list[float] = []  # in MiB (raw checker unit)
+    data_size_values:  list[int] = []
+    item_count_values: list[int] = []
     bad_count = warn_count = 0
     bad_names:  set[str] = set()
     warn_names: set[str] = set()
+
+    def _to_bytes(raw) -> int | None:
+        """Convert a raw value (int bytes, or dict with 'bytes'/'value') to int bytes."""
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        if isinstance(raw, dict):
+            for k in ("bytes", "value", "total", "raw"):
+                if isinstance(raw.get(k), (int, float)):
+                    return int(raw[k])
+        return None
 
     def _process_node_checkers(nc: dict) -> None:
         nonlocal bad_count, warn_count
@@ -21491,6 +22261,14 @@ def _parse_structured_api_json(data: dict) -> dict:
                 tot = raw_ram.get("total")
                 if tot:
                     ram_values.append(int(tot))
+        # Used RAM: raw = {"used": <MiB float>, "total": <MiB float>}
+        _ur = nc.get("Used RAM", {})
+        if isinstance(_ur, dict):
+            _ur_raw = _ur.get("raw")
+            if isinstance(_ur_raw, dict):
+                _used_mib = _ur_raw.get("used")
+                if isinstance(_used_mib, (int, float)):
+                    ram_used_values.append(float(_used_mib))
         _c = nc.get("Installed CPUs", {})
         if isinstance(_c, dict):
             raw_cpu = _c.get("raw")
@@ -21501,6 +22279,50 @@ def _parse_structured_api_json(data: dict) -> dict:
             raw_os = _on.get("raw")
             if raw_os:
                 topo["os_name"] = str(raw_os)
+        # Disk stats
+        for _dk in ("Disk Total", "Total Disk", "Disk Size"):
+            _dv = nc.get(_dk, {})
+            if isinstance(_dv, dict):
+                b = _to_bytes(_dv.get("raw"))
+                if b:
+                    disk_total_values.append(b)
+                    break
+        for _dk in ("Disk Used", "Disk Usage"):
+            _dv = nc.get(_dk, {})
+            if isinstance(_dv, dict):
+                b = _to_bytes(_dv.get("raw"))
+                if b:
+                    disk_used_values.append(b)
+                    break
+        # Swap Used: raw = {"used": <kB int>, "total": <kB int>} — units are kibibytes
+        for _sk in ("Swap Used", "Swap Usage"):
+            _sv = nc.get(_sk, {})
+            if isinstance(_sv, dict):
+                _sw_raw = _sv.get("raw")
+                _sw_kb = None
+                if isinstance(_sw_raw, dict):
+                    _sw_kb = _sw_raw.get("used")
+                elif isinstance(_sw_raw, (int, float)):
+                    _sw_kb = int(_sw_raw)
+                if _sw_kb is not None:
+                    swap_used_values.append(int(_sw_kb))
+                break
+        # Data size (KV service)
+        for _sk in ("Data Size", "Data Used", "Couch Docs Actual Disk Size"):
+            _sv = nc.get(_sk, {})
+            if isinstance(_sv, dict):
+                b = _to_bytes(_sv.get("raw"))
+                if b:
+                    data_size_values.append(b)
+                    break
+        # Item count
+        for _ik in ("Items", "Item Count", "Curr Items"):
+            _iv = nc.get(_ik, {})
+            if isinstance(_iv, dict):
+                raw_items = _iv.get("raw")
+                if isinstance(raw_items, (int, float)):
+                    item_count_values.append(int(raw_items))
+                    break
         for _ck_name, _ck_val in nc.items():
             if not isinstance(_ck_val, dict):
                 continue
@@ -21512,14 +22334,23 @@ def _parse_structured_api_json(data: dict) -> dict:
                 warn_count += 1
                 warn_names.add(_normalize_checker_name(_ck_name))
 
+    _node_checker_keys_logged = False
     if isinstance(node_list, list):
         for ne in node_list:
             if isinstance(ne, dict):
-                _process_node_checkers(ne.get("results", {}).get("checkers", {}))
+                _nc = ne.get("results", {}).get("checkers", {})
+                if not _node_checker_keys_logged and _nc:
+                    topo["raw_fields"]["_node_checker_keys"] = ", ".join(sorted(_nc.keys())[:30])
+                    _node_checker_keys_logged = True
+                _process_node_checkers(_nc)
     elif isinstance(node_list, dict):
         for nd in node_list.values():
             if isinstance(nd, dict):
-                _process_node_checkers(nd.get("checkers", {}))
+                _nc = nd.get("checkers", {})
+                if not _node_checker_keys_logged and _nc:
+                    topo["raw_fields"]["_node_checker_keys"] = ", ".join(sorted(_nc.keys())[:30])
+                    _node_checker_keys_logged = True
+                _process_node_checkers(_nc)
 
     # Also collect names from cluster-level checkers
     for _ck_name, _ck_val in cluster_checkers.items():
@@ -21540,6 +22371,27 @@ def _parse_structured_api_json(data: dict) -> dict:
         topo["ram_per_node_mib"] = int(sorted(ram_values)[len(ram_values) // 2])
     if cpu_values:
         topo["cpus_per_node"] = int(sorted(cpu_values)[len(cpu_values) // 2])
+    if ram_used_values:
+        topo["ram_used_per_node_mib"] = round(sorted(ram_used_values)[len(ram_used_values) // 2])
+
+    def _median_mb(byte_list: list[int]) -> int | None:
+        if not byte_list:
+            return None
+        return round(sorted(byte_list)[len(byte_list) // 2] / (1024 * 1024))
+
+    if disk_total_values:
+        topo["disk_total_per_node_mib"] = _median_mb(disk_total_values)
+    if disk_used_values:
+        topo["disk_used_per_node_mib"] = _median_mb(disk_used_values)
+    if swap_used_values:
+        # swap_used_values are in kibibytes — convert to MiB (÷ 1024, not ÷ 1M)
+        _sw_median_kb = sorted(swap_used_values)[len(swap_used_values) // 2]
+        topo["swap_used_per_node_mib"] = round(_sw_median_kb / 1024)
+    if data_size_values:
+        topo["data_size_mib"] = round(sum(data_size_values) / (1024 * 1024))  # cluster total
+    if item_count_values:
+        topo["total_items"] = sum(item_count_values)
+
     topo["bad_count"]  = bad_count
     topo["warn_count"] = warn_count
     topo["bad_items"]  = sorted(bad_names)
@@ -21749,6 +22601,8 @@ def enrich_tickets_with_snapshots(
                         "bucket_names":       topo.get("bucket_names") or [],
                         "auto_failover_seconds": topo.get("auto_failover_seconds"),
                         "ram_per_node_mib":   topo.get("ram_per_node_mib"),
+                        "cpus_per_node":      topo.get("cpus_per_node"),
+                        "os_name":            topo.get("os_name"),
                         "bucket_count":       topo.get("bucket_count", 0),
                         "server_groups":      topo.get("server_groups") or [],
                     }
@@ -21778,6 +22632,165 @@ def enrich_tickets_with_snapshots(
     progress_cb(
         f"Enriched {enriched} ticket(s) from {total_unique} unique snapshots"
         + (f" ({errors} errors)" if errors else "") + ".",
+        1.0,
+    )
+    return enriched, errors
+
+
+def enrich_ticket_apps_via_analytics(
+    customer_name: str,
+    cookie: str | None,
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    llm_provider: str,
+    llm_model: str,
+    llm_api_key: str,
+    llm_base_url: str,
+    progress_cb: Callable[[str, float], None] = lambda m, p: None,
+) -> tuple[int, int]:
+    """
+    For tickets that are missing app labels (no entry in the cluster→app map),
+    use the LLM to infer the Couchbase product name from the cluster hostname,
+    then write analytics_app_labels into ticket["score"] and re-upsert to CB.
+
+    Returns (enriched_count, error_count).
+    """
+    if not _CB_AVAILABLE:
+        raise RuntimeError("Couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    col      = cluster.bucket(bucket).scope(scope).collection(collection)
+
+    progress_cb("Loading tickets from Couchbase…", 0.05)
+    try:
+        ks = f"`{bucket}`.`{scope}`.`{collection}`"
+        _cf = customer_name.strip().lower().replace("%", "\\%").replace("_", "\\_")
+        q   = (
+            f"SELECT META().id AS _key, t.* "
+            f"FROM {ks} t "
+            f"WHERE t.type = 'ticket' "
+            f"AND LOWER(t.organization) LIKE {json.dumps(_cf + '%')}"
+        )
+        rows = list(cluster.query(q))
+    except Exception as exc:
+        cluster.close()
+        raise RuntimeError(f"CB query failed: {exc}") from exc
+
+    progress_cb(f"Loaded {len(rows)} tickets for '{customer_name}'.", 0.15)
+
+    c2a = _get_cluster_to_app()
+
+    # Collect tickets lacking app labels + their unmapped cluster names
+    to_enrich: list[dict] = []
+    all_unmapped: set[str] = set()
+    for row in rows:
+        ticket = dict(row)
+        ticket.pop("_key", None)
+        cids = _ticket_cluster_ids(ticket)
+        has_label = any(c2a.get(cid) for cid in cids)
+        if not has_label:
+            # Also check stored analytics_app_labels
+            _sc = ticket.get("score") or {}
+            if _sc.get("analytics_app_labels"):
+                continue  # already enriched
+            to_enrich.append(ticket)
+            for cid in cids:
+                if cid and not c2a.get(cid):
+                    all_unmapped.add(cid)
+
+    if not to_enrich:
+        progress_cb("All tickets already have app labels — nothing to enrich.", 1.0)
+        cluster.close()
+        return 0, 0
+
+    progress_cb(
+        f"{len(to_enrich)} ticket(s) missing app labels; "
+        f"{len(all_unmapped)} unique unmapped cluster name(s).",
+        0.2,
+    )
+
+    # ── LLM: infer app name from cluster hostname ────────────────────────────
+    cname_to_app: dict[str, str] = {}
+    if all_unmapped and llm_provider and llm_model:
+        names_list = "\n".join(f"- {n}" for n in sorted(all_unmapped))
+        prompt = (
+            "You are a Couchbase product expert. Given a list of Couchbase cluster "
+            "hostnames or names, identify which Couchbase product each cluster is "
+            "running. Reply with a JSON object mapping each cluster name to the "
+            "product label. Use these exact labels when applicable: "
+            "\"Couchbase Server\", \"Sync Gateway\", \"App Services\", \"Mobile\", "
+            "\"Analytics\", \"Eventing\", \"Search\", \"MLE\", \"Columnar\". "
+            "If you cannot determine the product, use \"Unknown\". "
+            "Reply ONLY with valid JSON, no explanation.\n\n"
+            f"Cluster names:\n{names_list}"
+        )
+        try:
+            progress_cb("Calling LLM to infer app labels from cluster names…", 0.35)
+            raw = call_llm(
+                [{"role": "user", "content": prompt}],
+                llm_provider, llm_model, llm_api_key, llm_base_url,
+                max_tokens=512,
+            )
+            # Strip markdown fences if present
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:])
+            if raw.endswith("```"):
+                raw = raw.rsplit("```", 1)[0]
+            parsed = json.loads(raw.strip())
+            for cname, label in parsed.items():
+                if label and label.strip().lower() != "unknown":
+                    cname_to_app[cname.strip()] = label.strip()
+            progress_cb(
+                f"LLM mapped {len(cname_to_app)} cluster name(s) to app labels.",
+                0.50,
+            )
+        except Exception as exc:
+            progress_cb(f"LLM inference warning: {exc} — will skip unmapped clusters.", 0.50)
+
+    # ── Apply labels and upsert ──────────────────────────────────────────────
+    enriched = errors = 0
+    total = len(to_enrich)
+    for i, ticket in enumerate(to_enrich):
+        pct = 0.5 + 0.5 * (i / total)
+        tid = ticket.get("ticket_id") or ticket.get("id", "?")
+        doc_key = f"ticket::{tid}"
+
+        cids   = _ticket_cluster_ids(ticket)
+        labels = sorted({
+            cname_to_app[cid]
+            for cid in cids
+            if cname_to_app.get(cid)
+        })
+        if not labels:
+            continue  # LLM had no mapping for this ticket's clusters either
+
+        sc = dict(ticket.get("score") or {})
+        sc["analytics_app_labels"] = labels
+        ticket = {**ticket, "score": sc}
+
+        try:
+            col.upsert(doc_key, ticket)
+            enriched += 1
+            progress_cb(
+                f"[{i+1}/{total}] #{tid} → {', '.join(labels)}",
+                pct,
+            )
+        except Exception as exc:
+            errors += 1
+            progress_cb(f"[{i+1}/{total}] CB upsert error for {tid}: {exc}", pct)
+
+    cluster.close()
+    progress_cb(
+        f"App label enrichment complete: {enriched} ticket(s) updated"
+        + (f", {errors} error(s)" if errors else "") + ".",
         1.0,
     )
     return enriched, errors
@@ -22490,6 +23503,9 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
                 "node_count_min":    None,
                 "node_count_max":    None,
                 "node_count_last":   None,
+                "cpus_per_node":     None,
+                "ram_per_node_mib":  None,
+                "os_name":           None,
                 "version_history":   [],
                 "bucket_names_seen": set(),
                 "bad_counts":        [],
@@ -22500,7 +23516,8 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
         ci = index[cid]
 
         _cn = snap.get("cluster_name") or ""
-        name = (_cn[0] if isinstance(_cn, list) else _cn).strip() if _cn else ""
+        _cn_val = (_cn[0] if isinstance(_cn, list) else _cn)
+        name = str(_cn_val).strip() if _cn_val else ""
         if name and name not in ci["cluster_names"]:
             ci["cluster_names"].append(name)
 
@@ -22519,8 +23536,17 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
             if ci["node_count_last"] is None:   # first (=newest) wins when sorted desc
                 ci["node_count_last"] = nc
 
+        # Promote hardware fields from top-level snap field or nested topology
+        _topo_d = snap.get("topology") or {}
+        for _hw_field in ("cpus_per_node", "ram_per_node_mib", "os_name"):
+            if ci[_hw_field] is None:
+                _val = snap.get(_hw_field) or _topo_d.get(_hw_field)
+                if _val:
+                    ci[_hw_field] = _val
+
         _ver = snap.get("cb_version") or ""
-        ver = (_ver[0] if isinstance(_ver, list) else _ver).strip() if _ver else ""
+        _ver_val = (_ver[0] if isinstance(_ver, list) else _ver)
+        ver = str(_ver_val).strip() if _ver_val else ""
         if ver and ver not in ci["version_history"]:
             ci["version_history"].append(ver)
 
@@ -24632,10 +25658,33 @@ def build_customer_profile(
     )
 
     # ── CB version distribution ───────────────────────────────────────────────
-    version_counts: Counter = Counter(
-        v for t in org_tickets
-        for v in [extract_ticket_version(t)] if v
-    )
+    version_counts: Counter = Counter()
+    _p_eol_count   = 0
+    _p_admin_count = 0
+    _p_blank_count = 0
+    for t in org_tickets:
+        ver = extract_ticket_version(t)
+        if ver and ver != "Unknown":
+            version_counts[ver] += 1
+        else:
+            _tf_p = _parse_ticket_fields(t)
+            _cs_p = (_tf_p.get("Couchbase_Server") or "").strip().lower()
+            if "Couchbase_Server" not in _tf_p:
+                _p_admin_count += 1
+            elif "end of life" in _cs_p:
+                _p_eol_count += 1
+            else:
+                _p_blank_count += 1
+
+    _prof_ver_breakdown: list[tuple[str, int, str]] = [
+        (v, c, "version") for v, c in version_counts.most_common(12)
+    ]
+    if _p_eol_count:
+        _prof_ver_breakdown.append(("EOL / End of Life", _p_eol_count, "eol"))
+    if _p_admin_count:
+        _prof_ver_breakdown.append(("Admin / No Product Fields", _p_admin_count, "admin"))
+    if _p_blank_count:
+        _prof_ver_breakdown.append(("Version Not Specified", _p_blank_count, "blank"))
 
     return {
         "org":                  org,
@@ -24665,8 +25714,12 @@ def build_customer_profile(
         # Composition
         "feature_labels":       [f for f, _ in feature_counts.most_common()],
         "feature_values":       [c for _, c in feature_counts.most_common()],
-        "version_labels":       [v for v, _ in version_counts.most_common(12)],
-        "version_values":       [c for _, c in version_counts.most_common(12)],
+        "version_labels":          [v for v, _ in version_counts.most_common(12)],
+        "version_values":          [c for _, c in version_counts.most_common(12)],
+        "version_breakdown":       _prof_ver_breakdown,
+        "version_eol_count":       _p_eol_count,
+        "version_admin_count":     _p_admin_count,
+        "version_blank_count":     _p_blank_count,
     }
 
 
@@ -25121,11 +26174,25 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
     _uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
     all_unique_cluster_uuids: set = set()
     clusters_by_version: dict[str, set] = {}
+    _snap_info_cache: dict[str, dict] = {}  # ticket_id → extract_cluster_snapshot_info result
+
+    _ver_eol_count   = 0  # Couchbase_Server = "End of Life*"
+    _ver_admin_count = 0  # No product version fields at all (Account Admin schema)
+    _ver_blank_count = 0  # Couchbase_Server key present but blank (SE didn't fill in)
 
     for t in tickets:
         ver = extract_ticket_version(t)
         if ver and ver != "Unknown":
             version_counts[ver] += 1
+        else:
+            _tf_v = _parse_ticket_fields(t)
+            _cs   = (_tf_v.get("Couchbase_Server") or "").strip().lower()
+            if "Couchbase_Server" not in _tf_v:
+                _ver_admin_count += 1
+            elif "end of life" in _cs:
+                _ver_eol_count += 1
+            else:
+                _ver_blank_count += 1
 
         # Collect cluster UUIDs from all available sources
         ticket_uuids: set = set()
@@ -25153,6 +26220,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
         # Source 3: UUIDs parsed from comments/description/snapshots
         info = extract_cluster_snapshot_info(t)
+        _snap_info_cache[str(t.get("ticket_id", ""))] = info  # reused in second loop
         for cid in (info.get("cluster_ids") or []):
             if _uuid_re.match(cid):
                 ticket_uuids.add(cid.lower())
@@ -25165,6 +26233,18 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
     version_counts.pop("Unknown", None)
     version_items = sorted(version_counts.items())   # sort by version string
+
+    # Build a combined breakdown list for the color-coded chart:
+    #   (label, count, category)  — category drives bar colour + checkbox visibility
+    _version_breakdown: list[tuple[str, int, str]] = [
+        (v, c, "version") for v, c in version_items
+    ]
+    if _ver_eol_count:
+        _version_breakdown.append(("EOL / End of Life", _ver_eol_count, "eol"))
+    if _ver_admin_count:
+        _version_breakdown.append(("Admin / No Product Fields", _ver_admin_count, "admin"))
+    if _ver_blank_count:
+        _version_breakdown.append(("Version Not Specified", _ver_blank_count, "blank"))
 
     # Build parallel lists for chart: versions with ≥1 known cluster UUID
     _ver_with_clusters = sorted(clusters_by_version.keys())
@@ -25202,10 +26282,11 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
         tid = str(ticket.get("ticket_id", ""))
         score = scores.get(tid, {})
 
-        # Snapshot count: use score pre-computed value if available, else extract
+        # Snapshot count: use score pre-computed value if available, else extract.
+        # Reuse cached result from the version loop above to avoid double-parsing.
         s_count = score.get("snapshot_count") if score else None
         if s_count is None:
-            info    = extract_cluster_snapshot_info(ticket)
+            info    = _snap_info_cache.get(tid) or extract_cluster_snapshot_info(ticket)
             s_count = info["snapshot_count"]
 
         # For analytics charts use ONLY authoritative sources — snapshot_topology
@@ -25406,8 +26487,12 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
         "proactive_by_subject":       proactive_by_subject,
         "proactive_by_comment":       proactive_by_comment,
         "proactive_tickets_sample":   proactive_tickets_sample[:50],
-        "version_labels":    [v for v, _ in version_items],
-        "version_values":    [c for _, c in version_items],
+        "version_labels":          [v for v, _ in version_items],
+        "version_values":          [c for _, c in version_items],
+        "version_breakdown":       _version_breakdown,
+        "version_eol_count":       _ver_eol_count,
+        "version_admin_count":     _ver_admin_count,
+        "version_blank_count":     _ver_blank_count,
         "unique_cluster_total":          unique_cluster_total,
         "clusters_by_version_labels":    _ver_with_clusters,
         "clusters_by_version_values":    [len(clusters_by_version[v]) for v in _ver_with_clusters],

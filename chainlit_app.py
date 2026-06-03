@@ -168,6 +168,52 @@ def _cb_args(p: dict) -> tuple:
     )
 
 
+def _emb_config(p: dict) -> tuple[str, str, str, str, int]:
+    """Return (provider, model, api_key, base_url, dims) for the configured embedding provider."""
+    provider = (p.get("emb_provider") or "Ollama").strip()
+    plo = provider.lower()
+    if plo == "lmstudio":
+        return (
+            "lmstudio",
+            (p.get("emb_lms_model") or "").strip(),
+            "",
+            (p.get("emb_lms_url") or "http://localhost:1234").rstrip("/"),
+            int(p.get("emb_lms_dims") or 768),
+        )
+    elif plo == "gemini":
+        return (
+            "gemini",
+            (p.get("emb_gemini_model") or "text-embedding-004").strip(),
+            p.get("emb_gemini_key") or "",
+            "",
+            int(p.get("emb_gemini_dims") or 768),
+        )
+    elif plo == "openai":
+        return (
+            "openai",
+            (p.get("emb_openai_model") or "text-embedding-3-small").strip(),
+            p.get("emb_openai_key") or "",
+            "",
+            int(p.get("emb_openai_dims") or 1536),
+        )
+    elif plo == "mlx":
+        return (
+            "mlx",
+            (p.get("emb_mlx_model") or "mixedbread-ai/mxbai-embed-large-v1").strip(),
+            "",
+            "",
+            int(p.get("emb_mlx_dims") or 1024),
+        )
+    else:  # ollama (default)
+        return (
+            "ollama",
+            (p.get("emb_ollama_model") or "nomic-embed-text").strip(),
+            "",
+            (p.get("emb_ollama_url") or "http://localhost:11434").rstrip("/"),
+            int(p.get("emb_ollama_dims") or 1024),
+        )
+
+
 def _llm_config(p: dict, overrides: dict) -> tuple[str, str, str, str]:
     provider = (overrides.get("provider") or p.get("llm_provider", "claude")).lower()
     if provider == "claude":
@@ -466,6 +512,77 @@ async def _restore_assets(thread_id: str) -> None:
             pass
 
 
+# ── Quick-action helpers ──────────────────────────────────────────────────────
+async def _fetch_saved_queries(customer: str, profile: dict) -> list[dict]:
+    """Return list of saved query dicts ({name, question, organization}) for customer."""
+    app = _get_pipeline()
+    if not hasattr(app, "_list_saved_queries") or not customer:
+        return []
+    try:
+        return await asyncio.to_thread(
+            app._list_saved_queries, *_cb_args(profile), customer
+        ) or []
+    except Exception:
+        return []
+
+
+async def _send_quick_actions(customer: str) -> None:
+    """Send a Quick Actions bar. Customer-specific actions added when customer is set."""
+    actions = [
+        cl.Action(
+            name="morning_briefing", value="morning_briefing", payload={},
+            label="☀ Morning Briefing",
+            description="Fleet-wide briefing for top customers",
+        ),
+        cl.Action(
+            name="quick_dashboard", value=customer or "all",
+            payload={"customer": customer or "all"},
+            label="📊 Quick Dashboard",
+            description="Health score summary",
+        ),
+    ]
+    if customer:
+        actions.insert(
+            1,
+            cl.Action(
+                name="whats_new", value=customer, payload={"customer": customer},
+                label=f"🆕 What's New? ({customer})",
+                description=f"Changes for {customer} in the last 24 hours",
+            ),
+        )
+        actions.append(
+            cl.Action(
+                name="show_saved_queries", value=customer, payload={"customer": customer},
+                label="🔖 Saved Queries",
+                description=f"Load saved queries for {customer}",
+            )
+        )
+    await cl.Message(content="**Quick Actions**", actions=actions, author="Supportal").send()
+
+
+# ── Chat starters (shown before first message) ────────────────────────────────
+@cl.set_starters
+async def set_starters():
+    return [
+        cl.Starter(
+            label="Morning Briefing",
+            message="Show me a morning briefing for my top customers",
+        ),
+        cl.Starter(
+            label="What's New?",
+            message="What's new for my customer in the last 24 hours?",
+        ),
+        cl.Starter(
+            label="Open P1 Tickets",
+            message="Show all open P1 tickets",
+        ),
+        cl.Starter(
+            label="Customer Health Dashboard",
+            message="Show me a quick health score dashboard",
+        ),
+    ]
+
+
 # ── Chainlit handlers ────────────────────────────────────────────────────────
 @cl.on_chat_resume
 async def on_resume(thread: dict):
@@ -565,6 +682,7 @@ async def on_start():
         ),
         author="Supportal",
     ).send()
+    await _send_quick_actions("")
 
 
 @cl.on_settings_update
@@ -594,6 +712,7 @@ async def on_settings_update(settings: dict):
         content=f"Settings saved. Customer: **{customer or 'all'}**.{note}",
         author="System",
     ).send()
+    await _send_quick_actions(customer)
 
 
 @cl.on_message
@@ -607,18 +726,17 @@ async def on_message(message: cl.Message):
 
     provider, model, api_key, base_url = _llm_config(profile, overrides)
     cb = _cb_args(profile)
+    emb_provider, emb_model, emb_api_key, emb_base_url, emb_dims = _emb_config(profile)
     # AFTER v1.5.0: carry session log across turns so call_llm_with_tools can
     # inject it into the system prompt (reduces redundant re-calls by the LLM).
     agent_ctx = {
         "provider": provider, "model": model,
         "api_key": api_key, "base_url": base_url,
-        "emb_provider": profile.get("emb_provider", "ollama"),
-        "emb_model":    profile.get("emb_ollama_model") or profile.get("emb_lms_model") or
-                        profile.get("emb_gemini_model") or profile.get("emb_openai_model") or "nomic-embed-text",
-        "emb_api_key":  profile.get("emb_gemini_key") or profile.get("emb_openai_key") or "",
-        "emb_base_url": profile.get("emb_ollama_url") or profile.get("emb_lms_url") or "",
-        "emb_dims":     int(profile.get("emb_ollama_dims") or profile.get("emb_lms_dims") or
-                            profile.get("emb_gemini_dims") or profile.get("emb_openai_dims") or 1024),
+        "emb_provider": emb_provider,
+        "emb_model":    emb_model,
+        "emb_api_key":  emb_api_key,
+        "emb_base_url": emb_base_url,
+        "emb_dims":     emb_dims,
         "cookie":       profile.get("cookie") or "",
         "_session_log": cl.user_session.get("_session_log", {}),  # AFTER v1.5.0
     }
@@ -729,4 +847,72 @@ async def on_retry(action: cl.Action):
 async def on_followup(action: cl.Action):
     """Send a follow-up suggestion as a new user message."""
     fake_msg = cl.Message(content=action.value, author="User")
+    await on_message(fake_msg)
+
+
+@cl.action_callback("morning_briefing")
+async def on_morning_briefing(action: cl.Action):
+    fake_msg = cl.Message(content="Show me a morning briefing for my top customers", author="User")
+    await on_message(fake_msg)
+
+
+@cl.action_callback("whats_new")
+async def on_whats_new(action: cl.Action):
+    customer = action.payload.get("customer") or cl.user_session.get("customer", "")
+    if not customer:
+        await cl.Message(content="Set a customer in ⚙ Settings first.", author="System").send()
+        return
+    fake_msg = cl.Message(content=f"What's new for {customer} in the last 24 hours?", author="User")
+    await on_message(fake_msg)
+
+
+@cl.action_callback("quick_dashboard")
+async def on_quick_dashboard(action: cl.Action):
+    customer = action.payload.get("customer") or cl.user_session.get("customer", "")
+    if customer and customer != "all":
+        query = f"Show me a quick health score dashboard for {customer}"
+    else:
+        query = "Show me a portfolio health score dashboard for all customers"
+    fake_msg = cl.Message(content=query, author="User")
+    await on_message(fake_msg)
+
+
+@cl.action_callback("show_saved_queries")
+async def on_show_saved_queries(action: cl.Action):
+    customer = action.payload.get("customer") or cl.user_session.get("customer", "")
+    profile = cl.user_session.get("profile") or _load_cb_settings()
+    queries = await _fetch_saved_queries(customer, profile)
+    if not queries:
+        await cl.Message(
+            content=f"No saved queries found for **{customer or 'this customer'}**.",
+            author="Supportal",
+        ).send()
+        return
+    sq_actions = [
+        cl.Action(
+            name="run_saved_query",
+            value=q.get("question", ""),
+            payload={"query": q.get("question", ""), "customer": customer},
+            label=(q.get("name") or q.get("question") or "")[:60],
+            description=q.get("question", ""),
+        )
+        for q in queries[:10]
+        if q.get("question")
+    ]
+    if not sq_actions:
+        await cl.Message(content="No runnable saved queries found.", author="Supportal").send()
+        return
+    await cl.Message(
+        content=f"**Saved Queries for {customer}** — click to run:",
+        actions=sq_actions,
+        author="Supportal",
+    ).send()
+
+
+@cl.action_callback("run_saved_query")
+async def on_run_saved_query(action: cl.Action):
+    query = action.payload.get("query") or action.value
+    if not query:
+        return
+    fake_msg = cl.Message(content=query, author="User")
     await on_message(fake_msg)
