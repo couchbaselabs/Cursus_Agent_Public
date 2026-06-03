@@ -10392,8 +10392,8 @@ def main_page():
                                     topo = t.get("snapshot_topology") or {}
                                     if not isinstance(topo, dict):
                                         topo = {}
-                                    name       = (topo.get("cluster_name") or "").strip()
-                                    capella_id = (topo.get("capella_cluster_id") or "").strip()
+                                    name       = _topo_str(topo.get("cluster_name"))
+                                    capella_id = _topo_str(topo.get("capella_cluster_id"))
                                     # Also pull Cluster_ID from ticket fields — it's the
                                     # Capella UUID users see in Zendesk (matches capella_cluster_id)
                                     tf    = _parse_ticket_fields(t)
@@ -13118,7 +13118,7 @@ def build_embed_text(ticket: dict) -> str:
         topo_lines = []
         if topo.get("cluster_name"):
             topo_lines.append(f"  Cluster Name: {topo['cluster_name']}")
-        snap_ver = (topo.get("cb_version") or "").strip()
+        snap_ver = _topo_str(topo.get("cb_version"))
         if snap_ver:
             topo_lines.append(f"  Cluster CB Version (at snapshot): {snap_ver}")
         if topo.get("total_nodes"):
@@ -15849,11 +15849,11 @@ def _ticket_cluster_ids(t: dict) -> list[str]:
         except Exception:
             topo = {}
     # cluster_name is the short hostname (e.g. "peuse1cbecpsd2000083") — used by _CLUSTER_TO_APP
-    _cname = (topo.get("cluster_name") or "").strip()
+    _cname = _topo_str(topo.get("cluster_name"))
     if _cname and _cname not in ids:
         ids.append(_cname)
     # UUID from topology
-    _cuuid = (topo.get("cluster_uuid") or "").strip()
+    _cuuid = _topo_str(topo.get("cluster_uuid"))
     if _cuuid and _cuuid not in ids:
         ids.append(_cuuid)
     # snap_ids prefix (UUID format — lower priority, kept for compatibility)
@@ -21458,6 +21458,20 @@ _UUID_RE = re.compile(
 _SNAP_ID_RE = re.compile(r"\b([0-9a-f]{32}::\d+)\b", re.IGNORECASE)
 
 
+def _topo_str(val) -> str:
+    """Safely coerce a topology field value to a stripped string.
+
+    Topology dicts are stored in CB and occasionally have list values (e.g.
+    cluster_name) due to raw checker data or legacy format differences.
+    This helper handles str, list, int, None — callers don't need to guard.
+    """
+    if not val:
+        return ""
+    if isinstance(val, list):
+        val = val[0] if val else ""
+    return str(val).strip()
+
+
 def _highest_snap_id(snap_ids: list[str]) -> str:
     """Return the snapshot ID with the highest ::N sequence number (most recent)."""
     def _seq(s: str) -> int:
@@ -25414,7 +25428,7 @@ def extract_ticket_version(ticket: dict) -> str:
             except Exception:
                 topo = {}
         if isinstance(topo, dict):
-            snap_ver = (topo.get("cb_version") or "").strip()
+            snap_ver = _topo_str(topo.get("cb_version"))
             if snap_ver:
                 # Strip build suffix: "7.2.3-6705-enterprise" → "7.2.3"
                 m2 = re.match(r"(\d+\.\d+(?:\.\d+)?)", snap_ver)
@@ -25614,8 +25628,8 @@ def build_customer_profile(
     for t in org_tickets:
         topo = t.get("snapshot_topology")
         if isinstance(topo, dict):
-            name = (topo.get("cluster_name") or "").strip()
-            uuid = (topo.get("cluster_uuid") or "").strip()
+            name = _topo_str(topo.get("cluster_name"))
+            uuid = _topo_str(topo.get("cluster_uuid"))
             if name:
                 clusters.add(name)
             elif uuid:
@@ -26102,13 +26116,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
     from collections import Counter
     import datetime
 
-    def _sf(val) -> str:
-        """Safely coerce any topo/field value to a stripped string (guards against lists)."""
-        if not val:
-            return ""
-        if isinstance(val, list):
-            val = val[0] if val else ""
-        return str(val).strip()
+    _sf = _topo_str  # local alias for readability inside this function
 
     # Frequency over time — total and per origin
     month_by_origin: dict[str, Counter] = {
