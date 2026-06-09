@@ -7520,7 +7520,8 @@ def main_page():
                                                             else:
                                                                 def _make_toggle(_k=_cat_key):
                                                                     def _toggle(e):
-                                                                        _vf_state[_k] = e.args
+                                                                        v = e.args
+                                                                        _vf_state[_k] = v[0] if isinstance(v, (list, tuple)) else v
                                                                         _refresh_vchart()
                                                                     return _toggle
                                                                 ui.checkbox(
@@ -8968,7 +8969,8 @@ def main_page():
                                                             else:
                                                                 def _make_ptoggle(_k=_pcat_key):
                                                                     def _ptoggle(e):
-                                                                        _pvf_state[_k] = e.args
+                                                                        v = e.args
+                                                                        _pvf_state[_k] = v[0] if isinstance(v, (list, tuple)) else v
                                                                         _refresh_pvchart()
                                                                     return _ptoggle
                                                                 ui.checkbox(
