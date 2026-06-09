@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.2"
+__version__ = "2.4.3"
 
 import asyncio
 import threading
@@ -11215,6 +11215,46 @@ def main_page():
 
 
 
+def _upsert_job_doc(job: dict, col) -> None:
+    """Write job state using an already-open CB collection handle. Never raises."""
+    if col is None:
+        return
+    try:
+        from couchbase.options import UpsertOptions as _UO
+        col.upsert(
+            f"scrape_job::{job['job_id']}",
+            {**job, "type": "scrape_job"},
+            _UO(expiry=timedelta(hours=48)),
+        )
+    except Exception:
+        pass
+
+
+def _persist_job_state(
+    job: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+) -> None:
+    """Write job state to CB by opening a short-lived connection. Use at phase transitions."""
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        from couchbase.options import UpsertOptions as _UO
+        _conn = _cb_conn_str(cb_url, use_tls)
+        _c    = _Cl(_conn, _CO(_PA(username, password)))
+        _c.wait_until_ready(timedelta(seconds=5))
+        _c.bucket(bucket).scope(scope).collection(collection).upsert(
+            f"scrape_job::{job['job_id']}",
+            {**job, "type": "scrape_job"},
+            _UO(expiry=timedelta(hours=48)),
+        )
+        _c.close()
+    except Exception:
+        pass
+
+
 def _make_scrape_job(org: str, mode: str) -> dict:
     """Create a new scrape job record, register it, and return it."""
     import secrets
@@ -11298,6 +11338,7 @@ def _run_scrape_job_bg(
             _cluster = _Cl(_conn, _CO(_PA(username, password)))
             _cluster.wait_until_ready(timedelta(seconds=15))
             _col = _cluster.bucket(bucket).scope(scope).collection(collection)
+            _upsert_job_doc(job, _col)   # persist "saving" phase start
             for t in scraped:
                 tid = t.get("ticket_id")
                 if not tid:
@@ -11307,6 +11348,7 @@ def _run_scrape_job_bg(
                     _saved += 1
                 except Exception:
                     job["errors"] += 1
+            _upsert_job_doc(job, _col)   # persist end-of-save state
             _cluster.close()
         except Exception as exc:
             job["errors"] += 1
@@ -11379,6 +11421,7 @@ def _run_scrape_job_bg(
         )
         job["last_message"] = summary
         _set_op(summary, 1.0, done=True)
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
 
     except Exception as exc:
         job["status"]      = "error"
@@ -11387,6 +11430,7 @@ def _run_scrape_job_bg(
         job["last_message"] = f"Fatal error: {exc}"
         job["errors"] += 1
         _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
 
 
 def _run_rescrape_job_bg(
@@ -11429,6 +11473,7 @@ def _run_rescrape_job_bg(
         _bcluster = _Cl(conn_str, _CO(_PA(username, password)))
         _bcluster.wait_until_ready(timedelta(seconds=10))
         _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
+        _upsert_job_doc(job, _bcol)   # persist initial "scraping" state
 
         # Create session once — reused across all ticket fetches
         _sess = _make_api_session(cookie)
@@ -11477,6 +11522,8 @@ def _run_rescrape_job_bg(
             pct = i / total * 0.80   # scrape phase = 0–80%
             if i % 10 == 0 or i == total:
                 _set_op(f"Rescraping {i}/{total} for '{org}'…", pct)
+            if i % 20 == 0 or i == total:
+                _upsert_job_doc(job, _bcol)   # persist progress every 20 tickets
             time.sleep(0.35)
 
         try:
@@ -11547,6 +11594,7 @@ def _run_rescrape_job_bg(
         )
         job["last_message"] = summary
         _set_op(summary, 1.0, done=True)
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
 
     except Exception as exc:
         job["status"]      = "error"
@@ -11555,6 +11603,7 @@ def _run_rescrape_job_bg(
         job["last_message"] = f"Fatal error: {exc}"
         job["errors"] += 1
         _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
 
 
 def _execute_agent_tool(

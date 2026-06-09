@@ -68,6 +68,60 @@ def _get_pipeline():
     return _pipeline
 
 
+# ── Scrape-job persistence helpers ───────────────────────────────────────────
+def _cb_get_job(job_id: str, cb_url: str, bucket: str, username: str,
+                password: str, use_tls: bool, scope: str, collection: str) -> dict | None:
+    """Read a single scrape_job doc from CB. Returns None on any error."""
+    if not cb_url or not username:
+        return None
+    try:
+        app = _get_pipeline()
+        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        from datetime import timedelta as _td
+        conn = app._cb_conn_str(cb_url, use_tls)
+        _c   = _Cl(conn, _CO(_PA(username, password)))
+        _c.wait_until_ready(_td(seconds=5))
+        doc  = _c.bucket(bucket).scope(scope).collection(collection).get(
+            f"scrape_job::{job_id}"
+        ).content_as[dict]
+        _c.close()
+        return doc
+    except Exception:
+        return None
+
+
+def _cb_query_active_jobs(cb_url: str, bucket: str, username: str,
+                           password: str, use_tls: bool, scope: str,
+                           collection: str) -> list[dict]:
+    """Return all scrape_job docs that are running or finished within the last 6h."""
+    if not cb_url or not username:
+        return []
+    try:
+        import time as _t
+        app = _get_pipeline()
+        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        from couchbase.options import QueryOptions as _QO
+        from datetime import timedelta as _td
+        conn = app._cb_conn_str(cb_url, use_tls)
+        _c   = _Cl(conn, _CO(_PA(username, password)))
+        _c.wait_until_ready(_td(seconds=5))
+        cutoff = _t.time() - 6 * 3600
+        ks = f"`{bucket}`.`{scope}`.`{collection}`"
+        rows = list(_c.query(
+            f"SELECT j.* FROM {ks} AS j "
+            f"WHERE j.type = 'scrape_job' "
+            f"AND (j.status = 'running' OR j.started_at > {cutoff}) "
+            f"ORDER BY j.started_at DESC LIMIT 20",
+            _QO(timeout=_td(seconds=10)),
+        ))
+        _c.close()
+        return rows
+    except Exception:
+        return []
+
+
 # ── Couchbase data layer (thread persistence / sidebar) ──────────────────────
 def _load_cb_settings() -> dict:
     """Read active profile without importing the full pipeline module."""
@@ -584,6 +638,46 @@ async def set_starters():
 
 
 # ── Chainlit handlers ────────────────────────────────────────────────────────
+async def _resume_scrape_job_monitors(profile: dict) -> None:
+    """Find running/recent scrape jobs (memory + CB) and spawn monitor tasks."""
+    app    = _get_pipeline()
+    cb     = _cb_args(profile)
+    cb_url = cb[0]
+
+    # Collect running jobs from both sources, deduplicated by job_id
+    seen: set[str] = set()
+    running: list[tuple[str, dict]] = []
+
+    # 1. In-process memory (same-process jobs or already-rehydrated)
+    for jid, job in list(app._SCRAPE_JOBS.items()):
+        if job.get("status") == "running" and jid not in seen:
+            seen.add(jid)
+            running.append((jid, job))
+
+    # 2. Couchbase (cross-process, or jobs from before a server restart)
+    if cb_url:
+        cb_jobs = await asyncio.to_thread(_cb_query_active_jobs, *cb)
+        for job in cb_jobs:
+            jid = job.get("job_id", "")
+            if not jid or jid in seen:
+                continue
+            seen.add(jid)
+            if job.get("status") == "running":
+                app._SCRAPE_JOBS[jid] = job   # rehydrate into memory
+                running.append((jid, job))
+
+    if not running:
+        return
+
+    summary_lines = [f"Found **{len(running)} scrape job(s)** still running — resuming live monitoring:\n"]
+    for jid, job in running:
+        summary_lines.append(f"- Job **{jid}** — {job.get('org')} ({job.get('mode')}), phase: {job.get('phase')}")
+    await cl.Message(content="\n".join(summary_lines), author="Job Monitor").send()
+
+    for jid, _ in running:
+        asyncio.create_task(_monitor_job(jid, app, cb))
+
+
 @cl.on_chat_resume
 async def on_resume(thread: dict):
     """Restore session state when user clicks a previous thread in the sidebar."""
@@ -616,6 +710,9 @@ async def on_resume(thread: dict):
 
     # Re-display any charts/tables that were saved during this thread
     await _restore_assets(thread.get("id", ""))
+
+    # Resume monitoring for any scrape jobs that were running when the session dropped
+    await _resume_scrape_job_monitors(profile)
 
 
 @cl.on_chat_start
@@ -683,6 +780,8 @@ async def on_start():
         author="Supportal",
     ).send()
     await _send_quick_actions("")
+    # Pick up any jobs that started in NiceGUI or a prior Chainlit session
+    await _resume_scrape_job_monitors(profile)
 
 
 @cl.on_settings_update
@@ -810,8 +909,9 @@ async def on_message(message: cl.Message):
     cl.user_session.set("_session_log", agent_ctx.get("_session_log", {}))  # AFTER v1.5.0
 
     # Spawn a live-updating monitor message for any scrape/rescrape jobs started this turn.
+    _cb_tuple = _cb_args(profile)
     for _jid in agent_ctx.get("_started_jobs", []):
-        asyncio.create_task(_monitor_job(_jid, app))
+        asyncio.create_task(_monitor_job(_jid, app, _cb_tuple))
 
     history.append({"role": "user",      "content": message.content})
     history.append({"role": "assistant", "content": answer})
@@ -840,8 +940,13 @@ async def on_message(message: cl.Message):
     await cl.Message(content=clean_text, elements=elements, actions=_actions, author="Supportal").send()
 
 
-async def _monitor_job(job_id: str, app: Any) -> None:
-    """Poll _SCRAPE_JOBS[job_id] every 3s and update a dedicated Chainlit message."""
+async def _monitor_job(job_id: str, app: Any, cb: tuple | None = None) -> None:
+    """Poll a scrape job every 3s and update a dedicated Chainlit message.
+
+    Reads from app._SCRAPE_JOBS (in-memory, same process) first; falls back to
+    Couchbase when the job isn't present (cross-process or post-restart).
+    cb = (cb_url, bucket, username, password, use_tls, scope, collection).
+    """
     import time as _time
 
     def _fmt(job: dict) -> str:
@@ -849,42 +954,58 @@ async def _monitor_job(job_id: str, app: Any) -> None:
         proc  = job.get("processed") or 0
         total = job.get("total")
         pct   = f" ({proc/total:.0%})" if total else ""
-        elap  = int(now - job["started_at"])
+        elap  = int(now - job.get("started_at", now))
         icon  = "🔄" if job["status"] == "running" else ("✅" if job["status"] == "done" else "❌")
         lines = [
             f"{icon} **Job {job['job_id']}** — {job['org']} ({job['mode']})",
-            f"Phase: **{job['phase']}** | {proc}/{total or '?'} tickets{pct}",
+            f"Phase: **{job.get('phase') or 'done'}** | {proc}/{total or '?'} tickets{pct}",
             f"Elapsed: {elap}s",
         ]
         if job.get("last_message"):
-            lines.append(f"Last: {job['last_message']}")
+            lines.append(f"_{job['last_message']}_")
         if job["status"] != "running" and job.get("finished_at"):
-            dur = int(job["finished_at"] - job["started_at"])
-            saved = job.get("saved", 0)
-            emb   = job.get("embedded", 0)
-            scr   = job.get("scored", 0)
-            errs  = job.get("errors", 0)
+            dur  = int(job["finished_at"] - job.get("started_at", job["finished_at"]))
+            errs = job.get("errors", 0)
             lines.append(
-                f"Done in {dur}s — {proc} scraped, {saved} saved, {emb} embedded, {scr} scored"
+                f"Done in {dur}s — {proc} scraped, {job.get('saved',0)} saved, "
+                f"{job.get('embedded',0)} embedded, {job.get('scored',0)} scored"
                 + (f", {errs} errors" if errs else "")
             )
         return "\n".join(lines)
 
-    job = app._SCRAPE_JOBS.get(job_id)
+    async def _get_job() -> dict | None:
+        j = app._SCRAPE_JOBS.get(job_id)
+        if j is not None:
+            return j
+        if cb:
+            return await asyncio.to_thread(_cb_get_job, job_id, *cb)
+        return None
+
+    job = await _get_job()
     if not job:
         return
+    # Re-hydrate in-memory dict so subsequent in-process reads are fast
+    if job_id not in app._SCRAPE_JOBS:
+        app._SCRAPE_JOBS[job_id] = job
+
     msg = await cl.Message(content=_fmt(job), author="Job Monitor").send()
-    while job["status"] == "running":
+    while job and job.get("status") == "running":
         await asyncio.sleep(3)
-        job = app._SCRAPE_JOBS.get(job_id)
-        if not job:
-            break
-        msg.content = _fmt(job)
-        await msg.update()
-    # Final update once done/error
+        job = await _get_job()
+        if job:
+            app._SCRAPE_JOBS[job_id] = job
+        try:
+            msg.content = _fmt(job) if job else f"Job {job_id} — status unknown"
+            await msg.update()
+        except Exception:
+            break  # WebSocket gone; stop updating but don't crash
+    # Final update
     if job:
-        msg.content = _fmt(job)
-        await msg.update()
+        try:
+            msg.content = _fmt(job)
+            await msg.update()
+        except Exception:
+            pass
 
 
 @cl.action_callback("retry")
