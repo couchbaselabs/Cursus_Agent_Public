@@ -822,3 +822,34 @@ def _find_customer_url_in_search(html: str, query: str) -> Optional[str]:
     # will reject them. The caller uses the user-provided name to build the URL.
     return None
 
+
+def _extract_ticket_ids(text: str) -> set[str]:
+    """Extract ticket IDs from free text (hash-prefixed, 'ticket N', or standalone 5+ digit)."""
+    ids: set[str] = set()
+    for m in re.finditer(r"(?:ticket\s+#?|#)(\d{4,})", text, re.IGNORECASE):
+        ids.add(m.group(1))
+    for m in re.finditer(r"(?<!\d)(\d{5,})(?!\d)", text):
+        ids.add(m.group(1))
+    return ids
+
+
+def _parse_ticket_fields(ticket: dict) -> dict:
+    """Return ticket_fields custom-field dict with normalized keys, or {}.
+
+    Handles three formats: already-normalized dict, JSON string with original
+    spaced keys, or missing field.
+    """
+    import json as _json
+    raw = ticket.get("ticket_fields") or ticket.get("fields") or {}
+    if isinstance(raw, dict):
+        if all(" " not in k and "(" not in k for k in raw):
+            return raw
+        return {_normalize_field_key(k): v for k, v in raw.items()}
+    try:
+        parsed = _json.loads(raw)
+        if isinstance(parsed, dict):
+            return {_normalize_field_key(k): v for k, v in parsed.items()}
+        return {}
+    except Exception:
+        return {}
+
