@@ -345,8 +345,10 @@ def _system_prompt(customer: str) -> str:
         "- get_customer_health_score: 0-100 composite score (P1s, escalations, resolution, freshness). "
         "Call for any 'how is X doing', 'status of X', 'health of X' question.\n"
         "- check_sla_compliance: SLA compliance % by priority for a customer.\n"
-        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions.\n"
-        "- get_digest: what's new/changed for a customer in the last N hours.\n"
+        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions. "
+        "Use for 'morning briefing', 'what should I focus on today', 'portfolio status', 'top customers', "
+        "'any urgent issues across all accounts' — call it with no required args.\n"
+        "- get_digest: what's new/changed for a specific named customer in the last N hours.\n"
         "- tag_ticket: apply tags to a ticket (e.g. 'performance', 'upgrade').\n"
         "- save_query / list_saved_queries: bookmark and recall queries.\n"
         "- generate_customer_report: full markdown report (health + SLA + open tickets + digest).\n"
@@ -620,7 +622,7 @@ async def set_starters():
     return [
         cl.Starter(
             label="Morning Briefing",
-            message="Show me a morning briefing for my top customers",
+            message="Run get_portfolio_status to show me a ranked portfolio overview — my morning briefing across all customers.",
         ),
         cl.Starter(
             label="What's New?",
@@ -1024,7 +1026,7 @@ async def on_followup(action: cl.Action):
 
 @cl.action_callback("morning_briefing")
 async def on_morning_briefing(action: cl.Action):
-    fake_msg = cl.Message(content="Show me a morning briefing for my top customers", author="User")
+    fake_msg = cl.Message(content="Run get_portfolio_status to show me a ranked portfolio overview — my morning briefing across all customers.", author="User")
     await on_message(fake_msg)
 
 

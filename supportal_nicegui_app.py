@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.6"
+__version__ = "2.4.7"
 
 import asyncio
 import threading
@@ -5855,7 +5855,9 @@ def main_page():
                                         "Call for any 'how is X doing', 'status of X', 'health of X' question.\n"
                                         "- check_sla_compliance: SLA compliance % by priority for a customer.\n"
                                         "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions. "
-                                        "Always cross-org; never filter by current customer.\n"
+                                        "Always cross-org; never filter by current customer. "
+                                        "Use for 'morning briefing', 'what should I focus on today', 'portfolio status', 'top customers', "
+                                        "'any urgent issues across all accounts' — call it with no required args.\n"
                                         "- get_digest: what's new/changed for a customer in the last N hours.\n"
                                         "- tag_ticket: apply tags to a ticket (e.g. 'performance', 'upgrade').\n"
                                         "- save_query / list_saved_queries: bookmark and recall queries.\n"
@@ -5924,10 +5926,10 @@ def main_page():
                                         _agent_sys += (
                                             f"\n\nUSER PROFILE — top accounts by recent activity: "
                                             + ", ".join(f'"{n}"' for n in _top_cust_names)
-                                            + ". When the user asks an open-ended status question "
-                                            "with no specific customer, use get_briefing to check "
-                                            "these accounts. When the user asks 'what should I know "
-                                            "today?' or 'any urgent issues?', call get_briefing immediately."
+                                            + ". For open-ended fleet questions ('morning briefing', "
+                                            "'what should I focus on today', 'any urgent issues') call "
+                                            "get_portfolio_status (no args needed). "
+                                            "Use get_digest only when the user names a specific customer."
                                         )
                                     if state.get("prior_session_block"):
                                         _agent_sys += "\n" + state["prior_session_block"]
