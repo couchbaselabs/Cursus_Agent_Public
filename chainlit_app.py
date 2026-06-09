@@ -293,80 +293,13 @@ def _llm_config(p: dict, overrides: dict) -> tuple[str, str, str, str]:
     return provider, model, api_key, base_url
 
 
-def _system_prompt(customer: str) -> str:
-    today = date.today().isoformat()
-    scope = f" for {customer}" if customer else ""
-    prompt = (
-        f"You are a Couchbase support ticket analyst. Today is {today}. "
-        f"You have access to tools that query a live Couchbase database containing "
-        f"Zendesk support tickets{scope}. "
-        "Use the available tools to answer questions accurately. "
-        "Always call tools to retrieve data — never guess at counts or ticket details.\n\n"
-        "TOOL GUIDANCE:\n"
-        "DATA SOURCE ROUTING — choose based on what the user is asking about:\n"
-        "  LOCAL (your Couchbase): list_organizations, query_tickets, count_tickets, get_ticket\n"
-        "    → 'what customers are you aware of?', 'what do you have locally?', 'which orgs have I scraped?'\n"
-        "  LIVE/GLOBAL (Supportal Analytics API): list_supportal_customers, query_supportal\n"
-        "    → 'how many customers get support today?', 'what's in Supportal globally?', "
-        "'how many clusters exist?', 'live snapshot data', 'version distribution across all customers'\n"
-        "When ambiguous, prefer LOCAL unless the user says 'today', 'live', 'Supportal', 'globally', or 'all customers'.\n"
-        "- count_tickets: for total/count questions\n"
-        "- query_tickets: to list or filter tickets\n"
-        "- get_ticket: full detail on one ticket including cluster topology — node count, "
-        "CB version, services, buckets, RAM, auto-failover, bad/warn health counts\n"
-        "- check_data_freshness: call when the user asks about 'current status' or 'latest'\n"
-        "- rescrape_ticket: refresh a single ticket from Supportal and save to CB\n"
-        "- rescrape_customer_tickets: bulk-refresh all stale tickets for a customer — "
-        "call this when the user says 'rescrape all', 'refresh everything', 'update all tickets'. "
-        "Use stale_hours=0 to force-refresh all regardless of age.\n"
-        "- generate_chart: MANDATORY when the user asks for any chart or visualization. "
-        "Call this tool — do NOT describe a chart in text. "
-        "Types: bar, horizontal_bar, line, area, stacked_bar, scatter, combo, pie, donut, gauge, treemap, funnel. "
-        "Use area/line for time trends; gauge for a single KPI; stacked_bar for part-of-whole; "
-        "horizontal_bar for ranked lists; scatter for correlations; treemap for hierarchy. "
-        "Extra params: height, stacked, show_labels, description (insight caption), color_scheme.\n"
-        "- generate_table: MANDATORY when the user asks for a table or exportable data. "
-        "Call this tool — do NOT render markdown tables.\n"
-        "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
-        "- vector_search: semantic/similarity search — finds tickets by meaning, not just keywords.\n"
-        "- get_cluster_health: cluster health summary from stored snapshots (versions, nodes, bad/warn). "
-        "Auto-triggers sync_snapshots if no local snapshots exist and a cookie is available.\n"
-        "- sync_snapshots: ONE-STEP snapshot sync — fetches stubs then enriches topology. "
-        "Prefer this over calling fetch_snapshots + backfill_snapshot_topology separately.\n"
-        "- fetch_snapshots: pull snapshot listing from Analytics API and save stubs to CB.\n"
-        "- backfill_snapshot_topology: enrich snapshot stubs with topology detail. Call after fetch_snapshots.\n"
-        "- scrape_customer_tickets: scrape fresh tickets from Supportal (capped). Use when tickets are missing.\n"
-        "- score_ticket: LLM-score a single ticket for stars, temperature, complexity.\n"
-        "- batch_score_tickets: score up to 10 tickets at once — pass ticket_ids list OR organization+limit. "
-        "Prefer over calling score_ticket repeatedly.\n"
-        "- batch_rescrape_tickets: re-fetch up to 20 tickets from Supportal in one call. "
-        "Prefer over calling rescrape_ticket in a loop.\n"
-        "CUSTOMER INTELLIGENCE (v1.6.0):\n"
-        "- get_customer_health_score: 0-100 composite score (P1s, escalations, resolution, freshness). "
-        "Call for any 'how is X doing', 'status of X', 'health of X' question.\n"
-        "- check_sla_compliance: SLA compliance % by priority for a customer.\n"
-        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions. "
-        "Use for 'morning briefing', 'what should I focus on today', 'portfolio status', 'top customers', "
-        "'any urgent issues across all accounts' — call it with no required args.\n"
-        "- get_digest: what's new/changed for a specific named customer in the last N hours.\n"
-        "- tag_ticket: apply tags to a ticket (e.g. 'performance', 'upgrade').\n"
-        "- save_query / list_saved_queries: bookmark and recall queries.\n"
-        "- generate_customer_report: full markdown report (health + SLA + open tickets + digest).\n"
+def _system_prompt(customer: str, profile_hint: str = "", prior_session_block: str = "") -> str:
+    from supportal.prompts import build_agent_system_prompt
+    return build_agent_system_prompt(
+        customer=customer,
+        profile_hint=profile_hint,
+        prior_session_block=prior_session_block,
     )
-    if customer and customer.lower() != "all customers":
-        prompt += (
-            f"\n\nSCOPING RULE: Customer is scoped to \"{customer}\". "
-            f"You MUST include customer=\"{customer}\" in every query_tickets and count_tickets call. "
-            f"Never ask the user for the customer name — it is already set.\n"
-            f"DISCOVERY EXCEPTIONS (cross-customer queries are allowed ONLY for):\n"
-            f"  1. list_organizations — always exempt, always runs across all customers.\n"
-            f"  2. Discovering what customers exist ('what orgs are in the system', "
-            f"'what other customers are there', 'update the customer list').\n"
-            f"  3. Getting a basic ticket count or summary for a specific other customer "
-            f"the user names explicitly.\n"
-            f"For all analysis, trends, ticket details, and comparisons: stay scoped to \"{customer}\"."
-        )
-    return prompt
 
 
 # ── ECharts → Plotly converter ───────────────────────────────────────────────
@@ -859,7 +792,9 @@ async def on_message(message: cl.Message):
 
     # AFTER v1.5.0: history depth — configurable via settings, default 10
     _ctx_depth = int(overrides.get("agent_context_depth") or profile.get("agent_context_depth") or 10)
-    msgs = [{"role": "system", "content": _system_prompt(customer)}]
+    _prior_block = cl.user_session.get("prior_session_block", "")
+    _profile_hint = cl.user_session.get("profile_hint", "")
+    msgs = [{"role": "system", "content": _system_prompt(customer, _profile_hint, _prior_block)}]
     msgs.extend(history[-_ctx_depth:])
     msgs.append({"role": "user", "content": message.content})
 

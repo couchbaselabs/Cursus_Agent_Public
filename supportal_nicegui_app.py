@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.8"
+__version__ = "2.4.9"
 
 import asyncio
 import threading
@@ -210,6 +210,7 @@ from supportal.agent_tools import (
     _fleet_cbse_impact,
     _compute_health_score_with_cluster,
 )
+from supportal.prompts import build_agent_system_prompt
 
 
 def _safe_notify(client, message: str, type: str = "info") -> None:  # noqa: A002
@@ -5783,126 +5784,8 @@ def main_page():
                                         if _cust_agent and _cust_agent.lower() != "all customers"
                                         else ""
                                     )
-                                    _agent_sys = (
-                                        f"You are a Couchbase support ticket analyst. Today is {_today_str_agent}. "
-                                        f"You have access to tools that query a live Couchbase database containing "
-                                        f"Zendesk support tickets{_cust_scope}. "
-                                        "Use the available tools to answer questions accurately. "
-                                        "Always call tools to retrieve data — never guess at counts or ticket details.\n\n"
-                                        "TOOL GUIDANCE:\n"
-                                        "DATA SOURCE ROUTING — choose based on what the user is asking about:\n"
-                                        "  LOCAL (your Couchbase): list_organizations, query_tickets, count_tickets, get_ticket\n"
-                                        "    → 'what customers are you aware of?', 'what do you have locally?', 'which orgs have I scraped?'\n"
-                                        "  LIVE/GLOBAL (Supportal Analytics API): list_supportal_customers, query_supportal\n"
-                                        "    → 'how many customers get support today?', 'what's in Supportal globally?', "
-                                        "'how many clusters exist?', 'live snapshot data', 'version distribution across all customers'\n"
-                                        "When ambiguous, prefer LOCAL unless the user says 'today', 'live', 'Supportal', 'globally', or 'all customers'.\n"
-                                        "- count_tickets: for total/count questions\n"
-                                        "- query_tickets: to list or filter tickets (returns Last Scraped age per ticket)\n"
-                                        "- get_ticket: full detail on one ticket including cluster topology from the linked "
-                                        "snapshot (node count, CB version, services, buckets, RAM/node, CPUs/node, "
-                                        "auto-failover, bad/warn health counts). Use this whenever the user asks about "
-                                        "cluster configuration, node count, topology, or infrastructure details for a "
-                                        "specific ticket. NOTE: CPUs/node may be absent from a specific snapshot — if so, "
-                                        "the output will say to call get_cluster_health to check other snapshots.\n"
-                                        "HARDWARE RULE — CRITICAL: Never answer questions about CPUs/node, RAM/node, "
-                                        "disk, or OS from conversation memory. If a prior get_ticket result lacked "
-                                        "CPUs/node, you MUST call get_cluster_health(organization=...) — it aggregates "
-                                        "across ALL snapshots and will find the value even when one snapshot is missing it. "
-                                        "Do NOT say 'CPU data is not available' without first calling get_cluster_health.\n"
-                                        "- check_data_freshness: ALWAYS call this when the user asks about 'current status', "
-                                        "'latest', 'live', 'today', or 'has this changed'. Pass the ticket_ids from a prior "
-                                        "query_tickets call. Report the age and include Supportal URLs for live verification.\n"
-                                        "- rescrape_ticket: refresh a single ticket from Supportal.\n"
-                                        "- rescrape_customer_tickets: bulk-refresh all stale tickets for a customer. "
-                                        "Call this when the user says 'rescrape all', 'refresh all tickets', 'update everything', "
-                                        "'get the latest for all tickets'. By default only rescrapes tickets older than 4 hours. "
-                                        "Use stale_hours=0 to force-refresh all regardless of age.\n"
-                                        "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true.\n"
-                                        "- generate_chart: MANDATORY when the user asks for any chart, graph, or "
-                                        "visualization. Call this tool — do NOT describe a chart in text. "
-                                        "Supported types: bar, horizontal_bar, line, area, stacked_bar, scatter, combo, "
-                                        "pie, donut, gauge, treemap, funnel. "
-                                        "TYPE SELECTION: use area/line for trends over time; gauge for a single KPI; "
-                                        "stacked_bar for part-of-whole; horizontal_bar for ranked lists; "
-                                        "scatter for correlations; combo to overlay bars+line; treemap for hierarchy. "
-                                        "Extra params: height (px), stacked, show_labels, description (insight caption), "
-                                        "color_scheme (default/warm/cool/traffic/couchbase/monochrome). "
-                                        "Also call proactively when comparing counts across categories.\n"
-                                        "- generate_table: MANDATORY when the user asks for a table, spreadsheet, or "
-                                        "exportable data. Call this tool — do NOT render a markdown table. Always call "
-                                        "generate_table BEFORE your final summary text so the table appears above your "
-                                        "explanation. Produces real CSV and Excel download buttons.\n"
-                                        "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
-                                        "- vector_search: semantic/similarity search — use when keyword filters won't capture the concept.\n"
-                                        "- get_cluster_health: summary of all clusters for a customer from stored snapshots. "
-                                        "Returns CB version, node counts, CPUs/node, RAM/node, bad/warn counts, and status. "
-                                        "Call this when the user asks about hardware specs (CPU cores, RAM per node), "
-                                        "cluster state, or version distribution — even if a specific ticket had no CPU data. "
-                                        "Auto-triggers sync_snapshots if no local snapshots exist and a cookie is available.\n"
-                                        "- sync_snapshots: ONE-STEP snapshot sync — fetches stubs then enriches topology. "
-                                        "Prefer this over calling fetch_snapshots + backfill_snapshot_topology separately.\n"
-                                        "- fetch_snapshots: pull snapshot listing from Analytics API → saves stubs to CB. Fast.\n"
-                                        "- backfill_snapshot_topology: enrich CB snapshot stubs with CB version, nodes, bad/warn. Call after fetch_snapshots.\n"
-                                        "- scrape_customer_tickets: scrape fresh tickets from Supportal (capped at 50). Use when tickets are missing.\n"
-                                        "- score_ticket: LLM-score a single ticket for stars, temperature, complexity.\n"
-                                        "- batch_score_tickets: score up to 10 tickets at once — pass ticket_ids list OR organization+limit. "
-                                        "Prefer over calling score_ticket repeatedly.\n"
-                                        "- batch_rescrape_tickets: re-fetch up to 20 tickets from Supportal in one call. "
-                                        "Prefer over calling rescrape_ticket in a loop.\n"
-                                        "CUSTOMER INTELLIGENCE (v1.6.0):\n"
-                                        "- get_customer_health_score: 0-100 composite score (P1s, escalations, resolution, freshness). "
-                                        "Call for any 'how is X doing', 'status of X', 'health of X' question.\n"
-                                        "- check_sla_compliance: SLA compliance % by priority for a customer.\n"
-                                        "- get_portfolio_status: ranked overview of ALL customers by urgency — for fleet/portfolio questions. "
-                                        "Always cross-org; never filter by current customer. "
-                                        "Use for 'morning briefing', 'what should I focus on today', 'portfolio status', 'top customers', "
-                                        "'any urgent issues across all accounts' — call it with no required args.\n"
-                                        "- get_digest: what's new/changed for a customer in the last N hours.\n"
-                                        "- tag_ticket: apply tags to a ticket (e.g. 'performance', 'upgrade').\n"
-                                        "- save_query / list_saved_queries: bookmark and recall queries.\n"
-                                        "- generate_customer_report: full markdown report (health + SLA + open tickets + digest).\n"
-                                        "FLEET TOOLS (Phase 3) — always cross-org, never filtered by current customer:\n"
-                                        "- query_fleet_tickets: aggregate ticket counts across ALL orgs. Use for 'which customers have the most P1s', "
-                                        "'fleet-wide ticket breakdown', 'which orgs have open criticals'.\n"
-                                        "- list_at_risk_clusters: clusters with elevated bad/warn items and NO open ticket — leading indicators.\n"
-                                        "- fleet_version_distribution: CB version spread across all clusters fleet-wide.\n"
-                                        "- fleet_cbse_impact: which CBSEs affect the most customers (ranked by blast radius)."
-                                    )
-                                    if not _cust_agent or _cust_agent.lower() == "all customers":
-                                        _agent_sys += (
-                                            "\n\nNO CUSTOMER CONFIGURED — follow this flow:\n"
-                                            "1. When the user mentions any company, account, or customer name, "
-                                            "call search_customer_names({\"query\": \"<fragment>\"}) immediately.\n"
-                                            "2. Present the ranked matches to the user and ask them to confirm "
-                                            "which one they mean (e.g. '1. NetDocuments Inc, 2. NetDocuments Ltd — which one?').\n"
-                                            "3. Once confirmed, use that exact name as customer=<name> in every "
-                                            "subsequent tool call (query_tickets, get_customer_health_score, etc.) "
-                                            "for the rest of this conversation.\n"
-                                            "4. If no match is found, suggest the user go to the Scraping tab to "
-                                            "add the customer, or call scrape_customer_tickets to pull fresh data.\n"
-                                            "Do NOT attempt to query tickets or health scores before a customer is confirmed."
-                                        )
-                                    if _cust_agent and _cust_agent.lower() != "all customers":
-                                        _agent_sys += (
-                                            f"\n\nSCOPING RULE: Customer is scoped to \"{_cust_agent}\". "
-                                            f"You MUST include customer=\"{_cust_agent}\" in every query_tickets and "
-                                            f"count_tickets call. Never ask the user for the customer name — it is already set.\n"
-                                            f"FLEET TOOL EXEMPTIONS — the following tools are ALWAYS cross-org and must NEVER "
-                                            f"have a customer or organization filter added:\n"
-                                            f"  query_fleet_tickets, list_at_risk_clusters, fleet_version_distribution, "
-                                            f"fleet_cbse_impact, get_portfolio_status, list_organizations, search_customer_names\n"
-                                            f"DISCOVERY EXCEPTIONS (cross-customer queries are allowed ONLY for):\n"
-                                            f"  1. Any FLEET TOOL EXEMPTION listed above.\n"
-                                            f"  2. Discovering what customers exist ('what orgs are in the system', "
-                                            f"'what other customers are there', 'update the customer list').\n"
-                                            f"  3. Getting a basic ticket count or summary for a specific other customer "
-                                            f"the user names explicitly.\n"
-                                            f"For all analysis, trends, ticket details, and comparisons: stay scoped to \"{_cust_agent}\"."
-                                        )
-                                    # ── Profile: load top customers, inject into prompt ──────
+                                    # ── Profile: load top customers for prompt hint ──────────
                                     _profile_user = (cb_user_input.value.strip() or "default")
-                                    _user_profile: dict = {}
                                     _top_cust_names: list[str] = []
                                     if _CB_AVAILABLE and cb_url_input.value.strip():
                                         try:
@@ -5922,30 +5805,12 @@ def main_page():
                                             ][:5]
                                         except Exception:
                                             pass
-                                    if _top_cust_names:
-                                        _agent_sys += (
-                                            f"\n\nUSER PROFILE — top accounts by recent activity: "
-                                            + ", ".join(f'"{n}"' for n in _top_cust_names)
-                                            + ". For open-ended fleet questions ('morning briefing', "
-                                            "'what should I focus on today', 'any urgent issues') call "
-                                            "get_portfolio_status (no args needed). "
-                                            "Use get_digest only when the user names a specific customer."
-                                        )
-                                    if state.get("prior_session_block"):
-                                        _agent_sys += "\n" + state["prior_session_block"]
-                                    _agent_sys += (
-                                        "\n\nBACKGROUND JOBS — critical rules:\n"
-                                        "scrape_customer_tickets and rescrape_customer_tickets return IMMEDIATELY "
-                                        "after starting a background job. The pipeline (scrape → save → embed) "
-                                        "runs in a separate thread and you have NO way to watch it or be notified "
-                                        "when it finishes.\n"
-                                        "NEVER say 'I am monitoring', 'I will alert you', 'I will notify you when done', "
-                                        "or any similar phrase — you cannot do this.\n"
-                                        "ALWAYS tell the user: 'I cannot proactively notify you when the job finishes — "
-                                        "you will need to ask me for a status update.' Then suggest they ask "
-                                        "'what is the scrape status?' after a minute or two.\n"
-                                        "When get_scrape_status shows a job is still RUNNING, remind the user "
-                                        "that they need to ask again to get a fresh update."
+                                    _profile_hint = ", ".join(f'"{n}"' for n in _top_cust_names)
+                                    _agent_sys = build_agent_system_prompt(
+                                        customer=_cust_agent,
+                                        today_str=_today_str_agent,
+                                        profile_hint=_profile_hint,
+                                        prior_session_block=state.get("prior_session_block", ""),
                                     )
                                     _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
                                     _ctx_depth = int(agent_ctx_depth_input.value or 10)  # AFTER v1.5.0
