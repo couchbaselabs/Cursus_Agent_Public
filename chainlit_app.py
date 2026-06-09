@@ -809,6 +809,10 @@ async def on_message(message: cl.Message):
 
     cl.user_session.set("_session_log", agent_ctx.get("_session_log", {}))  # AFTER v1.5.0
 
+    # Spawn a live-updating monitor message for any scrape/rescrape jobs started this turn.
+    for _jid in agent_ctx.get("_started_jobs", []):
+        asyncio.create_task(_monitor_job(_jid, app))
+
     history.append({"role": "user",      "content": message.content})
     history.append({"role": "assistant", "content": answer})
     cl.user_session.set("history", history)
@@ -834,6 +838,53 @@ async def on_message(message: cl.Message):
         for s in _sugs
     ]
     await cl.Message(content=clean_text, elements=elements, actions=_actions, author="Supportal").send()
+
+
+async def _monitor_job(job_id: str, app: Any) -> None:
+    """Poll _SCRAPE_JOBS[job_id] every 3s and update a dedicated Chainlit message."""
+    import time as _time
+
+    def _fmt(job: dict) -> str:
+        now   = _time.time()
+        proc  = job.get("processed") or 0
+        total = job.get("total")
+        pct   = f" ({proc/total:.0%})" if total else ""
+        elap  = int(now - job["started_at"])
+        icon  = "🔄" if job["status"] == "running" else ("✅" if job["status"] == "done" else "❌")
+        lines = [
+            f"{icon} **Job {job['job_id']}** — {job['org']} ({job['mode']})",
+            f"Phase: **{job['phase']}** | {proc}/{total or '?'} tickets{pct}",
+            f"Elapsed: {elap}s",
+        ]
+        if job.get("last_message"):
+            lines.append(f"Last: {job['last_message']}")
+        if job["status"] != "running" and job.get("finished_at"):
+            dur = int(job["finished_at"] - job["started_at"])
+            saved = job.get("saved", 0)
+            emb   = job.get("embedded", 0)
+            scr   = job.get("scored", 0)
+            errs  = job.get("errors", 0)
+            lines.append(
+                f"Done in {dur}s — {proc} scraped, {saved} saved, {emb} embedded, {scr} scored"
+                + (f", {errs} errors" if errs else "")
+            )
+        return "\n".join(lines)
+
+    job = app._SCRAPE_JOBS.get(job_id)
+    if not job:
+        return
+    msg = await cl.Message(content=_fmt(job), author="Job Monitor").send()
+    while job["status"] == "running":
+        await asyncio.sleep(3)
+        job = app._SCRAPE_JOBS.get(job_id)
+        if not job:
+            break
+        msg.content = _fmt(job)
+        await msg.update()
+    # Final update once done/error
+    if job:
+        msg.content = _fmt(job)
+        await msg.update()
 
 
 @cl.action_callback("retry")

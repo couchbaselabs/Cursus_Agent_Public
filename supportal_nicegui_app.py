@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 import asyncio
 import threading
@@ -3022,6 +3022,56 @@ def main_page():
                             ui.separator().classes("my-2")
                             ui.label("Activity Log").classes("text-xs font-semibold text-gray-500 mb-1")
                             pipe_log = ui.log(max_lines=500).classes("w-full h-40 text-xs font-mono border rounded")
+
+                    # ── Background Jobs ───────────────────────────────────────────────────
+                    _jobs_card = ui.card().classes("w-full mt-2")
+                    with _jobs_card:
+                        with ui.row().classes("items-center justify-between w-full mb-2"):
+                            ui.label("Background Jobs").classes("text-base font-semibold")
+                            ui.label("Auto-refreshes every 3s").classes("text-xs text-gray-400")
+
+                        @ui.refreshable
+                        def _render_jobs():
+                            if not _SCRAPE_JOBS:
+                                ui.label("No jobs started yet.").classes("text-xs text-gray-400 italic")
+                                return
+                            import time as _jt
+                            _now = _jt.time()
+                            for job in reversed(list(_SCRAPE_JOBS.values())):
+                                proc  = job.get("processed") or 0
+                                total = job.get("total")
+                                elap  = int(_now - job["started_at"])
+                                is_run = job["status"] == "running"
+                                color = "blue" if is_run else ("positive" if job["status"] == "done" else "negative")
+                                icon  = "sync" if is_run else ("check_circle" if job["status"] == "done" else "error")
+                                with ui.row().classes("items-start gap-3 w-full py-2 border-b last:border-b-0"):
+                                    ui.icon(icon, size="xs").classes(f"mt-1 text-{color}-500")
+                                    with ui.column().classes("flex-1 gap-0.5"):
+                                        with ui.row().classes("items-center gap-2"):
+                                            ui.label(f"{job['org']}").classes("text-sm font-medium")
+                                            ui.badge(job["mode"], color="teal").classes("text-xs")
+                                            ui.badge(job["phase"], color=color).classes("text-xs")
+                                            ui.label(f"#{job['job_id']}").classes("text-xs text-gray-400 font-mono")
+                                        if total:
+                                            ui.linear_progress(
+                                                value=proc / total,
+                                                color=color,
+                                            ).classes("w-full mt-0.5").props("stripe" if is_run else "")
+                                        ui.label(job.get("last_message") or "").classes("text-xs text-gray-500")
+                                        if is_run:
+                                            ui.label(f"Elapsed: {elap}s").classes("text-xs text-gray-400 font-mono")
+                                        elif job.get("finished_at"):
+                                            dur = int(job["finished_at"] - job["started_at"])
+                                            ui.label(
+                                                f"Done in {dur}s — {proc} scraped, "
+                                                f"{job.get('saved',0)} saved, "
+                                                f"{job.get('embedded',0)} embedded, "
+                                                f"{job.get('scored',0)} scored"
+                                                + (f", {job.get('errors',0)} errors" if job.get("errors") else "")
+                                            ).classes("text-xs text-gray-500 font-mono")
+
+                        _render_jobs()
+                        ui.timer(3.0, _render_jobs.refresh)
 
                     # ── Diagnostics output ────────────────────────────────────────────────
                     with ui.card().classes("w-full"):
@@ -11827,6 +11877,8 @@ def _execute_agent_tool(
             ),
             daemon=True,
         ).start()
+        if ctx is not None:
+            ctx.setdefault("_started_jobs", []).append(_job["job_id"])
         return (
             f"Started rescrape job **{_job['job_id']}** for '{cust or 'all customers'}' "
             f"({len(to_scrape)} tickets, stale > {stale_hours:.0f}h). "
@@ -12533,6 +12585,8 @@ LIMIT {limit}
             ),
             daemon=True,
         ).start()
+        if ctx is not None:
+            ctx.setdefault("_started_jobs", []).append(_job["job_id"])
         return (
             f"Started scrape job **{_job['job_id']}** for '{org}' (up to {max_tickets} tickets). "
             f"The pipeline runs in the background — scraping, saving, embedding, and scoring. "
