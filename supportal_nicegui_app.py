@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 import asyncio
 import threading
@@ -809,6 +809,59 @@ def fetch_ticket_signals_from_cb(
         return signals
     except Exception:
         return {}
+
+
+def _reconcile_deleted_tickets(
+    scraped_ids: set[str],
+    customer: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    progress_cb=None,
+) -> tuple[int, int]:
+    """Delete CB ticket docs for the given org that are absent from scraped_ids.
+
+    Returns (deleted_count, error_count).
+    Only touches docs whose LOWER(organization) matches customer — never
+    deletes tickets belonging to other orgs.
+    """
+    if not _CB_AVAILABLE:
+        return 0, 0
+    try:
+        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        from couchbase.options import QueryOptions as _QO
+        from datetime import timedelta as _td
+        conn   = _cb_conn_str(cb_url, use_tls)
+        _clust = _Cl(conn, _CO(_PA(username, password)))
+        _clust.wait_until_ready(_td(seconds=15))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+        cust_pat = customer.lower().replace("'", "''")
+        rows = list(_clust.query(
+            f"SELECT RAW META(t).id FROM {keyspace} AS t "
+            f"WHERE META(t).id LIKE 'ticket::%' "
+            f"AND LOWER(t.organization) LIKE '%{cust_pat}%'",
+            _QO(timeout=_td(seconds=60)),
+        ))
+        cb_ids = {str(k).split("::")[-1] for k in rows if k}
+        orphans = cb_ids - scraped_ids
+        if not orphans:
+            return 0, 0
+        col     = _clust.bucket(bucket).scope(scope).collection(collection)
+        deleted = 0
+        errors  = 0
+        total   = len(orphans)
+        for i, tid in enumerate(sorted(orphans), 1):
+            try:
+                col.remove(f"ticket::{tid}")
+                deleted += 1
+            except Exception:
+                errors += 1
+            if progress_cb and i % 10 == 0:
+                progress_cb(f"Removed {deleted}/{total}…", i / total)
+        _clust.close()
+        return deleted, errors
+    except Exception:
+        return 0, 1
 
 
 def _filter_changed_tickets(
@@ -2373,12 +2426,14 @@ def main_page():
                                 if _CB_AVAILABLE and pipeline_save_toggle.value and data:
                                     import time as _time
                                     _pipe_step_start: dict = {}
+                                    _is_full_scrape = scrape_mode_select.value != "Changed only (skip existing)"
                                     _steps_enabled = (
                                         ["save"]
-                                        + (["enrich"]   if pipeline_enrich_toggle.value   else [])
-                                        + (["embed"]    if pipeline_embed_toggle.value    else [])
-                                        + (["score"]    if pipeline_score_toggle.value    else [])
-                                        + (["validate"] if pipeline_validate_toggle.value else [])
+                                        + (["enrich"]    if pipeline_enrich_toggle.value    else [])
+                                        + (["embed"]     if pipeline_embed_toggle.value     else [])
+                                        + (["score"]     if pipeline_score_toggle.value     else [])
+                                        + (["validate"]  if pipeline_validate_toggle.value  else [])
+                                        + (["reconcile"] if pipeline_reconcile_toggle.value and _is_full_scrape else [])
                                     )
 
                                     _cancel.clear()
@@ -2703,6 +2758,33 @@ def main_page():
                                             await _step_finish("validate", f"Error: {exc}", ok=False)
                                             ui.notify(f"Pipeline validate error: {exc}", type="negative")
 
+                                    # ── Step 5: Reconcile (delete removed tickets) ──────────
+                                    if pipeline_reconcile_toggle.value and _is_full_scrape and _save_ok and not _cancel.is_set():
+                                        await _step_activate("reconcile")
+                                        try:
+                                            _scraped_ids = {str(t["ticket_id"]) for t in data if t.get("ticket_id")}
+                                            _rec_deleted, _rec_errors = await run.io_bound(
+                                                _reconcile_deleted_tickets,
+                                                _scraped_ids,
+                                                customer,
+                                                cb_url_input.value.strip(),
+                                                cb_bucket_input.value.strip(),
+                                                cb_user_input.value.strip(),
+                                                cb_pass_input.value,
+                                                cb_tls_toggle.value,
+                                                cb_scope_input.value.strip() or "_default",
+                                                cb_collection_input.value.strip() or "tickets",
+                                                _make_step_prog("reconcile"),
+                                            )
+                                            await _step_finish(
+                                                "reconcile",
+                                                f"{_rec_deleted} removed" + (f", {_rec_errors} errors" if _rec_errors else "") if _rec_deleted else "Nothing to remove",
+                                                ok=_rec_errors == 0,
+                                            )
+                                        except Exception as exc:
+                                            await _step_finish("reconcile", f"Error: {exc}", ok=False)
+                                            ui.notify(f"Pipeline reconcile error: {exc}", type="negative")
+
                                     # ── Write customer inventory doc ────────────────────────
                                     if _inv and state.get("customer_name"):
                                         await run.io_bound(
@@ -2895,6 +2977,14 @@ def main_page():
                             with ui.row().classes("items-center gap-4 py-1"):
                                 pipeline_validate_toggle = ui.checkbox("").tooltip("Re-scrape, re-embed, re-score any tickets missing from Couchbase")
                                 ui.label("Validate & Recover").classes(_step_label_cls)
+
+                            # ── Reconcile ─────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_reconcile_toggle = ui.checkbox("").tooltip(
+                                    "Delete tickets from Couchbase that no longer exist in Zendesk. "
+                                    "Only runs on full scrapes — skipped for 'Changed only' mode."
+                                )
+                                ui.label("Reconcile (delete removed)").classes(_step_label_cls)
                         pipeline_status = ui.label("").classes("text-sm text-gray-500 mt-1")
 
                         # ── Pipeline observability card ───────────────────────────────────
@@ -2908,11 +2998,12 @@ def main_page():
                                 btn_stop_pipeline.set_enabled(False)
                             _pipe_step_rows: dict = {}
                             for _sk, _sicon, _sname in [
-                                ("save",     "save",            "Save to Couchbase"),
-                                ("enrich",   "biotech",         "Enrich with Snapshot Topology"),
-                                ("embed",    "model_training",  "Embed Tickets"),
-                                ("score",    "psychology",      "Score & Save"),
-                                ("validate", "verified_user",   "Validate & Recover"),
+                                ("save",      "save",            "Save to Couchbase"),
+                                ("enrich",    "biotech",         "Enrich with Snapshot Topology"),
+                                ("embed",     "model_training",  "Embed Tickets"),
+                                ("score",     "psychology",      "Score & Save"),
+                                ("validate",  "verified_user",   "Validate & Recover"),
+                                ("reconcile", "delete_sweep",    "Reconcile (delete removed)"),
                             ]:
                                 with ui.row().classes("items-start gap-3 w-full py-2 border-b last:border-b-0"):
                                     _ico = ui.icon(_sicon, size="xs").classes("text-gray-300 mt-1")
@@ -10821,8 +10912,9 @@ def main_page():
             "pipeline_embed":     pipeline_embed_toggle.value,
             "pipeline_score":     pipeline_score_toggle.value,
             "pipeline_enrich":    pipeline_enrich_toggle.value,
-            "pipeline_validate":  pipeline_validate_toggle.value,
-            "snap_auto_save_cb":  ch_auto_save_cb.value,
+            "pipeline_validate":   pipeline_validate_toggle.value,
+            "pipeline_reconcile":  pipeline_reconcile_toggle.value,
+            "snap_auto_save_cb":   ch_auto_save_cb.value,
             # CH scrape settings
             "ch_max_pages":       ch_max_pages.value,
             "ch_workers":         ch_workers.value,
@@ -10920,8 +11012,9 @@ def main_page():
         _set(pipeline_embed_toggle,   "pipeline_embed")
         _set(pipeline_score_toggle,   "pipeline_score")
         _set(pipeline_enrich_toggle,  "pipeline_enrich")
-        _set(pipeline_validate_toggle,"pipeline_validate")
-        _set(ch_auto_save_cb,         "snap_auto_save_cb")
+        _set(pipeline_validate_toggle, "pipeline_validate")
+        _set(pipeline_reconcile_toggle,"pipeline_reconcile")
+        _set(ch_auto_save_cb,          "snap_auto_save_cb")
         _set(ch_max_pages,            "ch_max_pages")
         _set(ch_workers,              "ch_workers")
         _set(ch_max_snapshots,        "ch_max_snapshots")
