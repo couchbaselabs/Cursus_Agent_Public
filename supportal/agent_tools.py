@@ -1274,6 +1274,16 @@ def _agent_filters_from_args(args: dict) -> dict:
 
 
 
+_TC_PATTERNS = [
+    # Qwen/LMStudio native: <|tool_call>call:name{...}<tool_call|>
+    re.compile(r"<\|tool_call\>call:(\w+)\s*(\{.*?\})\s*<tool_call\|>", re.DOTALL),
+    # Hermes / ChatML: <tool_call>{"name":"...","arguments":{...}}</tool_call>
+    re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL),
+    # Qwen3 formal: <|tool_call|>{...}<|/tool_call|>
+    re.compile(r"<\|tool_call\|>\s*(\{.*?\})\s*<\|/tool_call\|>", re.DOTALL),
+]
+
+
 def _extract_text_tool_calls(content: str) -> list[tuple[str, dict]]:
     """
     Parse text-encoded tool calls from model content.
