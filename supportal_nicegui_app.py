@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.7"
+__version__ = "2.4.8"
 
 import asyncio
 import threading
@@ -11606,6 +11606,74 @@ def _run_rescrape_job_bg(
         job["errors"] += 1
         _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+
+
+_PROFILE_SCOPE      = "chat"
+_PROFILE_COLLECTION = "profiles"
+
+
+def _ensure_profiles_collection(cluster, bucket_name: str) -> None:
+    try:
+        from couchbase.management.collections import CollectionSpec  # type: ignore
+        cm = cluster.bucket(bucket_name).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if _PROFILE_SCOPE not in existing:
+            cm.create_scope(_PROFILE_SCOPE)
+            existing[_PROFILE_SCOPE] = set()
+        if _PROFILE_COLLECTION not in existing[_PROFILE_SCOPE]:
+            cm.create_collection(CollectionSpec(_PROFILE_COLLECTION, scope_name=_PROFILE_SCOPE))
+        cluster.query(
+            f"CREATE PRIMARY INDEX IF NOT EXISTS "
+            f"ON `{bucket_name}`.`{_PROFILE_SCOPE}`.`{_PROFILE_COLLECTION}`"
+        ).execute()
+    except Exception:
+        pass
+
+
+def _record_customer_access(
+    org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, profile_user: str,
+) -> None:
+    """Increment access_count and update last_accessed_at for org in the user profile."""
+    if not _CB_AVAILABLE or not cb_url or not org:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO  # type: ignore
+        from couchbase.auth import PasswordAuthenticator as _PA               # type: ignore
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        _ensure_profiles_collection(cl, bucket)
+        col = cl.bucket(bucket).scope(_PROFILE_SCOPE).collection(_PROFILE_COLLECTION)
+        key = f"profile::{profile_user}"
+        now = int(time.time())
+        try:
+            doc = col.get(key).content_as[dict]
+        except Exception:
+            doc = {"username": profile_user, "top_customers": [], "alert_thresholds": {
+                "new_p1": True, "score_drop_pts": 10, "stale_hours": 12,
+            }, "last_validated_at": 0, "updated_at": 0}
+        customers = doc.get("top_customers") or []
+        entry = next((c for c in customers if (c.get("name") or "").lower() == org.lower()), None)
+        if entry:
+            entry["access_count"] = (entry.get("access_count") or 0) + 1
+            entry["last_accessed_at"] = now
+        else:
+            customers.append({
+                "name": org, "access_count": 1,
+                "last_accessed_at": now, "validated_at": 0, "is_valid": True,
+            })
+        def _score(c: dict) -> float:
+            days = max(0, (now - (c.get("last_accessed_at") or 0)) / 86400)
+            return (c.get("access_count") or 1) / (1.0 + days)
+        customers.sort(key=_score, reverse=True)
+        doc["top_customers"] = customers[:20]
+        doc["updated_at"] = now
+        col.upsert(key, doc)
+        cl.close()
+    except Exception:
+        pass
 
 
 def _execute_agent_tool(
