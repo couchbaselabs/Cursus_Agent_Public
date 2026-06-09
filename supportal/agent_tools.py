@@ -13,10 +13,15 @@ import threading
 import datetime
 import uuid
 import html
+import importlib
 from collections import Counter
 from supportal.scoring import call_llm
 from supportal.cb_helpers import _cb_conn_str
 from supportal.llm_providers import lmstudio_ensure_model_loaded
+
+def _get_main_app():
+    """Lazy import of supportal_nicegui_app to avoid circular imports at load time."""
+    return importlib.import_module("supportal_nicegui_app")
 
 # ──────────────────────────── Phase 2b: Agent Tool Calling ───────────────────
 
@@ -1506,7 +1511,7 @@ def call_llm_with_tools(
                         _tc_args = _normalise_tool_args(_tc_name, _tc_args)
                         _notify_tool(_tc_name)
                         print(f"[agent] text-call executing tool={_tc_name!r} args_keys={list(_tc_args.keys())}")
-                        _tc_result = _execute_agent_tool(
+                        _tc_result = _get_main_app()._execute_agent_tool(
                             _tc_name, _tc_args,
                             cb_url, bucket, username, password, use_tls, scope, collection,
                             default_customer=default_customer, ctx=ctx,
@@ -1547,7 +1552,7 @@ def call_llm_with_tools(
                         _args = {}
                     _notify_tool(_fn.name)
                     print(f"[agent] executing tool={_fn.name!r} args={_args}")
-                    result = _execute_agent_tool(
+                    result = _get_main_app()._execute_agent_tool(
                         _fn.name, _args,
                         cb_url, bucket, username, password, use_tls, scope, collection,
                         default_customer=default_customer, ctx=ctx,
@@ -1616,7 +1621,7 @@ def call_llm_with_tools(
                 _args = tb.input if isinstance(tb.input, dict) else {}
                 _notify_tool(tb.name)
                 print(f"[agent/claude] tool={tb.name} args={_args}")
-                result = _execute_agent_tool(
+                result = _get_main_app()._execute_agent_tool(
                     tb.name, _args,
                     cb_url, bucket, username, password, use_tls, scope, collection,
                     default_customer=default_customer, ctx=ctx,
