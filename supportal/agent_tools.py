@@ -15,9 +15,17 @@ import uuid
 import html
 import importlib
 from collections import Counter
+from datetime import timedelta
 from supportal.scoring import call_llm
 from supportal.cb_helpers import _cb_conn_str
 from supportal.llm_providers import lmstudio_ensure_model_loaded
+
+try:
+    from couchbase.cluster import Cluster          # type: ignore
+    from couchbase.options import ClusterOptions   # type: ignore
+    from couchbase.auth import PasswordAuthenticator  # type: ignore
+except ImportError:
+    Cluster = ClusterOptions = PasswordAuthenticator = None  # type: ignore
 
 def _get_main_app():
     """Lazy import of supportal_nicegui_app to avoid circular imports at load time."""

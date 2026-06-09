@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.5"
+__version__ = "2.4.6"
 
 import asyncio
 import threading
@@ -12937,6 +12937,7 @@ LIMIT {limit}
             cl_.close()
             orgs = [r.get("organization") for r in orgs_rows if r.get("organization")][:limit]
             results = []
+            _errs: list[str] = []
             for org in orgs:
                 try:
                     if incl_cluster:
@@ -12947,8 +12948,11 @@ LIMIT {limit}
                         h = _compute_health_score(org, cb_url, bucket, username, password,
                                                    use_tls, scope, collection)
                     results.append(h)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _errs.append(f"{org}: {_e}")
+            if not results:
+                err_detail = "; ".join(_errs[:3]) if _errs else "no organizations found in ticket collection"
+                return f"Portfolio status: no data returned. {err_detail}"
             results.sort(key=lambda x: x["score"])
             if incl_cluster:
                 lines = [
