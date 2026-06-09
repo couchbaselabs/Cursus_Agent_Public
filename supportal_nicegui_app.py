@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 import asyncio
 import threading
@@ -1605,9 +1605,25 @@ def parse_ticket_detail(html: str, url: str) -> dict:
     }
 
 
+def _is_deleted_api_ticket(body: dict, ticket: dict) -> bool:
+    """Return True if the API response represents a deleted/empty ticket."""
+    status = str(ticket.get("status") or body.get("status") or "").lower()
+    if status == "deleted":
+        return True
+    # Deleted tickets sometimes return 200 with a null/empty subject and no description
+    subject = ticket.get("subject") or body.get("subject") or ""
+    description = ticket.get("description") or body.get("description") or ""
+    if not subject and not description and not (ticket.get("comments") or []):
+        return True
+    return False
+
+
 def parse_ticket_from_api(body: dict, ticket_id: str) -> dict:
     """Map a /zendesk/ticket/{id}/status JSON response to the same schema as parse_ticket_detail."""
     ticket = body.get("ticket") or {}
+
+    if _is_deleted_api_ticket(body, ticket):
+        return {"ticket_id": str(ticket_id), "_deleted": True, "url": f"{BASE_URL}/zendesk/ticket/{ticket_id}"}
 
     # Build author_id -> name map from known user objects in the response
     id_to_name: dict[int, str] = {}
@@ -2839,9 +2855,14 @@ def scrape_with_cookie(
     raw_listing = _get_customer_ticket_listing_api(customer, session, progress_cb)
 
     listing_summaries: list[dict] = []
+    _skipped_deleted = 0
     for item in raw_listing:
         tid = str(item.get("id") or "").strip()
         if not tid:
+            continue
+        item_status = str(item.get("status") or "").lower()
+        if item_status == "deleted":
+            _skipped_deleted += 1
             continue
         listing_summaries.append({
             "ticket_id": tid,
@@ -2853,7 +2874,8 @@ def scrape_with_cookie(
             "solved":    item.get("solved_at", ""),
         })
 
-    progress_cb(f"Listing complete — {len(listing_summaries)} tickets found. Fetching details…", 0.15)
+    _deleted_note = f" ({_skipped_deleted} deleted skipped)" if _skipped_deleted else ""
+    progress_cb(f"Listing complete — {len(listing_summaries)} tickets found{_deleted_note}. Fetching details…", 0.15)
 
     # ── Step 2: change detection / incremental filtering ──────────────────
     if change_signals is not None:
@@ -7118,9 +7140,16 @@ def main_page():
                                         "- count_tickets: for total/count questions\n"
                                         "- query_tickets: to list or filter tickets (returns Last Scraped age per ticket)\n"
                                         "- get_ticket: full detail on one ticket including cluster topology from the linked "
-                                        "snapshot (node count, CB version, services, buckets, RAM, auto-failover, bad/warn "
-                                        "health counts). Use this whenever the user asks about cluster configuration, "
-                                        "node count, topology, or infrastructure details for a specific ticket.\n"
+                                        "snapshot (node count, CB version, services, buckets, RAM/node, CPUs/node, "
+                                        "auto-failover, bad/warn health counts). Use this whenever the user asks about "
+                                        "cluster configuration, node count, topology, or infrastructure details for a "
+                                        "specific ticket. NOTE: CPUs/node may be absent from a specific snapshot — if so, "
+                                        "the output will say to call get_cluster_health to check other snapshots.\n"
+                                        "HARDWARE RULE — CRITICAL: Never answer questions about CPUs/node, RAM/node, "
+                                        "disk, or OS from conversation memory. If a prior get_ticket result lacked "
+                                        "CPUs/node, you MUST call get_cluster_health(organization=...) — it aggregates "
+                                        "across ALL snapshots and will find the value even when one snapshot is missing it. "
+                                        "Do NOT say 'CPU data is not available' without first calling get_cluster_health.\n"
                                         "- check_data_freshness: ALWAYS call this when the user asks about 'current status', "
                                         "'latest', 'live', 'today', or 'has this changed'. Pass the ticket_ids from a prior "
                                         "query_tickets call. Report the age and include Supportal URLs for live verification.\n"
@@ -7147,6 +7176,9 @@ def main_page():
                                         "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
                                         "- vector_search: semantic/similarity search — use when keyword filters won't capture the concept.\n"
                                         "- get_cluster_health: summary of all clusters for a customer from stored snapshots. "
+                                        "Returns CB version, node counts, CPUs/node, RAM/node, bad/warn counts, and status. "
+                                        "Call this when the user asks about hardware specs (CPU cores, RAM per node), "
+                                        "cluster state, or version distribution — even if a specific ticket had no CPU data. "
                                         "Auto-triggers sync_snapshots if no local snapshots exist and a cookie is available.\n"
                                         "- sync_snapshots: ONE-STEP snapshot sync — fetches stubs then enriches topology. "
                                         "Prefer this over calling fetch_snapshots + backfill_snapshot_topology separately.\n"
@@ -8438,15 +8470,14 @@ def main_page():
                         chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
                         charts_area  = ui.column().classes("w-full gap-4 mt-3")
 
-                        # ── Chart drill-down panel ─────────────────────────────────────────
-                        # Shared panel — any chart click populates this; cleared on next click
-                        _drill_panel = ui.card().classes("w-full border border-blue-300 bg-blue-50 mt-2")
-                        with _drill_panel:
-                            with ui.row().classes("w-full items-center justify-between mb-1"):
+                        # ── Chart drill-down dialog ────────────────────────────────────────
+                        # Shared modal — chart clicks open this; rows click to ticket detail
+                        _drill_dlg = ui.dialog().props("maximized=false").classes("q-pa-none")
+                        with _drill_dlg, ui.card().classes("w-full").style("min-width:700px;max-width:1000px;max-height:85vh;overflow-y:auto;padding:16px"):
+                            with ui.row().classes("w-full items-center justify-between mb-2"):
                                 _drill_label = ui.label("").classes("text-sm font-semibold text-blue-800")
-                                ui.button(icon="close", on_click=lambda: _drill_panel.set_visibility(False)).props("flat round dense color=grey-6 size=sm")
+                                ui.button(icon="close", on_click=lambda: _drill_dlg.close()).props("flat round dense color=grey-6 size=sm")
                             _drill_rows_area = ui.column().classes("w-full")
-                        _drill_panel.set_visibility(False)
 
                         # Ticket detail dialog
                         _ticket_dlg = ui.dialog().props("maximized=false").classes("q-pa-none")
@@ -8688,10 +8719,10 @@ def main_page():
                             def _show_drill(title: str, tickets: list[dict]):
                                 _drill_label.set_text(title)
                                 _drill_rows_area.clear()
-                                _drill_panel.set_visibility(True)
                                 if not tickets:
                                     with _drill_rows_area:
                                         ui.label("No matching tickets.").classes("text-sm text-gray-400 p-2")
+                                    _drill_dlg.open()
                                     return
                                 _sorted = sorted(tickets, key=lambda x: x.get("created") or "", reverse=True)[:200]
                                 _cols = [
@@ -8720,6 +8751,7 @@ def main_page():
                                     _dtbl.on("rowClick", lambda e: _open_ticket_detail(
                                         _tid_map.get((e.args[1] if isinstance(e.args, list) else e.args.get("row", {})).get("_tid", ""), {})
                                     ))
+                                _drill_dlg.open()
 
                             # Run in a thread so the NiceGUI event loop isn't blocked
                             # while processing large ticket sets (e.g. 1 000+ tickets).
@@ -8807,14 +8839,29 @@ def main_page():
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
                                         _comm_labels = data["comment_labels"]
-                                        ui.echart({
-                                            "title":   {"text": "Comment Count Distribution"},
+                                        _cchart = ui.echart({
+                                            "title":   {"text": "Comment Count Distribution", "subtext": "Click bar to drill down"},
                                             "tooltip": {"trigger": "axis"},
                                             "xAxis":   {"type": "category", "data": _comm_labels},
                                             "yAxis":   {"type": "value", "name": "Tickets"},
                                             "color":   ["#00ACC1"],
                                             "series":  [{"name": "Tickets", "type": "bar", "data": data["comment_values"]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        _comm_bucket_map = {
+                                            "1": lambda c: c <= 1,
+                                            "2-5": lambda c: 2 <= c <= 5,
+                                            "6-10": lambda c: 6 <= c <= 10,
+                                            "11-20": lambda c: 11 <= c <= 20,
+                                            "21+": lambda c: c >= 21,
+                                        }
+                                        def _on_comm_click(e, _dts=display_tickets, _bm=_comm_bucket_map):
+                                            lbl = e.name or ""
+                                            fn = _bm.get(lbl)
+                                            if not fn:
+                                                return
+                                            _f = [t for t in _dts if fn(int(t.get("comment_count") or 0))]
+                                            _show_drill(f"{len(_f)} tickets — Comments: {lbl}", _f)
+                                        _cchart.on_point_click(_on_comm_click)
                                     with ui.card().classes("flex-1"):
                                         _eschart = ui.echart({
                                             "title":   {"text": "Escalation Rate", "subtext": "Click slice to drill down"},
@@ -8978,33 +9025,55 @@ def main_page():
                                     # Row 4: Stars + Temperature
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "Experience Stars Distribution"},
+                                            _stchart = ui.echart({
+                                                "title":   {"text": "Experience Stars Distribution", "subtext": "Click bar to drill down"},
                                                 "tooltip": {"trigger": "axis"},
                                                 "xAxis":   {"type": "category", "data": ["★1","★2","★3","★4","★5"]},
                                                 "yAxis":   {"type": "value", "name": "Tickets"},
                                                 "color":   ["#FDD835"],
                                                 "series":  [{"name": "Tickets", "type": "bar", "data": data["stars_values"]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_stars_click(e, _dts=display_tickets, _sc=display_scores):
+                                                lbl = e.name or ""
+                                                n = lbl.replace("★","").strip()
+                                                if not n.isdigit():
+                                                    return
+                                                _f = [t for t in _dts if str(_sc.get(str(t.get("ticket_id","")), {}).get("stars") or "") == n]
+                                                _show_drill(f"{len(_f)} tickets — {lbl} stars", _f)
+                                            _stchart.on_point_click(_on_stars_click)
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "Temperature Distribution"},
+                                            _tempchart = ui.echart({
+                                                "title":   {"text": "Temperature Distribution", "subtext": "Click slice to drill down"},
                                                 "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                                 "color":   ["#42A5F5","#FFA726","#EF5350"],
                                                 "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["temp_labels"], data["temp_values"])]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_temp_click(e, _dts=display_tickets, _sc=display_scores):
+                                                lbl = (e.name or "").lower()
+                                                if not lbl:
+                                                    return
+                                                _f = [t for t in _dts if ((_sc.get(str(t.get("ticket_id","")), {}) or {}).get("temperature") or "").lower() == lbl]
+                                                _show_drill(f"{len(_f)} tickets — Temperature: {e.name}", _f)
+                                            _tempchart.on_point_click(_on_temp_click)
 
                                     # Row 5: Complexity + Dimension averages
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "Complexity Score Distribution"},
+                                            _compchart = ui.echart({
+                                                "title":   {"text": "Complexity Score Distribution", "subtext": "Click bar to drill down"},
                                                 "tooltip": {"trigger": "axis"},
                                                 "xAxis":   {"type": "category", "data": ["1","2","3","4","5"]},
                                                 "yAxis":   {"type": "value", "name": "Tickets"},
                                                 "color":   ["#8E24AA"],
                                                 "series":  [{"name": "Tickets", "type": "bar", "data": data["complexity_values"]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_complexity_click(e, _dts=display_tickets, _sc=display_scores):
+                                                lbl = e.name or ""
+                                                if not lbl.isdigit():
+                                                    return
+                                                _f = [t for t in _dts if str((_sc.get(str(t.get("ticket_id","")), {}) or {}).get("complexity") or "") == lbl]
+                                                _show_drill(f"{len(_f)} tickets — Complexity: {lbl}", _f)
+                                            _compchart.on_point_click(_on_complexity_click)
                                         with ui.card().classes("flex-1"):
                                             ui.echart({
                                                 "title":   {"text": "Avg Dimension Scores (1-5)"},
@@ -9031,8 +9100,8 @@ def main_page():
                                         ]
                                         if bubble_pts:
                                             with ui.card().classes("w-full"):
-                                                ui.echart({
-                                                    "title":     {"text": "Customer Portfolio: Volume vs Satisfaction", "subtext": "Bubble size = avg complexity · Hover for customer name"},
+                                                _bbchart = ui.echart({
+                                                    "title":     {"text": "Customer Portfolio: Volume vs Satisfaction", "subtext": "Bubble size = avg complexity · Click bubble to drill down"},
                                                     "tooltip":   {"trigger": "item", "formatter": "{b}<br/>Tickets: {c[0]}<br/>Avg Stars: {c[1]}<br/>Avg Complexity: {c[2]}"},
                                                     "xAxis":     {"type": "value", "name": "Ticket Count"},
                                                     "yAxis":     {"type": "value", "name": "Avg Stars (1-5)", "min": 0, "max": 5},
@@ -9040,27 +9109,53 @@ def main_page():
                                                     "color":     ["rgba(30,136,229,0.65)"],
                                                     "series":    [{"name": "Customers", "type": "scatter", "data": [{"name": pt["name"], "value": [pt["x"], pt["y"], pt["z"]]} for pt in bubble_pts]}],
                                                 }).classes("w-full").style(f"height:{ch_bbl}px")
+                                                def _on_bubble_click(e, _dts=display_tickets, _om=_org_map):
+                                                    org = e.name or ""
+                                                    if not org:
+                                                        return
+                                                    _f = [t for t in _dts if _apply_org_map(t.get("organization",""), _om) == org]
+                                                    _show_drill(f"{len(_f)} tickets — {org}", _f)
+                                                _bbchart.on_point_click(_on_bubble_click)
 
                                 # ── Cluster & Snapshot metrics ──────────────────────────
                                 ui.label("— Cluster & Snapshot Metrics —").classes("text-sm font-semibold text-gray-500 text-center w-full mt-2")
 
+                                _snap_bucket_fn = {
+                                    "0":    lambda t: int(t.get("snapshot_count") or 0) == 0,
+                                    "1":    lambda t: int(t.get("snapshot_count") or 0) == 1,
+                                    "2-5":  lambda t: 2 <= int(t.get("snapshot_count") or 0) <= 5,
+                                    "6-10": lambda t: 6 <= int(t.get("snapshot_count") or 0) <= 10,
+                                    "11+":  lambda t: int(t.get("snapshot_count") or 0) >= 11,
+                                }
+
                                 with ui.row().classes("w-full gap-4"):
                                     # Snapshot count distribution
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Snapshots per Ticket", "subtext": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot"},
+                                        _snchart = ui.echart({
+                                            "title":   {"text": "Snapshots per Ticket", "subtext": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot · Click bar to drill down"},
                                             "tooltip": {"trigger": "axis"},
                                             "xAxis":   {"type": "category", "data": data["snap_bucket_labels"], "name": "Snapshot Count"},
                                             "yAxis":   {"type": "value", "name": "Tickets"},
                                             "color":   ["#00ACC1"],
                                             "series":  [{"name": "Tickets", "type": "bar", "data": data["snap_bucket_values"]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_snap_click(e, _dts=display_tickets, _bm=_snap_bucket_fn):
+                                            lbl = e.name or ""
+                                            fn = _bm.get(lbl)
+                                            if not fn:
+                                                return
+                                            try:
+                                                _f = [t for t in _dts if fn(t)]
+                                            except Exception:
+                                                _f = []
+                                            _show_drill(f"{len(_f)} tickets — Snapshots: {lbl}", _f)
+                                        _snchart.on_point_click(_on_snap_click)
 
                                     # Cluster names (if any detected)
                                     if data["cluster_name_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":    {"text": "Top Cluster Names by Ticket Count", "subtext": "Drag to zoom"},
+                                            _cnchart = ui.echart({
+                                                "title":    {"text": "Top Cluster Names by Ticket Count", "subtext": "Drag to zoom · Click bar to drill down"},
                                                 "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                                 "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                                 "grid":     {"left": 190, "right": 60},
@@ -9069,10 +9164,17 @@ def main_page():
                                                 "color":    ["#5E35B1"],
                                                 "series":   [{"name": "Tickets", "type": "bar", "data": data["cluster_name_values"]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_cname_click(e, _dts=display_tickets):
+                                                cn = (e.name or "").lower()
+                                                if not cn:
+                                                    return
+                                                _f = [t for t in _dts if _topo_str((t.get("snapshot_topology") or {}).get("cluster_name")).lower() == cn]
+                                                _show_drill(f"{len(_f)} tickets — Cluster: {e.name}", _f)
+                                            _cnchart.on_point_click(_on_cname_click)
                                     elif data["cluster_id_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                            _cidchart = ui.echart({
+                                                "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom · Click bar to drill down"},
                                                 "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                                 "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                                 "grid":     {"left": 110, "right": 60},
@@ -9081,6 +9183,14 @@ def main_page():
                                                 "color":    ["#5E35B1"],
                                                 "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_cid_click(e, _dts=display_tickets):
+                                                # e.name is the full UUID embedded in the data item
+                                                cid = (e.name or "").lower()
+                                                if not cid:
+                                                    return
+                                                _f = [t for t in _dts if cid in _topo_str((t.get("snapshot_topology") or {}).get("cluster_uuid")).lower() or cid in _topo_str((t.get("snapshot_topology") or {}).get("capella_cluster_id")).lower()]
+                                                _show_drill(f"{len(_f)} tickets — Cluster ID: {e.name[:12]}…", _f)
+                                            _cidchart.on_point_click(_on_cid_click)
                                     else:
                                         with ui.card().classes("flex-1"):
                                             ui.label("No cluster names or IDs detected in ticket data.").classes("text-sm text-gray-400 p-4")
@@ -9088,8 +9198,8 @@ def main_page():
                                 # Cluster IDs (separate row, only if both names and IDs exist)
                                 if data["cluster_name_labels"] and data["cluster_id_labels"]:
                                     with ui.card().classes("w-full"):
-                                        ui.echart({
-                                            "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                        _cid2chart = ui.echart({
+                                            "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom · Click bar to drill down"},
                                             "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                             "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                             "grid":     {"left": 110, "right": 60},
@@ -9098,6 +9208,13 @@ def main_page():
                                             "color":    ["#3949AB"],
                                             "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
                                         }).classes("w-full").style(f"height:{ch}px")
+                                        def _on_cid2_click(e, _dts=display_tickets):
+                                            cid = (e.name or "").lower()
+                                            if not cid:
+                                                return
+                                            _f = [t for t in _dts if cid in _topo_str((t.get("snapshot_topology") or {}).get("cluster_uuid")).lower() or cid in _topo_str((t.get("snapshot_topology") or {}).get("capella_cluster_id")).lower()]
+                                            _show_drill(f"{len(_f)} tickets — Cluster ID: {e.name[:12]}…", _f)
+                                        _cid2chart.on_point_click(_on_cid2_click)
 
                                 # Unique clusters vs tickets per version
                                 if data["clusters_by_version_labels"]:
@@ -9107,8 +9224,8 @@ def main_page():
                                             ui.label(str(data["unique_cluster_total"])).classes("text-3xl font-bold text-teal-600")
                                             ui.label("Unique Clusters Seen (all tickets)").classes("text-xs text-gray-500")
                                     with ui.card().classes("w-full"):
-                                        ui.echart({
-                                            "title":   {"text": "Unique Clusters vs Tickets — by Version", "subtext": f"{data['unique_cluster_total']} unique cluster UUIDs · drag to zoom"},
+                                        _cvchart = ui.echart({
+                                            "title":   {"text": "Unique Clusters vs Tickets — by Version", "subtext": f"{data['unique_cluster_total']} unique cluster UUIDs · drag to zoom · click to drill down"},
                                             "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                             "legend":  {"bottom": 0},
                                             "grid":    {"left": 100, "bottom": 50},
@@ -9120,6 +9237,13 @@ def main_page():
                                                 {"name": "Tickets",         "type": "bar", "data": data["tickets_by_version_for_clusters"]},
                                             ],
                                         }).classes("w-full").style(f"height:{_cv_h}px")
+                                        def _on_cv_click(e, _dts=display_tickets):
+                                            ver = e.name or ""
+                                            if not ver:
+                                                return
+                                            _f = [t for t in _dts if extract_ticket_version(t) == ver]
+                                            _show_drill(f"{len(_f)} tickets — Version: {ver}", _f)
+                                        _cvchart.on_point_click(_on_cv_click)
 
                                 # ── CBSE Document Analytics ──────────────────────────────────────
                                 if data["cbse_total"] > 0:
@@ -9136,22 +9260,30 @@ def main_page():
                                             ui.label("CBSEs per Ticket (avg)").classes("text-xs text-gray-500")
 
                                     # Charts: per-year bar + per-month line
+                                    _cbse_re2 = re.compile(r"cbse[-_]?\d+", re.IGNORECASE)
                                     with ui.row().classes("w-full gap-4"):
                                         if data["cbse_year_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.echart({
-                                                    "title":   {"text": "CBSEs Generated per Year"},
+                                                _cbseyrchart = ui.echart({
+                                                    "title":   {"text": "CBSEs Generated per Year", "subtext": "Click bar to drill down"},
                                                     "tooltip": {"trigger": "axis"},
                                                     "xAxis":   {"type": "category", "data": data["cbse_year_labels"], "name": "Year"},
                                                     "yAxis":   {"type": "value", "name": "CBSE Count", "minInterval": 1},
                                                     "color":   ["#7B1FA2"],
                                                     "series":  [{"name": "CBSEs", "type": "bar", "data": data["cbse_year_values"], "label": {"show": True, "position": "top"}}],
                                                 }).classes("w-full").style(f"height:{ch_sm}px")
+                                                def _on_cbse_yr_click(e, _dts=display_tickets, _rx=_cbse_re2):
+                                                    yr = e.name or ""
+                                                    if not yr:
+                                                        return
+                                                    _f = [t for t in _dts if (t.get("created") or "")[:4] == yr and _rx.search(_topo_str(_parse_ticket_fields(t).get("CBSE")))]
+                                                    _show_drill(f"{len(_f)} tickets with CBSEs — {yr}", _f)
+                                                _cbseyrchart.on_point_click(_on_cbse_yr_click)
 
                                         if data["cbse_month_keys"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.echart({
-                                                    "title":    {"text": "CBSEs Generated per Month", "subtext": "Drag to zoom"},
+                                                _cbsemochart = ui.echart({
+                                                    "title":    {"text": "CBSEs Generated per Month", "subtext": "Drag to zoom · Click to drill down"},
                                                     "tooltip":  {"trigger": "axis"},
                                                     "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
                                                     "grid":     {"bottom": 60},
@@ -9160,6 +9292,13 @@ def main_page():
                                                     "color":    ["#5C6BC0"],
                                                     "series":   [{"name": "CBSEs", "type": "line", "smooth": True, "data": data["cbse_month_values"]}],
                                                 }).classes("w-full").style(f"height:{ch_sm}px")
+                                                def _on_cbse_mo_click(e, _dts=display_tickets, _rx=_cbse_re2):
+                                                    mo = e.name or ""
+                                                    if not mo:
+                                                        return
+                                                    _f = [t for t in _dts if _parse_created([t]) and _parse_created([t])[0] == mo and _rx.search(_topo_str(_parse_ticket_fields(t).get("CBSE")))]
+                                                    _show_drill(f"{len(_f)} tickets with CBSEs — {mo}", _f)
+                                                _cbsemochart.on_point_click(_on_cbse_mo_click)
 
                                 # ── Enriched topology charts (only when ≥1 ticket enriched) ──────
                                 if data["enriched_ticket_count"] > 0:
@@ -10505,15 +10644,83 @@ def main_page():
                                                     ui.label(label).classes("text-xs text-gray-500")
                                                     ui.label(str(val)).classes("text-sm font-semibold")
 
+                                # ── Ticket detail opener (reuses shared scoring-tab dialog) ──
+                                _cr_tid_map = {str(t.get("ticket_id","")): t for t in tickets_src}
+
+                                def _open_cr_ticket(ticket: dict):
+                                    _ticket_dlg_body.clear()
+                                    with _ticket_dlg_body:
+                                        tf2 = _parse_ticket_fields(ticket)
+                                        with ui.row().classes("w-full items-start justify-between gap-2"):
+                                            with ui.column().classes("flex-1 gap-0"):
+                                                ui.label(f"#{ticket.get('ticket_id')} · {ticket.get('organization','')}").classes("text-xs text-gray-400")
+                                                ui.label(ticket.get("subject") or "").classes("text-base font-semibold")
+                                            ui.button(icon="close", on_click=_ticket_dlg.close).props("flat round dense color=grey-6")
+                                        with ui.row().classes("gap-4 flex-wrap text-xs text-gray-500"):
+                                            for _l2, _v2 in [
+                                                ("Priority",  (ticket.get("priority") or "—").upper()),
+                                                ("Status",    (ticket.get("status")   or "—").capitalize()),
+                                                ("Created",   (ticket.get("created")  or "")[:10]),
+                                                ("Version",   extract_ticket_version(ticket)),
+                                                ("Component", tf2.get("Component") or "—"),
+                                            ]:
+                                                with ui.column().classes("gap-0"):
+                                                    ui.label(_l2).classes("text-xs text-gray-400")
+                                                    ui.label(_v2).classes("text-xs font-medium")
+                                        _dtopo2 = ticket.get("snapshot_topology") or {}
+                                        if isinstance(_dtopo2, dict) and _dtopo2 and (
+                                            _dtopo2.get("total_nodes") or _dtopo2.get("cb_version")
+                                        ):
+                                            ui.separator()
+                                            ui.label("Cluster Topology (snapshot)").classes("text-xs font-semibold text-gray-500")
+                                            _chips2 = []
+                                            for _l2, _k2 in [("CB Version","cb_version"),("Nodes","total_nodes"),("Buckets","bucket_count"),("GSI","global_index_count"),("FTS Idx","fts_index_count"),("Eventing Fns","eventing_function_count"),("N2N Enc","n2n_encryption"),("Auto-failover","auto_failover_seconds")]:
+                                                if _dtopo2.get(_k2) is not None:
+                                                    _chips2.append((_l2, str(_dtopo2[_k2]) + ("s" if _k2 == "auto_failover_seconds" else "")))
+                                            if _dtopo2.get("bad_count") or _dtopo2.get("warn_count"):
+                                                _chips2.append(("Health", f"{_dtopo2.get('bad_count',0)} bad / {_dtopo2.get('warn_count',0)} warn"))
+                                            with ui.row().classes("gap-2 flex-wrap mt-1"):
+                                                for _l2, _v2 in _chips2:
+                                                    with ui.column().classes("gap-0"):
+                                                        ui.label(_l2).classes("text-xs text-gray-400")
+                                                        ui.label(_v2).classes("text-xs font-medium")
+                                        desc2 = (ticket.get("description") or "").strip()
+                                        if desc2:
+                                            ui.separator()
+                                            ui.label(desc2[:2000]).classes("text-xs text-gray-700 whitespace-pre-wrap")
+                                    _ticket_dlg.open()
+
                                 # ── Time-series charts ────────────────────────────────────
                                 for spec in chart_specs:
                                     _ch = spec.pop("_height", 280)
+                                    _is_scatter = any(
+                                        s.get("type") == "scatter"
+                                        for s in (spec.get("series") or [])
+                                    )
                                     with ui.card().classes("w-full"):
-                                        ui.echart(spec).classes("w-full").style(f"height:{_ch}px")
+                                        _ec = ui.echart(spec).classes("w-full").style(f"height:{_ch}px")
+                                    if _is_scatter:
+                                        # Scatter: ticket_id is embedded at data[3]
+                                        def _on_scatter_click(e, _tm=_cr_tid_map):
+                                            d = e.data
+                                            if isinstance(d, list) and len(d) > 3:
+                                                t2 = _tm.get(str(d[3]))
+                                                if t2:
+                                                    _open_cr_ticket(t2)
+                                        _ec.on_point_click(_on_scatter_click)
+                                    else:
+                                        # Line/bar: data_index corresponds to points[idx]
+                                        def _on_tl_click(e, _pts=points, _tm=_cr_tid_map):
+                                            idx = e.data_index
+                                            if idx is not None and 0 <= idx < len(_pts):
+                                                t2 = _tm.get(str(_pts[idx]["ticket_id"]))
+                                                if t2:
+                                                    _open_cr_ticket(t2)
+                                        _ec.on_point_click(_on_tl_click)
 
-                                # ── CB Version & Orchestrator change log ──────────────────
+                                # ── CB Version / SDK / Orchestrator change log ────────────
                                 version_changes = [
-                                    (p["date_label"], p["ticket_id"], p["cb_version"])
+                                    (p["date_label"], p["ticket_id"], p["cb_version"], p.get("sdk_version") or "")
                                     for p in points if p["cb_version"]
                                 ]
                                 orch_changes = [
@@ -10525,17 +10732,18 @@ def main_page():
                                     with ui.row().classes("w-full gap-4"):
                                         if version_changes:
                                             with ui.card().classes("flex-1"):
-                                                ui.label("CB Version History").classes("text-sm font-semibold mb-2")
+                                                ui.label("CB Version & SDK Change Log").classes("text-sm font-semibold mb-2")
                                                 cols = [
-                                                    {"name": "date",    "label": "Date",      "field": "date",    "align": "left"},
-                                                    {"name": "tid",     "label": "Ticket",    "field": "tid",     "align": "left"},
-                                                    {"name": "version", "label": "Version",   "field": "version", "align": "left"},
+                                                    {"name": "date",    "label": "Date",        "field": "date",    "align": "left"},
+                                                    {"name": "tid",     "label": "Ticket",      "field": "tid",     "align": "left"},
+                                                    {"name": "version", "label": "CB Version",  "field": "version", "align": "left"},
+                                                    {"name": "sdk",     "label": "SDK Version", "field": "sdk",     "align": "left"},
                                                 ]
                                                 rows = [
-                                                    {"date": d, "tid": str(tid), "version": v}
-                                                    for d, tid, v in version_changes
+                                                    {"date": d, "tid": str(tid), "version": v, "sdk": sdk}
+                                                    for d, tid, v, sdk in version_changes
                                                 ]
-                                                ui.table(columns=cols, rows=rows, row_key="date").classes("w-full text-xs")
+                                                ui.table(columns=cols, rows=rows, row_key="tid").classes("w-full text-xs")
 
                                         if orch_changes:
                                             with ui.card().classes("flex-1"):
@@ -10549,20 +10757,21 @@ def main_page():
                                                     {"date": d, "tid": str(tid), "orch": o}
                                                     for d, tid, o in orch_changes
                                                 ]
-                                                ui.table(columns=cols, rows=rows, row_key="date").classes("w-full text-xs")
+                                                ui.table(columns=cols, rows=rows, row_key="tid").classes("w-full text-xs")
 
                                 # ── Ticket list ───────────────────────────────────────────
                                 with ui.card().classes("w-full"):
                                     ui.label("Matching Tickets (chronological)").classes("text-sm font-semibold mb-2")
                                     cols = [
-                                        {"name": "date",    "label": "Date",    "field": "date",    "align": "left"},
-                                        {"name": "tid",     "label": "Ticket",  "field": "tid",     "align": "left"},
-                                        {"name": "subject", "label": "Subject", "field": "subject", "align": "left"},
-                                        {"name": "nodes",   "label": "Nodes",   "field": "nodes",   "align": "right"},
-                                        {"name": "bkts",    "label": "Buckets", "field": "bkts",    "align": "right"},
-                                        {"name": "ver",     "label": "Version", "field": "ver",     "align": "left"},
-                                        {"name": "bad",     "label": "BAD",     "field": "bad",     "align": "right"},
-                                        {"name": "warn",    "label": "WARN",    "field": "warn",    "align": "right"},
+                                        {"name": "date",    "label": "Date",        "field": "date",    "align": "left"},
+                                        {"name": "tid",     "label": "Ticket",      "field": "tid",     "align": "left"},
+                                        {"name": "subject", "label": "Subject",     "field": "subject", "align": "left"},
+                                        {"name": "nodes",   "label": "Nodes",       "field": "nodes",   "align": "right"},
+                                        {"name": "bkts",    "label": "Buckets",     "field": "bkts",    "align": "right"},
+                                        {"name": "ver",     "label": "CB Version",  "field": "ver",     "align": "left"},
+                                        {"name": "sdk",     "label": "SDK Version", "field": "sdk",     "align": "left"},
+                                        {"name": "bad",     "label": "BAD",         "field": "bad",     "align": "right"},
+                                        {"name": "warn",    "label": "WARN",        "field": "warn",    "align": "right"},
                                     ]
                                     rows = [
                                         {
@@ -10572,6 +10781,7 @@ def main_page():
                                             "nodes":   p["node_count"] if p["node_count"] is not None else "",
                                             "bkts":    p["bucket_count"] if p["bucket_count"] is not None else "",
                                             "ver":     p["cb_version"] or "",
+                                            "sdk":     p.get("sdk_version") or "",
                                             "bad":     p["bad_count"],
                                             "warn":    p["warn_count"],
                                         }
@@ -12810,18 +13020,21 @@ def load_tickets_from_cb(
     _terms = [t.strip() for t in customer_filter.split(",") if t.strip()]
     # Step 1: N1QL returns only META().id in sort order (cheap — index can cover this).
     # The ORDER BY is preserved so KV results are re-assembled in priority order.
+    _not_deleted = "(t.`_deleted` IS MISSING OR t.`_deleted` = false)"
     if _terms:
         _clauses = " OR ".join(
             f"LOWER(t.organization) LIKE ${i+1}" for i in range(len(_terms))
         )
         id_query = (f"SELECT META(t).id AS id FROM {keyspace} AS t "
                     f"WHERE t.ticket_id IS NOT MISSING "
+                    f"AND {_not_deleted} "
                     f"AND ({_clauses}) "
                     f"ORDER BY {_order}")
         opts = QueryOptions(positional_parameters=[f"%{t.lower()}%" for t in _terms])
     else:
         id_query = (f"SELECT META(t).id AS id FROM {keyspace} AS t "
                     f"WHERE t.ticket_id IS NOT MISSING "
+                    f"AND {_not_deleted} "
                     f"ORDER BY {_order}")
         opts = QueryOptions()
 
@@ -14944,7 +15157,10 @@ def tool_query_tickets(
         cluster.wait_until_ready(timedelta(seconds=10))
         keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
 
-        where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]
+        where_parts: list[str] = [
+            "t.ticket_id IS NOT MISSING",
+            "(t.`_deleted` IS MISSING OR t.`_deleted` = false)",
+        ]
         params: list = []
 
         organization = (filters.get("organization") or "").strip()
@@ -17494,8 +17710,10 @@ _AGENT_TOOLS: list[dict] = [
             "name": "get_cluster_health",
             "description": (
                 "Return a cluster health summary for a customer using stored snapshot topology data. "
-                "Shows active clusters, CB versions, node counts, bad/warn item counts, and deprecation status. "
-                "Use this when the user asks about cluster state, infrastructure health, or version distribution."
+                "Shows active clusters, CB versions, node counts, CPUs/node, RAM/node, bad/warn item counts, "
+                "and deprecation status. Use this when the user asks about cluster state, infrastructure health, "
+                "version distribution, or hardware specs (CPU cores, RAM per node). "
+                "Preferred over get_ticket when the question is about hardware or cross-snapshot cluster config."
             ),
             "parameters": {
                 "type": "object",
@@ -18779,6 +18997,10 @@ def _execute_agent_tool(
                 topo_lines.append(f"  Health:          bad={bad}  warn={warn}")
             if topo.get("os_name"):
                 topo_lines.append(f"  OS:              {topo['os_name']}")
+            if not topo.get("cpus_per_node"):
+                _org_hint = t.get("organization") or ""
+                _hint_arg = f'organization="{_org_hint}"' if _org_hint else "organization=<org>"
+                topo_lines.append(f"  CPUs/Node:       [absent from this snapshot — MUST call get_cluster_health({_hint_arg}) to check other snapshots for this cluster]")
             if topo_lines:
                 parts.append("\n**Cluster Topology (snapshot):**\n" + "\n".join(topo_lines))
         elif not topo:
@@ -25963,14 +26185,21 @@ def build_cluster_timeline(tickets: list[dict], cluster_key: str) -> list[dict]:
         if dt is None:
             continue
 
+        # SDK version from ticket fields (Zendesk custom field)
+        sdk_ver = _topo_str(tf.get("Couchbase_Server_SDK_or_Connector"))
+        if not sdk_ver:
+            sdk_ver = _topo_str(tf.get("Couchbase_Analytics_SDK"))
+
         points.append({
             "dt":                dt,
+            "ts_ms":             int(dt.timestamp() * 1000),
             "date_label":        dt.strftime("%Y-%m-%d"),
             "ticket_id":         ticket.get("ticket_id", ""),
             "subject":           (ticket.get("subject") or "")[:80],
             "node_count":        topo.get("total_nodes"),
             "bucket_count":      topo.get("bucket_count"),
             "cb_version":        topo.get("cb_version"),
+            "sdk_version":       sdk_ver or None,
             "bad_count":         topo.get("bad_count", 0),
             "warn_count":        topo.get("warn_count", 0),
             "auto_failover_sec": topo.get("auto_failover_seconds"),
@@ -25994,17 +26223,91 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
     Convert a sorted list of timeline points into a list of ECharts option
     dicts ready to be passed to ui.echart().  Each dict has a '_height' key
     (popped at render time) so the caller can set the container height.
+
+    All x-axes use type="time" so points are spaced by actual date gap, not
+    evenly as category labels.  Series data is [[ts_ms, value], ...] pairs.
     Returns an empty list when there is no plottable data.
     """
     if not points:
         return []
 
-    dates = [p["date_label"] for p in points]
-    _zoom = [{"type": "inside"}, {"type": "slider", "bottom": 30}]
+    _zoom = [{"type": "inside"}, {"type": "slider", "bottom": 30, "height": 20}]
+    _xaxis_time = {
+        "type": "time",
+        "name": "Date",
+        "nameLocation": "end",
+        "axisLabel": {"formatter": "{yyyy}-{MM}-{dd}", "rotate": 30},
+    }
+    _tooltip_time = {
+        "trigger": "axis",
+        "axisPointer": {"type": "cross", "snap": True},
+    }
 
     charts = []
 
-    # ── 1. Node count over time ────────────────────────────────────────────────
+    # ── 1. CB Version & SDK version over time ─────────────────────────────────
+    # Scatter chart: y-axis is version string category, x-axis is time.
+    # Each row in the scatter data is [ts_ms, category_index].
+    _ver_set = sorted(set(p["cb_version"] for p in points if p["cb_version"]))
+    _sdk_set  = sorted(set(p["sdk_version"] for p in points if p["sdk_version"]))
+    _has_sdk  = bool(_sdk_set)
+
+    if _ver_set:
+        # Build combined category list: CB versions first, then SDK versions with prefix
+        _cb_labels  = _ver_set
+        _sdk_labels = [f"SDK {v}" for v in _sdk_set] if _has_sdk else []
+        _all_labels = _cb_labels + _sdk_labels
+        _label_idx  = {lbl: i for i, lbl in enumerate(_all_labels)}
+
+        _cb_scatter = [
+            [p["ts_ms"], _label_idx[p["cb_version"]], p["date_label"], str(p["ticket_id"]), p["cb_version"]]
+            for p in points if p["cb_version"] and p["cb_version"] in _label_idx
+        ]
+        _sdk_scatter = [
+            [p["ts_ms"], _label_idx[f"SDK {p['sdk_version']}"], p["date_label"], str(p["ticket_id"]), p["sdk_version"]]
+            for p in points if p["sdk_version"] and f"SDK {p['sdk_version']}" in _label_idx
+        ] if _has_sdk else []
+
+        _dims = ["ts", "y_idx", "Date", "Ticket", "Version"]
+        _ver_series = [{
+            "name": "CB Server",
+            "type": "scatter",
+            "symbolSize": 14,
+            "color": "#1565C0",
+            "dimensions": _dims,
+            "encode": {"x": "ts", "y": "y_idx", "tooltip": ["Date", "Ticket", "Version"]},
+            "data": _cb_scatter,
+        }]
+        if _sdk_scatter:
+            _ver_series.append({
+                "name": "SDK",
+                "type": "scatter",
+                "symbolSize": 10,
+                "symbol": "diamond",
+                "color": "#E65100",
+                "dimensions": _dims,
+                "encode": {"x": "ts", "y": "y_idx", "tooltip": ["Date", "Ticket", "Version"]},
+                "data": _sdk_scatter,
+            })
+
+        charts.append({
+            "_height": max(200, len(_all_labels) * 32 + 120),
+            "title":   {"text": "CB Server & SDK Version History"},
+            "tooltip": {"trigger": "item"},
+            "legend":  {"bottom": 0} if _has_sdk else {},
+            "dataZoom": _zoom,
+            "grid":    {"bottom": 70, "left": 120, "right": 30},
+            "xAxis":   dict(_xaxis_time),
+            "yAxis":   {
+                "type": "category",
+                "data": _all_labels,
+                "axisLabel": {"fontSize": 11},
+                "splitLine": {"show": True, "lineStyle": {"type": "dashed", "opacity": 0.4}},
+            },
+            "series": _ver_series,
+        })
+
+    # ── 2. Node count over time ────────────────────────────────────────────────
     node_vals = [p["node_count"] for p in points]
     if any(v is not None for v in node_vals):
         svc_fields = [
@@ -26021,10 +26324,15 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
                 "legend":   {"bottom": 0},
                 "dataZoom": _zoom,
                 "grid":     {"bottom": 70},
-                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
-                "yAxis":    {"type": "value", "name": "Nodes"},
+                "xAxis":    dict(_xaxis_time),
+                "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1},
                 "series":   [
-                    {"name": label, "type": "bar", "stack": "total", "data": [p.get(field, 0) or 0 for p in points]}
+                    {
+                        "name": label,
+                        "type": "bar",
+                        "stack": "total",
+                        "data": [[p["ts_ms"], p.get(field, 0) or 0] for p in points],
+                    }
                     for label, field in svc_fields
                     if any(p.get(field, 0) for p in points)
                 ],
@@ -26033,76 +26341,82 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
             charts.append({
                 "_height": 280,
                 "title":    {"text": "Node Count Over Time"},
-                "tooltip":  {"trigger": "axis"},
+                "tooltip":  _tooltip_time,
                 "dataZoom": _zoom,
                 "grid":     {"bottom": 70},
-                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+                "xAxis":    dict(_xaxis_time),
                 "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1},
                 "color":    ["#1E88E5"],
-                "series":   [{"name": "Total Nodes", "type": "line", "smooth": True, "data": [p["node_count"] for p in points]}],
+                "series":   [{"name": "Total Nodes", "type": "line", "smooth": True,
+                              "data": [[p["ts_ms"], p["node_count"]] for p in points]}],
             })
 
-    # ── 2. Bucket count over time ──────────────────────────────────────────────
+    # ── 3. Bucket count over time ──────────────────────────────────────────────
     bucket_vals = [p["bucket_count"] for p in points]
     if any(v is not None for v in bucket_vals):
         charts.append({
-            "_height": 280,
+            "_height": 260,
             "title":    {"text": "Bucket Count Over Time"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "Buckets", "minInterval": 1},
             "color":    ["#43A047"],
-            "series":   [{"name": "Buckets", "type": "line", "smooth": True, "data": [p["bucket_count"] for p in points]}],
+            "series":   [{"name": "Buckets", "type": "line", "smooth": True,
+                          "data": [[p["ts_ms"], p["bucket_count"]] for p in points]}],
         })
 
-    # ── 3. Checker health (BAD + WARN) over time ───────────────────────────────
+    # ── 4. Checker health (BAD + WARN) over time ───────────────────────────────
     if any(p["bad_count"] or p["warn_count"] for p in points):
         charts.append({
             "_height": 280,
             "title":    {"text": "Checker Health Over Time", "subtext": "Lower is better"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "legend":   {"bottom": 0},
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "Issue Count", "minInterval": 1},
             "color":    ["#E53935", "#FB8C00"],
             "series":   [
-                {"name": "BAD checks",  "type": "line", "smooth": True, "data": [p["bad_count"]  for p in points]},
-                {"name": "WARN checks", "type": "line", "smooth": True, "data": [p["warn_count"] for p in points]},
+                {"name": "BAD checks",  "type": "line", "smooth": True,
+                 "data": [[p["ts_ms"], p["bad_count"]]  for p in points]},
+                {"name": "WARN checks", "type": "line", "smooth": True,
+                 "data": [[p["ts_ms"], p["warn_count"]] for p in points]},
             ],
         })
 
-    # ── 4. Auto-failover setting over time ────────────────────────────────────
+    # ── 5. Auto-failover setting over time ────────────────────────────────────
     af_vals = [p["auto_failover_sec"] for p in points]
     if any(v is not None for v in af_vals):
         charts.append({
-            "_height": 280,
+            "_height": 260,
             "title":    {"text": "Auto-Failover Threshold Over Time"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "Seconds", "minInterval": 1},
             "color":    ["#8E24AA"],
-            "series":   [{"name": "Auto-failover (s)", "type": "line", "step": "start", "data": [p["auto_failover_sec"] for p in points]}],
+            "series":   [{"name": "Auto-failover (s)", "type": "line", "step": "start",
+                          "data": [[p["ts_ms"], p["auto_failover_sec"]] for p in points]}],
         })
 
-    # ── 5. RAM per node over time ─────────────────────────────────────────────
+    # ── 6. RAM per node over time ─────────────────────────────────────────────
     ram_vals = [p["ram_mib"] for p in points]
     if any(v is not None for v in ram_vals):
         charts.append({
-            "_height": 280,
+            "_height": 260,
             "title":    {"text": "RAM per Node Over Time"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "MiB", "minInterval": 1},
             "color":    ["#FB8C00"],
-            "series":   [{"name": "RAM (MiB)", "type": "line", "smooth": True, "data": [p["ram_mib"] for p in points]}],
+            "series":   [{"name": "RAM (MiB)", "type": "line", "smooth": True,
+                          "data": [[p["ts_ms"], p["ram_mib"]] for p in points]}],
         })
 
     return charts
