@@ -16,6 +16,7 @@ import html
 from collections import Counter
 from supportal.scoring import call_llm
 from supportal.cb_helpers import _cb_conn_str
+from supportal.llm_providers import lmstudio_ensure_model_loaded
 
 # ──────────────────────────── Phase 2b: Agent Tool Calling ───────────────────
 
