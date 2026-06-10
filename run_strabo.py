@@ -2,16 +2,23 @@
 Strabo launcher.
 
 Usage:
-    venv/bin/python run_strabo.py [--port 8080]
+    venv/bin/python run_strabo.py [--port 8765]
 """
-import sys
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 _HERE = Path(__file__).parent
-sys.path.insert(0, str(_HERE))
 
-_PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8080
-os.environ.setdefault("NICEGUI_PORT", str(_PORT))
+_PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8765
 
-import apps.strabo.app  # noqa: F401, E402 — triggers ui.run() at bottom of module
+env = os.environ.copy()
+env["STRABO_PORT"] = str(_PORT)
+env["PYTHONPATH"] = str(_HERE) + os.pathsep + env.get("PYTHONPATH", "")
+
+subprocess.run(
+    [sys.executable, str(_HERE / "apps" / "strabo" / "app.py")],
+    env=env,
+    cwd=str(_HERE),
+)
