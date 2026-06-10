@@ -84,7 +84,7 @@
 </head>
 <body>
 
-<h1>Supportal AI Agent <span class="version">v2.4.9 · scaling branch</span></h1>
+<h1>Supportal AI Agent <span class="version">v2.5.0 · scaling branch</span></h1>
 <p class="subtitle">Architecture overview — updated 2026-06-09</p>
 
 <!-- ── Status row ── -->
@@ -114,7 +114,7 @@
 
 <!-- ── App layer ── -->
 <div class="section-label">App layer — apps/</div>
-<div class="grid">
+<div class="grid-4">
 
   <div class="card highlight">
     <div class="card-title"><span class="icon">🖥</span> Strabo <span class="chip blue">apps/strabo/app.py</span></div>
@@ -144,6 +144,17 @@
     </ul>
   </div>
 
+  <div class="card amber">
+    <div class="card-title"><span class="icon">⚡</span> Cursus <span class="chip amber">run_cursus.py</span></div>
+    <ul>
+      <li class="done">Single command starts Strabo + Corax together</li>
+      <li class="done">Coloured prefixed output: [strabo] / [corax]</li>
+      <li class="done">Ctrl+C shuts both down cleanly</li>
+      <li class="done">Watchdog: unexpected exit in either brings both down</li>
+      <li class="done">--strabo-port / --corax-port overrides</li>
+    </ul>
+  </div>
+
   <div class="card purple">
     <div class="card-title"><span class="icon">🔌</span> MCP Server <span class="chip purple">apps/mcp/server.py</span></div>
     <ul>
@@ -158,6 +169,7 @@
 </div>
 
 <!-- ── Library layer ── -->
+
 <div class="section-label">Shared library — supportal/</div>
 <div class="grid-4">
 
@@ -183,7 +195,7 @@
       <li class="done">hybrid_retrieval (RRF)</li>
       <li class="done">build_structured_query</li>
       <li class="done">_load_cluster_app_map</li>
-      <li class="done">couchbase_data_layer.py (Chainlit persistence)</li>
+      <li class="done">couchbase_data_layer.py (Corax session persistence)</li>
     </ul>
   </div>
 
@@ -217,6 +229,17 @@
       <li class="done">Bucket details: mem, compression, eviction</li>
       <li class="done">GSI / FTS / Eventing / UDF counts</li>
       <li class="done">RAM/node, N2N encryption, data quota</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><span class="icon">📚</span> prompt_library.py</div>
+    <ul>
+      <li class="done">28 curated prompts across 7 categories</li>
+      <li class="done">{customer} placeholder injection at runtime</li>
+      <li class="done">customer_required flag hides fleet-irrelevant prompts</li>
+      <li class="done">Corax: two-step category browser via action buttons</li>
+      <li class="done">Strabo: nested expansion panels in sidebar</li>
     </ul>
   </div>
 
@@ -269,7 +292,7 @@
       <li class="done">scrape_job::{id} — background job state (48h TTL)</li>
       <li class="done">saved_query::{hash} — bookmarked agent queries</li>
       <li class="done">profile::{user} — top_customers access tracking</li>
-      <li class="done">chat scope — Chainlit threads/steps/elements</li>
+      <li class="done">chat scope — Corax threads/steps/elements</li>
     </ul>
   </div>
 
@@ -381,8 +404,9 @@
       <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="file">custom.css</span></div>
       <div>&nbsp;&nbsp;<span class="dir">scratch/</span>&nbsp;<span class="note">(gitignored)</span></div>
       <div>&nbsp;&nbsp;<span class="dir">old/</span>&nbsp;<span class="note">(legacy files)</span></div>
-      <div>&nbsp;&nbsp;<span class="file">run_strabo.py&nbsp;&nbsp;<span class="note">← thin launcher</span></span></div>
-      <div>&nbsp;&nbsp;<span class="file">run_corax.py&nbsp;&nbsp;<span class="note">← thin launcher</span></span></span></div>
+      <div>&nbsp;&nbsp;<span class="new">run_cursus.py&nbsp;</span><span class="note">← start both together</span></div>
+      <div>&nbsp;&nbsp;<span class="file">run_strabo.py&nbsp;&nbsp;<span class="note">← Strabo launcher</span></span></div>
+      <div>&nbsp;&nbsp;<span class="file">run_corax.py&nbsp;&nbsp;<span class="note">← Corax launcher</span></span></div>
       <div>&nbsp;&nbsp;<span class="file">requirements.txt&nbsp;·&nbsp;README.md&nbsp;·&nbsp;.env</span></div>
     </div>
   </div>

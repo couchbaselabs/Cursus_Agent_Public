@@ -87,7 +87,7 @@
 </head>
 <body>
 
-<h1>Supportal AI Agent — User Workflow <span class="version">v2.4.9</span></h1>
+<h1>Supportal AI Agent — User Workflow <span class="version">v2.5.0</span></h1>
 <p class="subtitle">Step-by-step guide: setup → authentication → data ingestion → analysis</p>
 
 <!-- ══ STEP 1 ══ -->
@@ -98,19 +98,28 @@
     <div class="step-desc">Start both servers and configure your connection profile</div>
     <div class="cards">
 
-      <div class="card">
-        <div class="card-title">🖥 Start Strabo</div>
+      <div class="card" style="border-color:#f59e0b;background:#1f1800">
+        <div class="card-title">⚡ Start everything — Cursus <small style="color:#f59e0b;font-weight:600">(recommended)</small></div>
         <pre>cd ~/Downloads/Apps/Scraper
 source venv/bin/activate
-python run_strabo.py</pre>
-        <ul><li>Opens at <code>localhost:8080</code></li></ul>
+python run_cursus.py</pre>
+        <ul>
+          <li>Starts Strabo on <code>localhost:8765</code> and Corax on <code>localhost:8766</code></li>
+          <li>Coloured prefixed output: <code>[strabo]</code> / <code>[corax]</code></li>
+          <li>Ctrl+C stops both cleanly</li>
+        </ul>
       </div>
 
-      <div class="card">
-        <div class="card-title">💬 Start Corax <small style="color:#475569;font-weight:400">(optional)</small></div>
-        <pre>source venv/bin/activate
-python run_corax.py</pre>
-        <ul><li>Opens at <code>localhost:8766</code></li></ul>
+      <div class="card alt">
+        <div class="card-title">🖥 Start Strabo only</div>
+        <pre>python run_strabo.py</pre>
+        <ul><li>Dashboard only — <code>localhost:8765</code></li></ul>
+      </div>
+
+      <div class="card alt">
+        <div class="card-title">💬 Start Corax only</div>
+        <pre>python run_corax.py</pre>
+        <ul><li>Chat only — <code>localhost:8766</code></li></ul>
       </div>
 
       <div class="card">
@@ -421,7 +430,7 @@ python run_corax.py</pre>
 </div>
 
 <p style="font-size:0.65rem;color:#334155;margin-top:32px;text-align:center">
-  Supportal AI Agent · user workflow · v2.4.9 · updated 2026-06-09
+  Supportal AI Agent · user workflow · v2.5.0 · updated 2026-06-09
 </p>
 
 </body>
