@@ -1,0 +1,49 @@
+services:
+
+  # ── Strabo + Corax ───────────────────────────────────────────────────────────
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8765:8765"   # Strabo dashboard
+      - "8766:8766"   # Corax chat
+    environment:
+      - SUPPORTAL_COOKIE=${SUPPORTAL_COOKIE:-}
+      - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET:-}
+    volumes:
+      # Persist settings profiles and saved cookies between restarts
+      - app-home:/root
+    depends_on:
+      couchbase:
+        condition: service_healthy
+
+  # ── Couchbase ────────────────────────────────────────────────────────────────
+  # First-time setup (one-off, after `docker compose up`):
+  #   1. Open http://localhost:8091
+  #   2. Set up a new cluster — username / password / memory quotas
+  #   3. Create a bucket named "supportal"
+  #   4. In Strabo → Configuration → Couchbase, set URL to "couchbase://couchbase"
+  #
+  # To use a local Couchbase instead: comment out this service and set
+  # the Strabo CB URL to "couchbase://host.docker.internal"
+  couchbase:
+    image: couchbase/server:enterprise-7.6.3
+    restart: unless-stopped
+    ports:
+      - "8091:8091"     # Admin UI
+      - "8092:8092"     # Views
+      - "8093:8093"     # Query (N1QL)
+      - "8094:8094"     # FTS
+      - "11210:11210"   # KV (data service)
+    volumes:
+      - cb-data:/opt/couchbase/var
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8091/pools"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  app-home:
+  cb-data:

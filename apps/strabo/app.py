@@ -16842,8 +16842,8 @@ if __name__ == "__main__":
 
     ui.run(
         title=f"Strabo v{__version__}",
-        port=8765,
+        port=int(os.environ.get("STRABO_PORT", 8765)),
         reload=False,   # reload=True would destroy _browser_state mid-session
-        show=True,
+        show=os.environ.get("STRABO_OPEN_BROWSER", "1") == "1",
         favicon="🔍",
     )
