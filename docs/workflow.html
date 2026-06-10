@@ -334,6 +334,18 @@ python run_chainlit.py</pre>
       <li><strong>📊 Quick Dashboard</strong> → portfolio health score summary — always visible</li>
       <li><strong>🆕 What's New? (Customer)</strong> → 24 h digest — only shown when a customer is set</li>
       <li><strong>🔖 Saved Queries</strong> → browse + re-run CB-persisted queries — only when customer is set</li>
+      <li><strong>📚 Prompt Library</strong> → two-step category browser (see below) — always visible</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📚 Prompt Library flow <small style="color:#475569;font-weight:400">(supportal/prompt_library.py — 28 prompts, 7 categories)</small></div>
+    <ul>
+      <li>Click <strong>📚 Prompt Library</strong> → shows 7 category buttons (Morning Routine, Health &amp; SLA, Fleet Analysis, Ticket Investigation, Cluster &amp; Snapshot, Data Freshness, Reporting)</li>
+      <li>Select a category → shows up to 5 prompt buttons for that category; <code>customer_required</code> prompts are hidden when no customer is set</li>
+      <li>Click a prompt → <code>{customer}</code> placeholder is substituted with the active customer name, then sent through the full agent loop</li>
+      <li><strong>← Back</strong> button returns to the category list without re-sending a message</li>
+      <li>NiceGUI equivalent: nested expansion panels under <em>Prompt Library</em> in the sidebar</li>
     </ul>
   </div>
 
