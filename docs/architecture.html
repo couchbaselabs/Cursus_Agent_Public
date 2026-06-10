@@ -6,11 +6,11 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 32px; }
-  h1 { font-size: 1.6rem; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
+         background: #f8fafc; color: #1e293b; min-height: 100vh; padding: 32px; }
+  h1 { font-size: 1.6rem; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
   .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 32px; }
-  .version { display: inline-block; background: #1e293b; border: 1px solid #334155;
-             border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; color: #94a3b8;
+  .version { display: inline-block; background: #f1f5f9; border: 1px solid #cbd5e1;
+             border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; color: #64748b;
              margin-left: 10px; vertical-align: middle; }
 
   /* ── grid layout ── */
@@ -21,65 +21,65 @@
 
   /* ── section headers ── */
   .section-label { font-size: 0.7rem; font-weight: 700; letter-spacing: .12em;
-                   text-transform: uppercase; color: #475569; margin-bottom: 14px;
-                   padding-bottom: 6px; border-bottom: 1px solid #1e293b; }
+                   text-transform: uppercase; color: #94a3b8; margin-bottom: 14px;
+                   padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; }
 
   /* ── cards ── */
-  .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 10px;
+  .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
           padding: 16px; }
-  .card.highlight { border-color: #3b82f6; background: #162032; }
-  .card.green  { border-color: #22c55e; background: #0d2318; }
-  .card.amber  { border-color: #f59e0b; background: #1f1800; }
-  .card.purple { border-color: #a855f7; background: #1a0f2e; }
-  .card.slate  { border-color: #475569; background: #161b27; }
+  .card.highlight { border-color: #3b82f6; background: #eff6ff; }
+  .card.green  { border-color: #22c55e; background: #f0fdf4; }
+  .card.amber  { border-color: #f59e0b; background: #fffbeb; }
+  .card.purple { border-color: #a855f7; background: #faf5ff; }
+  .card.slate  { border-color: #cbd5e1; background: #f8fafc; }
 
-  .card-title { font-size: 0.8rem; font-weight: 700; color: #cbd5e1; margin-bottom: 10px;
+  .card-title { font-size: 0.8rem; font-weight: 700; color: #334155; margin-bottom: 10px;
                 display: flex; align-items: center; gap: 6px; }
   .card-title .icon { font-size: 1rem; }
   .chip { display: inline-block; font-size: 0.65rem; font-weight: 600; padding: 2px 7px;
           border-radius: 4px; margin-left: 6px; vertical-align: middle; }
-  .chip.blue   { background: #1d3e6a; color: #93c5fd; }
-  .chip.green  { background: #134020; color: #86efac; }
-  .chip.amber  { background: #3f2600; color: #fde68a; }
-  .chip.purple { background: #2d1060; color: #d8b4fe; }
-  .chip.grey   { background: #1e293b; color: #94a3b8; }
+  .chip.blue   { background: #dbeafe; color: #1d4ed8; }
+  .chip.green  { background: #dcfce7; color: #166534; }
+  .chip.amber  { background: #fef3c7; color: #92400e; }
+  .chip.purple { background: #f3e8ff; color: #6b21a8; }
+  .chip.grey   { background: #f1f5f9; color: #64748b; }
 
   ul { list-style: none; padding: 0; }
-  li { font-size: 0.73rem; color: #94a3b8; padding: 3px 0; padding-left: 14px;
+  li { font-size: 0.73rem; color: #64748b; padding: 3px 0; padding-left: 14px;
        position: relative; }
-  li::before { content: "›"; position: absolute; left: 0; color: #475569; }
-  li.done { color: #6ee7b7; }
+  li::before { content: "›"; position: absolute; left: 0; color: #94a3b8; }
+  li.done { color: #059669; }
   li.done::before { content: "✓"; color: #22c55e; }
-  li.pending { color: #64748b; }
-  li.pending::before { content: "·"; color: #334155; font-size: 1.2rem; top: -1px; }
+  li.pending { color: #94a3b8; }
+  li.pending::before { content: "·"; color: #cbd5e1; font-size: 1.2rem; top: -1px; }
 
   /* ── flow arrows ── */
   .flow { display: flex; align-items: center; gap: 0; margin-bottom: 28px;
-          background: #131720; border: 1px solid #1e293b; border-radius: 10px;
+          background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 10px;
           padding: 16px 20px; overflow-x: auto; }
-  .flow-node { background: #1e2a3a; border: 1px solid #334155; border-radius: 8px;
+  .flow-node { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px;
                padding: 10px 14px; text-align: center; white-space: nowrap; flex-shrink: 0; }
-  .flow-node .label { font-size: 0.7rem; font-weight: 700; color: #cbd5e1; }
+  .flow-node .label { font-size: 0.7rem; font-weight: 700; color: #334155; }
   .flow-node .sub   { font-size: 0.62rem; color: #64748b; margin-top: 2px; }
-  .arrow { color: #334155; font-size: 1.4rem; margin: 0 6px; flex-shrink: 0; }
+  .arrow { color: #cbd5e1; font-size: 1.4rem; margin: 0 6px; flex-shrink: 0; }
 
   /* ── file tree ── */
   .tree { font-family: "SF Mono", "Fira Code", monospace; font-size: 0.72rem;
-          color: #94a3b8; line-height: 1.9; }
-  .tree .dir  { color: #60a5fa; font-weight: 600; }
-  .tree .file { color: #94a3b8; }
-  .tree .note { color: #475569; font-style: italic; }
-  .tree .new  { color: #6ee7b7; }
+          color: #64748b; line-height: 1.9; }
+  .tree .dir  { color: #2563eb; font-weight: 600; }
+  .tree .file { color: #64748b; }
+  .tree .note { color: #94a3b8; font-style: italic; }
+  .tree .new  { color: #059669; }
 
   /* ── status badge ── */
   .status-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 28px; }
-  .badge { display: flex; align-items: center; gap: 8px; background: #1a1f2e;
-           border: 1px solid #2d3748; border-radius: 8px; padding: 8px 14px;
+  .badge { display: flex; align-items: center; gap: 8px; background: #ffffff;
+           border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 14px;
            font-size: 0.72rem; }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .dot.green  { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
   .dot.amber  { background: #f59e0b; box-shadow: 0 0 6px #f59e0b88; }
-  .dot.grey   { background: #475569; }
+  .dot.grey   { background: #94a3b8; }
 </style>
 </head>
 <body>

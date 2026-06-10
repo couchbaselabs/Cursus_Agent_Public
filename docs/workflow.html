@@ -6,11 +6,11 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 32px; }
-  h1 { font-size: 1.6rem; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
+         background: #f8fafc; color: #1e293b; min-height: 100vh; padding: 32px; }
+  h1 { font-size: 1.6rem; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
   .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 36px; }
-  .version { display: inline-block; background: #1e293b; border: 1px solid #334155;
-             border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; color: #94a3b8;
+  .version { display: inline-block; background: #f1f5f9; border: 1px solid #cbd5e1;
+             border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; color: #64748b;
              margin-left: 10px; vertical-align: middle; }
 
   /* ── step container ── */
@@ -19,70 +19,70 @@
               display: flex; align-items: center; justify-content: center;
               font-size: 0.85rem; font-weight: 800; flex-shrink: 0;
               margin-top: 2px; margin-right: 12px; }
-  .step-num.blue   { background: #1d3e6a; color: #93c5fd; border: 2px solid #3b82f6; }
-  .step-num.green  { background: #134020; color: #86efac; border: 2px solid #22c55e; }
-  .step-num.amber  { background: #3f2600; color: #fde68a; border: 2px solid #f59e0b; }
-  .step-num.purple { background: #2d1060; color: #d8b4fe; border: 2px solid #a855f7; }
+  .step-num.blue   { background: #dbeafe; color: #1d4ed8; border: 2px solid #3b82f6; }
+  .step-num.green  { background: #dcfce7; color: #166534; border: 2px solid #22c55e; }
+  .step-num.amber  { background: #fef3c7; color: #92400e; border: 2px solid #f59e0b; }
+  .step-num.purple { background: #f3e8ff; color: #6b21a8; border: 2px solid #a855f7; }
 
   .step-body { flex: 1; }
-  .step-title { font-size: 1rem; font-weight: 700; color: #f1f5f9; margin-bottom: 4px; }
+  .step-title { font-size: 1rem; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
   .step-desc  { font-size: 0.78rem; color: #64748b; margin-bottom: 14px; }
 
   /* ── outcome pill ── */
   .outcome { display: inline-flex; align-items: center; gap: 6px; font-size: 0.7rem;
              font-weight: 600; padding: 4px 12px; border-radius: 20px; margin-top: 14px; }
-  .outcome.blue   { background: #162032; border: 1px solid #3b82f6; color: #93c5fd; }
-  .outcome.green  { background: #0d2318; border: 1px solid #22c55e; color: #86efac; }
-  .outcome.amber  { background: #1f1800; border: 1px solid #f59e0b; color: #fde68a; }
-  .outcome.purple { background: #1a0f2e; border: 1px solid #a855f7; color: #d8b4fe; }
+  .outcome.blue   { background: #eff6ff; border: 1px solid #3b82f6; color: #1d4ed8; }
+  .outcome.green  { background: #f0fdf4; border: 1px solid #22c55e; color: #166534; }
+  .outcome.amber  { background: #fffbeb; border: 1px solid #f59e0b; color: #92400e; }
+  .outcome.purple { background: #faf5ff; border: 1px solid #a855f7; color: #6b21a8; }
 
   /* ── card grid ── */
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
            gap: 14px; margin-bottom: 6px; }
-  .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 10px; padding: 14px; }
-  .card.alt { border-color: #334155; background: #131720; }
-  .card-title { font-size: 0.78rem; font-weight: 700; color: #cbd5e1; margin-bottom: 8px;
+  .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; }
+  .card.alt { border-color: #cbd5e1; background: #f8fafc; }
+  .card-title { font-size: 0.78rem; font-weight: 700; color: #334155; margin-bottom: 8px;
                 display: flex; align-items: center; gap: 6px; }
 
   /* ── code blocks ── */
-  pre { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+  pre { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;
         padding: 10px 14px; font-family: "SF Mono","Fira Code",monospace;
-        font-size: 0.7rem; color: #8b949e; overflow-x: auto; margin: 6px 0 10px; }
+        font-size: 0.7rem; color: #374151; overflow-x: auto; margin: 6px 0 10px; }
   code { font-family: "SF Mono","Fira Code",monospace; font-size: 0.7rem;
-         background: #1e293b; color: #93c5fd; padding: 1px 5px; border-radius: 3px; }
+         background: #eff6ff; color: #1d4ed8; padding: 1px 5px; border-radius: 3px; }
 
   /* ── lists ── */
   ul { list-style: none; padding: 0; }
-  li { font-size: 0.73rem; color: #94a3b8; padding: 3px 0 3px 16px; position: relative; }
-  li::before { content: "›"; position: absolute; left: 0; color: #475569; }
-  li strong { color: #cbd5e1; }
+  li { font-size: 0.73rem; color: #64748b; padding: 3px 0 3px 16px; position: relative; }
+  li::before { content: "›"; position: absolute; left: 0; color: #94a3b8; }
+  li strong { color: #334155; }
 
   /* ── tool chips ── */
   .tool { display: inline-block; font-size: 0.62rem; font-weight: 600; padding: 2px 8px;
-          border-radius: 4px; background: #1e2d40; color: #60a5fa;
-          border: 1px solid #1d3e6a; margin: 2px 2px 2px 0; font-family: "SF Mono","Fira Code",monospace; }
+          border-radius: 4px; background: #dbeafe; color: #1d4ed8;
+          border: 1px solid #bfdbfe; margin: 2px 2px 2px 0; font-family: "SF Mono","Fira Code",monospace; }
 
   /* ── example queries ── */
   .examples { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .example { background: #131720; border: 1px solid #1e293b; border-radius: 8px;
+  .example { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
              padding: 12px 14px; }
-  .example q { display: block; font-size: 0.75rem; color: #e2e8f0; font-style: italic;
+  .example q { display: block; font-size: 0.75rem; color: #1e293b; font-style: italic;
                margin-bottom: 8px; quotes: "\201C" "\201D"; }
-  .example q::before { content: open-quote; color: #475569; }
-  .example q::after  { content: close-quote; color: #475569; }
+  .example q::before { content: open-quote; color: #94a3b8; }
+  .example q::after  { content: close-quote; color: #94a3b8; }
 
   /* ── tips ── */
   .tips { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
-  .tip { background: #131720; border-left: 3px solid #334155; border-radius: 0 8px 8px 0;
+  .tip { background: #f8fafc; border-left: 3px solid #cbd5e1; border-radius: 0 8px 8px 0;
          padding: 10px 14px; }
-  .tip-title { font-size: 0.72rem; font-weight: 700; color: #cbd5e1; margin-bottom: 5px; }
+  .tip-title { font-size: 0.72rem; font-weight: 700; color: #334155; margin-bottom: 5px; }
   .tip p { font-size: 0.7rem; color: #64748b; line-height: 1.55; }
   .tip p code { font-size: 0.67rem; }
 
   /* ── section label ── */
   .section-label { font-size: 0.7rem; font-weight: 700; letter-spacing: .12em;
-                   text-transform: uppercase; color: #475569; margin: 32px 0 16px;
-                   padding-bottom: 6px; border-bottom: 1px solid #1e293b; }
+                   text-transform: uppercase; color: #94a3b8; margin: 32px 0 16px;
+                   padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; }
 </style>
 </head>
 <body>
@@ -98,7 +98,7 @@
     <div class="step-desc">Start both servers and configure your connection profile</div>
     <div class="cards">
 
-      <div class="card" style="border-color:#f59e0b;background:#1f1800">
+      <div class="card" style="border-color:#f59e0b;background:#fffbeb">
         <div class="card-title">⚡ Start everything — Cursus <small style="color:#f59e0b;font-weight:600">(recommended)</small></div>
         <pre>cd ~/Downloads/Apps/Scraper
 source venv/bin/activate
@@ -429,7 +429,7 @@ python run_cursus.py</pre>
 
 </div>
 
-<p style="font-size:0.65rem;color:#334155;margin-top:32px;text-align:center">
+<p style="font-size:0.65rem;color:#94a3b8;margin-top:32px;text-align:center">
   Supportal AI Agent · user workflow · v2.5.0 · updated 2026-06-09
 </p>
 
