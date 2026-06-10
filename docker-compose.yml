@@ -14,18 +14,13 @@ services:
       # Persist settings profiles and saved cookies between restarts
       - app-home:/root
     depends_on:
-      couchbase:
-        condition: service_healthy
+      couchbase-init:
+        condition: service_completed_successfully
 
   # ── Couchbase ────────────────────────────────────────────────────────────────
-  # First-time setup (one-off, after `docker compose up`):
-  #   1. Open http://localhost:8091
-  #   2. Set up a new cluster — username / password / memory quotas
-  #   3. Create a bucket named "supportal"
-  #   4. In Strabo → Configuration → Couchbase, set URL to "couchbase://couchbase"
-  #
-  # To use a local Couchbase instead: comment out this service and set
-  # the Strabo CB URL to "couchbase://host.docker.internal"
+  # To use a local Couchbase instead: comment out the couchbase and
+  # couchbase-init services, then set the Strabo CB URL to
+  # "couchbase://host.docker.internal" in the Configuration tab.
   couchbase:
     image: couchbase/server:enterprise-7.6.3
     restart: unless-stopped
@@ -43,6 +38,29 @@ services:
       timeout: 5s
       retries: 20
       start_period: 30s
+
+  # ── Couchbase one-shot init ───────────────────────────────────────────────────
+  # Runs once after couchbase is healthy, then exits.
+  # Creates the cluster, bucket, scopes, collections, and all GSI indexes.
+  # Idempotent — safe to restart; skips everything if already initialised.
+  couchbase-init:
+    image: couchbase/server:enterprise-7.6.3
+    restart: "no"
+    environment:
+      - CB_HOST=couchbase
+      - CB_USER=${CB_USER:-Administrator}
+      - CB_PASS=${CB_PASS:-password}
+      - CB_BUCKET=${CB_BUCKET:-supportal}
+      - CB_RAMSIZE=${CB_RAMSIZE:-1024}
+      - CB_INDEX_RAMSIZE=${CB_INDEX_RAMSIZE:-512}
+      - CB_FTS_RAMSIZE=${CB_FTS_RAMSIZE:-512}
+      - CB_BUCKET_RAMSIZE=${CB_BUCKET_RAMSIZE:-256}
+    volumes:
+      - ./docker/couchbase-init.sh:/init/couchbase-init.sh:ro
+    entrypoint: ["sh", "/init/couchbase-init.sh"]
+    depends_on:
+      couchbase:
+        condition: service_healthy
 
 volumes:
   app-home:
