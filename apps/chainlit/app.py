@@ -545,6 +545,13 @@ async def _send_quick_actions(customer: str) -> None:
                 description=f"Load saved queries for {customer}",
             )
         )
+    actions.append(
+        cl.Action(
+            name="prompt_library", value=customer or "", payload={"customer": customer or ""},
+            label="📚 Prompt Library",
+            description="Browse curated prompts by category",
+        )
+    )
     await cl.Message(content="**Quick Actions**", actions=actions, author="Supportal").send()
 
 
@@ -1023,4 +1030,89 @@ async def on_run_saved_query(action: cl.Action):
     if not query:
         return
     fake_msg = cl.Message(content=query, author="User")
+    await on_message(fake_msg)
+
+
+# ── Prompt Library ────────────────────────────────────────────────────────────
+
+@cl.action_callback("prompt_library")
+async def on_prompt_library(action: cl.Action):
+    """Show category selection for the prompt library."""
+    from supportal.prompt_library import PROMPT_LIBRARY
+    customer = action.payload.get("customer") or cl.user_session.get("customer", "")
+    cat_actions = [
+        cl.Action(
+            name="prompt_library_category",
+            value=cat["category"],
+            payload={"category": cat["category"], "customer": customer},
+            label=f"{cat['category']}",
+            description=f"{len(cat['prompts'])} prompts",
+        )
+        for cat in PROMPT_LIBRARY
+    ]
+    cust_note = f" · customer: **{customer}**" if customer else " · no customer set — customer-specific prompts will work once you set one in ⚙ Settings"
+    await cl.Message(
+        content=f"**📚 Prompt Library**{cust_note}\n\nChoose a category:",
+        actions=cat_actions,
+        author="Supportal",
+    ).send()
+
+
+@cl.action_callback("prompt_library_category")
+async def on_prompt_library_category(action: cl.Action):
+    """Show prompts for the selected category."""
+    from supportal.prompt_library import get_prompts_for_category, inject_customer
+    category = action.payload.get("category") or action.value
+    customer = action.payload.get("customer") or cl.user_session.get("customer", "")
+    prompts = get_prompts_for_category(category)
+    if not prompts:
+        await cl.Message(content=f"No prompts found for **{category}**.", author="Supportal").send()
+        return
+
+    prompt_actions = []
+    skipped = []
+    for p in prompts:
+        if p.get("customer_required") and not customer:
+            skipped.append(p["label"])
+            continue
+        filled = inject_customer(p["prompt"], customer)
+        label = inject_customer(p["label"], customer)
+        prompt_actions.append(
+            cl.Action(
+                name="run_library_prompt",
+                value=filled,
+                payload={"prompt": filled},
+                label=label,
+                description=filled[:100],
+            )
+        )
+    # Always offer back button
+    back_actions = [
+        cl.Action(
+            name="prompt_library",
+            value=customer,
+            payload={"customer": customer},
+            label="← Back to categories",
+            description="Return to category list",
+        )
+    ]
+
+    lines = [f"**{category}** — click a prompt to run it:"]
+    if skipped:
+        lines.append(f"\n*{len(skipped)} prompt(s) hidden — set a customer in ⚙ Settings to unlock them.*")
+
+    await cl.Message(
+        content="\n".join(lines),
+        actions=prompt_actions + back_actions,
+        author="Supportal",
+    ).send()
+
+
+@cl.action_callback("run_library_prompt")
+async def on_run_library_prompt(action: cl.Action):
+    """Run a prompt from the library."""
+    prompt = action.payload.get("prompt") or action.value
+    if not prompt:
+        return
+    fake_msg = cl.Message(content=prompt, author="User")
     await on_message(fake_msg)

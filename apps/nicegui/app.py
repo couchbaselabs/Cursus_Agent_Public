@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.4.9"
+__version__ = "2.5.0"
 
 import asyncio
 import threading
@@ -6497,6 +6497,30 @@ def main_page():
                             ui.button("Refresh list", icon="refresh", on_click=_reload_saved_queries).props(
                                 "flat dense size=sm color=primary"
                             )
+
+                        # ── Prompt Library ───────────────────────────────────────────────
+                        with ui.expansion("Prompt Library", icon="auto_stories").classes("w-full mt-2 border rounded"):
+                            from supportal.prompt_library import PROMPT_LIBRARY, inject_customer
+                            ui.label("Click any prompt to load it into the chat.").classes("text-xs text-gray-400 mb-2")
+                            for _pl_cat in PROMPT_LIBRARY:
+                                with ui.expansion(_pl_cat["category"], icon=_pl_cat["icon"]).classes("w-full mt-1"):
+                                    with ui.column().classes("w-full gap-1 pl-2"):
+                                        for _pl_p in _pl_cat["prompts"]:
+                                            def _make_pl_handler(tmpl=_pl_p["prompt"]):
+                                                async def _handler():
+                                                    _cust = (main_cust_input.value or "").strip()
+                                                    chat_input.value = inject_customer(tmpl, _cust)
+                                                    await _send_chat()
+                                                return _handler
+                                            _pl_label = _pl_p["label"]
+                                            _pl_needs_cust = _pl_p.get("customer_required", False)
+                                            with ui.row().classes("w-full items-center gap-2"):
+                                                ui.button(
+                                                    inject_customer(_pl_label, ""),
+                                                    on_click=_make_pl_handler(),
+                                                ).props("flat dense size=sm color=primary align=left").classes("flex-1 text-left justify-start")
+                                                if _pl_needs_cust:
+                                                    ui.icon("person", size="xs").classes("text-gray-400").tooltip("Requires a customer to be set")
 
             with ui.tab_panel(tab_scoring):
                 with ui.column().classes("w-full gap-0"):
