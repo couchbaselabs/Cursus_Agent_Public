@@ -5,7 +5,7 @@ Chainlit's CLI applies nest_asyncio.apply() at import time, which breaks
 asyncio.current_task() under Python 3.14.  This launcher replicates the
 same server setup without patching asyncio, so anyio/sniffio work correctly.
 
-Usage (instead of 'chainlit run chainlit_app.py --port 8766'):
+Usage (instead of 'chainlit run apps/chainlit/app.py --port 8766'):
     venv/bin/python run_chainlit.py [--port 8766]
 """
 import asyncio
@@ -59,7 +59,7 @@ config.run.root_path = os.environ.get("CHAINLIT_ROOT_PATH", DEFAULT_ROOT_PATH)
 from chainlit.server import app                      # noqa: E402
 
 # Load our handler module — this registers @cl.on_chat_start / @cl.on_message
-_target = str(_HERE / "chainlit_app.py")
+_target = str(_HERE / "apps" / "chainlit" / "app.py")
 config.run.module_name = _target
 load_module(_target)
 

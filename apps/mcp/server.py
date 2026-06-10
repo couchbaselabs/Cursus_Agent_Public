@@ -44,7 +44,7 @@ def _load_app() -> Any:
     global _app
     if _app is None:
         import importlib
-        _app = importlib.import_module("supportal_nicegui_app")
+        _app = importlib.import_module("apps.nicegui.app")
     return _app
 
 

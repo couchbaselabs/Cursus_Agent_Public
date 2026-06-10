@@ -54,17 +54,16 @@ import chainlit as cl
 import chainlit.data as cl_data
 
 # ── Pipeline is imported lazily to avoid NiceGUI event-loop side-effects ─────
-# Importing supportal_nicegui_app at module level can initialise NiceGUI's
+# Importing apps.nicegui.app at module level can initialise NiceGUI's
 # asyncio state before Chainlit's anyio backend is running, causing
 # NoEventLoopError on static file requests.  We load it on first handler call.
-sys.path.insert(0, str(Path(__file__).parent))
 _pipeline: Any = None
 
 
 def _get_pipeline():
     global _pipeline
     if _pipeline is None:
-        _pipeline = importlib.import_module("supportal_nicegui_app")
+        _pipeline = importlib.import_module("apps.nicegui.app")
     return _pipeline
 
 
@@ -167,7 +166,7 @@ async def _save_shared_history(customer: str, history: list[dict], profile: dict
 @cl.data_layer
 def _make_data_layer():
     """Factory registered with Chainlit — called once on first data access."""
-    from couchbase_data_layer import CouchbaseDataLayer
+    from supportal.couchbase_data_layer import CouchbaseDataLayer
     p = _load_cb_settings()
     if not p.get("cb_user") or not p.get("cb_bucket"):
         return None  # No profile configured — sidebar disabled
