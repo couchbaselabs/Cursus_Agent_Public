@@ -1,11 +1,11 @@
 """
-Supportal Chainlit Chat — professional AI chat sidecar.
+Corax — Supportal AI Chat
 Shares all pipeline functions and agent tools with the Strabo app.
 
 Run alongside the main app:
-    chainlit run chainlit_app.py --port 8766
+    python run_corax.py --port 8766
 
-Then click "Open Chainlit Chat" in the Strabo Agent tab.
+Then click "Open Corax ↗" in the Strabo Agent tab.
 The Strabo app (port 8765) continues running unchanged.
 """
 

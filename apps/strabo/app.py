@@ -5073,11 +5073,11 @@ def main_page():
                             ui.label("LLM provider is configured in the AI Models tab").classes("text-xs text-gray-500")
                             ui.space()
                             ui.button(
-                                "Open Chainlit Chat ↗",
+                                "Open Corax ↗",
                                 on_click=lambda: ui.run_javascript("window.open('http://localhost:8766','_blank')"),
                             ).props("flat dense size=sm color=indigo").tooltip(
-                                "Open the professional Chainlit chat UI in a new tab.\n"
-                                "Start it first: python run_chainlit.py --port 8766"
+                                "Open Corax (AI chat) in a new tab.\n"
+                                "Start it first: python run_corax.py --port 8766"
                             )
 
                         with ui.row().classes("items-center gap-4 mt-2 flex-wrap"):
