@@ -28,8 +28,8 @@ except ImportError:
     Cluster = ClusterOptions = PasswordAuthenticator = None  # type: ignore
 
 def _get_main_app():
-    """Lazy import of the NiceGUI app to avoid circular imports at load time."""
-    return importlib.import_module("apps.nicegui.app")
+    """Lazy import of the Strabo app to avoid circular imports at load time."""
+    return importlib.import_module("apps.strabo.app")
 
 # ──────────────────────────── Phase 2b: Agent Tool Calling ───────────────────
 

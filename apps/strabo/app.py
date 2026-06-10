@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Couchbase Supportal Scraper — NiceGUI App
-==========================================
-Single script replacing all previous scraper versions.
+Strabo — Couchbase Supportal Explorer
+======================================
+Multi-tab dashboard for scraping, analysing, and chatting with support data.
 
 Auth modes:
   1. Cookie paste  — copy the Cookie header from browser DevTools, paste here.
@@ -11,7 +11,7 @@ Auth modes:
                      then scrapes headlessly with the saved session.
 
 Usage:
-  ./venv/bin/python supportal_nicegui_app.py
+  ./venv/bin/python run_strabo.py
   # then open http://localhost:8765 in your browser
 """
 
@@ -2020,7 +2020,7 @@ def main_page():
 
     # ── Header ──────────────────────────────────────────────────────────────
     with ui.header().classes("bg-blue-900 text-white items-center px-6 py-3 shadow-md gap-3"):
-        ui.label("Couchbase Supportal").classes("text-xl font-bold tracking-tight")
+        ui.label("Strabo").classes("text-xl font-bold tracking-tight")
         ui.label(f"v{__version__}").classes(
             "text-xs font-mono bg-blue-700 text-blue-200 px-2 py-0.5 rounded"
         )
@@ -12112,7 +12112,7 @@ def _execute_agent_tool(
         if not cookie:
             return (
                 "No session cookie found in saved profile — cannot reach Supportal Analytics. "
-                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
+                "Paste a fresh cookie in the Strabo Authentication tab."
             )
         try:
             order = {"snapshots": "snaps DESC", "tickets": "tickets DESC"}.get(sort_by, "cu_name ASC")
@@ -12150,7 +12150,7 @@ LIMIT {limit}
         if not cookie:
             return (
                 "No session cookie found in saved profile — cannot reach Supportal Analytics. "
-                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
+                "Paste a fresh cookie in the Strabo Authentication tab."
             )
         try:
             rows = query_supportal_analytics(statement, cookie)
@@ -16841,7 +16841,7 @@ if __name__ == "__main__":
     _ngcore.sio.eio.max_http_buffer_size = 16 * 1024 * 1024
 
     ui.run(
-        title=f"Supportal Scraper v{__version__}",
+        title=f"Strabo v{__version__}",
         port=8765,
         reload=False,   # reload=True would destroy _browser_state mid-session
         show=True,

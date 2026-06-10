@@ -282,7 +282,7 @@ Output:
 Now score the following tickets. Return ONLY the JSON array.
 """
 
-# ── Agent system prompt (shared by NiceGUI and Chainlit) ─────────────────────
+# ── Agent system prompt (shared by Strabo and Chainlit) ──────────────────────
 
 TOOL_GUIDANCE = (
     "TOOL GUIDANCE:\n"
@@ -407,7 +407,7 @@ def build_agent_system_prompt(
     profile_hint: str = "",
     prior_session_block: str = "",
 ) -> str:
-    """Build the full agent system prompt used by both NiceGUI and Chainlit.
+    """Build the full agent system prompt used by both Strabo and Chainlit.
 
     Parameters
     ----------

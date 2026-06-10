@@ -99,10 +99,10 @@
     <div class="cards">
 
       <div class="card">
-        <div class="card-title">🖥 Start NiceGUI</div>
+        <div class="card-title">🖥 Start Strabo</div>
         <pre>cd ~/Downloads/Apps/Scraper
 source venv/bin/activate
-python run_nicegui.py</pre>
+python run_strabo.py</pre>
         <ul><li>Opens at <code>localhost:8080</code></li></ul>
       </div>
 
@@ -116,7 +116,7 @@ python run_chainlit.py</pre>
       <div class="card">
         <div class="card-title">⚙️ Create a Profile</div>
         <ul>
-          <li>NiceGUI → <strong>Configuration</strong> tab</li>
+          <li>Strabo → <strong>Configuration</strong> tab</li>
           <li>Set Couchbase URL, bucket, username &amp; password</li>
           <li>Click <strong>Test Connection</strong> to verify</li>
           <li>Choose LLM provider (Claude / Ollama / LMStudio)</li>
@@ -155,7 +155,7 @@ python run_chainlit.py</pre>
           <li>Log into <code>supportal.couchbase.com</code> in your browser</li>
           <li>Open DevTools → Application → Cookies</li>
           <li>Copy the full <strong>Cookie</strong> header value</li>
-          <li>Paste into the <strong>Cookie</strong> field in NiceGUI Configuration</li>
+          <li>Paste into the <strong>Cookie</strong> field in Strabo Configuration</li>
           <li>Click <strong>Save Cookie</strong> — all scraping runs headless</li>
         </ul>
       </div>
@@ -187,7 +187,7 @@ python run_chainlit.py</pre>
       <div class="card">
         <div class="card-title">🎫 Scrape Tickets</div>
         <ul>
-          <li>NiceGUI → <strong>Scraping</strong> tab</li>
+          <li>Strabo → <strong>Scraping</strong> tab</li>
           <li>Enter customer org name (or alias)</li>
           <li>Click <strong>Scrape Tickets</strong></li>
           <li>Change-detection skips unchanged tickets on re-runs</li>
@@ -201,7 +201,7 @@ python run_chainlit.py</pre>
       <div class="card">
         <div class="card-title">📸 Fetch Snapshot Stubs</div>
         <ul>
-          <li>NiceGUI → <strong>Scraping</strong> tab → Snapshots section</li>
+          <li>Strabo → <strong>Scraping</strong> tab → Snapshots section</li>
           <li>Click <strong>Fetch Snapshot Stubs</strong></li>
           <li>Uses <code>POST /api/support360/query</code> — one round-trip</li>
           <li>Stubs saved to <code>supportal.snapshots</code> (no topology yet)</li>
@@ -213,7 +213,7 @@ python run_chainlit.py</pre>
       <div class="card">
         <div class="card-title">🔬 Backfill Topology</div>
         <ul>
-          <li>NiceGUI → <strong>Scraping</strong> tab → click <strong>Backfill Topology</strong></li>
+          <li>Strabo → <strong>Scraping</strong> tab → click <strong>Backfill Topology</strong></li>
           <li>Fetches <code>GET /snapshot/{enc}/nutshell</code> per stub</li>
           <li>Adds: CB version, node layout, services, bad/warn items</li>
           <li>RAM/node, CPUs/node, GSI/FTS/Eventing counts</li>
@@ -226,7 +226,7 @@ python run_chainlit.py</pre>
       <div class="card">
         <div class="card-title">🧠 Embed Tickets</div>
         <ul>
-          <li>NiceGUI → <strong>Scoring &amp; Analysis</strong> tab</li>
+          <li>Strabo → <strong>Scoring &amp; Analysis</strong> tab</li>
           <li>Click <strong>Embed All Tickets</strong> (or new tickets only)</li>
           <li>Generates vectors via configured embedding model</li>
           <li>Vectors stored in <code>supportal.tickets</code> alongside text</li>
@@ -248,7 +248,7 @@ python run_chainlit.py</pre>
     <div class="cards">
 
       <div class="card">
-        <div class="card-title">🖥 NiceGUI Chat — <code>localhost:8080</code></div>
+        <div class="card-title">🖥 Strabo Chat — <code>localhost:8080</code></div>
         <ul>
           <li>Quick queries, admin ops, pipeline control</li>
           <li>Inline ECharts (12 types, SVG/PNG export)</li>
@@ -345,7 +345,7 @@ python run_chainlit.py</pre>
       <li>Select a category → shows up to 5 prompt buttons for that category; <code>customer_required</code> prompts are hidden when no customer is set</li>
       <li>Click a prompt → <code>{customer}</code> placeholder is substituted with the active customer name, then sent through the full agent loop</li>
       <li><strong>← Back</strong> button returns to the category list without re-sending a message</li>
-      <li>NiceGUI equivalent: nested expansion panels under <em>Prompt Library</em> in the sidebar</li>
+      <li>Strabo equivalent: nested expansion panels under <em>Prompt Library</em> in the sidebar</li>
     </ul>
   </div>
 
@@ -405,12 +405,12 @@ python run_chainlit.py</pre>
 
   <div class="tip">
     <div class="tip-title">Results tab export</div>
-    <p>The NiceGUI Results tab provides quick CSV / Excel export without asking the agent. Use it for bulk extracts; use the agent for analysis and visualisation.</p>
+    <p>The Strabo Results tab provides quick CSV / Excel export without asking the agent. Use it for bulk extracts; use the agent for analysis and visualisation.</p>
   </div>
 
   <div class="tip">
     <div class="tip-title">Profile = shared config</div>
-    <p>The active NiceGUI profile drives the Chainlit app too — LLM provider, embedding model, CB connection, and cookie are all read from the same saved profile. Change once, applies everywhere.</p>
+    <p>The active Strabo profile drives the Chainlit app too — LLM provider, embedding model, CB connection, and cookie are all read from the same saved profile. Change once, applies everywhere.</p>
   </div>
 
   <div class="tip">

@@ -1,12 +1,12 @@
 """
 Supportal Chainlit Chat — professional AI chat sidecar.
-Shares all pipeline functions and agent tools with the NiceGUI app.
+Shares all pipeline functions and agent tools with the Strabo app.
 
 Run alongside the main app:
     chainlit run chainlit_app.py --port 8766
 
-Then click "Open Chainlit Chat" in the NiceGUI Agent tab.
-The NiceGUI app (port 8765) continues running unchanged.
+Then click "Open Chainlit Chat" in the Strabo Agent tab.
+The Strabo app (port 8765) continues running unchanged.
 """
 
 from __future__ import annotations
@@ -53,8 +53,8 @@ _patch_anyio_backend()
 import chainlit as cl
 import chainlit.data as cl_data
 
-# ── Pipeline is imported lazily to avoid NiceGUI event-loop side-effects ─────
-# Importing apps.nicegui.app at module level can initialise NiceGUI's
+# ── Pipeline is imported lazily to avoid Strabo event-loop side-effects ──────
+# Importing apps.strabo.app at module level can initialise NiceGUI's
 # asyncio state before Chainlit's anyio backend is running, causing
 # NoEventLoopError on static file requests.  We load it on first handler call.
 _pipeline: Any = None
@@ -63,7 +63,7 @@ _pipeline: Any = None
 def _get_pipeline():
     global _pipeline
     if _pipeline is None:
-        _pipeline = importlib.import_module("apps.nicegui.app")
+        _pipeline = importlib.import_module("apps.strabo.app")
     return _pipeline
 
 
@@ -677,12 +677,12 @@ async def on_start():
         ),
         cl.input_widget.TextInput(
             id="model", label="Model override",
-            description="Leave blank to use the model saved in your NiceGUI profile.",
+            description="Leave blank to use the model saved in your Strabo profile.",
             initial="",
         ),
         cl.input_widget.TextInput(
             id="api_key", label="API Key override",
-            description="Leave blank to use the key saved in your NiceGUI profile.",
+            description="Leave blank to use the key saved in your Strabo profile.",
             initial="",
         ),
         cl.input_widget.Slider(  # AFTER v1.5.0: history depth control
@@ -714,7 +714,7 @@ async def on_start():
         content=(
             f"**Supportal Agent**{_ver_str} — professional AI chat\n\n"
             "Open the **⚙ Settings** panel to set your customer and LLM provider.\n"
-            "Your Couchbase connection is loaded from the active NiceGUI profile automatically.\n\n"
+            "Your Couchbase connection is loaded from the active Strabo profile automatically.\n\n"
             "Ask anything about your support tickets, request charts or tables, "
             "or ask me to refresh a specific ticket from Supportal."
         ),

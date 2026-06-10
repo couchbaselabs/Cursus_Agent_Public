@@ -2,7 +2,7 @@
 Supportal MCP Server — Phase 2
 
 Exposes pipeline functions as MCP tools so Claude (or any MCP client) can call
-them natively rather than relying on the NiceGUI button-driven workflow.
+them natively rather than relying on the Strabo button-driven workflow.
 
 Tools:
   query_tickets       — structured N1QL search with filters
@@ -44,7 +44,7 @@ def _load_app() -> Any:
     global _app
     if _app is None:
         import importlib
-        _app = importlib.import_module("apps.nicegui.app")
+        _app = importlib.import_module("apps.strabo.app")
     return _app
 
 
