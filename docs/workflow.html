@@ -312,6 +312,51 @@ python run_chainlit.py</pre>
   </div>
 </div>
 
+<!-- ══ CHAINLIT TRIGGERS ══ -->
+<div class="section-label">Chainlit — interactive triggers</div>
+
+<div class="cards" style="margin-bottom:28px">
+
+  <div class="card">
+    <div class="card-title">🚀 Chat Starters <small style="color:#475569;font-weight:400">(shown before first message)</small></div>
+    <ul>
+      <li><strong>Morning Briefing</strong> → calls <span class="tool">get_portfolio_status</span> — fleet-wide urgency rank</li>
+      <li><strong>What's New?</strong> → asks for 24 h digest for the current customer</li>
+      <li><strong>Open P1 Tickets</strong> → queries all open P1s</li>
+      <li><strong>Customer Health Dashboard</strong> → <span class="tool">get_customer_health_score</span> summary</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">⚡ Quick Actions bar <small style="color:#475569;font-weight:400">(sent after chat start / settings save)</small></div>
+    <ul>
+      <li><strong>☀ Morning Briefing</strong> → <span class="tool">get_portfolio_status</span> — always visible</li>
+      <li><strong>📊 Quick Dashboard</strong> → portfolio health score summary — always visible</li>
+      <li><strong>🆕 What's New? (Customer)</strong> → 24 h digest — only shown when a customer is set</li>
+      <li><strong>🔖 Saved Queries</strong> → browse + re-run CB-persisted queries — only when customer is set</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🔄 Post-response actions <small style="color:#475569;font-weight:400">(appear after each agent reply)</small></div>
+    <ul>
+      <li><strong>Retry</strong> → re-sends the same message if the agent errored</li>
+      <li><strong>Follow-up chips</strong> → AI-generated suggestions (up to 3) based on Q&amp;A context</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🔖 Saved Queries flow</div>
+    <ul>
+      <li>Click <strong>Saved Queries</strong> → lists CB-persisted queries for current customer</li>
+      <li>Each query gets a <strong>▶ Run</strong> action button</li>
+      <li>Clicking Run re-executes the query through the full agent loop</li>
+      <li>Save a new query via agent: <em>"Save this query for next time"</em> → <span class="tool">save_query</span></li>
+    </ul>
+  </div>
+
+</div>
+
 <!-- ══ TIPS ══ -->
 <div class="section-label">Tips &amp; Shortcuts</div>
 <div class="tips">
