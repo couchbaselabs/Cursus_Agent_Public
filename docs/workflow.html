@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Supportal AI Agent — User Workflow</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 32px; }
+  h1 { font-size: 1.6rem; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
+  .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 36px; }
+  .version { display: inline-block; background: #1e293b; border: 1px solid #334155;
+             border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; color: #94a3b8;
+             margin-left: 10px; vertical-align: middle; }
+
+  /* ── step container ── */
+  .step { display: grid; grid-template-columns: 48px 1fr; gap: 0; margin-bottom: 36px; }
+  .step-num { width: 36px; height: 36px; border-radius: 50%;
+              display: flex; align-items: center; justify-content: center;
+              font-size: 0.85rem; font-weight: 800; flex-shrink: 0;
+              margin-top: 2px; margin-right: 12px; }
+  .step-num.blue   { background: #1d3e6a; color: #93c5fd; border: 2px solid #3b82f6; }
+  .step-num.green  { background: #134020; color: #86efac; border: 2px solid #22c55e; }
+  .step-num.amber  { background: #3f2600; color: #fde68a; border: 2px solid #f59e0b; }
+  .step-num.purple { background: #2d1060; color: #d8b4fe; border: 2px solid #a855f7; }
+
+  .step-body { flex: 1; }
+  .step-title { font-size: 1rem; font-weight: 700; color: #f1f5f9; margin-bottom: 4px; }
+  .step-desc  { font-size: 0.78rem; color: #64748b; margin-bottom: 14px; }
+
+  /* ── outcome pill ── */
+  .outcome { display: inline-flex; align-items: center; gap: 6px; font-size: 0.7rem;
+             font-weight: 600; padding: 4px 12px; border-radius: 20px; margin-top: 14px; }
+  .outcome.blue   { background: #162032; border: 1px solid #3b82f6; color: #93c5fd; }
+  .outcome.green  { background: #0d2318; border: 1px solid #22c55e; color: #86efac; }
+  .outcome.amber  { background: #1f1800; border: 1px solid #f59e0b; color: #fde68a; }
+  .outcome.purple { background: #1a0f2e; border: 1px solid #a855f7; color: #d8b4fe; }
+
+  /* ── card grid ── */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+           gap: 14px; margin-bottom: 6px; }
+  .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 10px; padding: 14px; }
+  .card.alt { border-color: #334155; background: #131720; }
+  .card-title { font-size: 0.78rem; font-weight: 700; color: #cbd5e1; margin-bottom: 8px;
+                display: flex; align-items: center; gap: 6px; }
+
+  /* ── code blocks ── */
+  pre { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+        padding: 10px 14px; font-family: "SF Mono","Fira Code",monospace;
+        font-size: 0.7rem; color: #8b949e; overflow-x: auto; margin: 6px 0 10px; }
+  code { font-family: "SF Mono","Fira Code",monospace; font-size: 0.7rem;
+         background: #1e293b; color: #93c5fd; padding: 1px 5px; border-radius: 3px; }
+
+  /* ── lists ── */
+  ul { list-style: none; padding: 0; }
+  li { font-size: 0.73rem; color: #94a3b8; padding: 3px 0 3px 16px; position: relative; }
+  li::before { content: "›"; position: absolute; left: 0; color: #475569; }
+  li strong { color: #cbd5e1; }
+
+  /* ── tool chips ── */
+  .tool { display: inline-block; font-size: 0.62rem; font-weight: 600; padding: 2px 8px;
+          border-radius: 4px; background: #1e2d40; color: #60a5fa;
+          border: 1px solid #1d3e6a; margin: 2px 2px 2px 0; font-family: "SF Mono","Fira Code",monospace; }
+
+  /* ── example queries ── */
+  .examples { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .example { background: #131720; border: 1px solid #1e293b; border-radius: 8px;
+             padding: 12px 14px; }
+  .example q { display: block; font-size: 0.75rem; color: #e2e8f0; font-style: italic;
+               margin-bottom: 8px; quotes: "\201C" "\201D"; }
+  .example q::before { content: open-quote; color: #475569; }
+  .example q::after  { content: close-quote; color: #475569; }
+
+  /* ── tips ── */
+  .tips { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .tip { background: #131720; border-left: 3px solid #334155; border-radius: 0 8px 8px 0;
+         padding: 10px 14px; }
+  .tip-title { font-size: 0.72rem; font-weight: 700; color: #cbd5e1; margin-bottom: 5px; }
+  .tip p { font-size: 0.7rem; color: #64748b; line-height: 1.55; }
+  .tip p code { font-size: 0.67rem; }
+
+  /* ── section label ── */
+  .section-label { font-size: 0.7rem; font-weight: 700; letter-spacing: .12em;
+                   text-transform: uppercase; color: #475569; margin: 32px 0 16px;
+                   padding-bottom: 6px; border-bottom: 1px solid #1e293b; }
+</style>
+</head>
+<body>
+
+<h1>Supportal AI Agent — User Workflow <span class="version">v2.4.9</span></h1>
+<p class="subtitle">Step-by-step guide: setup → authentication → data ingestion → analysis</p>
+
+<!-- ══ STEP 1 ══ -->
+<div class="step">
+  <div class="step-num blue">1</div>
+  <div class="step-body">
+    <div class="step-title">Initial Setup — one time</div>
+    <div class="step-desc">Start both servers and configure your connection profile</div>
+    <div class="cards">
+
+      <div class="card">
+        <div class="card-title">🖥 Start NiceGUI</div>
+        <pre>cd ~/Downloads/Apps/Scraper
+source venv/bin/activate
+python run_nicegui.py</pre>
+        <ul><li>Opens at <code>localhost:8080</code></li></ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">💬 Start Chainlit <small style="color:#475569;font-weight:400">(optional)</small></div>
+        <pre>source venv/bin/activate
+python run_chainlit.py</pre>
+        <ul><li>Opens at <code>localhost:8766</code></li></ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">⚙️ Create a Profile</div>
+        <ul>
+          <li>NiceGUI → <strong>Configuration</strong> tab</li>
+          <li>Set Couchbase URL, bucket, username &amp; password</li>
+          <li>Click <strong>Test Connection</strong> to verify</li>
+          <li>Choose LLM provider (Claude / Ollama / LMStudio)</li>
+          <li>Choose embedding provider + model + dimensions</li>
+          <li>Save profile — applies to both UIs</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔍 Create FTS Index</div>
+        <ul>
+          <li>Still in <strong>Configuration</strong></li>
+          <li>Click <strong>Create / Update FTS Index</strong></li>
+          <li>Builds hybrid BM25 + vector index on the <code>supportal</code> scope</li>
+          <li>Only needed once, or after changing embedding dimensions</li>
+          <li>Index name: <code>supportal_hybrid</code></li>
+        </ul>
+      </div>
+
+    </div>
+    <div class="outcome blue">✓ profile saved → ready to authenticate</div>
+  </div>
+</div>
+
+<!-- ══ STEP 2 ══ -->
+<div class="step">
+  <div class="step-num amber">2</div>
+  <div class="step-body">
+    <div class="step-title">Authenticate with Supportal — refresh when cookie expires (~8 h)</div>
+    <div class="step-desc">Choose whichever method you have available</div>
+    <div class="cards">
+
+      <div class="card">
+        <div class="card-title">🍪 Option A — Paste Cookie <small style="color:#22c55e;font-weight:600">(recommended)</small></div>
+        <ul>
+          <li>Log into <code>supportal.couchbase.com</code> in your browser</li>
+          <li>Open DevTools → Application → Cookies</li>
+          <li>Copy the full <strong>Cookie</strong> header value</li>
+          <li>Paste into the <strong>Cookie</strong> field in NiceGUI Configuration</li>
+          <li>Click <strong>Save Cookie</strong> — all scraping runs headless</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🌐 Option B — Browser SSO Login</div>
+        <ul>
+          <li>Click <strong>Login with Browser</strong> in Configuration tab</li>
+          <li>A Chromium window opens — complete the SSO flow</li>
+          <li>Cookie is extracted automatically and saved to profile</li>
+          <li>Chromium closes — all subsequent scraping is headless</li>
+          <li>Re-run on <code>403</code> errors or session expiry</li>
+        </ul>
+      </div>
+
+    </div>
+    <div class="outcome amber">✓ cookie active → ready to ingest data</div>
+  </div>
+</div>
+
+<!-- ══ STEP 3 ══ -->
+<div class="step">
+  <div class="step-num green">3</div>
+  <div class="step-body">
+    <div class="step-title">Ingest Data — per customer, run periodically or via agent</div>
+    <div class="step-desc">Pull tickets and cluster snapshots from Supportal into Couchbase</div>
+    <div class="cards">
+
+      <div class="card">
+        <div class="card-title">🎫 Scrape Tickets</div>
+        <ul>
+          <li>NiceGUI → <strong>Scraping</strong> tab</li>
+          <li>Enter customer org name (or alias)</li>
+          <li>Click <strong>Scrape Tickets</strong></li>
+          <li>Change-detection skips unchanged tickets on re-runs</li>
+          <li>Reconcile step removes deleted Zendesk tickets from CB</li>
+          <li>Results stored in <code>supportal.tickets</code></li>
+          <li>Or via agent: <em>"Scrape latest tickets for Acme Corp"</em></li>
+        </ul>
+        <div style="margin-top:8px"><span class="tool">scrape_customer_tickets</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">📸 Fetch Snapshot Stubs</div>
+        <ul>
+          <li>NiceGUI → <strong>Scraping</strong> tab → Snapshots section</li>
+          <li>Click <strong>Fetch Snapshot Stubs</strong></li>
+          <li>Uses <code>POST /api/support360/query</code> — one round-trip</li>
+          <li>Stubs saved to <code>supportal.snapshots</code> (no topology yet)</li>
+          <li>Or via agent: <em>"Fetch snapshot stubs for Acme"</em></li>
+        </ul>
+        <div style="margin-top:8px"><span class="tool">fetch_snapshots</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔬 Backfill Topology</div>
+        <ul>
+          <li>NiceGUI → <strong>Scraping</strong> tab → click <strong>Backfill Topology</strong></li>
+          <li>Fetches <code>GET /snapshot/{enc}/nutshell</code> per stub</li>
+          <li>Adds: CB version, node layout, services, bad/warn items</li>
+          <li>RAM/node, CPUs/node, GSI/FTS/Eventing counts</li>
+          <li>Skips stubs already fully populated</li>
+          <li>Or: <em>"Backfill topology for pending snapshots"</em></li>
+        </ul>
+        <div style="margin-top:8px"><span class="tool">backfill_snapshot_topology</span> <span class="tool">sync_snapshots</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🧠 Embed Tickets</div>
+        <ul>
+          <li>NiceGUI → <strong>Scoring &amp; Analysis</strong> tab</li>
+          <li>Click <strong>Embed All Tickets</strong> (or new tickets only)</li>
+          <li>Generates vectors via configured embedding model</li>
+          <li>Vectors stored in <code>supportal.tickets</code> alongside text</li>
+          <li>Required for <code>vector_search</code> to work in chat</li>
+        </ul>
+      </div>
+
+    </div>
+    <div class="outcome green">✓ data in Couchbase → ready to analyze</div>
+  </div>
+</div>
+
+<!-- ══ STEP 4 ══ -->
+<div class="step">
+  <div class="step-num purple">4</div>
+  <div class="step-body">
+    <div class="step-title">Analyze &amp; Query</div>
+    <div class="step-desc">Use either UI — full agent parity, different strengths</div>
+    <div class="cards">
+
+      <div class="card">
+        <div class="card-title">🖥 NiceGUI Chat — <code>localhost:8080</code></div>
+        <ul>
+          <li>Quick queries, admin ops, pipeline control</li>
+          <li>Inline ECharts (12 types, SVG/PNG export)</li>
+          <li>Assets tab — browse saved charts, CSVs, reports</li>
+          <li>Analytics tab — drill-down charts with click handlers</li>
+          <li>Customers tab — health scores + P1 count badges</li>
+          <li>Good for: day-to-day triage, dashboard review</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">💬 Chainlit Chat — <code>localhost:8766</code></div>
+        <ul>
+          <li>Threaded sessions with full history sidebar</li>
+          <li>Live tool status updates per agent turn</li>
+          <li>Job monitors survive tab close + reconnect</li>
+          <li>Assets restored on session resume from CB</li>
+          <li>Mobile-friendly layout</li>
+          <li>Good for: multi-session research, sharing findings</li>
+        </ul>
+      </div>
+
+    </div>
+
+    <div class="section-label" style="margin-top:20px">Example questions &amp; tools used</div>
+    <div class="examples">
+      <div class="example">
+        <q>Show me all P1 tickets for Acme open more than 30 days</q>
+        <span class="tool">query_tickets</span> <span class="tool">generate_table</span>
+      </div>
+      <div class="example">
+        <q>Find tickets related to XDCR replication failures</q>
+        <span class="tool">vector_search</span> <span class="tool">generate_table</span>
+      </div>
+      <div class="example">
+        <q>What's the cluster health for ticket 98765?</q>
+        <span class="tool">get_ticket</span> <span class="tool">get_cluster_health</span> <span class="tool">generate_chart</span>
+      </div>
+      <div class="example">
+        <q>Morning briefing — where should I focus today?</q>
+        <span class="tool">get_portfolio_status</span>
+      </div>
+      <div class="example">
+        <q>Is our Couchbase data for Acme still fresh?</q>
+        <span class="tool">check_data_freshness</span> <span class="tool">scrape_customer_tickets</span>
+      </div>
+      <div class="example">
+        <q>Score ticket 98765 for complexity and sentiment</q>
+        <span class="tool">get_ticket</span> <span class="tool">score_ticket</span>
+      </div>
+      <div class="example">
+        <q>Fetch the latest snapshots for Globex and fill in topology</q>
+        <span class="tool">fetch_snapshots</span> <span class="tool">backfill_snapshot_topology</span>
+      </div>
+      <div class="example">
+        <q>Which customers have the most unresolved P1s right now?</q>
+        <span class="tool">query_fleet_tickets</span> <span class="tool">generate_chart</span>
+      </div>
+    </div>
+    <div class="outcome purple">✓ findings → export / act</div>
+  </div>
+</div>
+
+<!-- ══ TIPS ══ -->
+<div class="section-label">Tips &amp; Shortcuts</div>
+<div class="tips">
+
+  <div class="tip">
+    <div class="tip-title">Cookie expiry</div>
+    <p>Supportal sessions last ~8 hours. If scraping returns <code>403</code> errors or the agent reports empty results, your cookie has expired. Re-paste or re-run browser login.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Incremental scraping</div>
+    <p>Re-running <code>scrape_customer_tickets</code> is safe — change-detection skips tickets whose content hasn't changed. Deleted Zendesk tickets are automatically removed from CB (reconcile step).</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Embedding after ingest</div>
+    <p>New tickets won't appear in semantic search until embedded. Run <strong>Embed Tickets</strong> in the Scoring tab after any scrape, or ask the agent to embed as part of the ingest.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Snapshot two-step</div>
+    <p>Stub fetch is fast (one Analytics API call). Topology backfill is slow (one REST call per snapshot). Run stub fetch first to see what's available, then backfill in background. Or use <code>sync_snapshots</code> to do both in one agent call.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Agent data routing</div>
+    <p>The agent automatically chooses LOCAL (Couchbase) vs LIVE (Supportal API) based on your question. Ask explicitly if needed: <em>"using live data, show me…"</em> or <em>"from our local copy, …"</em></p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Chainlit thread resume</div>
+    <p>Prior sessions appear in the sidebar. Click any thread to resume — charts and tables are restored from <code>chat.assets</code>. Job monitors re-attach automatically on reconnect.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Results tab export</div>
+    <p>The NiceGUI Results tab provides quick CSV / Excel export without asking the agent. Use it for bulk extracts; use the agent for analysis and visualisation.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Profile = shared config</div>
+    <p>The active NiceGUI profile drives the Chainlit app too — LLM provider, embedding model, CB connection, and cookie are all read from the same saved profile. Change once, applies everywhere.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">MCP server</div>
+    <p>Run <code>python apps/mcp/server.py</code> and add it to Claude Desktop's <code>mcp_servers</code> config to use all 29 agent tools directly from the Claude desktop app.</p>
+  </div>
+
+</div>
+
+<p style="font-size:0.65rem;color:#334155;margin-top:32px;text-align:center">
+  Supportal AI Agent · user workflow · v2.4.9 · updated 2026-06-09
+</p>
+
+</body>
+</html>
