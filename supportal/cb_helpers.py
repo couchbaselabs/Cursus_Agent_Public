@@ -295,6 +295,7 @@ def load_to_couchbase(
     cb_url: str, bucket: str, username: str, password: str,
     use_tls: bool, scope: str, collection: str,
     progress_cb: Callable[[str, float], None],
+    cancel_event=None,
 ) -> tuple[int, int]:
     """Upsert each ticket into Couchbase. Returns (upserted_count, error_count)."""
     if not _CB_AVAILABLE:
@@ -310,6 +311,9 @@ def load_to_couchbase(
     upserted = errors = 0
     _now = int(time.time())
     for i, ticket in enumerate(tickets, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            progress_cb("Cancelled.", i / total)
+            break
         tid = ticket.get("ticket_id") or f"unknown_{i}"
         doc_key = f"ticket::{tid}"
         try:

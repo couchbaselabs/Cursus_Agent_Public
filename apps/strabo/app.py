@@ -2542,7 +2542,7 @@ def main_page():
                                     _save_ok = False
                                     try:
                                         saved, errs = await run.io_bound(
-                                            save_tickets_to_cb,
+                                            load_to_couchbase,
                                             data,
                                             cb_url_input.value.strip(),
                                             cb_bucket_input.value.strip(),
