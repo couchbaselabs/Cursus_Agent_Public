@@ -483,7 +483,7 @@ async def _restore_assets(thread_id: str) -> None:
                             figure=fig,
                             display="inline",
                         )],
-                        author="Supportal (restored)",
+                        author="Corax (restored)",
                     ).send()
             elif atype == "table":
                 cols = data.get("columns") or []
@@ -494,7 +494,7 @@ async def _restore_assets(thread_id: str) -> None:
                     await cl.Message(
                         content=label,
                         elements=[cl.Dataframe(name=tname, data=df, display="inline")],
-                        author="Supportal (restored)",
+                        author="Corax (restored)",
                     ).send()
         except Exception:
             pass
@@ -552,7 +552,7 @@ async def _send_quick_actions(customer: str) -> None:
             description="Browse curated prompts by category",
         )
     )
-    await cl.Message(content="**Quick Actions**", actions=actions, author="Supportal").send()
+    await cl.Message(content="**Quick Actions**", actions=actions, author="Corax").send()
 
 
 # ── Chat starters (shown before first message) ────────────────────────────────
@@ -685,10 +685,15 @@ async def on_start():
             description="Leave blank to use the key saved in your Strabo profile.",
             initial="",
         ),
-        cl.input_widget.Slider(  # AFTER v1.5.0: history depth control
+        cl.input_widget.Slider(
             id="agent_context_depth", label="History depth",
             description="Number of prior messages included in each agent call (default 10).",
             initial=10, min=2, max=40, step=2,
+        ),
+        cl.input_widget.Slider(
+            id="top_k", label="Top-K retrieval",
+            description="Documents returned from RRF fusion before the LLM context is built (default 10).",
+            initial=10, min=1, max=100, step=1,
         ),
     ]).send()
 
@@ -712,13 +717,13 @@ async def on_start():
     _ver_str = f" `v{_ver}`" if _ver else ""
     await cl.Message(
         content=(
-            f"**Supportal Agent**{_ver_str} — professional AI chat\n\n"
-            "Open the **⚙ Settings** panel to set your customer and LLM provider.\n"
+            f"**Corax**{_ver_str} — Supportal AI chat\n\n"
+            "Open the **⚙ Settings** panel to set your customer, LLM provider, and Top-K retrieval.\n"
             "Your Couchbase connection is loaded from the active Strabo profile automatically.\n\n"
             "Ask anything about your support tickets, request charts or tables, "
             "or ask me to refresh a specific ticket from Supportal."
         ),
-        author="Supportal",
+        author="Corax",
     ).send()
     await _send_quick_actions("")
     # Pick up any jobs that started in NiceGUI or a prior Chainlit session
@@ -732,7 +737,8 @@ async def on_settings_update(settings: dict):
         "provider":            settings.get("provider") or "",
         "model":               (settings.get("model") or "").strip(),
         "api_key":             (settings.get("api_key") or "").strip(),
-        "agent_context_depth": int(settings.get("agent_context_depth") or 10),  # AFTER v1.5.0
+        "agent_context_depth": int(settings.get("agent_context_depth") or 10),
+        "top_k":               int(settings.get("top_k") or 10),
     }
     old_customer = cl.user_session.get("customer", "")
     cl.user_session.set("customer", customer)
@@ -809,7 +815,7 @@ async def on_message(message: cl.Message):
     # It stays visible after the agent finishes as a tool trace.
     loop = asyncio.get_event_loop()
     _tool_log: list[str] = []
-    status_msg = await cl.Message(content="⏳ Agent starting…", author="Supportal").send()
+    status_msg = await cl.Message(content="⏳ Agent starting…", author="Corax").send()
 
     def _cl_status_cb(tool_name: str):
         _tool_log.append(tool_name)
@@ -846,7 +852,7 @@ async def on_message(message: cl.Message):
         status_msg.content = f"❌ {_friendly}"
         await status_msg.update()
         retry_action = cl.Action(name="retry", value=message.content, payload={"value": message.content}, label="Retry", description="Re-run the same question")
-        await cl.Message(content=_friendly, actions=[retry_action], author="Supportal").send()
+        await cl.Message(content=_friendly, actions=[retry_action], author="Corax").send()
         return
 
     cl.user_session.set("_session_log", agent_ctx.get("_session_log", {}))  # AFTER v1.5.0
@@ -880,7 +886,7 @@ async def on_message(message: cl.Message):
         cl.Action(name="followup", value=s, payload={"value": s}, label=s, description="Ask this follow-up")
         for s in _sugs
     ]
-    await cl.Message(content=clean_text, elements=elements, actions=_actions, author="Supportal").send()
+    await cl.Message(content=clean_text, elements=elements, actions=_actions, author="Corax").send()
 
 
 async def _monitor_job(job_id: str, app: Any, cb: tuple | None = None) -> None:
@@ -1000,7 +1006,7 @@ async def on_show_saved_queries(action: cl.Action):
     if not queries:
         await cl.Message(
             content=f"No saved queries found for **{customer or 'this customer'}**.",
-            author="Supportal",
+            author="Corax",
         ).send()
         return
     sq_actions = [
@@ -1015,12 +1021,12 @@ async def on_show_saved_queries(action: cl.Action):
         if q.get("question")
     ]
     if not sq_actions:
-        await cl.Message(content="No runnable saved queries found.", author="Supportal").send()
+        await cl.Message(content="No runnable saved queries found.", author="Corax").send()
         return
     await cl.Message(
         content=f"**Saved Queries for {customer}** — click to run:",
         actions=sq_actions,
-        author="Supportal",
+        author="Corax",
     ).send()
 
 
@@ -1054,7 +1060,7 @@ async def on_prompt_library(action: cl.Action):
     await cl.Message(
         content=f"**📚 Prompt Library**{cust_note}\n\nChoose a category:",
         actions=cat_actions,
-        author="Supportal",
+        author="Corax",
     ).send()
 
 
@@ -1066,7 +1072,7 @@ async def on_prompt_library_category(action: cl.Action):
     customer = action.payload.get("customer") or cl.user_session.get("customer", "")
     prompts = get_prompts_for_category(category)
     if not prompts:
-        await cl.Message(content=f"No prompts found for **{category}**.", author="Supportal").send()
+        await cl.Message(content=f"No prompts found for **{category}**.", author="Corax").send()
         return
 
     prompt_actions = []
@@ -1104,7 +1110,7 @@ async def on_prompt_library_category(action: cl.Action):
     await cl.Message(
         content="\n".join(lines),
         actions=prompt_actions + back_actions,
-        author="Supportal",
+        author="Corax",
     ).send()
 
 
