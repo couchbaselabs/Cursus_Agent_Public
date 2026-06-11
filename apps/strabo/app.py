@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import asyncio
 import threading
@@ -9384,13 +9384,7 @@ def main_page():
             "ch_workers":         ch_workers.value,
             "ch_max_snapshots":   ch_max_snapshots.value,
             "ch_analytics_limit": ch_analytics_limit.value,
-            # Chat settings
-            "chat_mode":              chat_mode_select.value,
-            "top_k":                  top_k_input.value,
-            "batch_size_chat":        batch_size_chat_input.value,
-            "batch_parallel":         batch_parallel_input.value,
-            "compact_context":        compact_context_toggle.value,
-            "deep_reason":            deep_reason_toggle.value,
+            # Chat settings (retired — Corax handles chat; keys kept for profile compat)
             # Chat cache / memory
             "cache_collection":   cache_collection_input.value,
             "embed_cache_ttl":    embed_cache_ttl.value,
@@ -9483,13 +9477,7 @@ def main_page():
         _set(ch_workers,              "ch_workers")
         _set(ch_max_snapshots,        "ch_max_snapshots")
         _set(ch_analytics_limit,      "ch_analytics_limit")
-        if p.get("chat_mode"):
-            chat_mode_select.set_value(p["chat_mode"])
-        _set(top_k_input,             "top_k")
-        _set(batch_size_chat_input,   "batch_size_chat")
-        _set(batch_parallel_input,    "batch_parallel")
-        _set(compact_context_toggle,  "compact_context")
-        _set(deep_reason_toggle,      "deep_reason")
+        # chat_mode / top_k / batch_size / compact_context / deep_reason retired
         _set(cache_collection_input,  "cache_collection")
         _set(embed_cache_ttl,        "embed_cache_ttl")
         _set(search_cache_ttl,       "search_cache_ttl")
