@@ -1917,6 +1917,45 @@ def reciprocal_rank_fusion(*ranked_lists: list[str], k: int = 60) -> list[str]:
     return sorted(scores, key=lambda d: scores[d], reverse=True)
 
 
+def _rrf_elbow_k(
+    ordered_ids: list[str],
+    all_ranked: list[list[str]],
+    k_max: int,
+    k_min: int = 3,
+    rrf_k: int = 60,
+) -> int:
+    """
+    Find the natural cutoff in RRF scores using the largest relative score drop
+    (elbow detection).  Returns a value between k_min and k_max inclusive.
+
+    Works by recomputing the RRF score for each candidate in ordered_ids[:k_max]
+    and finding the index where the score drops most sharply relative to the
+    previous score — the "elbow" in the score curve.  Everything above the elbow
+    is signal; everything below is noise.
+    """
+    candidates = ordered_ids[:k_max]
+    if len(candidates) <= k_min:
+        return len(candidates)
+
+    score_map: dict[str, float] = {}
+    for ranked in all_ranked:
+        for rank, doc_id in enumerate(ranked):
+            score_map[doc_id] = score_map.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+
+    scores = [score_map.get(doc_id, 0.0) for doc_id in candidates]
+
+    best_drop, cut_at = 0.0, len(scores)
+    for i in range(k_min - 1, len(scores) - 1):
+        if scores[i] == 0:
+            cut_at = i
+            break
+        drop = (scores[i] - scores[i + 1]) / scores[i]
+        if drop > best_drop:
+            best_drop, cut_at = drop, i + 1
+
+    return max(k_min, min(cut_at, k_max))
+
+
 def hybrid_retrieval(
     question: str,
     query_vec: list[float] | None,
@@ -2141,4 +2180,8 @@ def hybrid_retrieval(
             resolved = date_filtered
             notes.append(f"date-filtered to {len(resolved)}")
 
-    return resolved[:top_k], " | ".join(notes)
+    _auto_k = _rrf_elbow_k(_rrf_ordered, all_lists, k_max=min(_rrf_cap, len(resolved)))
+    _final_k = min(_auto_k, top_k, len(resolved))
+    if _final_k < top_k:
+        notes.append(f"elbow@{_final_k}")
+    return resolved[:_final_k], " | ".join(notes)
