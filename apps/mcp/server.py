@@ -248,7 +248,8 @@ async def _dispatch(name: str, args: dict) -> Any:
         if results:
             import concurrent.futures
             from couchbase.options import GetOptions  # type: ignore
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             from datetime import timedelta
             conn_str = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
@@ -285,7 +286,8 @@ async def _dispatch(name: str, args: dict) -> Any:
         raw_keys = app.vector_search_cb(query_vec, *cb_args, int(args.get("top_k", 20)))
         customer = args.get("customer", "").lower()
         # Resolve to summary dicts (same pattern as query_tickets)
-        from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+        from couchbase.cluster import Cluster  # type: ignore
+        from couchbase.options import ClusterOptions  # type: ignore
         from couchbase.auth import PasswordAuthenticator  # type: ignore
         from datetime import timedelta
         conn_str = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])

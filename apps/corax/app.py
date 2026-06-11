@@ -75,7 +75,8 @@ def _cb_get_job(job_id: str, cb_url: str, bucket: str, username: str,
         return None
     try:
         app = _get_pipeline()
-        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
         from couchbase.auth import PasswordAuthenticator as _PA
         from datetime import timedelta as _td
         conn = app._cb_conn_str(cb_url, use_tls)
@@ -99,7 +100,8 @@ def _cb_query_active_jobs(cb_url: str, bucket: str, username: str,
     try:
         import time as _t
         app = _get_pipeline()
-        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
         from couchbase.auth import PasswordAuthenticator as _PA
         from couchbase.options import QueryOptions as _QO
         from datetime import timedelta as _td

@@ -828,7 +828,8 @@ def _reconcile_deleted_tickets(
     if not _CB_AVAILABLE:
         return 0, 0
     try:
-        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
         from couchbase.auth import PasswordAuthenticator as _PA
         from couchbase.options import QueryOptions as _QO
         from datetime import timedelta as _td
@@ -9641,7 +9642,8 @@ def _persist_job_state(
     if not _CB_AVAILABLE or not cb_url:
         return
     try:
-        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
         from couchbase.auth import PasswordAuthenticator as _PA
         from couchbase.options import UpsertOptions as _UO
         _conn = _cb_conn_str(cb_url, use_tls)
@@ -9734,7 +9736,8 @@ def _run_scrape_job_bg(
         _saved = 0
         now_epoch = int(time.time())
         try:
-            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
             from couchbase.auth import PasswordAuthenticator as _PA
             _conn = _cb_conn_str(cb_url, use_tls)
             _cluster = _Cl(_conn, _CO(_PA(username, password)))
@@ -9869,7 +9872,8 @@ def _run_rescrape_job_bg(
         job["phase"] = "scraping"
         _set_op(f"Rescraping 0/{total} tickets for '{org}'…", 0.0)
 
-        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
         from couchbase.auth import PasswordAuthenticator as _PA
         conn_str  = _cb_conn_str(cb_url, use_tls)
         _bcluster = _Cl(conn_str, _CO(_PA(username, password)))
@@ -10039,7 +10043,8 @@ def _record_customer_access(
     if not _CB_AVAILABLE or not cb_url or not org:
         return
     try:
-        from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO  # type: ignore
+        from couchbase.cluster import Cluster as _Cl  # type: ignore
+        from couchbase.options import ClusterOptions as _CO  # type: ignore
         from couchbase.auth import PasswordAuthenticator as _PA               # type: ignore
         conn = _cb_conn_str(cb_url, use_tls)
         cl = _Cl(conn, _CO(_PA(username, password)))
@@ -10299,7 +10304,8 @@ def _execute_agent_tool(
         if not _CB_AVAILABLE:
             return "Couchbase not available."
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             from couchbase.options import QueryOptions  # type: ignore
             conn_str = _cb_conn_str(cb_url, use_tls)
@@ -10462,7 +10468,8 @@ def _execute_agent_tool(
             # Persist the deletion marker so future incremental scrapes skip it
             doc_key = f"ticket::{ticket_id}"
             try:
-                from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+                from couchbase.cluster import Cluster  # type: ignore
+                from couchbase.options import ClusterOptions  # type: ignore
                 from couchbase.auth import PasswordAuthenticator  # type: ignore
                 conn_str = _cb_conn_str(cb_url, use_tls)
                 cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
@@ -10514,7 +10521,8 @@ def _execute_agent_tool(
         # ── Merge onto existing CB doc (preserve score, embedding, etc.) ─────
         _saved = False
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             conn_str = _cb_conn_str(cb_url, use_tls)
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
@@ -10687,7 +10695,8 @@ LIMIT {limit}
         if not _CB_AVAILABLE:
             return "Couchbase not available."
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             from couchbase.options import QueryOptions  # type: ignore
             conn_str = _cb_conn_str(cb_url, use_tls)
@@ -10849,7 +10858,8 @@ LIMIT {limit}
             return "Error: organization is required."
         # Load snapshots for this org from CB
         try:
-            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
             from couchbase.auth import PasswordAuthenticator as _PA
             from couchbase.options import QueryOptions as _QO
             _conn = _cb_conn_str(cb_url, use_tls)
@@ -10883,7 +10893,8 @@ LIMIT {limit}
             _auto_prefix += _sync_result + "\n\n"
             # Re-query after sync
             try:
-                from couchbase.cluster import Cluster as _Cl2, ClusterOptions as _CO2
+                from couchbase.cluster import Cluster as _Cl2
+                from couchbase.options import ClusterOptions as _CO2
                 from couchbase.auth import PasswordAuthenticator as _PA2
                 from couchbase.options import QueryOptions as _QO2
                 _conn2 = _cb_conn_str(cb_url, use_tls)
@@ -10941,7 +10952,8 @@ LIMIT {limit}
         # Save stubs to CB
         _saved = 0
         try:
-            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
             from couchbase.auth import PasswordAuthenticator as _PA
             _conn = _cb_conn_str(cb_url, use_tls)
             _cluster = _Cl(_conn, _CO(_PA(username, password)))
@@ -10974,7 +10986,8 @@ LIMIT {limit}
             return "No session cookie available — paste a cookie in the Configuration tab first."
         # Load incomplete stubs from CB
         try:
-            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
             from couchbase.auth import PasswordAuthenticator as _PA
             from couchbase.options import QueryOptions as _QO
             _conn = _cb_conn_str(cb_url, use_tls)
@@ -11001,7 +11014,8 @@ LIMIT {limit}
         # Save enriched docs back to CB
         _saved = 0
         try:
-            from couchbase.cluster import Cluster as _Cl2, ClusterOptions as _CO2
+            from couchbase.cluster import Cluster as _Cl2
+            from couchbase.options import ClusterOptions as _CO2
             from couchbase.auth import PasswordAuthenticator as _PA2
             _conn2 = _cb_conn_str(cb_url, use_tls)
             _cl2 = _Cl2(_conn2, _CO2(_PA2(username, password)))
@@ -11136,7 +11150,8 @@ LIMIT {limit}
         s = scored[0]
         # Save scores back to CB
         try:
-            from couchbase.cluster import Cluster as _Cl, ClusterOptions as _CO
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
             from couchbase.auth import PasswordAuthenticator as _PA
             _conn = _cb_conn_str(cb_url, use_tls)
             _cluster = _Cl(_conn, _CO(_PA(username, password)))
@@ -11235,7 +11250,8 @@ LIMIT {limit}
 
         _saved = 0
         try:
-            from couchbase.cluster import Cluster as _ScCl, ClusterOptions as _ScCO
+            from couchbase.cluster import Cluster as _ScCl
+            from couchbase.options import ClusterOptions as _ScCO
             from couchbase.auth import PasswordAuthenticator as _ScPA
             _sc_conn = _cb_conn_str(cb_url, use_tls)
             _sc_cl = _ScCl(_sc_conn, _ScCO(_ScPA(username, password)))
@@ -11283,7 +11299,8 @@ LIMIT {limit}
             return "No session cookie available — paste a cookie in the Configuration tab first."
 
         try:
-            from couchbase.cluster import Cluster as _BrCl, ClusterOptions as _BrCO
+            from couchbase.cluster import Cluster as _BrCl
+            from couchbase.options import ClusterOptions as _BrCO
             from couchbase.auth import PasswordAuthenticator as _BrPA
             _br_conn = _cb_conn_str(cb_url, use_tls)
             _br_cl = _BrCl(_br_conn, _BrCO(_BrPA(username, password)))
@@ -11395,7 +11412,8 @@ LIMIT {limit}
         incl_cluster    = bool(args.get("include_cluster"))
         snap_collection = ctx.get("snap_collection", "snapshots")
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator        # type: ignore
             conn = _cb_conn_str(cb_url, use_tls)
             cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
