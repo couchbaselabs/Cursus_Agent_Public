@@ -480,40 +480,69 @@ async def _save_assets(thread_id: str, prompt: str, raw_artifacts: list) -> None
             pass
 
 
-async def _restore_assets(thread_id: str) -> None:
-    """Re-display stored charts/tables for a resumed thread."""
-    dl = cl_data.get_data_layer()
-    if dl is None or not hasattr(dl, "get_assets_for_thread"):
+async def _push_sidebar(new_elements: list | None = None, title: str | None = None) -> None:
+    """Add elements to the sidebar and refresh it. Maintains a session-level list."""
+    registry: list = cl.user_session.get("_sidebar_elements") or []
+    if new_elements:
+        registry.extend(new_elements)
+        cl.user_session.set("_sidebar_elements", registry)
+    if not registry:
         return
+    count = len(registry)
+    sidebar_title = title or f"📦 Artifacts ({count})"
+    await cl.ElementSidebar.set_title(sidebar_title)
+    await cl.ElementSidebar.set_elements(registry)
+
+
+async def _restore_assets(thread_id: str) -> None:
+    """Rebuild the sidebar from assets saved for this thread in CB."""
+    from supportal.agent_tools import _list_assets_from_cb, _get_asset_content_from_cb
+
+    profile = cl.user_session.get("profile") or _load_cb_settings()
+    cb_a = _cb_args_assets(profile)
+    if not cb_a[2]:
+        return
+
+    # Fetch asset list for this thread via the thread_id stored in session_id field
     try:
-        assets = await dl.get_assets_for_thread(thread_id)
+        all_assets = await asyncio.to_thread(_list_assets_from_cb, *cb_a, "", "", 100)
+        thread_assets = [a for a in all_assets if a.get("session_id") == thread_id]
     except Exception:
         return
-    for asset in assets:
+
+    if not thread_assets:
+        return
+
+    elements: list = []
+    for a in thread_assets:
         try:
-            data = json.loads(base64.b64decode(asset["content_b64"]))
-            snippet = (asset.get("prompt") or "")[:80]
-            label = f'*Restored from: "{snippet}"*' if snippet else "*Restored asset*"
-            atype = asset.get("type", "")
-            if atype == "echart":
-                await cl.Message(
-                    content=label,
-                    elements=[_echart_element(data, asset.get("title", "chart"))],
-                    author="Corax (restored)",
-                ).send()
+            aid   = a.get("id") or ""
+            atype = a.get("asset_type") or ""
+            title = a.get("title") or a.get("filename") or aid[:8]
+            doc   = await asyncio.to_thread(_get_asset_content_from_cb, *cb_a, aid)
+            content = doc.get("content") or ""
+            if atype in ("chart", "echart"):
+                option = json.loads(content)
+                elements.append(_echart_element(option, title))
             elif atype == "table":
+                data = json.loads(content)
                 cols = data.get("columns") or []
                 rows = data.get("rows") or []
-                tname = asset.get("title", "table")
+                cols = [c.get("name") or c.get("label") or str(c) if isinstance(c, dict) else str(c) for c in cols]
                 if _PANDAS and cols:
-                    df = pd.DataFrame(rows, columns=cols)
-                    await cl.Message(
-                        content=label,
-                        elements=[cl.Dataframe(name=tname, data=df, display="inline")],
-                        author="Corax (restored)",
-                    ).send()
+                    elements.append(cl.Dataframe(name=title, data=pd.DataFrame(rows, columns=cols), display="side"))
+                else:
+                    elements.append(cl.Text(name=title, content=content[:2000], display="side"))
+            elif atype in ("report", "html"):
+                elements.append(cl.Text(name=title, content=content[:4000], display="side"))
+            else:
+                elements.append(cl.Text(name=title, content=content[:2000], display="side"))
         except Exception:
-            pass
+            continue
+
+    if elements:
+        cl.user_session.set("_sidebar_elements", elements)
+        await _push_sidebar(title=f"📦 Artifacts — restored ({len(elements)})")
 
 
 # ── Quick-action helpers ──────────────────────────────────────────────────────
@@ -853,8 +882,9 @@ async def on_message(message: cl.Message):
 
     # ── File upload handling ──────────────────────────────────────────────────
     # Chainlit delivers uploaded files as message.elements with type "file".
-    # Extract text content and append it to the user message so the LLM sees it.
+    # Extract text content, append to LLM message, and add to the sidebar.
     _file_blocks: list[str] = []
+    _upload_sidebar_els: list = []
     for _el in (message.elements or []):
         _el_type = getattr(_el, "type", "") or ""
         _el_path = getattr(_el, "path", None) or getattr(_el, "url", None) or ""
@@ -868,8 +898,13 @@ async def on_message(message: cl.Message):
                 _file_blocks.append(
                     f'<file name="{_el_name}">\n{_content}\n</file>'
                 )
+                _upload_sidebar_els.append(
+                    cl.Text(name=f"📎 {_el_name}", content=_content[:4000], display="side")
+                )
         except Exception as _fe:
             print(f"[corax] file read failed ({_el_name}): {_fe}")
+    if _upload_sidebar_els:
+        await _push_sidebar(_upload_sidebar_els)
 
     _user_content = message.content or ""
     if _file_blocks:
@@ -943,6 +978,10 @@ async def on_message(message: cl.Message):
         print(f"[corax] _save_shared_history failed (non-fatal): {_se}")
 
     clean_text, elements, raw_artifacts = _parse_artifacts(answer)
+
+    # Push new artifacts into the sidebar immediately
+    if elements:
+        await _push_sidebar(elements)
 
     # Persist charts / tables to CB so they survive session restarts
     try:
@@ -1224,14 +1263,14 @@ def _fmt_asset_date(ts: int) -> str:
 
 @cl.action_callback("show_assets")
 async def on_show_assets(action: cl.Action):
-    """List saved assets from CB, with Preview and Delete buttons per asset."""
-    from supportal.agent_tools import _list_assets_from_cb
+    """Open the sidebar with all saved CB assets for the current customer."""
+    from supportal.agent_tools import _list_assets_from_cb, _get_asset_content_from_cb
 
     customer = action.payload.get("customer") or cl.user_session.get("customer", "")
-    profile = cl.user_session.get("profile") or _load_cb_settings()
-    cb_a = _cb_args_assets(profile)
+    profile  = cl.user_session.get("profile") or _load_cb_settings()
+    cb_a     = _cb_args_assets(profile)
 
-    if not cb_a[2]:  # no username configured
+    if not cb_a[2]:
         await cl.Message(
             content="⚠ No Couchbase profile configured — assets cannot be loaded.",
             author="Corax",
@@ -1247,49 +1286,47 @@ async def on_show_assets(action: cl.Action):
     if not assets:
         label = f" for **{customer}**" if customer else ""
         await cl.Message(
-            content=f"No saved assets found{label}. Charts, tables, and reports generated by the agent are saved here automatically.",
+            content=f"No saved assets found{label}. Charts, tables, and reports are saved here automatically as the agent generates them.",
             author="Corax",
         ).send()
         return
 
-    lines = [f"**📦 Assets** ({len(assets)} most recent{f' · {customer}' if customer else ''})\n"]
-    asset_actions = []
+    # Fetch content and build sidebar elements
+    sidebar_els: list = []
     for a in assets:
         aid   = a.get("id") or ""
-        atype = a.get("asset_type") or "?"
-        emoji = _ASSET_EMOJI.get(atype, "📁")
+        atype = a.get("asset_type") or ""
         title = a.get("title") or a.get("filename") or aid[:8]
-        org   = a.get("org") or ""
         ts    = _fmt_asset_date(a.get("created_at") or 0)
-        org_label = f" · {org}" if org and org.lower() != (customer or "").lower() else ""
-        size_kb = round((a.get("size_bytes") or 0) / 1024, 1)
-        lines.append(f"{emoji} **{title}**{org_label} — {atype} · {size_kb} KB · {ts}")
-        if aid:
-            asset_actions.append(
-                cl.Action(
-                    name="preview_asset",
-                    value=aid,
-                    payload={"asset_id": aid, "asset_type": atype, "title": title},
-                    label=f"Preview: {title[:40]}",
-                    description=f"Render this {atype} inline",
-                )
-            )
-            asset_actions.append(
-                cl.Action(
-                    name="delete_asset",
-                    value=aid,
-                    payload={"asset_id": aid, "title": title},
-                    label=f"🗑 Delete: {title[:35]}",
-                    description=f"Permanently delete this asset from Couchbase",
-                )
-            )
+        label = f"{_ASSET_EMOJI.get(atype, '📁')} {title} · {ts}"
+        if not aid:
+            continue
+        try:
+            doc     = await asyncio.to_thread(_get_asset_content_from_cb, *cb_a, aid)
+            content = doc.get("content") or ""
+            if atype in ("chart", "echart"):
+                sidebar_els.append(_echart_element(json.loads(content), label))
+            elif atype == "table":
+                data = json.loads(content)
+                cols = data.get("columns") or []
+                rows = data.get("rows") or []
+                cols = [c.get("name") or c.get("label") or str(c) if isinstance(c, dict) else str(c) for c in cols]
+                if _PANDAS and cols:
+                    sidebar_els.append(cl.Dataframe(name=label, data=pd.DataFrame(rows, columns=cols), display="side"))
+                else:
+                    sidebar_els.append(cl.Text(name=label, content=content[:2000], display="side"))
+            else:
+                sidebar_els.append(cl.Text(name=label, content=content[:4000], display="side"))
+        except Exception:
+            continue
 
-    # Chainlit caps actions per message — send list text + first batch of actions
-    await cl.Message(
-        content="\n".join(lines),
-        actions=asset_actions[:20],  # ~10 assets worth of preview+delete pairs
-        author="Corax",
-    ).send()
+    if not sidebar_els:
+        await cl.Message(content="Assets found but could not be rendered.", author="Corax").send()
+        return
+
+    cust_label = f" · {customer}" if customer else ""
+    await cl.ElementSidebar.set_title(f"📦 All Assets ({len(sidebar_els)}){cust_label}")
+    await cl.ElementSidebar.set_elements(sidebar_els)
 
 
 @cl.action_callback("preview_asset")
