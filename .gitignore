@@ -43,3 +43,10 @@ scraper/
 
 # Chainlit temp uploads
 .files/
+
+# Snapshot debug dumps
+snap_debug/
+
+# Generated PowerPoint / office lock files
+docs/*.pptx
+docs/~$*
