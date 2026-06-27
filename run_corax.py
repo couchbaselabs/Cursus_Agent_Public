@@ -16,6 +16,10 @@ from pathlib import Path
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 
+# Pin APP_ROOT so Chainlit always resolves public/ relative to this repo root,
+# regardless of the caller's cwd. Must be set before any chainlit import.
+os.environ.setdefault("CHAINLIT_APP_ROOT", str(_HERE))
+
 _PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8766
 _HOST = os.environ.get("CHAINLIT_HOST", "0.0.0.0")
 

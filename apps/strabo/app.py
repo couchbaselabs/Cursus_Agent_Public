@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.6.0"
+__version__ = "2.6.3"
 
 import asyncio
 import threading
@@ -1777,8 +1777,8 @@ def open_browser_thread() -> None:
     _browser_state["logged_in"]     = False
     _browser_state["cookie_string"] = ""
 
-    script = Path(__file__).parent / "login_browser.py"
-    venv_python = Path(__file__).parent / "venv" / "bin" / "python"
+    script = Path(__file__).parent.parent.parent / "tools" / "login_browser.py"
+    venv_python = Path(__file__).parent.parent.parent / "venv" / "bin" / "python"
     python = str(venv_python) if venv_python.exists() else _sys.executable
 
     # Signal "subprocess starting" so the UI unblocks from _browser_ready_event.wait()
@@ -2666,6 +2666,7 @@ def main_page():
                                                 _make_step_prog("embed"),
                                                 _cancel,
                                                 emb_num_ctx,
+                                                int(embed_parallel_input.value or 1),
                                             )
                                             await _step_finish(
                                                 "embed",
@@ -4787,6 +4788,56 @@ def main_page():
                         tab_ollama       = ai_tab_ollama
                         tab_lmstudio     = ai_tab_lmstudio
 
+                    def _warn_if_small_model(model: str) -> None:
+                        """Notify if the model name suggests a very small / 8B-or-under variant."""
+                        _low = (model or "").lower()
+                        _small_hints = ("3b", "7b", "8b", "1b", "mini", "nano", "tiny", "phi-2", "phi2")
+                        if any(h in _low for h in _small_hints):
+                            ui.notify(
+                                f"⚠ Small model detected ({model}). Scoring quality may be reduced.",
+                                type="warning",
+                                timeout=6000,
+                            )
+
+                    def _get_llm_config():
+                        """Return (provider, model, api_key, base_url) from current UI inputs."""
+                        provider = (ai_llm_provider.value or "Claude").lower()
+                        if provider == "claude":
+                            return (
+                                provider,
+                                claude_model_input.value or "claude-sonnet-4-6",
+                                claude_key_input.value or "",
+                                "",
+                            )
+                        elif provider == "gemini":
+                            return (
+                                provider,
+                                gemini_model_input.value or "gemini-2.0-flash",
+                                gemini_key_input.value or "",
+                                "",
+                            )
+                        elif provider == "openai":
+                            return (
+                                provider,
+                                openai_llm_model_input.value or "gpt-4o",
+                                emb_openai_key_input.value or "",
+                                "",
+                            )
+                        elif provider in ("lmstudio",):
+                            return (
+                                provider,
+                                lms_model_input.value or "local-model",
+                                "",
+                                emb_lms_url_input.value or "http://localhost:1234",
+                            )
+                        else:  # ollama
+                            return (
+                                "ollama",
+                                ollama_chat_model_input.value or "llama3.2",
+                                "",
+                                emb_ollama_url_input.value or "http://localhost:11434",
+                            )
+
                     # ── Preflight tab ─────────────────────────────────────────────────────
                     with ui.tab_panel(cfg_preflight):
                         ui.label("Preflight Checks").classes("text-base font-semibold mb-1")
@@ -5244,7 +5295,7 @@ def main_page():
                             score_error_log.set_visibility(False)
                             score_status.set_text("Starting …")
                             loop = asyncio.get_event_loop()
-                            _score_ts = lambda: _time.strftime("%H:%M:%S")
+                            _score_ts = lambda: time.strftime("%H:%M:%S")
 
                             def _prog(msg: str, pct: float):
                                 _OP_STATUS["op"] = "score"
@@ -9767,6 +9818,7 @@ def _run_scrape_job_bg(
         emb_k = emb_params.get("api_key", "")
         emb_u = emb_params.get("base_url", "")
         emb_d = int(emb_params.get("dims") or 0)
+        emb_workers = int(emb_params.get("max_workers") or emb_params.get("embed_parallel") or 1)
         if emb_p and emb_m and emb_d and _saved > 0:
             job["phase"] = "embedding"
             if emb_p == "lmstudio":
@@ -9787,6 +9839,7 @@ def _run_scrape_job_bg(
                     use_tls, scope, collection,
                     emb_p, emb_m, emb_k, emb_u, emb_d,
                     _emb_prog,
+                    max_workers=emb_workers,
                 )
                 job["embedded"] = _done_emb
                 job["errors"]  += _errs_emb
@@ -9885,6 +9938,7 @@ def _run_rescrape_job_bg(
         _sess = _make_api_session(cookie)
 
         ok = skipped = errors = 0
+        job["enriched"] = 0
         refreshed_tickets: list[dict] = []
         for i, t in enumerate(to_scrape, 1):
             tid = str(t.get("ticket_id") or "").strip()
@@ -9937,12 +9991,82 @@ def _run_rescrape_job_bg(
         except Exception:
             pass
 
+        # ── Enrich with snapshot topology ─────────────────────────────────
+        # Fetch snapshot topology for any refreshed ticket that has snap IDs,
+        # then patch the topology fields back into the already-saved CB docs.
+        if refreshed_tickets:
+            job["phase"] = "enriching"
+            _set_op(f"Enriching {len(refreshed_tickets)} tickets with snapshot topology…", 0.81)
+            try:
+                _enrich_cancel = threading.Event()  # never set — runs to completion
+
+                # Reconnect to CB for topology write-back
+                from couchbase.cluster import Cluster as _ECl
+                from couchbase.options import ClusterOptions as _ECO
+                from couchbase.auth import PasswordAuthenticator as _EPA
+                from couchbase.options import UpsertOptions as _EUO
+                _econn  = _cb_conn_str(cb_url, use_tls)
+                _eclust = _ECl(_econn, _ECO(_EPA(username, password)))
+                _eclust.wait_until_ready(timedelta(seconds=10))
+                _ecol   = _eclust.bucket(bucket).scope(scope).collection(collection)
+                _snapcol = None
+                try:
+                    _snapcol = _eclust.bucket(bucket).scope(scope).collection("snapshots")
+                except Exception:
+                    pass
+
+                def _snap_upsert(snap_doc: dict):
+                    if _snapcol is None:
+                        return
+                    _sid = snap_doc.get("snap_id") or ""
+                    if _sid:
+                        try:
+                            _snapcol.upsert(f"snapshot::{_sid}", snap_doc)
+                        except Exception:
+                            pass
+
+                def _enrich_prog(msg: str, pct: float):
+                    job["last_message"] = msg
+                    _OP_STATUS["status"] = f"[{job['job_id']}] {msg}"
+
+                _enriched_n, _enrich_errs = enrich_tickets_with_snapshots(
+                    refreshed_tickets, cookie, _enrich_prog, _enrich_cancel,
+                    max_workers=4, snap_upsert_fn=_snap_upsert,
+                )
+                job["enriched"] = _enriched_n
+
+                # Write topology fields back to the ticket docs in CB
+                _topo_op_to = timedelta(seconds=5)
+                for _et in refreshed_tickets:
+                    if not _et.get("snapshot_topology"):
+                        continue
+                    _etid = str(_et.get("ticket_id") or "").strip()
+                    if not _etid:
+                        continue
+                    try:
+                        _ex2 = _ecol.get(f"ticket::{_etid}", GetOptions(timeout=_topo_op_to)).content_as[dict]
+                        _ex2["snapshot_topology"] = _et["snapshot_topology"]
+                        _ex2["snapshot_summary"]  = _et.get("snapshot_summary") or {}
+                        _ex2["snap_ids"]          = _et.get("snap_ids") or []
+                        _ecol.upsert(f"ticket::{_etid}", _ex2, UpsertOptions(timeout=_topo_op_to))
+                    except Exception:
+                        pass
+
+                try:
+                    _eclust.close()
+                except Exception:
+                    pass
+            except Exception as exc:
+                job["last_message"] = f"Enrichment failed: {exc}"
+                job["errors"] += 1
+
         # ── Embed refreshed tickets ────────────────────────────────────────
         emb_p = (emb_params or {}).get("provider", "").lower().strip()
         emb_m = (emb_params or {}).get("model", "")
         emb_k = (emb_params or {}).get("api_key", "")
         emb_u = (emb_params or {}).get("base_url", "")
         emb_d = int((emb_params or {}).get("dims") or 0)
+        emb_workers = int((emb_params or {}).get("max_workers") or (emb_params or {}).get("embed_parallel") or 1)
         if emb_p and emb_m and emb_d and refreshed_tickets:
             job["phase"] = "embedding"
             _set_op(f"Embedding {len(refreshed_tickets)} refreshed tickets…", 0.82)
@@ -9962,6 +10086,7 @@ def _run_rescrape_job_bg(
                     use_tls, scope, collection,
                     emb_p, emb_m, emb_k, emb_u, emb_d,
                     _emb_prog,
+                    max_workers=emb_workers,
                 )
                 job["embedded"] = _done_emb
                 job["errors"]  += _errs_emb
@@ -9992,9 +10117,12 @@ def _run_rescrape_job_bg(
         job["status"]      = "done"
         job["phase"]       = None
         job["finished_at"] = time.time()
+        _new_n = job.get("new_count", 0)
+        _new_label = f"{_new_n} new + " if _new_n else ""
         summary = (
-            f"Done — {ok}/{total} tickets updated, {job['embedded']} embedded, "
-            f"{job['scored']} scored"
+            f"Done — {_new_label}{ok}/{total} tickets updated, "
+            f"{job.get('enriched', 0)} enriched with topology, "
+            f"{job['embedded']} embedded, {job['scored']} scored"
             + (f", {skipped} skipped" if skipped else "")
             + (f", {job['errors']} errors" if job["errors"] else "")
         )
@@ -10081,6 +10209,139 @@ def _record_customer_access(
         pass
 
 
+_SETTINGS_SCOPE      = "chat"
+_SETTINGS_COLLECTION = "settings"
+_SETTINGS_KEY        = "strabo::profiles"
+
+
+def _cb_save_settings(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    profiles: dict,
+) -> None:
+    """Persist the profiles dict to a fixed CB doc (best-effort, does not raise)."""
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=15))
+        col = cl.bucket(bucket).scope(scope).collection(collection)
+        col.upsert(_SETTINGS_KEY, profiles)
+        cl.close()
+    except Exception:
+        pass
+
+
+def _cb_load_settings(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+) -> dict:
+    """Load the profiles dict from CB. Returns {} on any error."""
+    if not _CB_AVAILABLE or not cb_url:
+        return {}
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=15))
+        col = cl.bucket(bucket).scope(scope).collection(collection)
+        result = col.get(_SETTINGS_KEY).content_as[dict]
+        cl.close()
+        return result
+    except Exception:
+        return {}
+
+
+def _load_customer_profile(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    profile_user: str,
+) -> dict:
+    """Read the profile doc for profile_user from CB. Returns empty profile on error."""
+    _default = {
+        "username": profile_user,
+        "top_customers": [],
+        "alert_thresholds": {"new_p1": True, "score_drop_pts": 10, "stale_hours": 12},
+    }
+    if not _CB_AVAILABLE or not cb_url:
+        return _default
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        _ensure_profiles_collection(cl, bucket)
+        col = cl.bucket(bucket).scope(_PROFILE_SCOPE).collection(_PROFILE_COLLECTION)
+        doc = col.get(f"profile::{profile_user}").content_as[dict]
+        cl.close()
+        return doc
+    except Exception:
+        return _default
+
+
+def _get_briefing_data(
+    top_customers: list[dict],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    stale_hours: float = 12.0,
+) -> list[dict]:
+    """Return one health-summary row per customer in top_customers."""
+    rows = []
+    for c in top_customers:
+        org = (c.get("name") or "").strip()
+        if not org:
+            continue
+        try:
+            h = _compute_health_score(org, cb_url, bucket, username, password,
+                                      use_tls, scope, collection)
+            hours_stale = h.get("hours_since_scraped") or 0.0
+            rows.append({
+                "name":        org,
+                "score":       h.get("score", 0),
+                "grade":       h.get("grade", "N/A"),
+                "open_p1":     h.get("open_p1", 0),
+                "open_p2":     h.get("open_p2", 0),
+                "hours_stale": round(float(hours_stale), 1),
+                "alert":       (
+                    h.get("open_p1", 0) > 0
+                    or h.get("score", 100) < 40
+                    or float(hours_stale) > stale_hours
+                ),
+            })
+        except Exception:
+            rows.append({
+                "name": org, "score": 0, "grade": "?",
+                "open_p1": 0, "open_p2": 0, "hours_stale": 0.0, "alert": False,
+            })
+    return rows
+
+
 def _execute_agent_tool(
     name: str,
     args: dict,
@@ -10136,12 +10397,9 @@ def _execute_agent_tool(
             # AFTER v1.5.0: hint at scrape_customer_tickets when data is missing for a scoped customer
             _org = filters.get("organization") or default_customer
             if _org:
-                _cookie_ok = bool(ctx.get("cookie") or _get_profile_cookie())
                 _ingest_hint = (
                     f" No local tickets for '{_org}'. "
-                    + ("Call scrape_customer_tickets to pull them from Supportal first."
-                       if _cookie_ok else
-                       "Paste a session cookie to enable scrape_customer_tickets.")
+                    "Call scrape_customer_tickets to pull them from Supportal first."
                 )
             else:
                 _ingest_hint = ""
@@ -10187,7 +10445,31 @@ def _execute_agent_tool(
             [doc_key], cb_url, bucket, username, password, use_tls, scope, collection,
         )
         if not tickets:
-            return f"Ticket {ticket_id} not found."
+            # Live fallback — fetch directly from Supportal and save to CB so future lookups work
+            try:
+                _live_sess = _make_api_session("")
+                _live = fetch_ticket_api(ticket_id, _live_sess)
+                if _live and _live.get("ticket_id"):
+                    _live["last_scraped_at"] = int(time.time())
+                    _live["type"]            = "ticket"
+                    _live["cb_version"]      = extract_ticket_version(_live)
+                    _live["feature_area"]    = classify_ticket_feature(_live)
+                    _live["ticket_origin"]   = classify_ticket_origin(_live)
+                    try:
+                        from couchbase.cluster import Cluster as _GtCl
+                        from couchbase.options import ClusterOptions as _GtCO
+                        from couchbase.auth import PasswordAuthenticator as _GtPA
+                        _gt_cl = _GtCl(_cb_conn_str(cb_url, use_tls), _GtCO(_GtPA(username, password)))
+                        _gt_cl.wait_until_ready(timedelta(seconds=10))
+                        _gt_cl.bucket(bucket).scope(scope).collection(collection).upsert(doc_key, _live)
+                        _gt_cl.close()
+                    except Exception:
+                        pass
+                    tickets = [_live]
+                else:
+                    return f"Ticket {ticket_id} not found in local DB or Supportal."
+            except Exception as _lfe:
+                return f"Ticket {ticket_id} not found locally. Live fetch also failed: {_lfe}"
         t = tickets[0]
         _tid = t.get("ticket_id", ticket_id)
         _lsa = t.get("last_scraped_at") or 0
@@ -10356,11 +10638,9 @@ def _execute_agent_tool(
         max_tix     = min(int(args.get("max_tickets") or 50), 200)
         status_filt = (args.get("status") or "").strip().lower() or None
 
-        cookie = _get_profile_cookie()
-        if not cookie:
-            return "No session cookie in saved profile — paste a fresh cookie in the Auth tab."
+        cookie = _get_profile_cookie()  # optional as of v2.6.2; retained for re-enablement
 
-        # Gather candidate ticket IDs from CB synchronously (fast query, no scraping yet)
+        # ── Step 1: Gather existing CB tickets for this customer ──────────────
         _rs_filters: dict = {}
         if cust and cust.lower() != "all customers":
             _rs_filters["organization"] = cust
@@ -10369,25 +10649,68 @@ def _execute_agent_tool(
 
         candidates = tool_query_tickets(
             _rs_filters, cb_url, bucket, username, password,
-            use_tls, scope, collection, limit=max_tix * 4,
+            use_tls, scope, collection, limit=max_tix * 8,
         )
-        if not candidates:
-            return f"No tickets found in Couchbase for {cust or 'all customers'}."
+        cb_ids = {str(t.get("ticket_id") or "").strip() for t in candidates if t.get("ticket_id")}
 
+        # ── Step 2: Fetch full Supportal listing to discover new tickets ──────
+        new_stubs: list[dict] = []
+        _listing_note = ""
+        if cust and cust.lower() != "all customers":
+            try:
+                _list_sess = _make_api_session(cookie)
+                _listing = _get_customer_ticket_listing_api(cust, _list_sess)
+                supportal_ids = {str(r.get("id") or "").strip() for r in _listing if r.get("id")}
+                new_ids = supportal_ids - cb_ids
+                if new_ids:
+                    # Apply status filter if requested
+                    if status_filt:
+                        _id_map = {str(r.get("id") or ""): r for r in _listing}
+                        new_ids = {
+                            nid for nid in new_ids
+                            if (_id_map.get(nid, {}).get("status") or "").lower() == status_filt
+                        }
+                    for nid in sorted(new_ids):
+                        new_stubs.append({
+                            "ticket_id": nid,
+                            "organization": cust,
+                            "last_scraped_at": 0,  # force scrape
+                        })
+                    _listing_note = f"{len(new_stubs)} new"
+            except Exception as _le:
+                _listing_note = f"(listing unavailable: {_le})"
+
+        # ── Step 3: Apply stale filter to existing candidates ─────────────────
         now_epoch    = time.time()
         stale_cutoff = now_epoch - stale_hours * 3600
-        to_scrape    = (
+        stale_existing = (
             [t for t in candidates if (t.get("last_scraped_at") or 0) < stale_cutoff]
             if stale_hours > 0 else list(candidates)
-        )[:max_tix]
+        )
+
+        # Merge: new stubs first, then stale existing (deduped), cap at max_tix
+        _seen_ids: set[str] = set()
+        to_scrape: list[dict] = []
+        for t in new_stubs + stale_existing:
+            tid = str(t.get("ticket_id") or "").strip()
+            if tid and tid not in _seen_ids:
+                _seen_ids.add(tid)
+                to_scrape.append(t)
+            if len(to_scrape) >= max_tix:
+                break
+
+        new_count = min(len(new_stubs), len(to_scrape))  # new stubs are always first in to_scrape
 
         if not to_scrape:
+            if not candidates:
+                return f"No tickets found in Couchbase or Supportal for '{cust or 'all customers'}'."
             return (
                 f"All {len(candidates)} tickets for {cust or 'all customers'} "
                 f"were scraped within the last {stale_hours:.0f} hours — nothing to update."
             )
 
         _job = _make_scrape_job(cust or "all customers", "rescrape")
+        _job["new_count"] = new_count
         threading.Thread(
             target=_run_rescrape_job_bg,
             args=(
@@ -10397,6 +10720,7 @@ def _execute_agent_tool(
                 {"provider": ctx.get("emb_provider",""), "model": ctx.get("emb_model",""),
                  "api_key": ctx.get("emb_api_key",""), "base_url": ctx.get("emb_base_url",""),
                  "dims": ctx.get("emb_dims", 0),
+                 "embed_parallel": ctx.get("embed_parallel", 1),
                  "score_provider": ctx.get("provider",""), "score_model": ctx.get("model",""),
                  "score_api_key": ctx.get("api_key",""), "score_base_url": ctx.get("base_url","")},
             ),
@@ -10404,9 +10728,12 @@ def _execute_agent_tool(
         ).start()
         if ctx is not None:
             ctx.setdefault("_started_jobs", []).append(_job["job_id"])
+
+        _new_label = f"{new_count} new + " if new_count else ""
+        _stale_label = f"{len(to_scrape) - new_count} stale" if new_count else f"{len(to_scrape)} stale"
         return (
             f"Started rescrape job **{_job['job_id']}** for '{cust or 'all customers'}' "
-            f"({len(to_scrape)} tickets, stale > {stale_hours:.0f}h). "
+            f"({_new_label}{_stale_label} tickets{f', stale > {stale_hours:.0f}h' if stale_hours > 0 else ''}). "
             f"Running in the background at ~3 req/s. "
             f"**I cannot notify you when it finishes — you must ask me.** "
             f"Ask 'what is the scrape status?' after a minute or two to check progress."
@@ -10430,7 +10757,8 @@ def _execute_agent_tool(
         if not ticket_id:
             return "Error: ticket_id is required. Pass a single numeric ticket ID, e.g. {\"ticket_id\": \"12345\"}. For bulk refresh use rescrape_customer_tickets instead."
 
-        # Read session cookie from saved app profile
+        # Cookie is optional as of v2.6.2 — Supportal endpoints are open.
+        # Retained in case auth is re-added; pass empty string to make an unauthenticated session.
         cookie = ""
         try:
             _settings = _load_settings_file()
@@ -10440,16 +10768,6 @@ def _execute_agent_tool(
         except Exception as _pe:
             print(f"[rescrape_ticket] profile read failed: {_pe}")
 
-        # Prefer Playwright when a saved session profile exists — the ticket detail
-        # page is a Vue SPA that renders CBSEs/JIRA Issues only after JS executes,
-        # so a plain HTTP GET silently misses those fields.
-        if not cookie:
-            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
-            return (
-                f"No session cookie found — cannot scrape automatically.\n"
-                f"Verify manually: {_url}"
-            )
-
         # Scrape fresh data from Supportal via REST API
         try:
             _sess = _make_api_session(cookie)
@@ -10457,7 +10775,7 @@ def _execute_agent_tool(
         except Exception as exc:
             _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
             return (
-                f"Scrape failed ({exc}). Session cookie may have expired.\n"
+                f"Scrape failed ({exc}).\n"
                 f"Verify manually: {_url}"
             )
 
@@ -10627,12 +10945,7 @@ def _execute_agent_tool(
     elif name == "list_supportal_customers":
         sort_by = (args.get("sort_by") or "name").lower()
         limit   = min(int(args.get("limit") or 200), 500)
-        cookie  = _get_profile_cookie()
-        if not cookie:
-            return (
-                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
-                "Paste a fresh cookie in the Strabo Authentication tab."
-            )
+        cookie  = _get_profile_cookie()  # unused as of v2.6.2; retained for re-enablement
         try:
             order = {"snapshots": "snaps DESC", "tickets": "tickets DESC"}.get(sort_by, "cu_name ASC")
             statement = f"""
@@ -10665,12 +10978,7 @@ LIMIT {limit}
         limit_rows = min(int(args.get("limit_rows") or 100), 500)
         if not statement:
             return "Error: statement is required."
-        cookie = _get_profile_cookie()
-        if not cookie:
-            return (
-                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
-                "Paste a fresh cookie in the Strabo Authentication tab."
-            )
+        cookie = _get_profile_cookie()  # unused as of v2.6.2; retained for re-enablement
         try:
             rows = query_supportal_analytics(statement, cookie)
         except Exception as exc:
@@ -10878,12 +11186,7 @@ LIMIT {limit}
         if not _rows:
             # BEFORE v1.5.0: returned a "use fetch_snapshots first" message and stopped.
             # AFTER v1.5.0: auto-triggers sync_snapshots if a cookie is available, then re-queries.
-            _auto_cookie = ctx.get("cookie") or _get_profile_cookie()
-            if not _auto_cookie:
-                return (
-                    f"No snapshots for '{org}' in Couchbase and no session cookie to auto-fetch. "
-                    "Paste a cookie in the Configuration tab, then try again."
-                )
+            _auto_cookie = ctx.get("cookie") or _get_profile_cookie()  # unused as of v2.6.2
             _auto_prefix = f"No snapshots in Couchbase for '{org}' — auto-syncing now.\n\n"
             _sync_result = _execute_agent_tool(
                 "sync_snapshots", {"organization": org, "max_stubs": 10},
@@ -10935,14 +11238,231 @@ LIMIT {limit}
             lines.append(f"| {name} | {ver} | {nodes} | {cpus} | {ram} | {last} | {bad} | {warn} | {status} |")
         return _auto_prefix + "\n".join(lines)
 
+    elif name == "cluster_hw_chart":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required for cluster_hw_chart."
+        _sf = (args.get("status_filter") or "open_or_pending").lower()
+        _height = int(args.get("height") or 0)
+        try:
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO, QueryOptions as _QO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cl2 = _Cl(_conn, _CO(_PA(username, password)))
+            _cl2.wait_until_ready(timedelta(seconds=15))
+
+            _status_vals = {
+                "open":            ["open", "new"],
+                "pending":         ["pending"],
+                "open_or_pending": ["open", "new", "pending"],
+                "all":             [],
+            }.get(_sf, ["open", "new", "pending"])
+            _status_clause = (
+                "AND LOWER(t.status) IN [" + ",".join(f'"{s}"' for s in _status_vals) + "] "
+                if _status_vals else ""
+            )
+
+            # Hardware is embedded directly in snapshot_topology on each ticket.
+            # Pull cluster name, hw specs, and CBSEs in one query.
+            _tkt_sql = (
+                f"SELECT t.ticket_id, t.cbses, "
+                f"t.snapshot_topology.cluster_name, "
+                f"t.snapshot_topology.total_nodes, "
+                f"t.snapshot_topology.cpus_per_node, "
+                f"t.snapshot_topology.ram_per_node_mib "
+                f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+                f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org "
+                f"{_status_clause}"
+                f"AND t.snapshot_topology IS NOT NULL "
+                f"AND t.snapshot_topology.cluster_name IS NOT NULL "
+                f"LIMIT 500"
+            )
+            _tkt_rows = list(_cl2.query(_tkt_sql, _QO(
+                named_parameters={"org": f"%{_org.lower()}%"}, timeout=timedelta(seconds=30)
+            )))
+            _cl2.close()
+
+            if not _tkt_rows:
+                # Diagnose: count tickets without topology
+                return (
+                    f"No {_sf} tickets with embedded snapshot topology found for '{_org}'. "
+                    "Tickets may be missing snapshot data — ask to rescrape or sync_snapshots."
+                )
+
+            # Deduplicate by cluster_name; collect CBSEs per cluster
+            _seen: set = set()
+            _hw: list[dict] = []
+            _cluster_cbses: dict[str, set] = {}
+            for _r in _tkt_rows:
+                _cn = (_r.get("cluster_name") or "").strip()
+                _cbses = [c for c in (_r.get("cbses") or []) if c]
+                if _cn:
+                    _cluster_cbses.setdefault(_cn, set()).update(_cbses)
+                if not _cn or _cn in _seen:
+                    continue
+                _seen.add(_cn)
+                _hw.append({
+                    "cluster": _cn,
+                    "nodes":   int(_r.get("total_nodes") or 0),
+                    "cpus":    int(_r.get("cpus_per_node") or 0),
+                    "ram_gib": round((_r.get("ram_per_node_mib") or 0) / 1024, 1),
+                })
+
+            # Attach de-duped CBSEs
+            for _h in _hw:
+                _h["cbses"] = sorted(_cluster_cbses.get(_h["cluster"], set()))
+
+            if not _hw:
+                return f"Tickets found but no cluster topology could be extracted for '{_org}'."
+
+            # ── 3. Build chart ────────────────────────────────────────────────────
+            # Label: cluster name + ● if has CBSEs
+            _labels = []
+            for _h in _hw:
+                _cbse_list = _h["cbses"]
+                _lbl = _h["cluster"]
+                if _cbse_list:
+                    # Normalise IDs and append indicator
+                    _ids = [c if c.upper().startswith("CBSE-") else f"CBSE-{c}" for c in _cbse_list[:3]]
+                    _lbl += f" ● ({', '.join(_ids)})"
+                _labels.append(_lbl)
+
+            _auto_h = max(300, min(700, 80 + len(_hw) * 26))
+            _opt = _build_agent_echart_option({
+                "chart_type":   "horizontal_bar",
+                "title":        f"Cluster Hardware — Open/Pending Tickets ({_org})",
+                "labels":       _labels,
+                "series": [
+                    {"name": "Nodes",      "data": [_h["nodes"]   for _h in _hw]},
+                    {"name": "CPUs/node",  "data": [_h["cpus"]    for _h in _hw]},
+                    {"name": "RAM GiB/node", "data": [_h["ram_gib"] for _h in _hw]},
+                ],
+                "height":       _height or _auto_h,
+                "description":  "● = cluster has one or more CBSE-linked tickets. "
+                                "Values: physical node count, CPU cores per node, RAM per node in GiB.",
+                "color_scheme": "couchbase",
+            })
+            return "```echart\n" + json.dumps(_opt, ensure_ascii=False) + "\n```"
+
+        except Exception as exc:
+            import traceback as _tb2; _tb2.print_exc()
+            return f"cluster_hw_chart error: {exc}"
+
+    elif name == "query_local_snapshots":
+        org   = (args.get("organization") or "").strip()
+        days  = int(args.get("days") or 30)
+        limit = min(int(args.get("limit") or 50), 500)
+        try:
+            import time as _time
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO, QueryOptions as _QO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _snap_ks = f"`{bucket}`.`{scope}`.`snapshots`"
+            _cutoff  = _time.time() - days * 86400
+            _org_clause = "AND LOWER(s.organization) LIKE $org " if org else ""
+            _sql = (
+                f"SELECT s.organization, s.cluster_name, s.cb_version, "
+                f"s.node_count, s.cpus_per_node, s.ram_per_node_mib, "
+                f"s.topology.disk_total_per_node_mib, s.topology.disk_used_per_node_mib, "
+                f"s.topology.ram_used_per_node_mib, "
+                f"s.bad_count, s.warn_count, s.date, s.last_scraped_at "
+                f"FROM {_snap_ks} AS s "
+                f"WHERE s.last_scraped_at >= $cutoff "
+                f"{_org_clause}"
+                f"ORDER BY s.last_scraped_at DESC LIMIT {limit}"
+            )
+            _params: dict = {"cutoff": _cutoff}
+            if org:
+                _params["org"] = f"%{org.lower()}%"
+            _rows = list(_cluster.query(_sql, _QO(named_parameters=_params, timeout=timedelta(seconds=30))))
+            _cluster.close()
+        except Exception as exc:
+            return f"query_local_snapshots failed: {exc}"
+        if not _rows:
+            _org_hint = f" for '{org}'" if org else ""
+            return f"No snapshots found{_org_hint} in the last {days} days in local Couchbase."
+        _header = (
+            f"**{len(_rows)} snapshots{(' for ' + org) if org else ''} — last {days} days (local CB)**\n\n"
+            "| Organization | Cluster | CB Version | Nodes | CPUs/node | RAM MiB | RAM Used MiB | Disk Total MiB | Disk Used MiB | Bad | Warn | Scraped |\n"
+            "|---|---|---|---|---|---|---|---|---|---|---|---|"
+        )
+        _lines = [_header]
+        import datetime as _dt2
+        for r in _rows:
+            _scraped = r.get("last_scraped_at")
+            _scraped_str = _dt2.datetime.fromtimestamp(_scraped).strftime("%Y-%m-%d") if _scraped else "?"
+            _lines.append(
+                f"| {r.get('organization','?')} | {r.get('cluster_name','?')} | {r.get('cb_version','?')} "
+                f"| {r.get('node_count','?')} | {r.get('cpus_per_node','?')} | {r.get('ram_per_node_mib','?')} "
+                f"| {r.get('ram_used_per_node_mib','?')} | {r.get('disk_total_per_node_mib','?')} "
+                f"| {r.get('disk_used_per_node_mib','?')} "
+                f"| {r.get('bad_count','?')} | {r.get('warn_count','?')} | {_scraped_str} |"
+            )
+        return "\n".join(_lines)
+
+    elif name == "analyze_snapshot":
+        snap_id  = (args.get("snap_id") or "").strip()
+        notes    = (args.get("analysis_notes") or "").strip()
+        save     = bool(args.get("save_notes", False))
+        if not snap_id:
+            return "Error: snap_id is required."
+        try:
+            topo = fetch_snapshot_topology(snap_id, cookie=None)
+        except Exception as exc:
+            return f"Failed to fetch snapshot {snap_id}: {exc}"
+        if not topo:
+            return f"Snapshot {snap_id} returned no topology data."
+
+        bad  = topo.get("bad_items")  or []
+        warn = topo.get("warn_items") or []
+        lines = [
+            f"**Snapshot {snap_id}**",
+            f"Cluster: {topo.get('cluster_name','')} | Version: {topo.get('cb_version','')}",
+            f"Nodes: {topo.get('total_nodes','')} | CPUs/node: {topo.get('cpus_per_node','')} | RAM/node: {topo.get('ram_per_node_mib','')} MiB",
+            f"Bad items ({len(bad)}): {', '.join(bad) if bad else 'none'}",
+            f"Warn items ({len(warn)}): {', '.join(warn) if warn else 'none'}",
+        ]
+        buckets = topo.get("buckets") or []
+        if buckets:
+            lines.append(f"Buckets: {', '.join(b.get('name','') for b in buckets if b.get('name'))}")
+        if notes:
+            lines.append(f"\n**Analysis notes:** {notes}")
+
+        # Save notes + topology back to the snapshot doc in CB if requested
+        if save and snap_id:
+            try:
+                from couchbase.cluster import Cluster as _AsCl
+                from couchbase.options import ClusterOptions as _AsCO
+                from couchbase.auth import PasswordAuthenticator as _AsPA
+                _as_cl = _AsCl(_cb_conn_str(cb_url, use_tls), _AsCO(_AsPA(username, password)))
+                _as_cl.wait_until_ready(timedelta(seconds=10))
+                _as_snap_col = _as_cl.bucket(bucket).scope(scope).collection("snapshots")
+                _snap_key = f"snapshot::{snap_id}"
+                try:
+                    _snap_doc = _as_snap_col.get(_snap_key).content_as[dict]
+                except Exception:
+                    _snap_doc = {"snap_id": snap_id, "type": "snapshot"}
+                _snap_doc["topology"]        = topo
+                _snap_doc["analysis_notes"]  = notes
+                _snap_doc["analyzed_at"]     = int(time.time())
+                _as_snap_col.upsert(_snap_key, _snap_doc)
+                _as_cl.close()
+                lines.append("_(Analysis notes saved to snapshot record.)_")
+            except Exception as exc:
+                lines.append(f"_(Note: could not save to CB — {exc})_")
+
+        return "\n".join(lines)
+
     elif name == "fetch_snapshots":
         org   = (args.get("organization") or default_customer or "").strip()
         limit = min(int(args.get("limit") or 100), 500)
         if not org:
             return "Error: organization is required."
-        cookie = ctx.get("cookie") or _get_profile_cookie()
-        if not cookie:
-            return "No session cookie available — paste a cookie in the Configuration tab first."
+        cookie = ctx.get("cookie") or _get_profile_cookie()  # unused as of v2.6.2; retained for re-enablement
         try:
             stubs = fetch_snapshots_via_analytics(org, cookie, limit=limit)
         except Exception as exc:
@@ -11112,7 +11632,8 @@ LIMIT {limit}
                  "use_tls": use_tls, "scope": scope, "collection": collection},
                 {"provider": ctx.get("emb_provider",""), "model": ctx.get("emb_model",""),
                  "api_key": ctx.get("emb_api_key",""), "base_url": ctx.get("emb_base_url",""),
-                 "dims": ctx.get("emb_dims", 0)},
+                 "dims": ctx.get("emb_dims", 0),
+                 "embed_parallel": ctx.get("embed_parallel", 1)},
                 {"provider": ctx.get("provider",""), "model": ctx.get("model",""),
                  "api_key": ctx.get("api_key",""), "base_url": ctx.get("base_url","")},
             ),
@@ -11208,7 +11729,7 @@ LIMIT {limit}
         # AFTER v1.5.0: scores up to 10 tickets per call, returns a summary table.
         raw_ids     = args.get("ticket_ids") or []
         org         = (args.get("organization") or default_customer or "").strip()
-        limit       = min(int(args.get("limit") or 5), 10)
+        limit       = min(int(args.get("limit") or 10), 50)
         unscored_only = bool(args.get("unscored_only", True))
         status_filt = (args.get("status") or "").strip().lower() or None
         provider = ctx.get("provider", "claude")
@@ -11483,6 +12004,10 @@ LIMIT {limit}
             if not rows:
                 return f"No tickets found (group_by={_group_by}, status={_status_filter})."
             _status_label = {"open": "open", "solved": "resolved", "all": "all"}.get(_status_filter, _status_filter)
+            def _fmt_cbse_id(raw):
+                s = str(raw or "?").strip()
+                return s if (s == "?" or s.upper().startswith("CBSE-")) else f"CBSE-{s}"
+
             if _group_by == "cbse":
                 lines = [
                     f"## Fleet Tickets by CBSE ({_status_label})\n",
@@ -11490,7 +12015,7 @@ LIMIT {limit}
                     "|---|---|---|",
                 ]
                 for r in rows:
-                    lines.append(f"| {r.get('label','?')} | {r.get('ticket_count',0)} | {r.get('org_count',0)} |")
+                    lines.append(f"| {_fmt_cbse_id(r.get('label'))} | {r.get('ticket_count',0)} | {r.get('org_count',0)} |")
             else:
                 lines = [
                     f"## Fleet Tickets by {_group_by.replace('_',' ').title()} ({_status_label})\n",
@@ -11565,6 +12090,13 @@ LIMIT {limit}
             )
             if not rows:
                 return "No CBSE data found in ticket records."
+
+            def _fmt_cbse(raw):
+                s = str(raw or "?").strip()
+                if s == "?":
+                    return s
+                return s if s.upper().startswith("CBSE-") else f"CBSE-{s}"
+
             lines = [
                 "## Fleet CBSE Blast Radius (ranked by orgs affected)\n",
                 "| CBSE | Orgs Affected | Tickets |",
@@ -11572,7 +12104,7 @@ LIMIT {limit}
             ]
             for r in rows:
                 lines.append(
-                    f"| {r.get('cbse','?')} | {r.get('org_count',0)} | {r.get('ticket_count',0)} |"
+                    f"| {_fmt_cbse(r.get('cbse'))} | {r.get('org_count',0)} | {r.get('ticket_count',0)} |"
                 )
             lines.append(f"\n*{len(rows)} CBSEs found across all tickets*")
             return "\n".join(lines)
@@ -11691,6 +12223,28 @@ LIMIT {limit}
             return f"Asset saved: **{_title}** (ID: `{aid}`). View it in the **Assets** tab."
         except Exception as exc:
             return f"Failed to save asset: {exc}"
+
+    elif name == "get_current_time":
+        import datetime as _dt_mod
+        _tz_name = (args.get("timezone") or "").strip()
+        try:
+            if _tz_name:
+                import zoneinfo as _zi
+                _tz = _zi.ZoneInfo(_tz_name)
+                _now = _dt_mod.datetime.now(_tz)
+            else:
+                _now = _dt_mod.datetime.now(_dt_mod.timezone.utc).astimezone()
+        except Exception:
+            _now = _dt_mod.datetime.now(_dt_mod.timezone.utc).astimezone()
+        _iso_week = _now.isocalendar()[1]
+        _quarter = (_now.month - 1) // 3 + 1
+        return (
+            f"Current date/time: {_now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"Day of week: {_now.strftime('%A')}\n"
+            f"ISO week: {_iso_week}\n"
+            f"Quarter: Q{_quarter} {_now.year}\n"
+            f"UTC offset: {_now.strftime('%z')}"
+        )
 
     else:
         return f"Unknown tool: {name}"
@@ -11932,6 +12486,28 @@ def load_snapshots_from_couchbase(
         return []
     finally:
         cluster.close()
+
+
+def list_orgs_from_cb(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+) -> list[str]:
+    """Return a sorted list of distinct organization names from the tickets collection."""
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+    q = f"SELECT DISTINCT RAW organization FROM {keyspace} WHERE organization IS NOT MISSING"
+    rows = [r for r in cluster.query(q) if r]
+    cluster.close()
+    return sorted(rows)
 
 
 def query_customer_directory_from_cb(
@@ -13708,6 +14284,12 @@ def fetch_ticket_summary(
         return None
 
 
+def _org_slug(org: str) -> str:
+    """Convert an org name to a lowercase underscore-separated slug for use as a doc key."""
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", "_", org.lower()).strip("_")
+
+
 def rescore_all_customers_cb(
     cb_url: str,
     bucket: str,
@@ -13938,6 +14520,41 @@ def recover_score_cluster_fields_cb(
     cl.close()
     progress_cb(f"Done — {recovered} recovered, {errors} errors.", 1.0)
     return recovered, errors
+
+
+def upsert_inventory_doc(
+    org: str,
+    pipeline_steps: dict,
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+) -> None:
+    """Write/merge a customer_inventory doc to Couchbase (best-effort, does not raise)."""
+    import datetime as _dt
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=15))
+        col = cluster.bucket(bucket).scope(scope).collection(collection)
+        key = f"inventory::{_org_slug(org)}"
+        try:
+            inv_doc = col.get(key).content_as[dict]
+        except Exception:
+            inv_doc = {"type": "customer_inventory", "organization": org, "pipeline": {}}
+        inv_doc["updated_at"] = (
+            _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        inv_doc.setdefault("pipeline", {}).update(pipeline_steps)
+        col.upsert(key, inv_doc)
+        cluster.close()
+    except Exception:
+        pass
 
 
 def persist_scores_to_cb(

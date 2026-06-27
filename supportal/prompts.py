@@ -285,6 +285,26 @@ Now score the following tickets. Return ONLY the JSON array.
 # ── Agent system prompt (shared by Strabo and Chainlit) ──────────────────────
 
 TOOL_GUIDANCE = (
+    "DOMAIN TERMINOLOGY — know these terms before answering:\n"
+    "  CBSE — Couchbase Support Escalation. An internal bug/issue tracking ID in the format "
+    "CBSE-XXXXX (e.g. CBSE-15533, CBSE-20157). When a support engineer identifies a known "
+    "Couchbase product bug as the root cause of a ticket, they link the CBSE ID to that ticket. "
+    "Multiple CBSEs can be linked to one ticket. A ticket with cbses=[\"CBSE-20157\"] means "
+    "Couchbase bug CBSE-20157 is the confirmed cause. If a ticket has NO cbses entries it means "
+    "no known product bug has been formally linked — it does NOT mean no bug exists. "
+    "NEVER invent or guess what CBSE stands for — it always means Couchbase Support Escalation.\n"
+    "  Jira issues — JIRA tickets from Couchbase's internal Jira (e.g. MB-12345, CBD-5678). "
+    "Linked when engineering work is tracked in Jira. Different from CBSEs.\n"
+    "  Escalations — formal management escalations on a ticket (e.g. ESC-441). Separate from CBSEs.\n"
+    "  bad_count / warn_count — counts of DIAGNOSTIC HEALTH MESSAGES from the Couchbase Support tool "
+    "(e.g. 'bad_count: 5' means 5 health check items are flagged bad, NOT 5 bad nodes). "
+    "Node count is always a separate field. NEVER say 'bad nodes' or 'warn nodes' — say 'bad items' or 'warn items'.\n\n"
+    "SUPPORTAL URLs — you know these patterns, no tool needed:\n"
+    "  Ticket:   https://supportal.couchbase.com/zendesk/ticket/{ticket_id}\n"
+    "  Customer: https://supportal.couchbase.com/customer/{customer_name}\n"
+    "  Snapshot: https://supportal.couchbase.com/snapshot/{snap_id}\n"
+    "Always include the direct link when the user asks for a ticket, customer, or snapshot URL. "
+    "get_ticket also returns the link as 'Live verification:' — quote it directly.\n\n"
     "TOOL GUIDANCE:\n"
     "DATA SOURCE ROUTING — choose based on what the user is asking about:\n"
     "  LOCAL (your Couchbase): list_organizations, query_tickets, count_tickets, get_ticket\n"
@@ -331,6 +351,11 @@ TOOL_GUIDANCE = (
     "explanation. Produces real CSV and Excel download buttons.\n"
     "INGESTION & ENRICHMENT TOOLS (use when data is missing or stale):\n"
     "- vector_search: semantic/similarity search — use when keyword filters won't capture the concept.\n"
+    "- cluster_hw_chart: MANDATORY for 'show hardware chart for open tickets', "
+    "'graph nodes/CPU/RAM for clusters with tickets', 'compare hardware across clusters with open cases', "
+    "'put CBSE dots on the hardware chart'. Returns a live EChart immediately — no need to call "
+    "generate_chart separately. Clusters with CBSE-linked tickets are marked ● in their label. "
+    "status_filter options: open, pending, open_or_pending (default), all.\n"
     "- get_cluster_health: summary of all clusters for a customer from stored snapshots. "
     "Returns CB version, node counts, CPUs/node, RAM/node, bad/warn counts, and status. "
     "Call this when the user asks about hardware specs (CPU cores, RAM per node), "
@@ -364,7 +389,10 @@ TOOL_GUIDANCE = (
     "- query_fleet_tickets: aggregate ticket counts across ALL orgs.\n"
     "- list_at_risk_clusters: clusters with elevated bad/warn items and NO open ticket.\n"
     "- fleet_version_distribution: CB version spread across all clusters fleet-wide.\n"
-    "- fleet_cbse_impact: which CBSEs affect the most customers (ranked by blast radius)."
+    "- fleet_cbse_impact: which CBSEs affect the most customers (ranked by blast radius).\n"
+    "SPELLING CORRECTION — if any tool returns a message containing 'Did you mean:':\n"
+    "  1. Automatically retry the same tool with the first suggested name — do not ask the user.\n"
+    "  2. Only surface the error if all suggestions also fail, or if the suggestions are ambiguous enough that the user should choose."
 )
 
 _FLEET_EXEMPT_TOOLS = (
@@ -382,7 +410,12 @@ _NO_CUSTOMER_GUIDANCE = (
     "subsequent tool call for the rest of this conversation.\n"
     "4. If no match is found, suggest the user go to the Scraping tab to "
     "add the customer, or call scrape_customer_tickets to pull fresh data.\n"
-    "Do NOT attempt to query tickets or health scores before a customer is confirmed."
+    "Do NOT attempt to query tickets or health scores before a customer is confirmed.\n\n"
+    "SPELLING CORRECTION — if any tool returns a 'Did you mean: ...' message:\n"
+    "- Automatically retry the same tool call using the first suggested name.\n"
+    "- Do NOT surface the error to the user unless all suggestions also fail.\n"
+    "- If multiple suggestions exist and the correct one is ambiguous, "
+    "ask the user to confirm before retrying."
 )
 
 _JOBS_GUIDANCE = (
@@ -416,12 +449,21 @@ def build_agent_system_prompt(
     profile_hint      : Comma-separated top-customer names from the user's access profile.
     prior_session_block: Prior-session summary injected by session-resume logic.
     """
-    from datetime import date as _date
+    from datetime import date as _date, datetime as _datetime, timezone as _tz
     today = today_str or _date.today().isoformat()
+    _now = _datetime.now(_tz.utc).astimezone()
+    _weekday = _now.strftime("%A")
+    _time_str = _now.strftime("%H:%M %Z")
+    _iso_week = _now.isocalendar()[1]
+    _quarter = (_now.month - 1) // 3 + 1
+    _datetime_ctx = (
+        f"Today is {today} ({_weekday}), current time {_time_str}, "
+        f"ISO week {_iso_week}, Q{_quarter} {_now.year}."
+    )
     cust_scope = f" for {customer}" if (customer and customer.lower() != "all customers") else ""
 
     prompt = (
-        f"You are a Couchbase support ticket analyst. Today is {today}. "
+        f"You are a Couchbase support ticket analyst. {_datetime_ctx} "
         f"You have access to tools that query a live Couchbase database containing "
         f"Zendesk support tickets{cust_scope}. "
         "Use the available tools to answer questions accurately. "

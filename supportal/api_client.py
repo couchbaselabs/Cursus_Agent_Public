@@ -54,17 +54,36 @@ def _make_api_session(cookie: str) -> requests.Session:
 # Analytics SQL++ endpoint
 # ---------------------------------------------------------------------------
 
-def query_supportal_analytics(statement: str, cookie: str) -> list[dict]:
-    """POST /api/support360/query with a SQL++ statement; returns result rows as dicts."""
-    if not cookie:
-        raise RuntimeError("No session cookie — log in first.")
+def _extract_xsrf(cookie: str) -> str:
+    """Pull the _xsrf token value out of a raw Cookie header string, URL-decoded."""
+    for part in cookie.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.strip() == "_xsrf":
+            return urllib.parse.unquote(v.strip())
+    return ""
+
+
+def query_supportal_analytics(statement: str, cookie: str = "") -> list[dict]:
+    """POST /api/support360/query with a SQL++ statement; returns result rows as dicts.
+
+    NOTE (v2.6.2): As of 2026-06-22 the analytics endpoint is open — no auth required.
+    The cookie parameter is retained so callers don't break and can be re-enabled if
+    Supportal adds authentication in the future.
+    """
     url = f"{BASE_URL}/api/support360/query"
     headers = {
         "User-Agent": UA,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Cookie": cookie,
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/v2/analytics/query",
     }
+    # Re-enable if Supportal adds auth: uncomment and pass cookie from callers.
+    # if cookie:
+    #     headers["Cookie"] = cookie
+    #     xsrf = _extract_xsrf(cookie)
+    #     if xsrf:
+    #         headers["X-Xsrftoken"] = xsrf
     try:
         resp = requests.post(
             url,
@@ -75,18 +94,22 @@ def query_supportal_analytics(statement: str, cookie: str) -> list[dict]:
         )
     except Exception as exc:
         raise RuntimeError(f"Analytics request failed: {exc}") from exc
+    if resp.status_code in (401, 403):
+        raise RuntimeError(
+            f"Analytics returned HTTP {resp.status_code} — endpoint may now require authentication. "
+            "Re-enable cookie auth in api_client.py query_supportal_analytics."
+        )
     resp.raise_for_status()
     body = resp.text.strip()
     if not body:
         raise ValueError(
-            f"Analytics endpoint returned HTTP {resp.status_code} with empty body. "
-            "Session cookie is likely missing or expired."
+            f"Analytics endpoint returned HTTP {resp.status_code} with empty body."
         )
     if body.lstrip().startswith("<"):
         snippet = body[:200].replace("\n", " ")
         raise ValueError(
             f"Analytics endpoint returned HTML (HTTP {resp.status_code}). "
-            f"Session cookie is missing or expired. Response: {snippet!r}"
+            f"Response: {snippet!r}"
         )
     try:
         payload = resp.json()
@@ -108,7 +131,7 @@ def query_supportal_analytics(statement: str, cookie: str) -> list[dict]:
 
 def fetch_snapshots_via_analytics(
     customer_name: str,
-    cookie: str | None,
+    cookie: str | None = None,
     limit: int = 200,
     progress_cb: Callable[[str, float], None] | None = None,
 ) -> list[dict]:
@@ -116,6 +139,7 @@ def fetch_snapshots_via_analytics(
 
     Tries exact match, then case-insensitive, then LIKE prefix — so partial or
     differently-cased customer names still resolve.
+    cookie is unused as of v2.6.2 (endpoint is open); retained for future re-enablement.
     """
     def _log(msg: str, pct: float = 0.0):
         print(f"[SNAP-ANALYTICS] {msg}")
@@ -158,9 +182,27 @@ def fetch_snapshots_via_analytics(
         )
 
     if not rows:
+        # Fuzzy fallback: load all customer names and use difflib to suggest close matches.
+        # No LLM tokens — one extra analytics query, zero UX dead-ends.
+        _close: list[str] = []
+        try:
+            import difflib as _dl
+            _all_rows = query_supportal_analytics(
+                "SELECT DISTINCT cu.`name` AS n FROM customer cu WHERE LENGTH(cu.`name`) > 2 LIMIT 15000",
+            )
+            _all_names = [r["n"] for r in _all_rows if r.get("n")]
+            _close = _dl.get_close_matches(customer_name, _all_names, n=3, cutoff=0.5)
+        except Exception:
+            pass
+        if _close:
+            _names = ", ".join(f"'{n}'" for n in _close)
+            raise ValueError(
+                f"Customer {customer_name!r} not found. Did you mean: {_names}? "
+                "Use the exact name and try again."
+            )
         raise ValueError(
             f"No snapshots found for customer {customer_name!r} in the analytics database. "
-            "Check the customer name matches Supportal exactly and that the session cookie is valid."
+            "Check the spelling or use list_supportal_customers to browse all customers."
         )
     _log(f"Analytics returned {len(rows)} snapshot records.", 0.5)
 
@@ -362,7 +404,7 @@ def search_customers_via_analytics(
     UI search API (/search/.../data) misses.
     Returns list of {slug, display_name, url, source}.
     """
-    if not query.strip() or not cookie:
+    if not query.strip():
         return []
     like_val = f"%{query.strip().lower().replace('%', '\\%').replace('_', '\\_')}%"
     try:
@@ -390,7 +432,7 @@ def search_customers_via_analytics(
 
 def resolve_customer_name(
     query: str,
-    cookie: str | None,
+    cookie: str | None = None,
     cb_url: str = "",
     cb_bucket: str = "supportal",
     cb_user: str = "",
@@ -419,15 +461,14 @@ def resolve_customer_name(
         url = f"{BASE_URL}/customer/{urllib.parse.quote(name.strip(), safe='')}"
         all_hits.append({"display_name": name.strip(), "url": url, "source": source})
 
-    # 1 — Analytics LIKE (most complete, authoritative)
-    if cookie:
-        try:
-            for h in search_customers_via_analytics(query, cookie, limit):
-                _add(h.get("display_name") or h.get("slug") or "", "Analytics")
-        except Exception:
-            pass
+    # 1 — Analytics LIKE (most complete, authoritative; open endpoint as of v2.6.2)
+    try:
+        for h in search_customers_via_analytics(query, cookie, limit):
+            _add(h.get("display_name") or h.get("slug") or "", "Analytics")
+    except Exception:
+        pass
 
-    # 2 — Local CB LIKE (works offline / no cookie needed)
+    # 2 — Local CB LIKE (works offline)
     if cb_url and cb_user:
         try:
             from supportal.cb_helpers import search_orgs_from_cb as _search_orgs_fn  # noqa: PLC0415
@@ -438,11 +479,37 @@ def resolve_customer_name(
         except Exception:
             pass
 
-    # 3 — Supportal UI search (good for short-name lookups, requires cookie)
-    if cookie and len(all_hits) < 3:
+    # 3 — Supportal UI search (good for short-name lookups)
+    if len(all_hits) < 3:
         try:
             for h in search_customers_on_supportal(query, cookie, limit):
                 _add(h.get("display_name") or h.get("slug") or "", "Supportal")
+        except Exception:
+            pass
+
+    # 4 — Per-word LIKE: split on whitespace, try each word >= 4 chars individually.
+    # Catches cases where one word is garbled but another is recognisable
+    # (e.g. "Azerixan Express" → word "Express" → matches "American Express AZ").
+    if not all_hits:
+        _words = [w for w in query.split() if len(w) >= 4]
+        for _w in _words:
+            try:
+                for h in search_customers_via_analytics(_w, cookie, limit):
+                    _add(h.get("display_name") or h.get("slug") or "", "Partial match")
+            except Exception:
+                pass
+
+    # 5 — difflib fuzzy fallback when all LIKE/FTS searches come up empty
+    # Handles transpositions and garbled names that LIKE can't catch.
+    if not all_hits:
+        try:
+            import difflib as _dl
+            _all_rows = query_supportal_analytics(
+                "SELECT DISTINCT cu.`name` AS n FROM customer cu WHERE LENGTH(cu.`name`) > 2 LIMIT 15000",
+            )
+            _all_names = [r["n"] for r in _all_rows if r.get("n")]
+            for name in _dl.get_close_matches(query, _all_names, n=3, cutoff=0.4):
+                _add(name, "Fuzzy match")
         except Exception:
             pass
 

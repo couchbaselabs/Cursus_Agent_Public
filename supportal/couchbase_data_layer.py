@@ -206,7 +206,21 @@ class CouchbaseDataLayer(BaseDataLayer):
                 if row.get("parentId") and row["parentId"] not in _kept_ids:
                     row["parentId"] = None
                 steps.append(row)
-            elements = [e for e in raw_elements if isinstance(e, dict) and e.get("id")]
+            # Filter elements:
+            # 1. Must have an id and a forId that belongs to a kept step.
+            # 2. Dataframe elements without content crash the frontend
+            #    (content is not in ElementDict so old stored elements lack it).
+            elements = []
+            for _e in raw_elements:
+                if not isinstance(_e, dict) or not _e.get("id"):
+                    continue
+                # Drop elements whose step was filtered out (prevents frontend index crash)
+                if _e.get("forId") and _e["forId"] not in _kept_ids:
+                    continue
+                # Drop Dataframe elements without content (JSON.parse(null) → crash)
+                if _e.get("type") == "dataframe" and not _e.get("content"):
+                    continue
+                elements.append(_e)
             return ThreadDict(
                 id=doc["id"],
                 createdAt=doc["createdAt"],
@@ -280,6 +294,23 @@ class CouchbaseDataLayer(BaseDataLayer):
                 doc["tags"] = tags
             self._col(_THREADS).upsert(key, doc)
         await self._run(_update)
+
+    async def touch_thread_ttl(self, thread_id: str, ttl_seconds: int) -> None:
+        """Set (or clear) the Couchbase TTL on a thread doc.
+
+        ttl_seconds=86400 → expires in 24 h.
+        ttl_seconds=0     → no expiry (permanent).
+        Silently ignored if the doc doesn't exist yet or CB is unavailable.
+        """
+        def _touch():
+            try:
+                self._col(_THREADS).touch(
+                    f"thread::{thread_id}",
+                    timedelta(seconds=ttl_seconds),
+                )
+            except Exception:
+                pass
+        await self._run(_touch)
 
     async def delete_thread(self, thread_id: str):
         def _delete():
@@ -392,6 +423,11 @@ class CouchbaseDataLayer(BaseDataLayer):
             eid = getattr(element, "id", None) or str(uuid.uuid4())
             element.id = eid
             doc = element.to_dict() if hasattr(element, "to_dict") else {}
+            # Element.to_dict() omits `content` (not part of ElementDict protocol),
+            # but the Dataframe component needs it to render — store it explicitly.
+            content = getattr(element, "content", None)
+            if content:
+                doc["content"] = content
             self._col(_ELEMENTS).upsert(f"element::{eid}", doc)
         await self._run(_create)
 
@@ -425,10 +461,92 @@ class CouchbaseDataLayer(BaseDataLayer):
                 "threadId": feedback.threadId,
                 "value": feedback.value,
                 "comment": feedback.comment,
+                "createdAt": _now(),
             }
+            # For positive feedback, capture the question text from the linked step
+            # so we can embed it later for few-shot retrieval.
+            if feedback.value == 1 and feedback.forId:
+                try:
+                    rows = self._q(
+                        f"SELECT s.input, s.output FROM `{self._bucket_name}`.`{_SCOPE}`.`{_STEPS}` s "
+                        f"WHERE s.id = $fid LIMIT 1",
+                        fid=feedback.forId,
+                    )
+                    if rows:
+                        doc["question_text"] = rows[0].get("input") or ""
+                        doc["answer_text"]   = rows[0].get("output") or ""
+                except Exception:
+                    pass
             self._col(_FEEDBACK).upsert(f"feedback::{fid}", doc)
             return fid
         return await self._run(_upsert)
+
+    async def get_unembedded_positive_feedback(self) -> list[dict]:
+        """Return positive feedback docs that haven't been embedded yet."""
+        def _get():
+            try:
+                return self._q(
+                    f"SELECT f.id, f.question_text, f.answer_text, f.comment "
+                    f"FROM `{self._bucket_name}`.`{_SCOPE}`.`{_FEEDBACK}` f "
+                    f"WHERE f.`value` = 1 AND f.question_text IS NOT MISSING "
+                    f"AND f.question_text != '' AND f.embedding IS MISSING"
+                )
+            except Exception:
+                return []
+        return await self._run(_get)
+
+    async def update_feedback_embedding(self, feedback_id: str, vector: list[float]) -> None:
+        """Store the question embedding on a feedback doc."""
+        def _update():
+            key = f"feedback::{feedback_id}"
+            try:
+                doc = self._col(_FEEDBACK).get(key).content_as[dict]
+                doc["embedding"] = vector
+                self._col(_FEEDBACK).upsert(key, doc)
+            except Exception:
+                pass
+        await self._run(_update)
+
+    async def search_similar_positive_feedback(
+        self, vector: list[float], top_k: int = 3
+    ) -> list[dict]:
+        """Brute-force cosine similarity over embedded positive feedback.
+
+        Returns up to top_k dicts with keys: question_text, answer_text, comment, score.
+        Fine for small feedback sets (<10k docs).
+        """
+        def _search():
+            try:
+                rows = self._q(
+                    f"SELECT f.id, f.question_text, f.answer_text, f.comment, f.embedding "
+                    f"FROM `{self._bucket_name}`.`{_SCOPE}`.`{_FEEDBACK}` f "
+                    f"WHERE f.`value` = 1 AND f.embedding IS NOT MISSING"
+                )
+            except Exception:
+                return []
+            if not rows:
+                return []
+
+            import math as _math
+
+            def _cos(a: list, b: list) -> float:
+                dot = sum(x * y for x, y in zip(a, b))
+                na  = _math.sqrt(sum(x * x for x in a)) or 1.0
+                nb  = _math.sqrt(sum(x * x for x in b)) or 1.0
+                return dot / (na * nb)
+
+            scored = []
+            for r in rows:
+                emb = r.get("embedding")
+                if emb and len(emb) == len(vector):
+                    scored.append({**r, "score": _cos(vector, emb)})
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            return [
+                {k: v for k, v in r.items() if k != "embedding"}
+                for r in scored[:top_k]
+                if r["score"] > 0.75   # only inject genuinely similar examples
+            ]
+        return await self._run(_search)
 
     async def delete_feedback(self, feedback_id: str) -> bool:
         def _delete():

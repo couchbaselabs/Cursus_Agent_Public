@@ -50,6 +50,10 @@ def _patch_anyio_backend() -> None:
 
 _patch_anyio_backend()
 
+# Chainlit persists uploaded/generated files under .files/{session_uuid}/.
+# mkdir(exist_ok=True) without parents=True fails if .files/ itself is missing.
+(Path(__file__).parent.parent.parent / ".files").mkdir(exist_ok=True)
+
 import chainlit as cl
 import chainlit.data as cl_data
 
@@ -190,11 +194,6 @@ def _auth(username: str, password: str) -> "cl.User | None":
 
 
 # ── Optional deps ────────────────────────────────────────────────────────────
-try:
-    import plotly.graph_objects as go
-    _PLOTLY = True
-except ImportError:
-    _PLOTLY = False
 
 try:
     import pandas as pd
@@ -220,6 +219,18 @@ def _cb_args(p: dict) -> tuple:
         p.get("cb_tls", False),
         p.get("cb_scope", "transcripts"),
         p.get("cb_collection", "tickets"),
+    )
+
+
+def _cb_args_assets(p: dict) -> tuple:
+    """CB args for the assets collection (no trailing collection name)."""
+    return (
+        p.get("cb_url", "couchbase://localhost"),
+        p.get("cb_bucket", "rag"),
+        p.get("cb_user", ""),
+        p.get("cb_pass", ""),
+        p.get("cb_tls", False),
+        p.get("cb_scope", "transcripts"),
     )
 
 
@@ -294,66 +305,72 @@ def _llm_config(p: dict, overrides: dict) -> tuple[str, str, str, str]:
     return provider, model, api_key, base_url
 
 
-def _system_prompt(customer: str, profile_hint: str = "", prior_session_block: str = "") -> str:
+def _system_prompt(
+    customer: str,
+    profile_hint: str = "",
+    prior_session_block: str = "",
+    few_shot_examples: list[dict] | None = None,
+) -> str:
     from supportal.prompts import build_agent_system_prompt
-    return build_agent_system_prompt(
+    base = build_agent_system_prompt(
         customer=customer,
         profile_hint=profile_hint,
         prior_session_block=prior_session_block,
     )
+    if few_shot_examples:
+        lines = ["\n\nEXAMPLES OF WELL-RECEIVED ANSWERS (use as style/depth reference):"]
+        for i, ex in enumerate(few_shot_examples, 1):
+            q = (ex.get("question_text") or "").strip()
+            a = (ex.get("answer_text") or "").strip()
+            note = (ex.get("comment") or "").strip()
+            if not q:
+                continue
+            lines.append(f"\nExample {i}:")
+            lines.append(f"  Q: {q[:300]}")
+            if a:
+                lines.append(f"  A: {a[:600]}")
+            if note:
+                lines.append(f"  (User noted: {note})")
+        if len(lines) > 1:
+            base += "\n".join(lines)
+    return base
 
 
-# ── ECharts → Plotly converter ───────────────────────────────────────────────
-def _to_plotly(option: dict):
-    """Convert an ECharts option dict (from _build_agent_echart_option) to Plotly."""
-    if not _PLOTLY:
-        return None
-    title = (option.get("title") or {}).get("text", "")
-    series = option.get("series") or []
-    if not series:
-        return None
+async def _embed_pending_feedback(profile: dict) -> None:
+    """Embed any positive feedback docs that don't have a vector yet."""
+    dl = cl_data.get_data_layer()
+    if dl is None or not hasattr(dl, "get_unembedded_positive_feedback"):
+        return
+    try:
+        pending = await dl.get_unembedded_positive_feedback()
+    except Exception:
+        return
+    if not pending:
+        return
+    app = _get_pipeline()
+    provider, model, api_key, base_url, dims = _emb_config(profile)
+    for doc in pending:
+        text = (doc.get("question_text") or "").strip()
+        if not text:
+            continue
+        try:
+            vector = await asyncio.to_thread(
+                app.embed_text, text, provider, model, api_key, base_url, dims
+            )
+            await dl.update_feedback_embedding(doc["id"], vector)
+        except Exception:
+            pass
 
-    s0 = series[0]
-    stype = s0.get("type", "bar")
 
-    if stype == "pie":
-        pie_data = s0.get("data") or []
-        labels = [d.get("name", "") for d in pie_data]
-        values = [d.get("value", 0) for d in pie_data]
-        radius = s0.get("radius", "60%")
-        hole = 0.4 if isinstance(radius, list) else 0
-        fig = go.Figure(go.Pie(labels=labels, values=values, hole=hole))
-
-    elif stype in ("bar", "line"):
-        x_axis = option.get("xAxis") or {}
-        y_axis = option.get("yAxis") or {}
-        is_horizontal = y_axis.get("type") == "category"
-
-        if is_horizontal:
-            cats = y_axis.get("data") or []
-            fig = go.Figure()
-            for s in series:
-                fig.add_trace(go.Bar(x=s.get("data") or [], y=cats,
-                                     orientation="h", name=s.get("name", "")))
-        elif stype == "line":
-            cats = x_axis.get("data") or []
-            fig = go.Figure()
-            for s in series:
-                fig.add_trace(go.Scatter(x=cats, y=s.get("data") or [],
-                                         mode="lines+markers", name=s.get("name", "")))
-        else:
-            cats = x_axis.get("data") or []
-            fig = go.Figure()
-            for s in series:
-                fig.add_trace(go.Bar(x=cats, y=s.get("data") or [], name=s.get("name", "")))
-    else:
-        return None
-
-    fig.update_layout(
-        title=title, template="plotly_white", height=380,
-        barmode="group", margin=dict(l=40, r=20, t=50, b=40),
+# ── ECharts element wrapper ───────────────────────────────────────────────────
+def _echart_element(option: dict, title: str) -> cl.CustomElement:
+    """Wrap an ECharts option dict as a Chainlit CustomElement rendered by public/elements/EChart.jsx."""
+    height = option.get("_height", 320)
+    return cl.CustomElement(
+        name="EChart",
+        props={"option": option, "height": height},
+        display="inline",
     )
-    return fig
 
 
 # ── Artifact parsing ─────────────────────────────────────────────────────────
@@ -385,31 +402,34 @@ def _parse_artifacts(answer: str) -> tuple[str, list, list]:
         if atype == "echart":
             title = (ap.get("title") or {}).get("text", "chart")
             raw_artifacts.append({"type": "echart", "data": ap, "title": title})
-            fig = _to_plotly(ap)
-            if fig:
-                elements.append(cl.Plotly(name=title or "chart", figure=fig, display="inline"))
-            else:
-                text_parts.append(
-                    f"*[Chart: {title} — install plotly for visual rendering: "
-                    f"`pip install plotly`]*"
-                )
+            elements.append(_echart_element(ap, title))
 
         elif atype == "table":
             cols = ap.get("columns") or []
             rows = ap.get("rows") or []
             tname = ap.get("title", "table")
+            # Normalize columns — LLMs sometimes emit [{"name": "Col"}] instead of ["Col"]
+            cols = [c.get("name") or c.get("label") or str(c) if isinstance(c, dict) else str(c) for c in cols]
             raw_artifacts.append({"type": "table", "data": ap, "title": tname})
             if tname:
                 text_parts.append(f"**{tname}**")
             if _PANDAS and cols:
-                df = pd.DataFrame(rows, columns=cols)
-                elements.append(cl.Dataframe(name=tname, data=df, display="inline"))
+                try:
+                    df = pd.DataFrame(rows, columns=cols)
+                    elements.append(cl.Dataframe(name=tname, data=df, display="inline"))
+                except Exception:
+                    # Fallback to markdown if DataFrame construction fails
+                    md = "| " + " | ".join(cols) + " |\n"
+                    md += "| " + " | ".join(["---"] * len(cols)) + " |\n"
+                    for row in rows:
+                        md += "| " + " | ".join(str(c) for c in (row.values() if isinstance(row, dict) else row)) + " |\n"
+                    text_parts.append(md)
             else:
                 # Markdown table fallback
                 md = "| " + " | ".join(cols) + " |\n"
                 md += "| " + " | ".join(["---"] * len(cols)) + " |\n"
                 for row in rows:
-                    md += "| " + " | ".join(str(c) for c in row) + " |\n"
+                    md += "| " + " | ".join(str(c) for c in (row.values() if isinstance(row, dict) else row)) + " |\n"
                 text_parts.append(md)
 
     post = answer[last:].strip()
@@ -476,17 +496,11 @@ async def _restore_assets(thread_id: str) -> None:
             label = f'*Restored from: "{snippet}"*' if snippet else "*Restored asset*"
             atype = asset.get("type", "")
             if atype == "echart":
-                fig = _to_plotly(data)
-                if fig:
-                    await cl.Message(
-                        content=label,
-                        elements=[cl.Plotly(
-                            name=asset.get("title", "chart"),
-                            figure=fig,
-                            display="inline",
-                        )],
-                        author="Corax (restored)",
-                    ).send()
+                await cl.Message(
+                    content=label,
+                    elements=[_echart_element(data, asset.get("title", "chart"))],
+                    author="Corax (restored)",
+                ).send()
             elif atype == "table":
                 cols = data.get("columns") or []
                 rows = data.get("rows") or []
@@ -552,6 +566,13 @@ async def _send_quick_actions(customer: str) -> None:
             name="prompt_library", value=customer or "", payload={"customer": customer or ""},
             label="📚 Prompt Library",
             description="Browse curated prompts by category",
+        )
+    )
+    actions.append(
+        cl.Action(
+            name="show_assets", value=customer or "", payload={"customer": customer or ""},
+            label="📦 Assets",
+            description="Browse saved charts, reports, and tables",
         )
     )
     await cl.Message(content="**Quick Actions**", actions=actions, author="Corax").send()
@@ -704,7 +725,10 @@ async def on_start():
     cl.user_session.set("overrides", {"provider": provider})
     cl.user_session.set("history", [])
 
-    # Associate this thread with the current user so it appears in the sidebar
+    # Associate this thread with the current user so it appears in the sidebar.
+    # Mark it with a 24-hour TTL — if no user message arrives, Couchbase will
+    # automatically expire the doc.  The first on_message update_thread() call
+    # does a plain upsert (no preserve_expiry), which resets TTL to 0 (permanent).
     dl = cl_data.get_data_layer()
     if dl:
         try:
@@ -712,6 +736,8 @@ async def on_start():
             uid = getattr(user, "id", None)
             if uid:
                 await dl.update_thread(cl.context.session.thread_id, user_id=uid)
+            if hasattr(dl, "touch_thread_ttl"):
+                await dl.touch_thread_ttl(cl.context.session.thread_id, 86400)
         except Exception:
             pass
 
@@ -728,6 +754,8 @@ async def on_start():
         author="Corax",
     ).send()
     await _send_quick_actions("")
+    # Embed any positive feedback that hasn't been vectorised yet (fire-and-forget)
+    asyncio.ensure_future(_embed_pending_feedback(profile))
     # Pick up any jobs that started in NiceGUI or a prior Chainlit session
     await _resume_scrape_job_monitors(profile)
 
@@ -808,9 +836,48 @@ async def on_message(message: cl.Message):
     _ctx_depth = int(overrides.get("agent_context_depth") or profile.get("agent_context_depth") or 10)
     _prior_block = cl.user_session.get("prior_session_block", "")
     _profile_hint = cl.user_session.get("profile_hint", "")
-    msgs = [{"role": "system", "content": _system_prompt(customer, _profile_hint, _prior_block)}]
+
+    # Few-shot injection — find similar positively-rated Q&A pairs from past feedback
+    _few_shot: list[dict] = []
+    _dl = cl_data.get_data_layer()
+    if _dl and hasattr(_dl, "search_similar_positive_feedback"):
+        try:
+            _app = _get_pipeline()
+            _ep, _em, _ek, _eu, _ed = _emb_config(profile)
+            _qvec = await asyncio.to_thread(
+                _app.embed_text, message.content, _ep, _em, _ek, _eu, _ed
+            )
+            _few_shot = await _dl.search_similar_positive_feedback(_qvec, top_k=3)
+        except Exception:
+            pass
+
+    # ── File upload handling ──────────────────────────────────────────────────
+    # Chainlit delivers uploaded files as message.elements with type "file".
+    # Extract text content and append it to the user message so the LLM sees it.
+    _file_blocks: list[str] = []
+    for _el in (message.elements or []):
+        _el_type = getattr(_el, "type", "") or ""
+        _el_path = getattr(_el, "path", None) or getattr(_el, "url", None) or ""
+        _el_name = getattr(_el, "name", "") or "attachment"
+        if _el_type not in ("file", "text") and not _el_path:
+            continue
+        try:
+            if _el_path and not _el_path.startswith("http"):
+                with open(_el_path, "r", errors="replace") as _fh:
+                    _content = _fh.read(64_000)  # cap at 64K chars
+                _file_blocks.append(
+                    f'<file name="{_el_name}">\n{_content}\n</file>'
+                )
+        except Exception as _fe:
+            print(f"[corax] file read failed ({_el_name}): {_fe}")
+
+    _user_content = message.content or ""
+    if _file_blocks:
+        _user_content = _user_content + "\n\n" + "\n\n".join(_file_blocks)
+
+    msgs = [{"role": "system", "content": _system_prompt(customer, _profile_hint, _prior_block, _few_shot)}]
     msgs.extend(history[-_ctx_depth:])
-    msgs.append({"role": "user", "content": message.content})
+    msgs.append({"role": "user", "content": _user_content})
 
     # AFTER v1.5.0: live tool-call status message
     # We update this message as each tool fires so users see progress.
@@ -868,22 +935,33 @@ async def on_message(message: cl.Message):
     history.append({"role": "assistant", "content": answer})
     cl.user_session.set("history", history)
 
-    # Persist to shared history so NiceGUI chat sees the same conversation
-    profile = cl.user_session.get("profile") or _load_cb_settings()
-    await _save_shared_history(customer, history, profile)
+    # Persist to shared history — isolated so a CB write failure never kills the session
+    try:
+        profile = cl.user_session.get("profile") or _load_cb_settings()
+        await _save_shared_history(customer, history, profile)
+    except Exception as _se:
+        print(f"[corax] _save_shared_history failed (non-fatal): {_se}")
 
     clean_text, elements, raw_artifacts = _parse_artifacts(answer)
 
     # Persist charts / tables to CB so they survive session restarts
-    await _save_assets(cl.context.session.thread_id, message.content, raw_artifacts)
+    try:
+        await _save_assets(cl.context.session.thread_id, message.content, raw_artifacts)
+    except Exception as _ae:
+        print(f"[corax] _save_assets failed (non-fatal): {_ae}")
 
-    # AFTER v1.5.0: follow-up suggestion chips as Actions
-    _sugs = await loop.run_in_executor(
-        None,
-        lambda: app._generate_followup_suggestions(
-            message.content, answer, provider, model, api_key, base_url
-        ),
-    )
+    # Follow-up suggestion chips — isolated so an LLM error here never resets the session
+    _sugs: list = []
+    try:
+        _sugs = await loop.run_in_executor(
+            None,
+            lambda: app._generate_followup_suggestions(
+                message.content, answer, provider, model, api_key, base_url
+            ),
+        )
+    except Exception as _fe:
+        print(f"[corax] _generate_followup_suggestions failed (non-fatal): {_fe}")
+
     _actions = [
         cl.Action(name="followup", value=s, payload={"value": s}, label=s, description="Ask this follow-up")
         for s in _sugs
@@ -1124,3 +1202,176 @@ async def on_run_library_prompt(action: cl.Action):
         return
     fake_msg = cl.Message(content=prompt, author="User")
     await on_message(fake_msg)
+
+
+# ── Assets panel ──────────────────────────────────────────────────────────────
+
+_ASSET_EMOJI = {
+    "chart": "📊", "echart": "📊",
+    "table": "📋", "csv": "📋",
+    "report": "📄",
+    "json": "📁", "js": "📁", "javascript": "📁", "html": "🌐",
+}
+
+
+def _fmt_asset_date(ts: int) -> str:
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(ts).strftime("%b %d %H:%M")
+    except Exception:
+        return ""
+
+
+@cl.action_callback("show_assets")
+async def on_show_assets(action: cl.Action):
+    """List saved assets from CB, with Preview and Delete buttons per asset."""
+    from supportal.agent_tools import _list_assets_from_cb
+
+    customer = action.payload.get("customer") or cl.user_session.get("customer", "")
+    profile = cl.user_session.get("profile") or _load_cb_settings()
+    cb_a = _cb_args_assets(profile)
+
+    if not cb_a[2]:  # no username configured
+        await cl.Message(
+            content="⚠ No Couchbase profile configured — assets cannot be loaded.",
+            author="Corax",
+        ).send()
+        return
+
+    try:
+        assets = await asyncio.to_thread(_list_assets_from_cb, *cb_a, customer, "", 50)
+    except Exception as exc:
+        await cl.Message(content=f"⚠ Could not load assets: {exc}", author="Corax").send()
+        return
+
+    if not assets:
+        label = f" for **{customer}**" if customer else ""
+        await cl.Message(
+            content=f"No saved assets found{label}. Charts, tables, and reports generated by the agent are saved here automatically.",
+            author="Corax",
+        ).send()
+        return
+
+    lines = [f"**📦 Assets** ({len(assets)} most recent{f' · {customer}' if customer else ''})\n"]
+    asset_actions = []
+    for a in assets:
+        aid   = a.get("id") or ""
+        atype = a.get("asset_type") or "?"
+        emoji = _ASSET_EMOJI.get(atype, "📁")
+        title = a.get("title") or a.get("filename") or aid[:8]
+        org   = a.get("org") or ""
+        ts    = _fmt_asset_date(a.get("created_at") or 0)
+        org_label = f" · {org}" if org and org.lower() != (customer or "").lower() else ""
+        size_kb = round((a.get("size_bytes") or 0) / 1024, 1)
+        lines.append(f"{emoji} **{title}**{org_label} — {atype} · {size_kb} KB · {ts}")
+        if aid:
+            asset_actions.append(
+                cl.Action(
+                    name="preview_asset",
+                    value=aid,
+                    payload={"asset_id": aid, "asset_type": atype, "title": title},
+                    label=f"Preview: {title[:40]}",
+                    description=f"Render this {atype} inline",
+                )
+            )
+            asset_actions.append(
+                cl.Action(
+                    name="delete_asset",
+                    value=aid,
+                    payload={"asset_id": aid, "title": title},
+                    label=f"🗑 Delete: {title[:35]}",
+                    description=f"Permanently delete this asset from Couchbase",
+                )
+            )
+
+    # Chainlit caps actions per message — send list text + first batch of actions
+    await cl.Message(
+        content="\n".join(lines),
+        actions=asset_actions[:20],  # ~10 assets worth of preview+delete pairs
+        author="Corax",
+    ).send()
+
+
+@cl.action_callback("preview_asset")
+async def on_preview_asset(action: cl.Action):
+    """Fetch a single asset from CB and render it inline."""
+    from supportal.agent_tools import _get_asset_content_from_cb
+
+    aid    = action.payload.get("asset_id") or action.value
+    atype  = action.payload.get("asset_type") or ""
+    title  = action.payload.get("title") or aid
+
+    profile = cl.user_session.get("profile") or _load_cb_settings()
+    cb_a = _cb_args_assets(profile)
+
+    try:
+        doc = await asyncio.to_thread(_get_asset_content_from_cb, *cb_a, aid)
+    except Exception as exc:
+        await cl.Message(content=f"⚠ Could not fetch asset: {exc}", author="Corax").send()
+        return
+
+    if not doc:
+        await cl.Message(content=f"Asset `{aid}` not found.", author="Corax").send()
+        return
+
+    content = doc.get("content") or ""
+    atype   = doc.get("asset_type") or atype
+
+    if atype in ("chart", "echart"):
+        try:
+            option = json.loads(content)
+            await cl.Message(
+                content=f"**{title}**",
+                elements=[_echart_element(option, title)],
+                author="Corax",
+            ).send()
+        except Exception:
+            await cl.Message(content=f"**{title}**\n```json\n{content[:2000]}\n```", author="Corax").send()
+
+    elif atype == "table":
+        try:
+            data = json.loads(content)
+            cols = data.get("columns") or []
+            rows = data.get("rows") or []
+            cols = [c.get("name") or c.get("label") or str(c) if isinstance(c, dict) else str(c) for c in cols]
+            if _PANDAS and cols:
+                df = pd.DataFrame(rows, columns=cols)
+                await cl.Message(
+                    content=f"**{title}**",
+                    elements=[cl.Dataframe(name=title, data=df, display="inline")],
+                    author="Corax",
+                ).send()
+            else:
+                await cl.Message(content=f"**{title}**\n```\n{content[:3000]}\n```", author="Corax").send()
+        except Exception:
+            await cl.Message(content=f"**{title}**\n```\n{content[:3000]}\n```", author="Corax").send()
+
+    elif atype in ("report", "html", "js", "javascript"):
+        snippet = content[:4000]
+        await cl.Message(content=f"**{title}**\n\n{snippet}", author="Corax").send()
+
+    else:
+        await cl.Message(content=f"**{title}**\n```\n{content[:3000]}\n```", author="Corax").send()
+
+
+@cl.action_callback("delete_asset")
+async def on_delete_asset(action: cl.Action):
+    """Delete a single asset from CB."""
+    from supportal.agent_tools import _delete_asset_from_cb
+
+    aid   = action.payload.get("asset_id") or action.value
+    title = action.payload.get("title") or aid
+
+    profile = cl.user_session.get("profile") or _load_cb_settings()
+    cb_a = _cb_args_assets(profile)
+
+    try:
+        ok = await asyncio.to_thread(_delete_asset_from_cb, *cb_a, aid)
+    except Exception as exc:
+        await cl.Message(content=f"⚠ Delete failed: {exc}", author="Corax").send()
+        return
+
+    if ok:
+        await cl.Message(content=f"🗑 Deleted **{title}**.", author="Corax").send()
+    else:
+        await cl.Message(content=f"Could not delete **{title}** — it may have already been removed.", author="Corax").send()

@@ -136,7 +136,9 @@ _AGENT_TOOLS: list[dict] = [
                 "and cluster topology from the linked snapshot — including node count, CB version, "
                 "service layout, bucket names, RAM per node, auto-failover setting, and health "
                 "(bad/warn item counts). Use this when the user asks about cluster configuration, "
-                "node count, topology, or any infrastructure details for a specific ticket."
+                "node count, topology, or any infrastructure details for a specific ticket. "
+                "If the ticket is not in local Couchbase, it is automatically fetched live from "
+                "Supportal and saved — do NOT give up or say the ticket doesn't exist before calling this."
             ),
             "parameters": {
                 "type": "object",
@@ -179,10 +181,13 @@ _AGENT_TOOLS: list[dict] = [
             "name": "rescrape_customer_tickets",
             "description": (
                 "Bulk re-scrape tickets for a customer from Supportal and update Couchbase. "
-                "Use when the user asks to refresh all tickets, update stale data, or rescrape "
-                "a customer's full ticket history. By default only scrapes tickets older than 4 hours. "
-                "Runs sequentially with a short delay between requests to avoid rate-limiting. "
-                "Returns a summary of how many succeeded, failed, or were skipped."
+                "Automatically discovers NEW tickets from Supportal that are not yet in the local database — "
+                "these are always scraped regardless of stale_hours. Existing stale tickets are also refreshed. "
+                "Use when the user asks to refresh, update, or rescrape a customer's ticket history, "
+                "or says 'what's new' / 'get the latest tickets'. "
+                "By default only re-scrapes existing tickets older than 4 hours. "
+                "The job summary reports 'N new + M stale tickets updated'. "
+                "Runs sequentially with a short delay between requests to avoid rate-limiting."
             ),
             "parameters": {
                 "type": "object",
@@ -343,12 +348,13 @@ _AGENT_TOOLS: list[dict] = [
         "function": {
             "name": "query_supportal",
             "description": (
-                "[LIVE / GLOBAL — hits Supportal Analytics API, not local Couchbase] "
+                "[LIVE / GLOBAL — hits Supportal Analytics API, requires a valid session cookie] "
                 "Run a SQL++ query against the live Supportal Analytics API. "
-                "Use for global/live questions not covered by other tools: snapshot details, "
-                "cluster configurations, version distributions, ticket-to-cluster mappings, "
-                "counts of customers/clusters/snapshots as seen by Supportal today. "
-                "Do NOT use for locally scraped ticket data — use query_tickets/count_tickets for that.\n\n"
+                "Use for global/live questions that need live data: customer lists from Supportal, "
+                "ticket-to-cluster mappings, counts of clusters/snapshots as seen by Supportal today. "
+                "Do NOT use for locally scraped ticket data — use query_tickets/count_tickets for that. "
+                "Do NOT use for cluster hardware topology, memory, CPU, or recent snapshot data — "
+                "use query_local_snapshots or get_cluster_health (both query local CB without a cookie).\n\n"
                 "SCHEMA (scope: v1):\n"
                 "  customer   — name (string). Key: Customer::{id}\n"
                 "  cluster    — ui_name (string), customer (string, customer id). Key: Cluster::{uuid}\n"
@@ -527,7 +533,11 @@ _AGENT_TOOLS: list[dict] = [
                 "Shows active clusters, CB versions, node counts, CPUs/node, RAM/node, bad/warn item counts, "
                 "and deprecation status. Use this when the user asks about cluster state, infrastructure health, "
                 "version distribution, or hardware specs (CPU cores, RAM per node). "
-                "Preferred over get_ticket when the question is about hardware or cross-snapshot cluster config."
+                "Preferred over get_ticket when the question is about hardware or cross-snapshot cluster config. "
+                "NOTE: bad_count and warn_count are counts of diagnostic health CHECK MESSAGES from Couchbase "
+                "Support diagnostics — they are NOT node counts. A bad_count of 5 means 5 diagnostic items "
+                "are flagged as bad, not 5 nodes. Node count is a separate 'Nodes' field. "
+                "For a visual chart of hardware stats for clusters with open tickets, prefer cluster_hw_chart."
             ),
             "parameters": {
                 "type": "object",
@@ -538,6 +548,106 @@ _AGENT_TOOLS: list[dict] = [
                     },
                 },
                 "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cluster_hw_chart",
+            "description": (
+                "Generate a hardware comparison chart (EChart) for clusters linked to open/pending tickets. "
+                "Shows node count, CPUs/node, and RAM/node (GiB) as grouped bars per cluster. "
+                "Clusters that have CBSE-linked tickets are marked with a ● dot in their label. "
+                "Returns a rendered chart — use this whenever the user asks to: "
+                "'show hardware stats for clusters with open tickets', 'compare nodes/CPU/RAM across clusters', "
+                "'graph hardware for tickets', 'which clusters have CBSEs on the chart', "
+                "'show me a chart of cluster topology for tickets'. "
+                "IMPORTANT: bad_count and warn_count are health MESSAGE counts (diagnostic items), NOT node counts. "
+                "This tool shows the real hardware specs: physical node count, CPU cores per node, RAM per node."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Customer/organization name.",
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "enum": ["open", "pending", "open_or_pending", "all"],
+                        "description": "Filter clusters by linked ticket status (default: open_or_pending).",
+                    },
+                    "height": {
+                        "type": "integer",
+                        "description": "Chart height in pixels (default: auto based on cluster count).",
+                    },
+                },
+                "required": ["organization"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_local_snapshots",
+            "description": (
+                "[LOCAL — queries your Couchbase snapshots collection directly, no API cookie needed] "
+                "Query the local snapshot topology database for cluster hardware specs and health. "
+                "Returns node count, CB version, CPUs/node, RAM/node, disk, bad/warn item counts per cluster. "
+                "Use for questions like: 'show me recent clusters', 'which clusters have snapshots in the last 30 days', "
+                "'what are the hardware specs of clusters', 'topology of recent clusters', "
+                "'memory/CPU/disk for clusters'. "
+                "Supports optional organization filter and days filter. "
+                "Prefer this over query_supportal for topology/hardware/resource questions — no cookie needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Optional customer/organization filter (fuzzy match). Omit to search all orgs.",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Only return snapshots scraped within this many days (default 30).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows to return (default 50).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_snapshot",
+            "description": (
+                "Fetch a snapshot's full topology live from Supportal and return a structured health summary. "
+                "Use when the user provides a snap_id (e.g. from a ticket or cluster name) and wants real-time analysis. "
+                "Optionally save analysis notes back to the snapshot record in Couchbase. "
+                "Returns: cluster name, CB version, node/CPU/RAM, bad items, warn items, bucket list."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "snap_id": {
+                        "type": "string",
+                        "description": "The snapshot ID (e.g. 'abc123::0'). Found in ticket snap_ids or snapshot listings.",
+                    },
+                    "analysis_notes": {
+                        "type": "string",
+                        "description": "Optional free-text analysis or findings to attach to the snapshot record.",
+                    },
+                    "save_notes": {
+                        "type": "boolean",
+                        "description": "If true, saves the topology and analysis_notes back to the snapshot doc in Couchbase (default false).",
+                    },
+                },
+                "required": ["snap_id"],
             },
         },
     },
@@ -722,10 +832,12 @@ _AGENT_TOOLS: list[dict] = [
             "name": "batch_score_tickets",
             "description": (
                 "Score multiple tickets for quality/complexity in one call. "
-                "Use when the user asks to score several tickets, 'all unscored' tickets, "
-                "or a filtered set. Returns a score summary table. "
+                "Use when the user asks to score, RE-score, or refresh scores for tickets. "
+                "Returns a score summary table. "
                 "Far more efficient than calling score_ticket once per ticket. "
-                "Limit is 10 per call — call again to continue larger batches."
+                "Limit is 50 per call. "
+                "IMPORTANT: when the user asks to RE-score or rescore (i.e. score again), "
+                "set unscored_only=false so already-scored tickets are included."
             ),
             "parameters": {
                 "type": "object",
@@ -737,15 +849,15 @@ _AGENT_TOOLS: list[dict] = [
                     },
                     "organization": {
                         "type": "string",
-                        "description": "Score unscored tickets for this customer (used when ticket_ids is empty).",
+                        "description": "Score tickets for this customer (used when ticket_ids is empty).",
                     },
                     "unscored_only": {
                         "type": "boolean",
-                        "description": "Only score tickets without existing scores (default true).",
+                        "description": "Only score tickets without existing scores (default true). Set false when the user explicitly asks to RE-score or refresh existing scores.",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max tickets to score in this call (default 5, max 10).",
+                        "description": "Max tickets to score in this call (default 10, max 50).",
                     },
                     "status": {
                         "type": "string",
@@ -1043,6 +1155,28 @@ _AGENT_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": (
+                "Returns the current date and time. Call this whenever you need to know "
+                "today's date, the current time, day of week, week number, or quarter — "
+                "for example when computing 'last 7 days', 'this month', 'this quarter', "
+                "or any other relative time range."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone name (e.g. 'America/New_York'). Defaults to server local time.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -1082,6 +1216,98 @@ _ASSET_ICONS: dict[str, str] = {
 }
 
 
+_DARK_TEXT   = "#d1d5db"   # gray-300 — readable on dark backgrounds
+_DARK_TITLE  = "#f3f4f6"   # gray-100
+_DARK_SUBTEXT= "#9ca3af"   # gray-400
+_DARK_AXIS   = "#4b5563"   # gray-600
+_DARK_GRID   = "#2d3748"   # very subtle grid lines
+_DARK_TT_BG  = "rgba(15,23,42,0.96)"  # slate-950
+
+
+def _apply_echart_theme(option: dict) -> dict:
+    """
+    Post-process an ECharts option dict for readability on a dark UI background.
+    Patches text/axis/tooltip colors and fixes legend-title overlap.
+    Mutates and returns the dict.
+    """
+    # Global text fallback
+    option.setdefault("textStyle", {})["color"] = _DARK_TEXT
+
+    # Title
+    t = option.get("title")
+    if isinstance(t, dict):
+        t.setdefault("textStyle", {})["color"] = _DARK_TITLE
+        t.setdefault("subtextStyle", {})["color"] = _DARK_SUBTEXT
+        # Push title up a bit; grid.top will keep it from overlapping the plot area
+        t.setdefault("top", 6)
+
+    # Legend — move below title so they don't collide
+    lg = option.get("legend")
+    if isinstance(lg, dict):
+        lg.setdefault("textStyle", {})["color"] = _DARK_TEXT
+        # Only override top if it's still default (0 / missing)
+        lg.setdefault("top", 32)
+        lg.setdefault("padding", [4, 12])
+
+    # Tooltip
+    tt = option.get("tooltip")
+    if isinstance(tt, dict):
+        tt["backgroundColor"] = _DARK_TT_BG
+        tt.setdefault("textStyle", {})["color"] = _DARK_TITLE
+        tt["borderColor"] = "#374151"
+
+    # Axis helper
+    def _patch_axis(ax: dict) -> None:
+        ax.setdefault("axisLabel", {}).update({"color": _DARK_TEXT, "fontSize": 11})
+        ax.setdefault("axisLine", {}).setdefault("lineStyle", {})["color"] = _DARK_AXIS
+        ax.setdefault("axisTick", {}).setdefault("lineStyle", {})["color"] = _DARK_AXIS
+        ax.setdefault("splitLine", {}).setdefault("lineStyle", {}).update({"color": _DARK_GRID, "type": "dashed"})
+        ax.setdefault("nameTextStyle", {})["color"] = _DARK_TEXT
+
+    for ak in ("xAxis", "yAxis"):
+        axval = option.get(ak)
+        if isinstance(axval, list):
+            for a in axval:
+                _patch_axis(a)
+        elif isinstance(axval, dict):
+            _patch_axis(axval)
+
+    # Grid — ensure enough top clearance for title + legend
+    option.setdefault("grid", {}).setdefault("top", 68)
+
+    return option
+
+
+def _auto_log_scale(option: dict, series: list[dict]) -> None:
+    """
+    If multiple series have wildly different magnitudes (ratio > 50×),
+    switch the primary y-axis to log scale so all bars are visible.
+    Only applied to bar/combo charts with a value yAxis.
+    """
+    if not series:
+        return
+    maxima = []
+    for s in series:
+        data = s.get("data") or []
+        nums = [v for v in data if isinstance(v, (int, float)) and v > 0]
+        if nums:
+            maxima.append(max(nums))
+    if len(maxima) < 2:
+        return
+    ratio = max(maxima) / min(maxima)
+    if ratio < 50:
+        return
+    yax = option.get("yAxis")
+    if isinstance(yax, dict) and yax.get("type") == "value":
+        yax["type"] = "log"
+        yax["logBase"] = 10
+        yax.setdefault("name", "(log scale)")
+    elif isinstance(yax, list) and yax and yax[0].get("type") == "value":
+        yax[0]["type"] = "log"
+        yax[0]["logBase"] = 10
+        yax[0].setdefault("name", "(log scale)")
+
+
 def _build_agent_echart_option(args: dict) -> dict:
     """Build an ECharts option dict from generate_chart tool arguments."""
     chart_type   = (args.get("chart_type") or "bar").lower()
@@ -1107,16 +1333,24 @@ def _build_agent_echart_option(args: dict) -> dict:
     }
     _PAL = _PALETTES.get(color_scheme, _PALETTES["default"])
 
+    def _out(opt: dict) -> dict:
+        """Apply dark theme + auto-log scale, then return."""
+        _apply_echart_theme(opt)
+        # Auto-log for bar-family charts with multi-magnitude series
+        if chart_type not in ("gauge", "treemap", "funnel", "scatter", "pie", "donut"):
+            _auto_log_scale(opt, opt.get("series") or [])
+        return opt
+
     # ── Gauge ──────────────────────────────────────────────────────────────────
     if chart_type == "gauge":
         gval = float(args.get("value") or (values[0] if values else 0))
         gmin = float(args.get("min_value") or 0)
         gmax = float(args.get("max_value") or 100)
-        return {
+        return _out({
             "title":   {"text": title, "left": "center", "top": "bottom"},
             "series":  [{
                 "type": "gauge", "min": gmin, "max": gmax,
-                "detail": {"formatter": "{value}", "fontSize": 22, "color": "#1d4ed8"},
+                "detail": {"formatter": "{value}", "fontSize": 22, "color": "#60a5fa"},
                 "data": [{"value": round(gval, 2), "name": title}],
                 "axisLine": {"lineStyle": {"width": 22, "color": [
                     [0.3, "#22C55E"], [0.7, "#F59E0B"], [1.0, "#EF4444"],
@@ -1124,43 +1358,43 @@ def _build_agent_echart_option(args: dict) -> dict:
                 "pointer": {"itemStyle": {"color": "auto"}},
                 "axisTick": {"distance": -22, "length": 6, "lineStyle": {"color": "#fff", "width": 2}},
                 "splitLine": {"distance": -22, "length": 14, "lineStyle": {"color": "#fff", "width": 3}},
-                "axisLabel": {"color": "inherit", "distance": 28, "fontSize": 11},
+                "axisLabel": {"color": _DARK_TEXT, "distance": 28, "fontSize": 11},
             }],
             "_height": height, "_description": description,
-        }
+        })
 
     # ── Treemap ─────────────────────────────────────────────────────────────────
     if chart_type == "treemap":
         tree_data = (args.get("data_points")
                      or [{"name": l, "value": v} for l, v in zip(labels, values)])
-        return {
+        return _out({
             "title":  {"text": title, "left": "center"},
             "color":  _PAL,
             "series": [{"type": "treemap", "data": tree_data,
-                        "label": {"show": True, "formatter": "{b}: {c}"},
+                        "label": {"show": True, "formatter": "{b}: {c}", "color": "#fff"},
                         "emphasis": {"label": {"fontSize": 14}}}],
             "_height": height, "_description": description,
-        }
+        })
 
     # ── Funnel ──────────────────────────────────────────────────────────────────
     if chart_type == "funnel":
         funnel_data = ([{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
                        if series else [{"name": l, "value": v} for l, v in zip(labels, values)])
-        return {
+        return _out({
             "title":   {"text": title, "left": "center"},
             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
             "legend":  {"orient": "vertical", "left": "left"},
             "color":   _PAL,
             "series":  [{"type": "funnel", "data": funnel_data,
-                         "label": {"position": "inside", "formatter": "{b}: {c}"}}],
+                         "label": {"position": "inside", "formatter": "{b}: {c}", "color": "#fff"}}],
             "_height": height, "_description": description,
-        }
+        })
 
     # ── Scatter ─────────────────────────────────────────────────────────────────
     if chart_type == "scatter":
         pts = (args.get("data_points")
                or [{"x": i, "y": v, "name": l} for i, (l, v) in enumerate(zip(labels, values))])
-        return {
+        return _out({
             "title":   {"text": title},
             "tooltip": {"trigger": "item"},
             "color":   _PAL,
@@ -1170,22 +1404,22 @@ def _build_agent_echart_option(args: dict) -> dict:
                          "data": [[p.get("x", 0), p.get("y", 0)] for p in pts],
                          "label": {"show": show_labels, "formatter": "function(p){return p.data[0]+', '+p.data[1];}"}}],
             "_height": height, "_description": description,
-        }
+        })
 
     # ── Pie / Donut ─────────────────────────────────────────────────────────────
     if chart_type in ("pie", "donut"):
         pie_data = ([{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
                     if series else [{"name": l, "value": v} for l, v in zip(labels, values)])
         radius   = ["40%", "70%"] if chart_type == "donut" else "60%"
-        lbl_opt  = {"formatter": "{b}: {c} ({d}%)"} if show_labels else {"show": False}
-        return {
+        lbl_opt  = {"formatter": "{b}: {c} ({d}%)", "color": _DARK_TEXT} if show_labels else {"show": False}
+        return _out({
             "title":   {"text": title, "left": "center"},
             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
             "legend":  {"orient": "vertical", "left": "left"},
             "color":   _PAL,
             "series":  [{"type": "pie", "radius": radius, "data": pie_data, "label": lbl_opt}],
             "_height": height, "_description": description,
-        }
+        })
 
     # ── Bar / Line / Area / Stacked bar / Combo ──────────────────────────────────
     _is_combo    = chart_type == "combo"
@@ -1202,9 +1436,9 @@ def _build_agent_echart_option(args: dict) -> dict:
         if _is_stacked:
             es["stack"] = "total"
             if show_labels:
-                es["label"] = {"show": True, "position": "inside"}
+                es["label"] = {"show": True, "position": "inside", "color": "#fff"}
         elif show_labels:
-            es["label"] = {"show": True, "position": "top"}
+            es["label"] = {"show": True, "position": "top", "color": _DARK_TEXT}
         return es
 
     if series:
@@ -1229,17 +1463,24 @@ def _build_agent_echart_option(args: dict) -> dict:
     if y_label: val_axis["name"] = y_label
 
     if chart_type == "horizontal_bar":
-        return {
+        # If LLM passed one series per category (no labels), flatten into a single series.
+        if not labels and series and all(len(s.get("data") or []) == 1 for s in series):
+            flat_labels = [s["name"] for s in series]
+            flat_values = [(s.get("data") or [0])[0] for s in series]
+            cat_axis = {"type": "category", "data": flat_labels}
+            ec_series = [{"type": "bar", "data": flat_values}]
+            legend_data = []
+        return _out({
             "title":   {"text": title},
             "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
             "legend":  {"data": legend_data} if legend_data else {},
             "color":   _PAL,
-            "grid":    {"left": "22%", "right": "6%"},
+            "grid":    {"left": "22%", "right": "6%", "top": 68},
             "xAxis":   val_axis,
             "yAxis":   cat_axis,
             "series":  ec_series,
             "_height": height, "_description": description,
-        }
+        })
 
     base: dict = {
         "title":   {"text": title},
@@ -1251,7 +1492,7 @@ def _build_agent_echart_option(args: dict) -> dict:
         "series":  ec_series,
         "_height": height, "_description": description,
     }
-    return base
+    return _out(base)
 
 
 def _agent_filters_from_args(args: dict) -> dict:
