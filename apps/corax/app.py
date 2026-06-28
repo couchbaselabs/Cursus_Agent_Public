@@ -377,7 +377,7 @@ def _echart_element(option: dict, title: str) -> cl.CustomElement:
 def _parse_artifacts(answer: str) -> tuple[str, list, list]:
     """Split answer into (clean_text, [cl.Element, ...], [raw_artifact_dict, ...]).
 
-    raw_artifact_dict: {type, data, title} — stored as base64 blobs in CB assets.
+    raw_artifact_dict: {type, data, title} — stored as JSON strings in CB assets.
     """
     app = _get_pipeline()
     artifact_re = app._ARTIFACT_RE
@@ -456,8 +456,9 @@ async def _save_thread_meta(customer: str, overrides: dict) -> None:
         pass
 
 
-async def _save_assets(thread_id: str, prompt: str, raw_artifacts: list) -> None:
-    """Persist generated charts/tables as base64-encoded JSON blobs in CB."""
+async def _save_assets(thread_id: str, prompt: str, raw_artifacts: list, org: str = "") -> None:
+    """Persist generated charts/tables as JSON blobs in CB."""
+    import time as _time
     if not raw_artifacts:
         return
     dl = cl_data.get_data_layer()
@@ -465,16 +466,16 @@ async def _save_assets(thread_id: str, prompt: str, raw_artifacts: list) -> None
         return
     for art in raw_artifacts:
         try:
-            content_b64 = base64.b64encode(
-                json.dumps(art["data"]).encode()
-            ).decode()
             await dl.save_asset({
                 "thread_id": thread_id,
-                "prompt": prompt[:500],
-                "type": art["type"],
-                "title": art.get("title", ""),
-                "content_b64": content_b64,
-                "mime_type": "application/json",
+                "type":       "asset",          # must be "asset" for _list_assets_from_cb
+                "asset_type": art["type"],       # "echart", "table", etc.
+                "title":      art.get("title", ""),
+                "content":    json.dumps(art["data"]),  # raw string (not base64)
+                "org":        org,
+                "prompt":     prompt[:500],
+                "mime_type":  "application/json",
+                "created_at": int(_time.time()),
             })
         except Exception:
             pass
@@ -494,33 +495,16 @@ async def _push_sidebar(new_elements: list | None = None, title: str | None = No
     await cl.ElementSidebar.set_elements(registry)
 
 
-async def _restore_assets(thread_id: str) -> None:
-    """Rebuild the sidebar from assets saved for this thread in CB."""
-    from supportal.agent_tools import _list_assets_from_cb, _get_asset_content_from_cb
-
-    profile = cl.user_session.get("profile") or _load_cb_settings()
-    cb_a = _cb_args_assets(profile)
-    if not cb_a[2]:
-        return
-
-    # Fetch asset list for this thread via the thread_id stored in session_id field
-    try:
-        all_assets = await asyncio.to_thread(_list_assets_from_cb, *cb_a, "", "", 100)
-        thread_assets = [a for a in all_assets if a.get("session_id") == thread_id]
-    except Exception:
-        return
-
-    if not thread_assets:
-        return
-
+def _build_sidebar_elements(assets: list) -> list:
+    """Convert raw asset dicts to Chainlit elements for the sidebar."""
     elements: list = []
-    for a in thread_assets:
+    for a in assets:
         try:
-            aid   = a.get("id") or ""
-            atype = a.get("asset_type") or ""
-            title = a.get("title") or a.get("filename") or aid[:8]
-            doc   = await asyncio.to_thread(_get_asset_content_from_cb, *cb_a, aid)
-            content = doc.get("content") or ""
+            atype   = a.get("asset_type") or a.get("type") or ""
+            title   = a.get("title") or a.get("filename") or a.get("id", "")[:8]
+            content = a.get("content") or ""
+            if not content:
+                continue
             if atype in ("chart", "echart"):
                 option = json.loads(content)
                 elements.append(_echart_element(option, title))
@@ -533,13 +517,39 @@ async def _restore_assets(thread_id: str) -> None:
                     elements.append(cl.Dataframe(name=title, data=pd.DataFrame(rows, columns=cols), display="side"))
                 else:
                     elements.append(cl.Text(name=title, content=content[:2000], display="side"))
+            elif atype == "image":
+                # content is base64-encoded bytes
+                _raw = base64.b64decode(content)
+                _mime = a.get("mime_type") or "image/png"
+                elements.append(cl.Image(name=f"🖼 {title}", content=_raw, display="side", mime=_mime))
+            elif atype == "pdf":
+                # content is base64-encoded bytes
+                _raw = base64.b64decode(content)
+                elements.append(cl.Pdf(name=f"📄 {title}", content=_raw, display="side"))
             elif atype in ("report", "html"):
                 elements.append(cl.Text(name=title, content=content[:4000], display="side"))
             else:
                 elements.append(cl.Text(name=title, content=content[:2000], display="side"))
         except Exception:
             continue
+    return elements
 
+
+async def _restore_assets(thread_id: str) -> None:
+    """Rebuild the sidebar from assets saved for this thread in CB."""
+    dl = cl_data.get_data_layer()
+    if dl is None or not hasattr(dl, "get_assets_for_thread"):
+        return
+
+    try:
+        assets = await dl.get_assets_for_thread(thread_id)
+    except Exception:
+        return
+
+    if not assets:
+        return
+
+    elements = _build_sidebar_elements(assets)
     if elements:
         cl.user_session.set("_sidebar_elements", elements)
         await _push_sidebar(title=f"📦 Artifacts — restored ({len(elements)})")
@@ -783,6 +793,8 @@ async def on_start():
         author="Corax",
     ).send()
     await _send_quick_actions("")
+    # Restore any charts/tables already saved for this thread (e.g. after page reload)
+    asyncio.ensure_future(_restore_assets(cl.context.session.thread_id))
     # Embed any positive feedback that hasn't been vectorised yet (fire-and-forget)
     asyncio.ensure_future(_embed_pending_feedback(profile))
     # Pick up any jobs that started in NiceGUI or a prior Chainlit session
@@ -882,25 +894,87 @@ async def on_message(message: cl.Message):
 
     # ── File upload handling ──────────────────────────────────────────────────
     # Chainlit delivers uploaded files as message.elements with type "file".
-    # Extract text content, append to LLM message, and add to the sidebar.
+    # Route by extension: images → cl.Image, PDFs → cl.Pdf, text → cl.Text, else cl.File.
+    # Binary files are saved to CB as base64; text files are injected into the LLM context.
+    _IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp"}
+    _TEXT_EXT  = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv",
+                  ".yaml", ".yml", ".xml", ".html", ".css", ".sh", ".log"}
+
     _file_blocks: list[str] = []
     _upload_sidebar_els: list = []
     for _el in (message.elements or []):
         _el_type = getattr(_el, "type", "") or ""
         _el_path = getattr(_el, "path", None) or getattr(_el, "url", None) or ""
         _el_name = getattr(_el, "name", "") or "attachment"
-        if _el_type not in ("file", "text") and not _el_path:
+        if _el_type not in ("file", "text", "image", "pdf") and not _el_path:
+            continue
+        if not _el_path or _el_path.startswith("http"):
             continue
         try:
-            if _el_path and not _el_path.startswith("http"):
-                with open(_el_path, "r", errors="replace") as _fh:
-                    _content = _fh.read(64_000)  # cap at 64K chars
-                _file_blocks.append(
-                    f'<file name="{_el_name}">\n{_content}\n</file>'
+            _ext = Path(_el_path).suffix.lower()
+            if _ext in _IMAGE_EXT:
+                # Read bytes, save to CB, show in sidebar as image
+                _raw = Path(_el_path).read_bytes()
+                _b64 = base64.b64encode(_raw).decode()
+                _mime = f"image/{'svg+xml' if _ext == '.svg' else _ext.lstrip('.')}"
+                _upload_sidebar_els.append(
+                    cl.Image(name=f"🖼 {_el_name}", path=_el_path, display="side", mime=_mime)
                 )
+                _file_blocks.append(f'<file name="{_el_name}" type="image">Image uploaded — cannot extract text content.</file>')
+                # Save to CB
+                _tid = cl.context.session.thread_id
+                _dl  = cl_data.get_data_layer()
+                if _dl and hasattr(_dl, "save_asset"):
+                    import time as _ft
+                    asyncio.ensure_future(_dl.save_asset({
+                        "thread_id": _tid, "type": "asset", "asset_type": "image",
+                        "title": _el_name, "content": _b64, "org": customer,
+                        "mime_type": _mime, "created_at": int(_ft.time()),
+                        "size_bytes": len(_raw),
+                    }))
+            elif _ext == ".pdf":
+                # Read bytes, save to CB, show in sidebar as PDF viewer
+                _raw = Path(_el_path).read_bytes()
+                _b64 = base64.b64encode(_raw).decode()
+                _upload_sidebar_els.append(
+                    cl.Pdf(name=f"📄 {_el_name}", path=_el_path, display="side")
+                )
+                # Attempt text extraction for LLM context
+                _pdf_text = ""
+                try:
+                    import pdfminer.high_level as _pml
+                    import io as _io
+                    _pdf_text = _pml.extract_text(_io.BytesIO(_raw))[:16_000]
+                except Exception:
+                    pass
+                if _pdf_text.strip():
+                    _file_blocks.append(f'<file name="{_el_name}" type="pdf">\n{_pdf_text}\n</file>')
+                else:
+                    _file_blocks.append(f'<file name="{_el_name}" type="pdf">PDF uploaded — text could not be extracted.</file>')
+                _tid = cl.context.session.thread_id
+                _dl  = cl_data.get_data_layer()
+                if _dl and hasattr(_dl, "save_asset"):
+                    import time as _ft
+                    asyncio.ensure_future(_dl.save_asset({
+                        "thread_id": _tid, "type": "asset", "asset_type": "pdf",
+                        "title": _el_name, "content": _b64, "org": customer,
+                        "mime_type": "application/pdf", "created_at": int(_ft.time()),
+                        "size_bytes": len(_raw),
+                    }))
+            elif _ext in _TEXT_EXT or _el_type == "text":
+                # Read as text, inject into LLM context, show as Text in sidebar
+                with open(_el_path, "r", errors="replace") as _fh:
+                    _content = _fh.read(64_000)
+                _file_blocks.append(f'<file name="{_el_name}">\n{_content}\n</file>')
                 _upload_sidebar_els.append(
                     cl.Text(name=f"📎 {_el_name}", content=_content[:4000], display="side")
                 )
+            else:
+                # Unknown binary — offer as download, mention to LLM
+                _upload_sidebar_els.append(
+                    cl.File(name=f"📁 {_el_name}", path=_el_path, display="side")
+                )
+                _file_blocks.append(f'<file name="{_el_name}" type="binary">Binary file uploaded ({_ext}). Cannot extract content.</file>')
         except Exception as _fe:
             print(f"[corax] file read failed ({_el_name}): {_fe}")
     if _upload_sidebar_els:
@@ -985,7 +1059,7 @@ async def on_message(message: cl.Message):
 
     # Persist charts / tables to CB so they survive session restarts
     try:
-        await _save_assets(cl.context.session.thread_id, message.content, raw_artifacts)
+        await _save_assets(cl.context.session.thread_id, message.content, raw_artifacts, org=customer)
     except Exception as _ae:
         print(f"[corax] _save_assets failed (non-fatal): {_ae}")
 
@@ -1264,7 +1338,7 @@ def _fmt_asset_date(ts: int) -> str:
 @cl.action_callback("show_assets")
 async def on_show_assets(action: cl.Action):
     """Open the sidebar with all saved CB assets for the current customer."""
-    from supportal.agent_tools import _list_assets_from_cb, _get_asset_content_from_cb
+    from supportal.agent_tools import _list_assets_from_cb
 
     customer = action.payload.get("customer") or cl.user_session.get("customer", "")
     profile  = cl.user_session.get("profile") or _load_cb_settings()
@@ -1277,6 +1351,7 @@ async def on_show_assets(action: cl.Action):
         ).send()
         return
 
+    # Load from CB (org-filtered) — includes assets from all threads for this customer
     try:
         assets = await asyncio.to_thread(_list_assets_from_cb, *cb_a, customer, "", 50)
     except Exception as exc:
@@ -1286,46 +1361,22 @@ async def on_show_assets(action: cl.Action):
     if not assets:
         label = f" for **{customer}**" if customer else ""
         await cl.Message(
-            content=f"No saved assets found{label}. Charts, tables, and reports are saved here automatically as the agent generates them.",
+            content=(
+                f"No saved assets found{label}. "
+                "Charts, tables, and reports are saved automatically as the agent generates them."
+            ),
             author="Corax",
         ).send()
         return
 
-    # Fetch content and build sidebar elements
-    sidebar_els: list = []
-    for a in assets:
-        aid   = a.get("id") or ""
-        atype = a.get("asset_type") or ""
-        title = a.get("title") or a.get("filename") or aid[:8]
-        ts    = _fmt_asset_date(a.get("created_at") or 0)
-        label = f"{_ASSET_EMOJI.get(atype, '📁')} {title} · {ts}"
-        if not aid:
-            continue
-        try:
-            doc     = await asyncio.to_thread(_get_asset_content_from_cb, *cb_a, aid)
-            content = doc.get("content") or ""
-            if atype in ("chart", "echart"):
-                sidebar_els.append(_echart_element(json.loads(content), label))
-            elif atype == "table":
-                data = json.loads(content)
-                cols = data.get("columns") or []
-                rows = data.get("rows") or []
-                cols = [c.get("name") or c.get("label") or str(c) if isinstance(c, dict) else str(c) for c in cols]
-                if _PANDAS and cols:
-                    sidebar_els.append(cl.Dataframe(name=label, data=pd.DataFrame(rows, columns=cols), display="side"))
-                else:
-                    sidebar_els.append(cl.Text(name=label, content=content[:2000], display="side"))
-            else:
-                sidebar_els.append(cl.Text(name=label, content=content[:4000], display="side"))
-        except Exception:
-            continue
+    sidebar_els = _build_sidebar_elements(assets)
 
     if not sidebar_els:
         await cl.Message(content="Assets found but could not be rendered.", author="Corax").send()
         return
 
     cust_label = f" · {customer}" if customer else ""
-    await cl.ElementSidebar.set_title(f"📦 All Assets ({len(sidebar_els)}){cust_label}")
+    await cl.ElementSidebar.set_title(f"📦 Assets ({len(sidebar_els)}){cust_label}")
     await cl.ElementSidebar.set_elements(sidebar_els)
 
 

@@ -10,7 +10,7 @@ Hot reload:
       - supportal/*.py  → restarts both Strabo and Corax (shared library)
       - apps/strabo/**  → restarts Strabo only
       - apps/corax/**   → restarts Corax only
-    A 2-second debounce prevents burst-write double-restarts.
+    A 15-second debounce + post-restart cooldown prevents startup-event loops.
     Corax session history is safe — threads are persisted in Couchbase.
 
 Usage:
@@ -35,8 +35,9 @@ _TEAL  = "\033[36m"
 _GREY  = "\033[90m"
 _YELL  = "\033[33m"
 
-# Debounce window — ignore further changes for this many seconds after a restart
-_DEBOUNCE = 2.0
+# Debounce: ignore further changes for this many seconds after a restart.
+# Must be longer than app startup time — Corax imports are heavy.
+_DEBOUNCE = 15.0
 
 # Files/dirs that trigger a restart of each app
 _STRABO_PATHS = {"apps/strabo", "run_strabo.py"}
@@ -123,9 +124,11 @@ def _watch_loop(
             now = time.monotonic()
             restart_strabo = False
             restart_corax  = False
+            trigger_files: list[str] = []
 
             for _change_type, path in changes:
                 rel = Path(path).relative_to(_HERE).as_posix()
+                trigger_files.append(rel)
                 if any(rel.startswith(p) for p in _SHARED_PATHS):
                     restart_strabo = True
                     restart_corax  = True
@@ -135,10 +138,13 @@ def _watch_loop(
                     restart_corax  = True
 
             if restart_strabo and now - last_restart["strabo"] > _DEBOUNCE:
+                print(f"{_GREY}[cursus] change detected: {', '.join(trigger_files)}{_RESET}")
                 _restart(strabo_holder, "strabo", strabo_fn, "[strabo]", _BLUE)
                 last_restart["strabo"] = now
 
             if restart_corax and now - last_restart["corax"] > _DEBOUNCE:
+                if not restart_strabo:  # avoid printing twice when both restart
+                    print(f"{_GREY}[cursus] change detected: {', '.join(trigger_files)}{_RESET}")
                 _restart(corax_holder, "corax", corax_fn, "[corax] ", _TEAL)
                 last_restart["corax"] = now
 
@@ -198,13 +204,16 @@ def main() -> None:
         target=_stream, args=(corax_holder, "[corax] ", _TEAL), daemon=True
     ).start()
 
-    # If either process exits unexpectedly, bring down everything
+    # If either process exits unexpectedly, bring down everything.
+    # Only shutdown if the process that died is still the *current* one in the
+    # holder — a restarted process has already been replaced before it's killed.
     def _watch_exit(holder: list, name: str) -> None:
         while True:
             p = holder[0]
             if p:
                 p.wait()
-                if p.returncode not in (0, -15):  # -15 = SIGTERM (our own shutdown)
+                # Check it's still the active process (not an old one from pre-restart)
+                if holder[0] is p and p.returncode not in (0, -15):  # -15 = SIGTERM
                     print(
                         f"\n{_BOLD}[cursus]{_RESET} {name} exited "
                         f"(code {p.returncode}) — stopping all."
@@ -222,8 +231,15 @@ def main() -> None:
             daemon=True,
         ).start()
 
-    strabo_holder[0].wait()
-    corax_holder[0].wait()
+    # Keep the main thread alive. Do NOT use holder[0].wait() here — after a
+    # hot-reload restart the initial process is already dead, so .wait() returns
+    # immediately and the main thread exits, killing Cursus entirely.
+    # The _watch_exit daemon threads handle unexpected exits.
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        _shutdown()
 
 
 if __name__ == "__main__":

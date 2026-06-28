@@ -21,6 +21,7 @@ mcp
 # Export (agent-generated tables and documents)
 openpyxl                # Excel (.xlsx) export
 python-docx             # Word (.docx) export — Phase 2 conversation exports
+pdfminer.six            # PDF text extraction for Corax file uploads
 
 # Chainlit professional chat sidecar
 chainlit                # run: chainlit run chainlit_app.py --port 8766
