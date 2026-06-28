@@ -508,8 +508,15 @@ def parse_ticket_from_api(body: dict, ticket_id: str) -> dict:
     if _is_deleted_api_ticket(body, ticket):
         return {"ticket_id": str(ticket_id), "_deleted": True, "url": f"{BASE_URL}/zendesk/ticket/{ticket_id}"}
 
-    # Build author_id -> name map from known user objects in the response
+    # Build author_id -> name map from all user objects in the response.
+    # The API returns a top-level "users" array with every participant (agents,
+    # requester, CC'd contacts). Without this, comment authors fall back to raw
+    # numeric IDs and the agent cannot resolve names like "Divya" or "Arun".
     id_to_name: dict[int, str] = {}
+    for u in (body.get("users") or []):
+        if u.get("id") and u.get("name"):
+            id_to_name[u["id"]] = u["name"]
+    # Overlay the named top-level user objects (may have richer data than list)
     for user_key in ("assignee", "requester", "current_user"):
         u = body.get(user_key) or {}
         if u.get("id") and u.get("name"):
@@ -561,15 +568,33 @@ def parse_ticket_from_api(body: dict, ticket_id: str) -> dict:
 
     priority = (fields.get("Priority") or ticket.get("priority")) or None
 
-    # Map comments
+    # Map comments — resolve author_id to name where possible.
+    # Fallback chain:
+    #   1. id_to_name (requester + assignee from API)
+    #   2. Sign-off extraction from body text ("Regards,\nDivya")
+    #   3. id_to_name cache built up from sign-offs seen earlier in the thread
+    #   4. Raw numeric ID (last resort so at least grouping is possible)
+    _dynamic_id_map: dict = {}  # built from sign-off extraction as we iterate
     comments: list[dict] = []
     for c in ticket.get("comments") or []:
         author_id = c.get("author_id")
-        author_name = id_to_name.get(author_id, str(author_id) if author_id else None)
+        body_text = c.get("body") or ""
+        author_name = (
+            id_to_name.get(author_id)
+            or _dynamic_id_map.get(author_id)
+        )
+        if not author_name and body_text and author_id:
+            extracted = _guess_author_from_text(body_text)
+            if extracted:
+                author_name = extracted
+                _dynamic_id_map[author_id] = extracted  # cache for future comments by same agent
+        if not author_name:
+            author_name = str(author_id) if author_id else None
         comments.append({
             "timestamp": c.get("created_at"),
             "author":    author_name,
-            "body":      c.get("body"),
+            "author_id": author_id,
+            "body":      body_text,
         })
 
     # ── Last comment timestamp → last_comment_at ──────────────────────────────
