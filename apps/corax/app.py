@@ -1406,7 +1406,9 @@ def _fmt_asset_date(ts: int) -> str:
 
 @cl.action_callback("show_assets")
 async def on_show_assets(action: cl.Action):
-    """Open the sidebar with all saved CB assets for the current customer."""
+    """Open the sidebar with the AssetBrowser two-pane component."""
+    from supportal.agent_tools import _list_assets_from_cb, _get_asset_content_from_cb
+
     customer = action.payload.get("customer") or cl.user_session.get("customer", "")
     profile  = cl.user_session.get("profile") or _load_cb_settings()
     cb_a     = _cb_args_assets(profile)
@@ -1418,11 +1420,8 @@ async def on_show_assets(action: cl.Action):
         ).send()
         return
 
-    # Load metadata list from CB (org-filtered), then fetch full content for each asset.
-    # _list_assets_from_cb returns only metadata columns — content must be fetched separately.
     try:
-        from supportal.agent_tools import _list_assets_from_cb, _get_asset_content_from_cb
-        asset_meta = await asyncio.to_thread(_list_assets_from_cb, *cb_a, customer, "", 50)
+        asset_meta = await asyncio.to_thread(_list_assets_from_cb, *cb_a, customer, "", 100)
     except Exception as exc:
         await cl.Message(content=f"⚠ Could not load assets: {exc}", author="Corax").send()
         return
@@ -1438,35 +1437,36 @@ async def on_show_assets(action: cl.Action):
         ).send()
         return
 
-    # Fetch full content for each asset in parallel
+    # Fetch full content in parallel; skip binary content for PDFs (too large for props)
+    _BINARY_TYPES = {"pdf"}
+
     async def _fetch_full(meta: dict) -> dict | None:
-        aid = meta.get("id") or ""
+        aid   = meta.get("id") or ""
+        atype = meta.get("asset_type") or ""
         if not aid:
             return None
         try:
+            if atype in _BINARY_TYPES:
+                # For PDFs: skip content — the component shows a placeholder
+                return {**meta, "content": ""}
             doc = await asyncio.to_thread(_get_asset_content_from_cb, *cb_a, aid)
-            return {**meta, **doc} if doc else None
+            return {**meta, **doc} if doc else {**meta, "content": ""}
         except Exception:
-            return None
+            return {**meta, "content": ""}
 
-    full_assets = [
+    browser_assets = [
         doc for doc in await asyncio.gather(*[_fetch_full(m) for m in asset_meta])
         if doc is not None
     ]
 
-    if not full_assets:
-        await cl.Message(content="⚠ Could not fetch asset content from Couchbase.", author="Corax").send()
-        return
-
-    sidebar_els = _build_sidebar_elements(full_assets)
-
-    if not sidebar_els:
-        await cl.Message(content="Assets found but none could be rendered (unsupported types or empty content).", author="Corax").send()
-        return
-
     cust_label = f" · {customer}" if customer else ""
-    await cl.ElementSidebar.set_title(f"📦 Assets ({len(sidebar_els)}){cust_label}")
-    await cl.ElementSidebar.set_elements(sidebar_els)
+    sidebar_el = cl.CustomElement(
+        name="AssetBrowser",
+        props={"assets": browser_assets},
+        display="inline",
+    )
+    await cl.ElementSidebar.set_title(f"📦 Assets ({len(browser_assets)}){cust_label}")
+    await cl.ElementSidebar.set_elements([sidebar_el])
 
 
 @cl.action_callback("preview_asset")
