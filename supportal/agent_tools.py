@@ -750,6 +750,30 @@ _AGENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "cancel_scrape_job",
+            "description": (
+                "Cancel a running scrape or rescrape job. "
+                "Call this when the user says 'kill', 'stop', 'cancel', or 'abort' a job, "
+                "or when a job appears stuck or needs to be terminated. "
+                "After cancellation, tickets already refreshed retain their new data. "
+                "To resume from the stopping point, rescrape with stale_hours=1 — "
+                "already-refreshed tickets have fresh timestamps and will be skipped."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The 6-character job ID to cancel (e.g. 'e02827').",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "scrape_customer_tickets",
             "description": (
                 "Scrape fresh tickets for a customer directly from Supportal and save them to Couchbase. "

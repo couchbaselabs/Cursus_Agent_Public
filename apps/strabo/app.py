@@ -1041,6 +1041,9 @@ _OP_STATUS: dict = {
 _SCRAPE_JOBS: dict[str, dict] = {}
 _MAX_SCRAPE_JOBS = 20
 
+# Cancel signals — set the event to request clean cancellation of a running job.
+_JOB_CANCEL_EVENTS: dict[str, threading.Event] = {}
+
 # Browser-login state — populated by login_browser.py subprocess.
 _browser_state: dict = {
     "logged_in":     False,
@@ -9719,7 +9722,7 @@ def _make_scrape_job(org: str, mode: str) -> dict:
         "org":          org,
         "mode":         mode,          # "scrape" | "rescrape"
         "phase":        "queued",      # queued → scraping → saving → embedding → scoring → done
-        "status":       "running",     # running | done | error
+        "status":       "running",     # running | done | error | cancelled | interrupted
         "total":        None,          # total tickets to process (set once known)
         "processed":    0,             # tickets processed so far
         "saved":        0,
@@ -9729,12 +9732,15 @@ def _make_scrape_job(org: str, mode: str) -> dict:
         "last_message": "Queued…",
         "started_at":   time.time(),
         "finished_at":  None,
+        "heartbeat_at": time.time(),   # updated every ticket; stale = process died
     }
     _SCRAPE_JOBS[job_id] = job
+    _JOB_CANCEL_EVENTS[job_id] = threading.Event()
     # Trim to MAX
     if len(_SCRAPE_JOBS) > _MAX_SCRAPE_JOBS:
         oldest = next(iter(_SCRAPE_JOBS))
         del _SCRAPE_JOBS[oldest]
+        _JOB_CANCEL_EVENTS.pop(oldest, None)
     return job
 
 
@@ -9940,8 +9946,23 @@ def _run_rescrape_job_bg(
         ok = skipped = errors = 0
         job["enriched"] = 0
         refreshed_tickets: list[dict] = []
+        _cancel_ev = _JOB_CANCEL_EVENTS.get(job["job_id"])
         for i, t in enumerate(to_scrape, 1):
+            # Check for cancellation request before each ticket
+            if _cancel_ev and _cancel_ev.is_set():
+                job["status"]       = "cancelled"
+                job["phase"]        = None
+                job["finished_at"]  = time.time()
+                job["last_message"] = (
+                    f"Cancelled at ticket {i}/{total}. "
+                    f"{ok} saved so far. To resume, rescrape with stale_hours=1 — "
+                    f"the {ok} already-refreshed tickets will be skipped automatically."
+                )
+                _upsert_job_doc(job, _bcol)
+                return
+
             tid = str(t.get("ticket_id") or "").strip()
+            job["heartbeat_at"] = time.time()   # alive signal for zombie detection
             if not tid:
                 skipped += 1
                 job["processed"] = i
@@ -11608,6 +11629,67 @@ LIMIT {limit}
                     f"  Duration: {duration}s | Finished: {ago}s ago\n"
                 )
         return "\n".join(lines).strip()
+
+    elif name == "cancel_scrape_job":
+        _cjid = (args.get("job_id") or "").strip().lower()
+        if not _cjid:
+            return "Error: job_id is required."
+        # Signal the running thread to stop cleanly
+        _cev = _JOB_CANCEL_EVENTS.get(_cjid)
+        if _cev:
+            _cev.set()
+        # Update in-memory record immediately so the monitor sees it
+        _cjob = _SCRAPE_JOBS.get(_cjid)
+        if _cjob:
+            if _cjob.get("status") == "running":
+                _cjob["status"]      = "cancelled"
+                _cjob["phase"]       = None
+                _cjob["finished_at"] = time.time()
+                _cjob["last_message"] = (
+                    f"Cancelled by user at ticket "
+                    f"{_cjob.get('processed',0)}/{_cjob.get('total','?')}. "
+                    f"To resume: rescrape with stale_hours=1 — the "
+                    f"{_cjob.get('saved',0)} already-refreshed tickets will be skipped."
+                )
+                # Write cancelled state to CB so it persists across restarts
+                _persist_job_state(
+                    _cjob, cb_url, bucket, username, password, use_tls, scope, collection
+                )
+                proc = _cjob.get("processed", 0)
+                total_ = _cjob.get("total", "?")
+                saved_ = _cjob.get("saved", 0)
+                return (
+                    f"Job **{_cjid}** cancelled at {proc}/{total_} tickets ({saved_} saved). "
+                    f"To resume from where it stopped, run: "
+                    f"*rescrape {_cjob.get('org','')} with stale_hours=1* — "
+                    f"already-refreshed tickets have fresh timestamps and will be skipped automatically."
+                )
+            else:
+                return f"Job **{_cjid}** is not running (status: {_cjob['status']})."
+        # Job not in memory — look it up in CB and mark cancelled there
+        if cb_url and username:
+            try:
+                from couchbase.cluster import Cluster as _CKCl
+                from couchbase.options import ClusterOptions as _CKCO
+                from couchbase.auth import PasswordAuthenticator as _CKPA
+                _ckconn = _cb_conn_str(cb_url, use_tls)
+                _ckc    = _CKCl(_ckconn, _CKCO(_CKPA(username, password)))
+                _ckc.wait_until_ready(timedelta(seconds=5))
+                _ckcol  = _ckc.bucket(bucket).scope(scope).collection(collection)
+                _ckdoc  = _ckcol.get(f"scrape_job::{_cjid}").content_as[dict]
+                if _ckdoc.get("status") == "running":
+                    _ckdoc["status"]      = "cancelled"
+                    _ckdoc["phase"]       = None
+                    _ckdoc["finished_at"] = time.time()
+                    _ckdoc["last_message"] = "Cancelled by user (post-restart)."
+                    _ckcol.upsert(f"scrape_job::{_cjid}", {**_ckdoc, "type": "scrape_job"})
+                    _ckc.close()
+                    return f"Job **{_cjid}** marked cancelled in Couchbase (thread was already dead after restart)."
+                _ckc.close()
+                return f"Job **{_cjid}** status in CB: {_ckdoc.get('status')} — nothing to cancel."
+            except Exception as _cke:
+                return f"Job **{_cjid}** not found in memory or Couchbase: {_cke}"
+        return f"Job '{_cjid}' not found in this session."
 
     elif name == "backfill_last_comment_at":
         _bf_org = (args.get("organization") or "").strip()

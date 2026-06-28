@@ -641,21 +641,70 @@ async def set_starters():
 
 
 # ── Chainlit handlers ────────────────────────────────────────────────────────
+_ZOMBIE_THRESHOLD_S = 180  # job is a zombie if heartbeat hasn't updated in 3 minutes
+
+
+async def _mark_job_interrupted(job: dict, cb: tuple) -> None:
+    """Write 'interrupted' status to CB for a zombie job so it stops appearing as running."""
+    import time as _t
+    job["status"]       = "interrupted"
+    job["phase"]        = None
+    job["finished_at"]  = _t.time()
+    proc  = job.get("processed", 0)
+    total = job.get("total", "?")
+    saved = job.get("saved", 0)
+    job["last_message"] = (
+        f"Interrupted (process died) at {proc}/{total} tickets, {saved} saved. "
+        f"To resume: rescrape with stale_hours=1 — already-refreshed tickets will be skipped."
+    )
+    try:
+        from couchbase.cluster import Cluster as _ZCl
+        from couchbase.options import ClusterOptions as _ZCO
+        from couchbase.auth import PasswordAuthenticator as _ZPA
+        from couchbase.options import UpsertOptions as _ZUO
+        app = _get_pipeline()
+        _zconn = app._cb_conn_str(cb[0], cb[4])
+        _zc    = _ZCl(_zconn, _ZCO(_ZPA(cb[2], cb[3])))
+        _zc.wait_until_ready(__import__("datetime").timedelta(seconds=5))
+        _zc.bucket(cb[1]).scope(cb[5]).collection(cb[6]).upsert(
+            f"scrape_job::{job['job_id']}",
+            {**job, "type": "scrape_job"},
+            _ZUO(expiry=__import__("datetime").timedelta(hours=48)),
+        )
+        _zc.close()
+    except Exception:
+        pass
+
+
 async def _resume_scrape_job_monitors(profile: dict) -> None:
-    """Find running/recent scrape jobs (memory + CB) and spawn monitor tasks."""
+    """Find running/recent scrape jobs (memory + CB) and spawn monitor tasks.
+
+    Zombie detection: if a job's heartbeat_at is older than ZOMBIE_THRESHOLD_S and
+    its status is still 'running', the background thread died (e.g. Corax restarted).
+    These jobs are marked 'interrupted' in CB and shown as such — not monitored.
+    """
+    import time as _t
     app    = _get_pipeline()
     cb     = _cb_args(profile)
     cb_url = cb[0]
+    now    = _t.time()
 
-    # Collect running jobs from both sources, deduplicated by job_id
     seen: set[str] = set()
-    running: list[tuple[str, dict]] = []
+    running:     list[tuple[str, dict]] = []
+    interrupted: list[tuple[str, dict]] = []
+
+    def _is_zombie(job: dict) -> bool:
+        hb = job.get("heartbeat_at") or job.get("started_at") or 0
+        return (now - hb) > _ZOMBIE_THRESHOLD_S
 
     # 1. In-process memory (same-process jobs or already-rehydrated)
     for jid, job in list(app._SCRAPE_JOBS.items()):
         if job.get("status") == "running" and jid not in seen:
             seen.add(jid)
-            running.append((jid, job))
+            if _is_zombie(job):
+                interrupted.append((jid, job))
+            else:
+                running.append((jid, job))
 
     # 2. Couchbase (cross-process, or jobs from before a server restart)
     if cb_url:
@@ -666,8 +715,28 @@ async def _resume_scrape_job_monitors(profile: dict) -> None:
                 continue
             seen.add(jid)
             if job.get("status") == "running":
-                app._SCRAPE_JOBS[jid] = job   # rehydrate into memory
-                running.append((jid, job))
+                if _is_zombie(job):
+                    interrupted.append((jid, job))
+                else:
+                    app._SCRAPE_JOBS[jid] = job   # rehydrate into memory
+                    running.append((jid, job))
+
+    # Mark zombie jobs as interrupted in CB (fire-and-forget)
+    for jid, job in interrupted:
+        job["status"] = "interrupted"  # update memory immediately
+        asyncio.ensure_future(_mark_job_interrupted(job, cb))
+
+    if interrupted:
+        lines = [f"Found **{len(interrupted)} interrupted job(s)** from a previous session (thread died during restart):\n"]
+        for jid, job in interrupted:
+            proc = job.get("processed", 0)
+            total = job.get("total", "?")
+            lines.append(
+                f"- Job **{jid}** — {job.get('org')} ({job.get('mode')}), "
+                f"{proc}/{total} tickets processed. "
+                f"To resume: *rescrape {job.get('org','')} with stale_hours=1*"
+            )
+        await cl.Message(content="\n".join(lines), author="Job Monitor").send()
 
     if not running:
         return
