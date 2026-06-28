@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.6.3"
+__version__ = "2.6.4"
 
 import asyncio
 import threading
@@ -10101,18 +10101,28 @@ def _run_rescrape_job_bg(
         s_url  = (emb_params or {}).get("score_base_url", "")
         if s_prov and s_mod and refreshed_tickets:
             job["phase"] = "scoring"
-            _set_op(f"Scoring refreshed tickets…", 0.97)
-            try:
-                _scores = score_tickets_batch(
-                    refreshed_tickets[:10],
-                    s_prov, s_mod, s_key, s_url,
-                    cb_url, bucket, username, password, use_tls, scope, collection,
-                    save_to_cb=True,
+            # Score all refreshed tickets in batches of 20 to avoid LLM timeouts
+            _score_batch = 20
+            _total_scored = 0
+            for _si in range(0, len(refreshed_tickets), _score_batch):
+                _chunk = refreshed_tickets[_si:_si + _score_batch]
+                _set_op(
+                    f"Scoring tickets {_si + 1}–{min(_si + _score_batch, len(refreshed_tickets))}"
+                    f" of {len(refreshed_tickets)}…",
+                    0.97 + (_si / max(len(refreshed_tickets), 1)) * 0.02,
                 )
-                job["scored"] = len(_scores)
-            except Exception as exc:
-                job["last_message"] = f"Scoring failed: {exc}"
-                job["errors"] += 1
+                try:
+                    _scores = score_tickets_batch(
+                        _chunk,
+                        s_prov, s_mod, s_key, s_url,
+                        cb_url, bucket, username, password, use_tls, scope, collection,
+                        save_to_cb=True,
+                    )
+                    _total_scored += len(_scores)
+                    job["scored"] = _total_scored
+                except Exception as exc:
+                    job["last_message"] = f"Scoring batch {_si // _score_batch + 1} failed: {exc}"
+                    job["errors"] += 1
 
         job["status"]      = "done"
         job["phase"]       = None
@@ -10635,7 +10645,7 @@ def _execute_agent_tool(
     elif name == "rescrape_customer_tickets":
         cust        = (args.get("customer") or default_customer or "").strip()
         stale_hours = float(args.get("stale_hours") if args.get("stale_hours") is not None else 4.0)
-        max_tix     = min(int(args.get("max_tickets") or 50), 200)
+        max_tix     = min(int(args.get("max_tickets") or 50), 2000)
         status_filt = (args.get("status") or "").strip().lower() or None
 
         cookie = _get_profile_cookie()  # optional as of v2.6.2; retained for re-enablement

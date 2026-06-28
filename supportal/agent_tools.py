@@ -183,11 +183,11 @@ _AGENT_TOOLS: list[dict] = [
                 "Bulk re-scrape tickets for a customer from Supportal and update Couchbase. "
                 "Automatically discovers NEW tickets from Supportal that are not yet in the local database — "
                 "these are always scraped regardless of stale_hours. Existing stale tickets are also refreshed. "
-                "Use when the user asks to refresh, update, or rescrape a customer's ticket history, "
-                "or says 'what's new' / 'get the latest tickets'. "
-                "By default only re-scrapes existing tickets older than 4 hours. "
-                "The job summary reports 'N new + M stale tickets updated'. "
-                "Runs sequentially with a short delay between requests to avoid rate-limiting."
+                "After scraping, ALL refreshed tickets are re-embedded and re-scored automatically. "
+                "Use when the user says 'refresh', 'rescrape', 'full rescrape', or 'rescore' for a customer. "
+                "When the user says 'all tickets', 'everything', or 'full rescrape', set max_tickets=2000 and stale_hours=0. "
+                "By default only re-scrapes tickets older than 4 hours (stale_hours=4). "
+                "The job summary reports 'N new + M stale tickets updated, K scored'."
             ),
             "parameters": {
                 "type": "object",
@@ -202,7 +202,7 @@ _AGENT_TOOLS: list[dict] = [
                     },
                     "max_tickets": {
                         "type": "integer",
-                        "description": "Safety cap on how many tickets to rescrape in one call (default 50, max 200).",
+                        "description": "Max tickets to rescrape in one call (default 50, max 2000). Set to 2000 when the user says 'all tickets', 'full rescrape', or 'everything'.",
                     },
                     "status": {
                         "type": "string",
