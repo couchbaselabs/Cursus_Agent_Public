@@ -1,411 +1,576 @@
 """
-Supportal MCP Server — Phase 2
+Cursus MCP Server
+─────────────────
+Exposes internal Supportal/Couchbase tooling as MCP tools consumable by
+Claude Desktop, Gemini, Cursor, or any MCP-compatible client.
 
-Exposes pipeline functions as MCP tools so Claude (or any MCP client) can call
-them natively rather than relying on the Strabo button-driven workflow.
+Transport:
+  stdio  (default) — for Claude Desktop / Cursor / local clients
+  sse              — for remote clients over HTTP (Gemini, custom shells)
 
-Tools:
-  query_tickets       — structured N1QL search with filters
-  vector_search       — semantic search via CB vector index
-  get_ticket          — single-ticket fetch by ID
-  check_freshness     — returns ticket IDs updated since a given epoch
-  fetch_fresh_data    — triggers the scrape pipeline for a customer
+Config:
+  Loaded automatically from the active Strabo profile (~/.scraper_settings.json).
+  Override any value with environment variables (CB_URL, CB_USER, etc.).
 
 Usage:
-  python mcp_server.py [--host HOST] [--port PORT]
-  or add to Claude Desktop's mcp_servers config as a stdio server.
+  # stdio (Claude Desktop / Cursor)
+  venv/bin/python run_mcp.py
 
-Environment variables (override CLI defaults):
-  CB_URL, CB_BUCKET, CB_USER, CB_PASS, CB_TLS, CB_SCOPE, CB_COLLECTION
-  EMBED_PROVIDER, EMBED_MODEL, EMBED_API_KEY, EMBED_BASE_URL, EMBED_DIMS
+  # SSE for remote clients
+  venv/bin/python run_mcp.py --transport sse --port 8768
+
+Claude Desktop config (~/.claude/claude_desktop_config.json):
+  {
+    "mcpServers": {
+      "cursus": {
+        "command": "/path/to/venv/bin/python",
+        "args": ["/path/to/Scraper/run_mcp.py"]
+      }
+    }
+  }
 """
 
 from __future__ import annotations
 
-import argparse
+import importlib
 import json
-import logging
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-# ── Path setup: import pipeline functions from the main app ─────────────────
-_HERE = Path(__file__).parent
-sys.path.insert(0, str(_HERE))
+from mcp.server.fastmcp import FastMCP
 
-# These imports are used lazily inside tool handlers to avoid startup errors
-# when optional deps (couchbase, openai) are not installed.
-_app: Any = None
+# ── Path: ensure project root is importable ───────────────────────────────────
+_ROOT = Path(__file__).parent.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+mcp = FastMCP(
+    "cursus",
+    instructions=(
+        "Cursus gives you access to Supportal support ticket data, customer health "
+        "signals, scrape job management, and saved assets — all backed by Couchbase. "
+        "Use query_tickets or search_tickets to find tickets, get_customer_health for "
+        "a single account, get_portfolio_status for a ranked fleet view, and "
+        "rescrape_customer_tickets to refresh stale data from Supportal."
+    ),
+)
+
+# ── Lazy pipeline loader ──────────────────────────────────────────────────────
+_pipeline: Any = None
 
 
-def _load_app() -> Any:
-    global _app
-    if _app is None:
-        import importlib
-        _app = importlib.import_module("apps.strabo.app")
-    return _app
+def _app() -> Any:
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = importlib.import_module("apps.strabo.app")
+    return _pipeline
 
 
-# ── CB config from env (fallbacks to empty string, tools will surface errors) ─
-def _cb_config() -> dict:
+# ── Config: active Strabo profile → env var overrides ────────────────────────
+def _cfg() -> dict:
+    """Load CB + embed config from the active Strabo profile, then apply env overrides."""
+    try:
+        app = _app()
+        s       = app._load_settings_file()
+        active  = s.get("__last__", "")
+        profile = s.get(active, {}) if active else {}
+    except Exception:
+        profile = {}
+
     return {
-        "cb_url":    os.environ.get("CB_URL",        "couchbase://localhost"),
-        "bucket":    os.environ.get("CB_BUCKET",     "rag"),
-        "username":  os.environ.get("CB_USER",       ""),
-        "password":  os.environ.get("CB_PASS",       ""),
-        "use_tls":   os.environ.get("CB_TLS",        "false").lower() == "true",
-        "scope":     os.environ.get("CB_SCOPE",      "transcripts"),
-        "collection":os.environ.get("CB_COLLECTION", "supportal"),
+        "cb_url":     os.environ.get("CB_URL",        profile.get("cb_url",        "couchbase://localhost")),
+        "bucket":     os.environ.get("CB_BUCKET",     profile.get("cb_bucket",     "rag")),
+        "username":   os.environ.get("CB_USER",       profile.get("cb_user",       "")),
+        "password":   os.environ.get("CB_PASS",       profile.get("cb_pass",       "")),
+        "use_tls":    os.environ.get("CB_TLS",        str(profile.get("cb_tls", False))).lower() == "true",
+        "scope":      os.environ.get("CB_SCOPE",      profile.get("cb_scope",      "transcripts")),
+        "collection": os.environ.get("CB_COLLECTION", profile.get("cb_collection", "tickets")),
+        "cookie":     os.environ.get("CB_COOKIE",     profile.get("cookie",        "")),
+        # Embedding
+        "emb_provider": profile.get("emb_provider", "ollama"),
+        "emb_model":    profile.get("emb_ollama_model") or profile.get("emb_lms_model") or "nomic-embed-text",
+        "emb_api_key":  profile.get("emb_gemini_key") or profile.get("emb_openai_key") or "",
+        "emb_base_url": profile.get("emb_ollama_url") or profile.get("emb_lms_url") or "http://localhost:11434",
+        "emb_dims":     int(profile.get("emb_ollama_dims") or profile.get("emb_lms_dims") or 1024),
     }
 
 
-def _embed_config() -> dict:
-    return {
-        "provider": os.environ.get("EMBED_PROVIDER", "ollama"),
-        "model":    os.environ.get("EMBED_MODEL",    "nomic-embed-text"),
-        "api_key":  os.environ.get("EMBED_API_KEY",  ""),
-        "base_url": os.environ.get("EMBED_BASE_URL", "http://localhost:11434"),
-        "dims":     int(os.environ.get("EMBED_DIMS", "768")),
-    }
+def _cb_tuple(cfg: dict) -> tuple:
+    return (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+            cfg["use_tls"], cfg["scope"], cfg["collection"])
 
 
-# ── MCP server setup ────────────────────────────────────────────────────────
-try:
-    from mcp.server import Server
-    from mcp.server.stdio import stdio_server
-    import mcp.types as types
-    _MCP_AVAILABLE = True
-except ImportError:
-    _MCP_AVAILABLE = False
-    print(
-        "mcp package not found — install with: pip install mcp\n"
-        "Running in dry-run mode (tool schemas printed, not served).",
-        file=sys.stderr,
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# TICKETS
+# ─────────────────────────────────────────────────────────────────────────────
 
-log = logging.getLogger("supportal-mcp")
+@mcp.tool()
+def query_tickets(
+    organization: str = "",
+    status: str = "",
+    priority: str = "",
+    keyword: str = "",
+    days_open: int = 0,
+    limit: int = 50,
+) -> str:
+    """
+    Search support tickets using structured filters.
+    Returns ticket summaries including subject, status, priority, dates, CBSEs, and JIRA issues.
 
-if _MCP_AVAILABLE:
-    server = Server("supportal-mcp")
+    Args:
+        organization: Customer/org name (partial match). Leave blank for all customers.
+        status:       open | pending | solved | closed | on-hold
+        priority:     low | normal | high | urgent | p1 | p2
+        keyword:      Text to match in subject or description.
+        days_open:    Only return tickets open longer than N days (0 = no filter).
+        limit:        Max results (default 50, max 200).
+    """
+    cfg  = _cfg()
+    app  = _app()
+    args: dict = {}
+    if organization: args["organization"] = organization
+    if status:       args["status"]       = status
+    if priority:     args["priority"]     = priority
+    if keyword:      args["keyword"]      = keyword
+    if days_open:    args["days_open"]    = days_open
+    args["limit"] = min(int(limit), 200)
 
-    # ── Tool: query_tickets ─────────────────────────────────────────────────
-    @server.list_tools()
-    async def list_tools() -> list[types.Tool]:
-        return [
-            types.Tool(
-                name="query_tickets",
-                description=(
-                    "Search support tickets in Couchbase using structured filters. "
-                    "Supports filtering by customer, date range, priority, status, "
-                    "keywords, ticket IDs, CBSEs, and JIRA issues. Returns ticket dicts "
-                    "with subject, status, priority, created_at, cluster info, and tags."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "Natural language question — filters are extracted automatically.",
-                        },
-                        "customer": {
-                            "type": "string",
-                            "description": "Customer/organization name to scope results.",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Max tickets to return (default 50).",
-                            "default": 50,
-                        },
-                    },
-                    "required": ["question"],
-                },
-            ),
-            types.Tool(
-                name="vector_search",
-                description=(
-                    "Semantic similarity search over ticket embeddings in Couchbase. "
-                    "Returns the top-K tickets most relevant to the query string."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Query text to embed and search against.",
-                        },
-                        "customer": {
-                            "type": "string",
-                            "description": "Optional customer name for post-filter.",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Number of results (default 20).",
-                            "default": 20,
-                        },
-                    },
-                    "required": ["query"],
-                },
-            ),
-            types.Tool(
-                name="get_ticket",
-                description=(
-                    "Fetch a single ticket document by ID from Couchbase. "
-                    "Returns full ticket including status, priority, description, "
-                    "cluster info, snapshot_topology, cbses, jira_issues, and score."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "ticket_id": {
-                            "type": "string",
-                            "description": "Zendesk ticket ID (numeric string).",
-                        },
-                    },
-                    "required": ["ticket_id"],
-                },
-            ),
-            types.Tool(
-                name="check_freshness",
-                description=(
-                    "Given a list of ticket IDs and an epoch timestamp, return the IDs "
-                    "of tickets that have been re-scraped (last_scraped_at > since_epoch). "
-                    "Use this to detect data drift before reasoning from a cached session."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "ticket_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Ticket IDs to check.",
-                        },
-                        "since_epoch": {
-                            "type": "integer",
-                            "description": "Unix epoch seconds; tickets updated after this are returned.",
-                        },
-                    },
-                    "required": ["ticket_ids", "since_epoch"],
-                },
-            ),
-            types.Tool(
-                name="fetch_fresh_data",
-                description=(
-                    "Trigger the scrape pipeline to refresh ticket data for a customer. "
-                    "Returns a summary of what was scraped and the new last_scraped_at epoch. "
-                    "Requires session cookie to be configured via CB_COOKIE env var."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "customer": {
-                            "type": "string",
-                            "description": "Customer/organization name to scrape.",
-                        },
-                        "incremental": {
-                            "type": "boolean",
-                            "description": "If true, only scrape changed/new tickets (default true).",
-                            "default": True,
-                        },
-                    },
-                    "required": ["customer"],
-                },
-            ),
-        ]
-
-    # ── Tool call dispatcher ────────────────────────────────────────────────
-    @server.call_tool()
-    async def call_tool(
-        name: str, arguments: dict
-    ) -> list[types.TextContent]:
-        try:
-            result = await _dispatch(name, arguments)
-            return [types.TextContent(type="text", text=json.dumps(result, default=str))]
-        except Exception as exc:
-            log.exception("Tool %s failed", name)
-            return [types.TextContent(type="text", text=json.dumps({"error": str(exc)}))]
+    try:
+        results = app.tool_query_tickets(args, *_cb_tuple(cfg), limit=args["limit"])
+        return json.dumps({"tickets": results, "count": len(results)}, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
 
-async def _dispatch(name: str, args: dict) -> Any:
-    app = _load_app()
-    cfg = _cb_config()
-    cb_args = (
-        cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
-        cfg["use_tls"], cfg["scope"], cfg["collection"],
-    )
+@mcp.tool()
+def get_ticket(ticket_id: str) -> str:
+    """
+    Fetch a single ticket by ID with full detail — description, comments, cluster topology,
+    CBSEs, JIRA issues, snapshot info, and LLM-generated scores.
 
-    if name == "query_tickets":
-        question = args["question"]
-        customer = args.get("customer", "")
-        limit    = int(args.get("limit", 50))
-        filters  = app.build_structured_query(question)
-        if customer:
-            filters["organization"] = customer
-        results = app.structured_search_cb(filters, *cb_args, limit)
-        # Resolve keys to full ticket dicts
-        tickets = []
-        if results:
-            import concurrent.futures
-            from couchbase.options import GetOptions  # type: ignore
-            from couchbase.cluster import Cluster  # type: ignore
-            from couchbase.options import ClusterOptions  # type: ignore
-            from couchbase.auth import PasswordAuthenticator  # type: ignore
-            from datetime import timedelta
-            conn_str = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
-            cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
-            cluster.wait_until_ready(timedelta(seconds=10))
-            col = cluster.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(cfg["collection"])
-            for key in results[:limit]:
-                try:
-                    doc = col.get(key).content_as[dict]
-                    # Return summary fields only to keep token count manageable
-                    tickets.append({
-                        "ticket_id":     doc.get("ticket_id"),
-                        "subject":       doc.get("subject"),
-                        "status":        doc.get("status"),
-                        "priority":      doc.get("priority"),
-                        "organization":  doc.get("organization"),
-                        "created_at":    doc.get("created_at"),
-                        "last_scraped_at": doc.get("last_scraped_at"),
-                        "cbses":         doc.get("cbses") or [],
-                        "jira_issues":   doc.get("jira_issues") or [],
-                        "tags":          (doc.get("score") or {}).get("cluster_names") or [],
-                    })
-                except Exception:
-                    pass
-            cluster.close()
-        return {"tickets": tickets, "count": len(tickets), "filters_applied": filters}
-
-    elif name == "vector_search":
-        ec = _embed_config()
-        query_vec = app.embed_text(
-            args["query"], ec["provider"], ec["model"],
-            ec["api_key"], ec["base_url"], ec["dims"],
-        )
-        raw_keys = app.vector_search_cb(query_vec, *cb_args, int(args.get("top_k", 20)))
-        customer = args.get("customer", "").lower()
-        # Resolve to summary dicts (same pattern as query_tickets)
-        from couchbase.cluster import Cluster  # type: ignore
-        from couchbase.options import ClusterOptions  # type: ignore
-        from couchbase.auth import PasswordAuthenticator  # type: ignore
+    Args:
+        ticket_id: Zendesk ticket ID (numeric string, e.g. "12345").
+    """
+    cfg = _cfg()
+    app = _app()
+    try:
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        from couchbase.auth import PasswordAuthenticator
         from datetime import timedelta
-        conn_str = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
-        cluster.wait_until_ready(timedelta(seconds=10))
-        col = cluster.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(cfg["collection"])
-        tickets = []
-        for key in raw_keys:
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        c    = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        c.wait_until_ready(timedelta(seconds=10))
+        doc  = c.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(cfg["collection"]).get(
+            f"ticket::{ticket_id}"
+        ).content_as[dict]
+        c.close()
+        doc.pop("embedding", None)  # strip vector — too large for tool output
+        return json.dumps(doc, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "ticket_id": ticket_id})
+
+
+@mcp.tool()
+def search_tickets(query: str, organization: str = "", top_k: int = 20) -> str:
+    """
+    Semantic (vector) search over ticket embeddings — finds tickets by meaning,
+    not just keyword match. Great for "authentication failures" or "rebalance issues".
+
+    Args:
+        query:        Natural language query.
+        organization: Optional customer filter applied after vector search.
+        top_k:        Number of results (default 20, max 100).
+    """
+    cfg = _cfg()
+    app = _app()
+    try:
+        vec  = app.embed_text(
+            query,
+            cfg["emb_provider"], cfg["emb_model"],
+            cfg["emb_api_key"],  cfg["emb_base_url"], cfg["emb_dims"],
+        )
+        keys = app.vector_search_cb(vec, *_cb_tuple(cfg), min(int(top_k), 100))
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        from couchbase.auth import PasswordAuthenticator
+        from datetime import timedelta
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        c    = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        c.wait_until_ready(timedelta(seconds=10))
+        col  = c.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(cfg["collection"])
+        results = []
+        org_lo  = organization.lower()
+        for key in keys:
             try:
                 doc = col.get(key).content_as[dict]
-                if customer and (doc.get("organization") or "").lower() not in customer:
+                if org_lo and org_lo not in (doc.get("organization") or "").lower():
                     continue
-                tickets.append({
-                    "ticket_id":   doc.get("ticket_id"),
-                    "subject":     doc.get("subject"),
-                    "status":      doc.get("status"),
-                    "priority":    doc.get("priority"),
-                    "organization":doc.get("organization"),
-                    "created_at":  doc.get("created_at"),
-                    "last_scraped_at": doc.get("last_scraped_at"),
-                })
+                doc.pop("embedding", None)
+                results.append({k: doc[k] for k in
+                    ("ticket_id", "subject", "status", "priority", "organization",
+                     "created_at", "last_scraped_at", "cbses", "jira_issues")
+                    if k in doc})
             except Exception:
                 pass
-        cluster.close()
-        return {"tickets": tickets, "count": len(tickets)}
+        c.close()
+        return json.dumps({"tickets": results, "count": len(results)}, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
-    elif name == "get_ticket":
-        ticket_id = str(args["ticket_id"])
-        doc = app.chat_cache_get(f"ticket::{ticket_id}", *cb_args)
-        if doc is None:
-            # Try without the prefix (some docs stored as just the numeric ID)
-            doc = app.chat_cache_get(ticket_id, *cb_args)
-        if doc is None:
-            return {"error": f"Ticket {ticket_id} not found"}
-        # Return full doc minus the raw embedding vector (too large)
+
+@mcp.tool()
+def score_ticket(ticket_id: str) -> str:
+    """
+    Run LLM scoring on a ticket — generates star rating (1-5), temperature
+    (cold/warm/hot), complexity, resolution_quality, and communication_clarity.
+    Saves scores back to Couchbase.
+
+    Args:
+        ticket_id: Zendesk ticket ID.
+    """
+    cfg = _cfg()
+    app = _app()
+    try:
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        from couchbase.auth import PasswordAuthenticator
+        from datetime import timedelta
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        c    = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        c.wait_until_ready(timedelta(seconds=10))
+        doc  = c.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(cfg["collection"]).get(
+            f"ticket::{ticket_id}"
+        ).content_as[dict]
+        c.close()
         doc.pop("embedding", None)
-        return doc
-
-    elif name == "check_freshness":
-        stale = app.check_freshness(
-            args["ticket_ids"],
-            int(args["since_epoch"]),
-            *cb_args,
+        profile = _cfg()
+        scores  = app.score_tickets_batch(
+            [doc],
+            profile.get("emb_provider", ""),
+            profile.get("emb_model", ""),
+            profile.get("emb_api_key", ""),
+            profile.get("emb_base_url", ""),
+            cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+            cfg["use_tls"], cfg["scope"], cfg["collection"],
+            save_to_cb=True,
         )
-        return {
-            "stale_ticket_ids": stale,
-            "stale_count":      len(stale),
-            "checked_count":    len(args["ticket_ids"]),
-        }
+        return json.dumps({"ticket_id": ticket_id, "scores": scores}, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
-    elif name == "fetch_fresh_data":
-        customer    = args["customer"]
-        incremental = bool(args.get("incremental", True))
-        cookie      = os.environ.get("CB_COOKIE", "")
-        if not cookie:
-            return {"error": "CB_COOKIE env var not set — cannot scrape without session cookie"}
 
-        cb_cfg = app.CbConfig(
-            url=cfg["cb_url"], bucket=cfg["bucket"],
-            username=cfg["username"], password=cfg["password"],
-            use_tls=cfg["use_tls"], scope=cfg["scope"],
-            collection=cfg["collection"],
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOMERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_customers(limit: int = 100) -> str:
+    """
+    List all distinct customer organizations that have tickets in Couchbase,
+    with open ticket counts.
+
+    Args:
+        limit: Max organizations to return (default 100).
+    """
+    cfg = _cfg()
+    app = _app()
+    try:
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions, QueryOptions
+        from couchbase.auth import PasswordAuthenticator
+        from datetime import timedelta
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        c    = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        c.wait_until_ready(timedelta(seconds=10))
+        ks   = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
+        rows = list(c.query(
+            f"SELECT t.organization, COUNT(*) AS total_tickets, "
+            f"SUM(CASE WHEN t.status IN ['open','pending','on-hold'] THEN 1 ELSE 0 END) AS open_tickets "
+            f"FROM {ks} t WHERE t.type='ticket' AND t.organization IS NOT NULL "
+            f"GROUP BY t.organization ORDER BY open_tickets DESC LIMIT {int(limit)}",
+            QueryOptions(timeout=timedelta(seconds=15)),
+        ))
+        c.close()
+        return json.dumps({"customers": rows, "count": len(rows)}, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def get_customer_health(organization: str) -> str:
+    """
+    Return a health summary for a single customer — open ticket counts by priority,
+    average score, recent activity, top CBSEs, and oldest unresolved tickets.
+
+    Args:
+        organization: Customer/org name (exact or partial match).
+    """
+    cfg = _cfg()
+    app = _app()
+    try:
+        result = app.tool_query_tickets(
+            {"organization": organization, "limit": 200},
+            *_cb_tuple(cfg),
+            limit=200,
         )
-        scraped: list[dict] = []
-        errors:  list[str]  = []
+        if not result:
+            return json.dumps({"error": f"No tickets found for '{organization}'"})
 
-        def _progress(msg: str) -> None:
-            log.info("[fetch_fresh_data] %s", msg)
+        open_tickets  = [t for t in result if t.get("status") in ("open", "pending", "on-hold")]
+        p1            = [t for t in open_tickets if (t.get("priority") or "").lower() in ("urgent", "p1")]
+        p2            = [t for t in open_tickets if (t.get("priority") or "").lower() in ("high", "p2")]
+        scores        = [t.get("score", {}).get("stars") for t in result if t.get("score", {}).get("stars")]
+        avg_score     = round(sum(scores) / len(scores), 2) if scores else None
 
-        try:
-            results = app.run_ticket_pipeline(
-                organization=customer,
-                cookie=cookie,
-                cb_cfg=cb_cfg,
-                incremental=incremental,
-                progress_cb=_progress,
-            )
-            scraped = results if isinstance(results, list) else []
-        except Exception as exc:
-            errors.append(str(exc))
+        cbses: dict = {}
+        for t in open_tickets:
+            for cb in (t.get("cbses") or []):
+                cbses[cb] = cbses.get(cb, 0) + 1
+        top_cbses = sorted(cbses.items(), key=lambda x: x[1], reverse=True)[:5]
 
-        return {
-            "customer":        customer,
-            "scraped_count":   len(scraped),
-            "last_scraped_at": int(time.time()),
-            "incremental":     incremental,
-            "errors":          errors,
-        }
-
-    raise ValueError(f"Unknown tool: {name}")
-
-
-# ── Entry point ─────────────────────────────────────────────────────────────
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Supportal MCP Server")
-    parser.add_argument("--log-level", default="WARNING",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    args = parser.parse_args()
-
-    logging.basicConfig(level=getattr(logging, args.log_level),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-    if not _MCP_AVAILABLE:
-        print("Install the mcp package first: pip install mcp", file=sys.stderr)
-        sys.exit(1)
-
-    import asyncio
-
-    async def _run() -> None:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
-
-    asyncio.run(_run())
+        return json.dumps({
+            "organization":  organization,
+            "total_tickets": len(result),
+            "open_tickets":  len(open_tickets),
+            "p1_open":       len(p1),
+            "p2_open":       len(p2),
+            "avg_score":     avg_score,
+            "top_cbses":     [{"cbse": k, "count": v} for k, v in top_cbses],
+            "sample_open":   [{"id": t.get("ticket_id"), "subject": t.get("subject"),
+                               "priority": t.get("priority"), "status": t.get("status")}
+                              for t in p1[:5]],
+        }, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
 
-if __name__ == "__main__":
-    main()
+@mcp.tool()
+def get_portfolio_status(limit: int = 20) -> str:
+    """
+    Ranked portfolio overview across all customers — sorted by open P1/P2 ticket count.
+    Use this as a morning briefing or fleet health check.
+
+    Args:
+        limit: Max customers to include (default 20).
+    """
+    cfg = _cfg()
+    app = _app()
+    try:
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions, QueryOptions
+        from couchbase.auth import PasswordAuthenticator
+        from datetime import timedelta
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        c    = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        c.wait_until_ready(timedelta(seconds=10))
+        ks   = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
+        rows = list(c.query(
+            f"SELECT t.organization, "
+            f"COUNT(*) AS total, "
+            f"SUM(CASE WHEN t.status IN ['open','pending','on-hold'] THEN 1 ELSE 0 END) AS open_count, "
+            f"SUM(CASE WHEN t.status IN ['open','pending','on-hold'] AND t.priority IN ['urgent','p1'] THEN 1 ELSE 0 END) AS p1_open, "
+            f"SUM(CASE WHEN t.status IN ['open','pending','on-hold'] AND t.priority IN ['high','p2'] THEN 1 ELSE 0 END) AS p2_open, "
+            f"AVG(t.score.stars) AS avg_stars "
+            f"FROM {ks} t WHERE t.type='ticket' AND t.organization IS NOT NULL "
+            f"GROUP BY t.organization ORDER BY p1_open DESC, p2_open DESC LIMIT {int(limit)}",
+            QueryOptions(timeout=timedelta(seconds=20)),
+        ))
+        c.close()
+        return json.dumps({"portfolio": rows, "count": len(rows)}, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCRAPE JOBS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_scrape_status(job_id: str = "") -> str:
+    """
+    Check the status of background scrape/rescrape jobs.
+
+    Args:
+        job_id: Specific 6-char job ID to check. Omit to see all recent jobs.
+    """
+    app = _app()
+    jobs = app._SCRAPE_JOBS
+    if not jobs:
+        return json.dumps({"message": "No scrape jobs in this session."})
+
+    now = time.time()
+    if job_id and job_id in jobs:
+        jobs_to_show = [jobs[job_id]]
+    elif job_id:
+        return json.dumps({"error": f"Job '{job_id}' not found.",
+                           "recent_ids": list(jobs)[-5:]})
+    else:
+        jobs_to_show = list(reversed(list(jobs.values())))[:10]
+
+    out = []
+    for j in jobs_to_show:
+        elapsed = int(now - j.get("started_at", now))
+        out.append({
+            "job_id":   j["job_id"],
+            "org":      j["org"],
+            "mode":     j["mode"],
+            "status":   j["status"],
+            "phase":    j.get("phase"),
+            "processed": j.get("processed", 0),
+            "total":    j.get("total"),
+            "saved":    j.get("saved", 0),
+            "scored":   j.get("scored", 0),
+            "errors":   j.get("errors", 0),
+            "elapsed_s": elapsed,
+            "last_message": j.get("last_message"),
+        })
+    return json.dumps({"jobs": out}, default=str)
+
+
+@mcp.tool()
+def rescrape_customer_tickets(
+    organization: str,
+    max_tickets: int = 50,
+    stale_hours: int = 24,
+) -> str:
+    """
+    Trigger a background rescrape job to refresh stale tickets for a customer
+    from Supportal. Returns immediately with a job_id — use get_scrape_status to poll.
+
+    To resume an interrupted job: set stale_hours=1 so already-refreshed tickets
+    (which have fresh timestamps) are skipped automatically.
+
+    Args:
+        organization: Customer org name.
+        max_tickets:  Max tickets to refresh (default 50, max 2000).
+        stale_hours:  Only refresh tickets not scraped in the last N hours (default 24).
+                      Set to 0 for force-refresh everything, 1 to resume an interrupted job.
+    """
+    cfg = _cfg()
+    app = _app()
+    if not cfg["cookie"]:
+        return json.dumps({"error": "No session cookie configured — set CB_COOKIE env var or update your Strabo profile."})
+    try:
+        result = app.tool_dispatch(
+            "rescrape_customer_tickets",
+            {"organization": organization, "max_tickets": max_tickets, "stale_hours": stale_hours},
+            *_cb_tuple(cfg),
+            cfg["emb_provider"], cfg["emb_model"], cfg["emb_api_key"], cfg["emb_base_url"],
+            cfg["emb_dims"], cfg["cookie"],
+        )
+        return json.dumps({"result": result}, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def cancel_scrape_job(job_id: str) -> str:
+    """
+    Cancel a running scrape or rescrape job. Tickets already refreshed keep their data.
+    After cancellation, resume with rescrape_customer_tickets(stale_hours=1).
+
+    Args:
+        job_id: The 6-character job ID to cancel (e.g. "e02827").
+    """
+    app = _app()
+    cfg = _cfg()
+    cancel_events = getattr(app, "_JOB_CANCEL_EVENTS", {})
+    jobs          = app._SCRAPE_JOBS
+
+    ev = cancel_events.get(job_id)
+    if ev:
+        ev.set()
+
+    job = jobs.get(job_id)
+    if job and job.get("status") == "running":
+        job["status"]      = "cancelled"
+        job["phase"]       = None
+        job["finished_at"] = time.time()
+        job["last_message"] = f"Cancelled via MCP at {job.get('processed',0)}/{job.get('total','?')} tickets."
+        return json.dumps({"cancelled": True, "job_id": job_id,
+                           "processed": job.get("processed", 0),
+                           "saved": job.get("saved", 0)})
+    return json.dumps({"error": f"Job '{job_id}' not running or not found."})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASSETS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_assets(
+    organization: str = "",
+    asset_type: str = "",
+    limit: int = 50,
+) -> str:
+    """
+    List saved charts, tables, reports, and files stored in Couchbase.
+
+    Args:
+        organization: Filter by customer/org (partial match). Leave blank for all.
+        asset_type:   echart | table | image | pdf | report | html
+        limit:        Max results (default 50).
+    """
+    from supportal.agent_tools import _list_assets_from_cb
+    cfg  = _cfg()
+    cb_a = (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+            cfg["use_tls"], cfg["scope"])
+    try:
+        assets = _list_assets_from_cb(*cb_a, organization, asset_type, int(limit))
+        # Strip content (large) from listing — use get_asset for full content
+        for a in assets:
+            a.pop("content", None)
+        return json.dumps({"assets": assets, "count": len(assets)}, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def get_asset(asset_id: str) -> str:
+    """
+    Fetch a single asset with full content (chart JSON, table data, report text, etc.).
+
+    Args:
+        asset_id: Asset UUID (from list_assets).
+    """
+    from supportal.agent_tools import _get_asset_content_from_cb
+    cfg  = _cfg()
+    cb_a = (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+            cfg["use_tls"], cfg["scope"])
+    try:
+        doc = _get_asset_content_from_cb(*cb_a, asset_id)
+        if not doc:
+            return json.dumps({"error": f"Asset '{asset_id}' not found."})
+        # For binary types (image, pdf), omit raw content — too large for tool output
+        atype = doc.get("asset_type", "")
+        if atype in ("image", "pdf") and len(doc.get("content", "")) > 10_000:
+            doc["content"] = f"[{atype.upper()} binary content — {len(doc.get('content',''))} chars base64]"
+        return json.dumps(doc, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCES  (read-only data endpoints — appear in clients as browseable sources)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.resource("customers://list")
+def resource_customers() -> str:
+    """All customers with open ticket counts."""
+    return list_customers(limit=200)
+
+
+@mcp.resource("tickets://{organization}")
+def resource_tickets(organization: str) -> str:
+    """Open tickets for a specific customer."""
+    return query_tickets(organization=organization, status="open", limit=100)
+
+
+@mcp.resource("health://{organization}")
+def resource_health(organization: str) -> str:
+    """Health summary for a specific customer."""
+    return get_customer_health(organization=organization)
