@@ -10116,33 +10116,55 @@ def _run_rescrape_job_bg(
                 job["errors"] += 1
 
         # ── Score refreshed tickets ───────────────────────────────────────
-        s_prov = (emb_params or {}).get("score_provider", "").lower().strip()
-        s_mod  = (emb_params or {}).get("score_model", "")
-        s_key  = (emb_params or {}).get("score_api_key", "")
-        s_url  = (emb_params or {}).get("score_base_url", "")
+        s_prov    = (emb_params or {}).get("score_provider", "").lower().strip()
+        s_mod     = (emb_params or {}).get("score_model", "")
+        s_key     = (emb_params or {}).get("score_api_key", "")
+        s_url     = (emb_params or {}).get("score_base_url", "")
+        s_num_ctx = int((emb_params or {}).get("score_ctx") or 0) or None
+        s_no_think = bool((emb_params or {}).get("score_no_think", False))
         if s_prov and s_mod and refreshed_tickets:
             job["phase"] = "scoring"
-            # Score all refreshed tickets in batches of 20 to avoid LLM timeouts
-            _score_batch = 20
+            _score_batch_sz = 20
             _total_scored = 0
-            for _si in range(0, len(refreshed_tickets), _score_batch):
-                _chunk = refreshed_tickets[_si:_si + _score_batch]
+            _scored_at = int(time.time())
+            # Reconnect for score save-back (may reuse _bcol if still open)
+            try:
+                _scol = _bcluster.bucket(bucket).scope(scope).collection(collection)
+            except Exception:
+                _scol = None
+            for _si in range(0, len(refreshed_tickets), _score_batch_sz):
+                _chunk = refreshed_tickets[_si:_si + _score_batch_sz]
                 _set_op(
-                    f"Scoring tickets {_si + 1}–{min(_si + _score_batch, len(refreshed_tickets))}"
+                    f"Scoring tickets {_si + 1}–{min(_si + _score_batch_sz, len(refreshed_tickets))}"
                     f" of {len(refreshed_tickets)}…",
                     0.97 + (_si / max(len(refreshed_tickets), 1)) * 0.02,
                 )
                 try:
-                    _scores = score_tickets_batch(
+                    _score_results = score_tickets_batch(
                         _chunk,
                         s_prov, s_mod, s_key, s_url,
-                        cb_url, bucket, username, password, use_tls, scope, collection,
-                        save_to_cb=True,
+                        num_ctx=s_num_ctx,
+                        no_think=s_no_think,
                     )
-                    _total_scored += len(_scores)
+                    # Persist scores back into ticket docs in CB
+                    if _scol and _score_results:
+                        for _sc in _score_results:
+                            _stid = str(_sc.get("ticket_id") or "").strip()
+                            if not _stid:
+                                continue
+                            try:
+                                _sdoc_key = f"ticket::{_stid}"
+                                _sdoc = _scol.get(_sdoc_key).content_as[dict]
+                                _sdoc["score"] = {**(_sdoc.get("score") or {}), **_sc, "scored_at": _scored_at}
+                                _scol.upsert(_sdoc_key, _sdoc)
+                                _total_scored += 1
+                            except Exception:
+                                pass
+                    else:
+                        _total_scored += len(_score_results)
                     job["scored"] = _total_scored
                 except Exception as exc:
-                    job["last_message"] = f"Scoring batch {_si // _score_batch + 1} failed: {exc}"
+                    job["last_message"] = f"Scoring batch {_si // _score_batch_sz + 1} failed: {exc}"
                     job["errors"] += 1
 
         job["status"]      = "done"
@@ -13490,8 +13512,16 @@ def score_tickets_batch(
     model: str,
     api_key: str,
     base_url: str,
+    cb_url: str = "",
+    bucket: str = "",
+    username: str = "",
+    password: str = "",
+    use_tls: bool = False,
+    scope: str = "transcripts",
+    collection: str = "tickets",
     num_ctx: int | None = None,
     no_think: bool = False,
+    save_to_cb: bool = False,
 ) -> list[dict]:
     """Send one batch to the LLM and return parsed score objects.
 

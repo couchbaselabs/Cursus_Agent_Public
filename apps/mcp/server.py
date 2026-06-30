@@ -125,6 +125,8 @@ def _cfg() -> dict:
         "score_model":     profile.get("lms_model") or profile.get("ollama_chat_model") or profile.get("claude_model") or "",
         "score_api_key":   profile.get("claude_api_key") or profile.get("gemini_llm_key") or profile.get("openai_api_key") or "",
         "score_base_url":  profile.get("emb_lms_url") or profile.get("emb_ollama_url") or "",
+        "score_ctx":       int(profile.get("score_ctx") or 0) or None,
+        "score_no_think":  bool(profile.get("score_no_think", False)),
         "embed_parallel":  int(profile.get("embed_parallel") or 1),
         "pipeline_embed":  bool(profile.get("pipeline_embed", True)),
         "pipeline_score":  bool(profile.get("pipeline_score", True)),
@@ -280,17 +282,25 @@ def score_ticket(ticket_id: str) -> str:
         ).content_as[dict]
         c.close()
         doc.pop("embedding", None)
-        profile = _cfg()
-        scores  = app.score_tickets_batch(
+        scores = app.score_tickets_batch(
             [doc],
-            profile.get("emb_provider", ""),
-            profile.get("emb_model", ""),
-            profile.get("emb_api_key", ""),
-            profile.get("emb_base_url", ""),
-            cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
-            cfg["use_tls"], cfg["scope"], cfg["collection"],
-            save_to_cb=True,
+            cfg["score_provider"], cfg["score_model"],
+            cfg["score_api_key"],  cfg["score_base_url"],
         )
+        # Save score back to CB
+        if scores:
+            from couchbase.cluster import Cluster as _Cl2
+            from couchbase.options import ClusterOptions as _CO2
+            from couchbase.auth import PasswordAuthenticator as _PA2
+            import time as _t
+            _c2 = _Cl2(app._cb_conn_str(cfg["cb_url"], cfg["use_tls"]),
+                       _CO2(_PA2(cfg["username"], cfg["password"])))
+            _c2.wait_until_ready(timedelta(seconds=10))
+            _col2 = _c2.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(cfg["collection"])
+            _sdoc = _col2.get(f"ticket::{ticket_id}").content_as[dict]
+            _sdoc["score"] = {**(_sdoc.get("score") or {}), **scores[0], "scored_at": int(_t.time())}
+            _col2.upsert(f"ticket::{ticket_id}", _sdoc)
+            _c2.close()
         return json.dumps({"ticket_id": ticket_id, "scores": scores}, default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -590,10 +600,12 @@ def rescrape_customer_tickets(
             "emb_base_url":       cfg["emb_base_url"],
             "emb_dims":           cfg["emb_dims"],
             "embed_parallel":     cfg.get("embed_parallel", 1),
-            "provider":           cfg["score_provider"] if run_score else "",
-            "model":              cfg["score_model"]    if run_score else "",
+            "provider":           cfg["score_provider"]  if run_score else "",
+            "model":              cfg["score_model"]     if run_score else "",
             "api_key":            cfg["score_api_key"],
             "base_url":           cfg["score_base_url"],
+            "score_ctx":          cfg.get("score_ctx"),
+            "score_no_think":     cfg.get("score_no_think", False),
             "skip_enrichment":    not enrich_snapshots,
         }
         result = app._execute_agent_tool(
