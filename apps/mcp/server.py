@@ -69,6 +69,31 @@ def _app() -> Any:
     return _pipeline
 
 
+# ── Embedding field helpers — pick the right keys based on active provider ────
+def _emb_model(profile: dict) -> str:
+    p = (profile.get("emb_provider") or "ollama").lower()
+    if p == "lmstudio":   return profile.get("emb_lms_model")    or "nomic-embed-text"
+    if p == "gemini":     return profile.get("emb_gemini_model")  or "text-embedding-004"
+    if p == "openai":     return profile.get("emb_openai_model")  or "text-embedding-3-small"
+    if p == "mlx":        return profile.get("emb_mlx_model")     or "nomic-embed-text"
+    return profile.get("emb_ollama_model") or "nomic-embed-text"
+
+
+def _emb_base_url(profile: dict) -> str:
+    p = (profile.get("emb_provider") or "ollama").lower()
+    if p == "lmstudio":   return profile.get("emb_lms_url")    or "http://localhost:1234"
+    return profile.get("emb_ollama_url") or "http://localhost:11434"
+
+
+def _emb_dims(profile: dict) -> int:
+    p = (profile.get("emb_provider") or "ollama").lower()
+    if p == "lmstudio":   return int(profile.get("emb_lms_dims")    or 1024)
+    if p == "gemini":     return int(profile.get("emb_gemini_dims")  or 768)
+    if p == "openai":     return int(profile.get("emb_openai_dims")  or 1536)
+    if p == "mlx":        return int(profile.get("emb_mlx_dims")     or 1024)
+    return int(profile.get("emb_ollama_dims") or 1024)
+
+
 # ── Config: active Strabo profile → env var overrides ────────────────────────
 def _cfg() -> dict:
     """Load CB + embed config from the active Strabo profile, then apply env overrides."""
@@ -89,12 +114,20 @@ def _cfg() -> dict:
         "scope":      os.environ.get("CB_SCOPE",      profile.get("cb_scope",      "transcripts")),
         "collection": os.environ.get("CB_COLLECTION", profile.get("cb_collection", "tickets")),
         "cookie":     os.environ.get("CB_COOKIE",     profile.get("cookie",        "")),
-        # Embedding
+        # Embedding — resolve model/url/dims based on active provider
         "emb_provider": profile.get("emb_provider", "ollama"),
-        "emb_model":    profile.get("emb_ollama_model") or profile.get("emb_lms_model") or "nomic-embed-text",
+        "emb_model":    _emb_model(profile),
         "emb_api_key":  profile.get("emb_gemini_key") or profile.get("emb_openai_key") or "",
-        "emb_base_url": profile.get("emb_ollama_url") or profile.get("emb_lms_url") or "http://localhost:11434",
-        "emb_dims":     int(profile.get("emb_ollama_dims") or profile.get("emb_lms_dims") or 1024),
+        "emb_base_url": _emb_base_url(profile),
+        "emb_dims":     _emb_dims(profile),
+        # Scoring
+        "score_provider":  profile.get("llm_provider", ""),
+        "score_model":     profile.get("lms_model") or profile.get("ollama_chat_model") or profile.get("claude_model") or "",
+        "score_api_key":   profile.get("claude_api_key") or profile.get("gemini_llm_key") or profile.get("openai_api_key") or "",
+        "score_base_url":  profile.get("emb_lms_url") or profile.get("emb_ollama_url") or "",
+        "embed_parallel":  int(profile.get("embed_parallel") or 1),
+        "pipeline_embed":  bool(profile.get("pipeline_embed", True)),
+        "pipeline_score":  bool(profile.get("pipeline_score", True)),
     }
 
 
@@ -534,12 +567,17 @@ def rescrape_customer_tickets(
         return json.dumps({"error": "No session cookie configured — set CB_COOKIE env var or update your Strabo profile."})
     try:
         ctx = {
-            "cookie":       cfg["cookie"],
-            "emb_provider": cfg["emb_provider"],
-            "emb_model":    cfg["emb_model"],
-            "emb_api_key":  cfg["emb_api_key"],
-            "emb_base_url": cfg["emb_base_url"],
-            "emb_dims":     cfg["emb_dims"],
+            "cookie":          cfg["cookie"],
+            "emb_provider":    cfg["emb_provider"]   if cfg.get("pipeline_embed") else "",
+            "emb_model":       cfg["emb_model"]      if cfg.get("pipeline_embed") else "",
+            "emb_api_key":     cfg["emb_api_key"],
+            "emb_base_url":    cfg["emb_base_url"],
+            "emb_dims":        cfg["emb_dims"],
+            "embed_parallel":  cfg.get("embed_parallel", 1),
+            "provider":        cfg["score_provider"]  if cfg.get("pipeline_score") else "",
+            "model":           cfg["score_model"]     if cfg.get("pipeline_score") else "",
+            "api_key":         cfg["score_api_key"],
+            "base_url":        cfg["score_base_url"],
         }
         result = app._execute_agent_tool(
             "rescrape_customer_tickets",
