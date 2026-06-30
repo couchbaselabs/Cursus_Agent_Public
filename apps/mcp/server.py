@@ -547,37 +547,54 @@ def rescrape_customer_tickets(
     organization: str,
     max_tickets: int = 50,
     stale_hours: int = 24,
+    embed: bool = True,
+    score: bool = True,
+    enrich_snapshots: bool = True,
 ) -> str:
     """
     Trigger a background rescrape job to refresh stale tickets for a customer
     from Supportal. Returns immediately with a job_id — use get_scrape_status to poll.
 
+    Pipeline stages (all on by default, can be disabled individually):
+      1. Scrape     — always runs; fetches fresh ticket data from Supportal
+      2. Enrich     — fetches cluster snapshot topology for each ticket (enrich_snapshots)
+      3. Embed      — generates vector embeddings for semantic search (embed)
+      4. Score      — runs LLM scoring: stars, temperature, complexity (score)
+
     To resume an interrupted job: set stale_hours=1 so already-refreshed tickets
     (which have fresh timestamps) are skipped automatically.
 
     Args:
-        organization: Customer org name.
-        max_tickets:  Max tickets to refresh (default 50, max 2000).
-        stale_hours:  Only refresh tickets not scraped in the last N hours (default 24).
-                      Set to 0 for force-refresh everything, 1 to resume an interrupted job.
+        organization:     Customer org name.
+        max_tickets:      Max tickets to refresh (default 50, max 2000).
+        stale_hours:      Only refresh tickets not scraped in the last N hours (default 24).
+                          Set to 0 to force-refresh everything, 1 to resume an interrupted job.
+        embed:            Run embedding after scrape (default True). Set False to skip — useful
+                          when LMStudio/Ollama is not running or you want raw data only.
+        score:            Run LLM scoring after embed (default True). Set False to skip.
+        enrich_snapshots: Fetch cluster snapshot topology for each ticket (default True).
+                          Set False for fastest possible scrape with no external calls.
     """
     cfg = _cfg()
     app = _app()
     if not cfg["cookie"]:
         return json.dumps({"error": "No session cookie configured — set CB_COOKIE env var or update your Strabo profile."})
     try:
+        run_embed = embed and cfg.get("pipeline_embed", True)
+        run_score = score and cfg.get("pipeline_score", True)
         ctx = {
-            "cookie":          cfg["cookie"],
-            "emb_provider":    cfg["emb_provider"]   if cfg.get("pipeline_embed") else "",
-            "emb_model":       cfg["emb_model"]      if cfg.get("pipeline_embed") else "",
-            "emb_api_key":     cfg["emb_api_key"],
-            "emb_base_url":    cfg["emb_base_url"],
-            "emb_dims":        cfg["emb_dims"],
-            "embed_parallel":  cfg.get("embed_parallel", 1),
-            "provider":        cfg["score_provider"]  if cfg.get("pipeline_score") else "",
-            "model":           cfg["score_model"]     if cfg.get("pipeline_score") else "",
-            "api_key":         cfg["score_api_key"],
-            "base_url":        cfg["score_base_url"],
+            "cookie":             cfg["cookie"],
+            "emb_provider":       cfg["emb_provider"]  if run_embed else "",
+            "emb_model":          cfg["emb_model"]     if run_embed else "",
+            "emb_api_key":        cfg["emb_api_key"],
+            "emb_base_url":       cfg["emb_base_url"],
+            "emb_dims":           cfg["emb_dims"],
+            "embed_parallel":     cfg.get("embed_parallel", 1),
+            "provider":           cfg["score_provider"] if run_score else "",
+            "model":              cfg["score_model"]    if run_score else "",
+            "api_key":            cfg["score_api_key"],
+            "base_url":           cfg["score_base_url"],
+            "skip_enrichment":    not enrich_snapshots,
         }
         result = app._execute_agent_tool(
             "rescrape_customer_tickets",
@@ -585,7 +602,12 @@ def rescrape_customer_tickets(
             *_cb_tuple(cfg),
             ctx=ctx,
         )
-        return json.dumps({"result": result}, default=str)
+        stages = []
+        if not enrich_snapshots: stages.append("no snapshot enrichment")
+        if not run_embed:        stages.append("no embedding")
+        if not run_score:        stages.append("no scoring")
+        suffix = f" [{', '.join(stages)}]" if stages else ""
+        return json.dumps({"result": result, "pipeline": suffix.strip("[]") or "full"}, default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 

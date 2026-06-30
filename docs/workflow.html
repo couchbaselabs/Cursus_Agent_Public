@@ -469,9 +469,12 @@ python run_cursus.py</pre>
     <div class="card-title">⚙ Scrape job management</div>
     <ul>
       <li><em>"Refresh Acme tickets from Supportal"</em> → <span class="tool">rescrape_customer_tickets</span></li>
+      <li><em>"Refresh Acme — scrape only, no embedding or scoring"</em> → <span class="tool">rescrape_customer_tickets</span> <code>embed=false score=false</code></li>
+      <li><em>"Refresh Acme — scrape and enrich but skip embedding"</em> → <span class="tool">rescrape_customer_tickets</span> <code>embed=false</code></li>
       <li><em>"Is the Western Union rescrape still running?"</em> → <span class="tool">get_scrape_status</span></li>
       <li><em>"Kill job e02827"</em> → <span class="tool">cancel_scrape_job</span></li>
       <li><em>"Resume the interrupted job"</em> → <span class="tool">rescrape_customer_tickets</span> with <code>stale_hours=1</code></li>
+      <li><em>"What tools does Cursus have?"</em> → ask Claude directly — it reads tool schemas and docstrings at runtime</li>
     </ul>
   </div>
 
