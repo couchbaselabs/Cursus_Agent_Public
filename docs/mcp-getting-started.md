@@ -63,7 +63,7 @@ from couchbase.management.collections import CollectionSpec
 CB_URL    = "couchbase://localhost"
 BUCKET    = "rag"
 USERNAME  = "Administrator"
-PASSWORD  = "Password123!"
+PASSWORD  = "your-cb-password"   # replace with your actual password
 
 c = Cluster(CB_URL, ClusterOptions(PasswordAuthenticator(USERNAME, PASSWORD)))
 c.wait_until_ready(timedelta(seconds=15))
