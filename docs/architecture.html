@@ -93,7 +93,8 @@
   <div class="badge"><div class="dot green"></div>Agent + UX polish complete</div>
   <div class="badge"><div class="dot green"></div>Modular extraction complete</div>
   <div class="badge"><div class="dot amber"></div>Phase 3 Fleet — in progress</div>
-  <div class="badge"><div class="dot grey"></div>Phase 4 AI-driven — planned</div>
+  <div class="badge"><div class="dot green"></div>MCP server live (12 tools)</div>
+  <div class="badge"><div class="dot grey"></div>Phase 4 milestones 4.2–4.5 — planned</div>
 </div>
 
 <!-- ── Top-level data flow ── -->
@@ -110,6 +111,8 @@
   <div class="flow-node"><div class="label">Couchbase</div><div class="sub">tickets · snapshots · assets</div></div>
   <div class="arrow">→</div>
   <div class="flow-node"><div class="label">Agent + UI</div><div class="sub">query · analyse · report</div></div>
+  <div class="arrow">→</div>
+  <div class="flow-node"><div class="label">MCP Clients</div><div class="sub">Claude Code · Desktop · Cursor · Gemini</div></div>
 </div>
 
 <!-- ── App layer ── -->
@@ -158,12 +161,22 @@
   <div class="card purple">
     <div class="card-title"><span class="icon">🔌</span> MCP Server <span class="chip purple">apps/mcp/server.py</span></div>
     <ul>
-      <li class="done">All 29+ agent tools exposed via MCP stdio</li>
-      <li class="done">Claude Desktop config supported</li>
-      <li class="pending">Auth: CB credentials via env vars</li>
-      <li class="pending">Tool result streaming for long-running ops</li>
-      <li class="pending">README: Claude Desktop setup + examples</li>
+      <li class="done">FastMCP — 12 tools, 3 resources</li>
+      <li class="done">stdio transport (Claude Desktop / Claude Code / Cursor)</li>
+      <li class="done">SSE transport (Gemini / remote clients) via run_mcp.py --transport sse</li>
+      <li class="done">Config from active Strabo profile + env var overrides</li>
+      <li class="done">Wired into Claude Code via ~/.claude.json + enabledMcpjsonServers</li>
+      <li class="done">Getting-started guide: docs/mcp-getting-started.md</li>
     </ul>
+    <div style="margin-top:8px;font-size:11px;color:#7c3aed;font-weight:600">
+      Tools: query_tickets · get_ticket · search_tickets · score_ticket ·
+      list_customers · get_customer_health · get_portfolio_status ·
+      get_scrape_status · rescrape_customer_tickets · cancel_scrape_job ·
+      list_assets · get_asset
+    </div>
+    <div style="margin-top:4px;font-size:11px;color:#7c3aed">
+      Resources: customers://list · tickets://{org} · health://{org}
+    </div>
   </div>
 
 </div>

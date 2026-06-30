@@ -424,13 +424,81 @@ python run_cursus.py</pre>
 
   <div class="tip">
     <div class="tip-title">MCP server</div>
-    <p>Run <code>python apps/mcp/server.py</code> and add it to Claude Desktop's <code>mcp_servers</code> config to use all 29 agent tools directly from the Claude desktop app.</p>
+    <p>Run <code>venv/bin/python run_mcp.py</code> and add it to Claude Code / Claude Desktop / Cursor. Full setup: <code>docs/mcp-getting-started.md</code>.</p>
+  </div>
+
+</div>
+
+<!-- ══ MCP WORKFLOW ══ -->
+<div class="section-label">Cursus MCP — Claude Code / Claude Desktop workflow</div>
+
+<div class="cards" style="margin-bottom:28px">
+
+  <div class="card">
+    <div class="card-title">🔌 Setup (one-time)</div>
+    <ul>
+      <li>Install: <code>venv/bin/pip install -r requirements.txt</code></li>
+      <li>Add to <code>~/.claude.json</code> → <code>mcpServers.cursus</code></li>
+      <li>Add <code>"cursus"</code> to <code>enabledMcpjsonServers</code> in <code>~/.claude/settings.json</code></li>
+      <li>Add <code>"mcp__cursus__*"</code> to permissions allowlist</li>
+      <li>Restart Claude Code — tools appear as <code>mcp__cursus__*</code></li>
+      <li>Full guide: <code>docs/mcp-getting-started.md</code></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📋 Ticket queries</div>
+    <ul>
+      <li><em>"Show all open P1s for Western Union"</em> → <span class="tool">query_tickets</span></li>
+      <li><em>"Find tickets about XDCR replication failures"</em> → <span class="tool">search_tickets</span></li>
+      <li><em>"Get full detail on ticket 79105"</em> → <span class="tool">get_ticket</span></li>
+      <li><em>"Score ticket 79105 for complexity and sentiment"</em> → <span class="tool">score_ticket</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🏢 Customer &amp; portfolio</div>
+    <ul>
+      <li><em>"Morning briefing — where should I focus?"</em> → <span class="tool">get_portfolio_status</span></li>
+      <li><em>"What's Western Union's health right now?"</em> → <span class="tool">get_customer_health</span></li>
+      <li><em>"List all customers with open tickets"</em> → <span class="tool">list_customers</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">⚙ Scrape job management</div>
+    <ul>
+      <li><em>"Refresh Acme tickets from Supportal"</em> → <span class="tool">rescrape_customer_tickets</span></li>
+      <li><em>"Is the Western Union rescrape still running?"</em> → <span class="tool">get_scrape_status</span></li>
+      <li><em>"Kill job e02827"</em> → <span class="tool">cancel_scrape_job</span></li>
+      <li><em>"Resume the interrupted job"</em> → <span class="tool">rescrape_customer_tickets</span> with <code>stale_hours=1</code></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📦 Assets</div>
+    <ul>
+      <li><em>"List saved charts for Western Union"</em> → <span class="tool">list_assets</span></li>
+      <li><em>"Show me the content of asset abc123"</em> → <span class="tool">get_asset</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🔗 MCP Resources (browseable)</div>
+    <ul>
+      <li><code>customers://list</code> — all orgs with open ticket counts</li>
+      <li><code>tickets://{organization}</code> — open tickets for a customer</li>
+      <li><code>health://{organization}</code> — health summary for a customer</li>
+    </ul>
+    <div style="margin-top:8px;font-size:11px;color:#475569">
+      Resources appear in Claude Desktop's attachment picker and Cursor's context menu.
+    </div>
   </div>
 
 </div>
 
 <p style="font-size:0.65rem;color:#94a3b8;margin-top:32px;text-align:center">
-  Supportal AI Agent · user workflow · v2.5.0 · updated 2026-06-09
+  Cursus Agent · user workflow · v2.6.7 · updated 2026-06-29
 </p>
 
 </body>
