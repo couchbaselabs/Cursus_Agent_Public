@@ -386,6 +386,83 @@ def get_portfolio_status(limit: int = 20) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CONNECTIVITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def check_connectivity() -> str:
+    """
+    Check VPN status and reachability of Couchbase and Supportal.
+
+    Returns VPN connection state (macOS scutil), whether Couchbase is reachable,
+    and whether Supportal is reachable. Call this before rescrape_customer_tickets
+    to confirm the VPN is active — Supportal requires the Couchbase corporate VPN.
+    """
+    import socket
+    import subprocess
+
+    result: dict = {}
+
+    # ── VPN (macOS only) ──────────────────────────────────────────────────────
+    try:
+        out = subprocess.run(
+            ["scutil", "--nc", "list"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        vpn_lines = [l.strip() for l in out.splitlines() if "VPN" in l or "Cisco" in l.lower() or "anyconnect" in l.lower()]
+        connected  = [l for l in vpn_lines if "(Connected)" in l]
+        result["vpn"] = {
+            "connected": bool(connected),
+            "connections": vpn_lines or ["(no VPN services found)"],
+            "note": "Supportal scraping requires the Couchbase corporate VPN (AEXP / Cisco AnyConnect).",
+        }
+    except FileNotFoundError:
+        result["vpn"] = {"connected": None, "note": "scutil not available (non-macOS host)"}
+    except Exception as exc:
+        result["vpn"] = {"connected": None, "error": str(exc)}
+
+    # ── Couchbase ─────────────────────────────────────────────────────────────
+    cfg = _cfg()
+    cb_host = cfg["cb_url"].replace("couchbases://", "").replace("couchbase://", "").split("/")[0]
+    cb_port = 18091 if cfg["use_tls"] else 8091
+    try:
+        s = socket.create_connection((cb_host, cb_port), timeout=4)
+        s.close()
+        result["couchbase"] = {"reachable": True, "host": cb_host, "port": cb_port}
+    except Exception as exc:
+        result["couchbase"] = {"reachable": False, "host": cb_host, "port": cb_port, "error": str(exc)}
+
+    # ── Supportal ─────────────────────────────────────────────────────────────
+    try:
+        s = socket.create_connection(("supportal.couchbase.com", 443), timeout=5)
+        s.close()
+        result["supportal"] = {"reachable": True, "host": "supportal.couchbase.com:443"}
+    except Exception as exc:
+        result["supportal"] = {
+            "reachable": False,
+            "host": "supportal.couchbase.com:443",
+            "error": str(exc),
+            "fix": "Connect to the Couchbase corporate VPN (AEXP) before running rescrape jobs.",
+        }
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    vpn_ok       = result.get("vpn", {}).get("connected")
+    cb_ok        = result.get("couchbase", {}).get("reachable", False)
+    supportal_ok = result.get("supportal", {}).get("reachable", False)
+
+    if cb_ok and supportal_ok:
+        result["summary"] = "All systems reachable. Scrape tools are ready."
+    elif cb_ok and not supportal_ok:
+        result["summary"] = "Couchbase OK. Supportal unreachable — connect VPN before scraping."
+    elif not cb_ok:
+        result["summary"] = "Couchbase unreachable — check CB is running and credentials are correct."
+    else:
+        result["summary"] = "No connectivity — check VPN and local services."
+
+    return json.dumps(result, indent=2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SCRAPE JOBS
 # ─────────────────────────────────────────────────────────────────────────────
 

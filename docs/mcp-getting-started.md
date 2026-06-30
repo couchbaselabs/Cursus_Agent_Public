@@ -235,6 +235,7 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 
 | Tool | Description |
 |---|---|
+| `check_connectivity` | Check VPN status + Couchbase + Supportal reachability. Run this first if scraping fails. |
 | `query_tickets` | Structured filter search — org, status, priority, keyword, days open |
 | `get_ticket` | Full ticket detail — description, comments, topology, CBSEs, scores |
 | `search_tickets` | Semantic vector search — finds tickets by meaning |
@@ -247,6 +248,12 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `cancel_scrape_job` | Cancel a running scrape job by job ID |
 | `list_assets` | List saved charts, tables, reports filtered by org/type |
 | `get_asset` | Fetch a single asset with full content |
+
+## VPN requirement
+
+`rescrape_customer_tickets` scrapes Supportal, which requires the **Couchbase corporate VPN (AEXP / Cisco AnyConnect)**. All other tools only need Couchbase to be reachable and work without VPN.
+
+Before triggering a rescrape, call `check_connectivity` — it inspects VPN state via `scutil` (macOS), then does a live TCP probe of both Couchbase and Supportal, and returns a plain-English summary with remediation hints if anything is unreachable.
 
 ## Available resources
 
