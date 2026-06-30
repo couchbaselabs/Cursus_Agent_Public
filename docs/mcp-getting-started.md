@@ -251,9 +251,9 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 
 ## VPN requirement
 
-`rescrape_customer_tickets` scrapes Supportal, which requires the **Couchbase corporate VPN (AEXP / Cisco AnyConnect)**. All other tools only need Couchbase to be reachable and work without VPN.
+`rescrape_customer_tickets` scrapes Supportal, which is an internal host and requires the **Couchbase corporate VPN**. All other tools only need Couchbase to be reachable and work without VPN.
 
-Before triggering a rescrape, call `check_connectivity` — it inspects VPN state via `scutil` (macOS), then does a live TCP probe of both Couchbase and Supportal, and returns a plain-English summary with remediation hints if anything is unreachable.
+Before triggering a rescrape, call `check_connectivity` — it lists any named VPN services and their state via `scutil` (macOS, vendor-agnostic), TCP-probes Couchbase and Supportal, and returns a plain-English summary. Supportal reachability is treated as the authoritative VPN indicator since named-service detection varies by VPN client (GlobalProtect, AnyConnect, WireGuard, etc.).
 
 ## Available resources
 

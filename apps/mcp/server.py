@@ -403,23 +403,24 @@ def check_connectivity() -> str:
 
     result: dict = {}
 
-    # ── VPN (macOS only) ──────────────────────────────────────────────────────
+    # ── VPN — named services via scutil (macOS), vendor-agnostic ─────────────
     try:
         out = subprocess.run(
             ["scutil", "--nc", "list"],
             capture_output=True, text=True, timeout=5,
         ).stdout
-        vpn_lines = [l.strip() for l in out.splitlines() if "VPN" in l or "Cisco" in l.lower() or "anyconnect" in l.lower()]
-        connected  = [l for l in vpn_lines if "(Connected)" in l]
-        result["vpn"] = {
-            "connected": bool(connected),
-            "connections": vpn_lines or ["(no VPN services found)"],
-            "note": "Supportal scraping requires the Couchbase corporate VPN (AEXP / Cisco AnyConnect).",
+        all_services   = [l.strip() for l in out.splitlines() if l.strip() and "Available" not in l]
+        connected_svcs = [l for l in all_services if "(Connected)" in l]
+        result["vpn_services"] = {
+            "connected": bool(connected_svcs),
+            "connected_services": connected_svcs or [],
+            "all_services": all_services,
+            "note": "Supportal reachability below is the authoritative VPN check.",
         }
     except FileNotFoundError:
-        result["vpn"] = {"connected": None, "note": "scutil not available (non-macOS host)"}
+        result["vpn_services"] = {"connected": None, "note": "scutil not available (non-macOS)"}
     except Exception as exc:
-        result["vpn"] = {"connected": None, "error": str(exc)}
+        result["vpn_services"] = {"connected": None, "error": str(exc)}
 
     # ── Couchbase ─────────────────────────────────────────────────────────────
     cfg = _cfg()
@@ -442,11 +443,11 @@ def check_connectivity() -> str:
             "reachable": False,
             "host": "supportal.couchbase.com:443",
             "error": str(exc),
-            "fix": "Connect to the Couchbase corporate VPN (AEXP) before running rescrape jobs.",
+            "fix": "Connect to the Couchbase corporate VPN — Supportal is an internal host.",
         }
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    vpn_ok       = result.get("vpn", {}).get("connected")
+    vpn_ok       = result.get("vpn_services", {}).get("connected")
     cb_ok        = result.get("couchbase", {}).get("reachable", False)
     supportal_ok = result.get("supportal", {}).get("reachable", False)
 
