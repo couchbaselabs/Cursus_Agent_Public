@@ -533,12 +533,19 @@ def rescrape_customer_tickets(
     if not cfg["cookie"]:
         return json.dumps({"error": "No session cookie configured — set CB_COOKIE env var or update your Strabo profile."})
     try:
-        result = app.tool_dispatch(
+        ctx = {
+            "cookie":       cfg["cookie"],
+            "emb_provider": cfg["emb_provider"],
+            "emb_model":    cfg["emb_model"],
+            "emb_api_key":  cfg["emb_api_key"],
+            "emb_base_url": cfg["emb_base_url"],
+            "emb_dims":     cfg["emb_dims"],
+        }
+        result = app._execute_agent_tool(
             "rescrape_customer_tickets",
             {"organization": organization, "max_tickets": max_tickets, "stale_hours": stale_hours},
             *_cb_tuple(cfg),
-            cfg["emb_provider"], cfg["emb_model"], cfg["emb_api_key"], cfg["emb_base_url"],
-            cfg["emb_dims"], cfg["cookie"],
+            ctx=ctx,
         )
         return json.dumps({"result": result}, default=str)
     except Exception as exc:
