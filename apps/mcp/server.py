@@ -428,6 +428,105 @@ def get_portfolio_status(limit: int = 20) -> str:
         return json.dumps({"error": str(exc)})
 
 
+@mcp.tool()
+def get_morning_briefing(
+    organizations: list[str] | None = None,
+    active_only: bool = True,
+    tickets_per_org: int = 100,
+) -> str:
+    """
+    Fleet-wide morning briefing — active ticket summary across your key accounts.
+    Returns one entry per org with open/pending/on-hold tickets including subject,
+    assignee, priority, LLM scores (temperature, stars), CBSEs, JIRA issues, and
+    the AI-generated interaction summary. Runs server-side — no shell execution needed.
+
+    Args:
+        organizations:   List of org names to include. Omit for the default fleet
+                         (American Express, Western Union, NetDocuments, DaVita,
+                          GoDaddy, Convera).
+        active_only:     When True (default) only open/pending/on-hold tickets are
+                         returned. Set False to include solved/closed for context.
+        tickets_per_org: Max tickets to query per org (default 100).
+    """
+    _ACTIVE = {"open", "pending", "on-hold", "hold", "on_hold"}
+    _DEFAULT_FLEET = [
+        "American Express",
+        "Western Union",
+        "NetDocuments",
+        "DaVita",
+        "GoDaddy",
+        "Convera",
+    ]
+
+    cfg   = _cfg()
+    app   = _app()
+    orgs  = organizations if organizations else _DEFAULT_FLEET
+    limit = min(int(tickets_per_org), 200)
+
+    briefing: list[dict] = []
+
+    for org in orgs:
+        try:
+            all_tickets = app.tool_query_tickets(
+                {"organization": org, "limit": limit},
+                *_cb_tuple(cfg),
+                limit=limit,
+            )
+        except Exception as exc:
+            briefing.append({"organization": org, "error": str(exc)})
+            continue
+
+        if active_only:
+            tickets = [t for t in all_tickets
+                       if (t.get("status") or "").lower() in _ACTIVE]
+        else:
+            tickets = all_tickets
+
+        tickets.sort(key=lambda t: t.get("created") or "", reverse=True)
+
+        ticket_summaries = []
+        for t in tickets:
+            sc = t.get("score") or {}
+            ticket_summaries.append({
+                "ticket_id":      t.get("ticket_id"),
+                "subject":        t.get("subject"),
+                "status":         t.get("status"),
+                "priority":       t.get("priority"),
+                "assignee":       t.get("assignee"),
+                "feature_area":   t.get("feature_area"),
+                "created":        (t.get("created") or "")[:10],
+                "last_comment_at": (t.get("last_comment_at") or "")[:10],
+                "cbses":          t.get("cbses") or [],
+                "jira_issues":    t.get("jira_issues") or [],
+                "temperature":    sc.get("temperature"),
+                "stars":          sc.get("stars"),
+                "complexity":     sc.get("complexity"),
+                "interaction_summary": sc.get("interaction_summary"),
+            })
+
+        p1 = [t for t in tickets if (t.get("priority") or "").lower() in ("urgent", "p1")]
+        p2 = [t for t in tickets if (t.get("priority") or "").lower() in ("high", "p2")]
+
+        briefing.append({
+            "organization":   org,
+            "active_count":   len(tickets),
+            "p1_count":       len(p1),
+            "p2_count":       len(p2),
+            "tickets":        ticket_summaries,
+        })
+
+    total_active = sum(e.get("active_count", 0) for e in briefing)
+    total_p1     = sum(e.get("p1_count", 0) for e in briefing)
+
+    return json.dumps({
+        "briefing_date": __import__("datetime").date.today().isoformat(),
+        "orgs_queried":  len(orgs),
+        "total_active":  total_active,
+        "total_p1":      total_p1,
+        "fleet":         briefing,
+    }, default=str)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONNECTIVITY
 # ─────────────────────────────────────────────────────────────────────────────
