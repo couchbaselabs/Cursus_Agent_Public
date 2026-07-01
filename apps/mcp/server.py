@@ -811,6 +811,661 @@ def get_asset(asset_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BRAND / REPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TEMPLATES_DIR = _ROOT / "docs" / "templates"
+
+
+def _load_template(name: str) -> str:
+    return (_TEMPLATES_DIR / name).read_text(encoding="utf-8")
+
+
+def _ensure_brands_collection(cluster: Any, bucket: str, scope: str = "transcripts") -> None:
+    try:
+        cm = cluster.bucket(bucket).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if "brands" not in existing.get(scope, set()):
+            from couchbase.management.collections import CollectionSpec
+            cm.create_collection(CollectionSpec("brands", scope_name=scope))
+    except Exception:
+        pass
+
+
+@mcp.tool()
+def save_customer_brand(
+    organization: str,
+    primary_color: str = "",
+    secondary_color: str = "",
+    accent_color: str = "",
+    logo_url: str = "",
+    font_family: str = "",
+    terminology: dict | None = None,
+) -> str:
+    """
+    Save a customer brand kit to Couchbase. The kit is applied when generating
+    health or ticket reports for that organization (colors override the default
+    Couchbase blue palette; terminology replaces generic labels like 'ticket').
+
+    Args:
+        organization:    Customer org name (exact match used for lookups).
+        primary_color:   CSS color for the brand's primary shade (e.g. '#0050A0').
+        secondary_color: CSS color for the secondary accent.
+        accent_color:    CSS color for highlights/CTAs.
+        logo_url:        URL or data-URI for the customer logo image.
+        font_family:     CSS font-family string to override the default sans-serif.
+        terminology:     Dict of label overrides, e.g. {'ticket': 'case', 'P1': 'Sev1'}.
+    """
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions
+    from couchbase.auth import PasswordAuthenticator
+    from datetime import timedelta
+    cfg = _cfg()
+    app = _app()
+    conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+    try:
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        cl.wait_until_ready(timedelta(seconds=10))
+        _ensure_brands_collection(cl, cfg["bucket"], cfg["scope"])
+        doc = {
+            "type":            "brand",
+            "organization":    organization,
+            "primary_color":   primary_color,
+            "secondary_color": secondary_color,
+            "accent_color":    accent_color,
+            "logo_url":        logo_url,
+            "font_family":     font_family,
+            "terminology":     terminology or {},
+            "updated_at":      int(time.time()),
+        }
+        key = f"brand::{organization.lower().replace(' ', '_')}"
+        cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("brands").upsert(key, doc)
+        cl.close()
+        return json.dumps({"saved": True, "organization": organization, "key": key})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def get_customer_brand(organization: str) -> str:
+    """
+    Retrieve a previously saved brand kit for a customer.
+
+    Args:
+        organization: Customer org name.
+    """
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions
+    from couchbase.auth import PasswordAuthenticator
+    from datetime import timedelta
+    cfg = _cfg()
+    app = _app()
+    conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+    try:
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        cl.wait_until_ready(timedelta(seconds=10))
+        key = f"brand::{organization.lower().replace(' ', '_')}"
+        result = cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("brands").get(key)
+        cl.close()
+        return json.dumps(result.content_as[dict], default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "organization": organization})
+
+
+# ── Report HTML builders ──────────────────────────────────────────────────────
+
+def _brand_css_overrides(brand: dict) -> str:
+    """Return a <style> block overriding CSS vars from the brand kit (empty if no brand)."""
+    lines = []
+    if brand.get("primary_color"):
+        lines.append(f"    --cb: {brand['primary_color']};")
+        lines.append(f"    --cb-light: {brand['primary_color']}22;")
+    if brand.get("secondary_color"):
+        lines.append(f"    --good: {brand['secondary_color']};")
+    if brand.get("accent_color"):
+        lines.append(f"    --warn: {brand['accent_color']};")
+    if brand.get("font_family"):
+        lines.append(f"    font-family: {brand['font_family']}, -apple-system, sans-serif;")
+    if not lines:
+        return ""
+    inner = "\n".join(lines)
+    return f"\n<style>\n  :root {{\n{inner}\n  }}\n</style>"
+
+
+def _build_health_report_html(org: str, tickets: list[dict], report_date: str, brand: dict) -> str:
+    """Generate a full health report HTML document from live CB ticket data."""
+    import datetime as _dt
+    from collections import Counter, defaultdict
+
+    term = brand.get("terminology") or {}
+    t_ticket = term.get("ticket", "Ticket")
+    t_p1 = term.get("P1", "P1")
+
+    now_ts = _dt.datetime.utcnow()
+    all_t = tickets
+
+    # ── Aggregate stats ──────────────────────────────────────────────────────
+    total = len(all_t)
+    open_t = [t for t in all_t if (t.get("status") or "").lower() in ("open", "pending", "on-hold", "hold")]
+    closed_t = [t for t in all_t if (t.get("status") or "").lower() in ("solved", "closed")]
+    closed_rate = f"{len(closed_t)/total*100:.1f}%" if total else "—"
+
+    def _priority(t: dict) -> str:
+        p = (t.get("priority") or "").lower()
+        if p in ("urgent", "p1"): return "P1"
+        if p in ("high", "p2"):   return "P2"
+        if p in ("normal", "p3"): return "P3"
+        if p in ("low", "p4"):    return "P4"
+        return "P?"
+
+    priority_counts: Counter = Counter(_priority(t) for t in all_t)
+    open_priority: Counter = Counter(_priority(t) for t in open_t)
+
+    # P1 tickets in last 12 months
+    cutoff_12mo = (now_ts - _dt.timedelta(days=365)).isoformat()
+    p1_12mo = [t for t in all_t if _priority(t) == "P1" and (t.get("created") or "") >= cutoff_12mo]
+    p1_90d  = [t for t in all_t if _priority(t) == "P1" and (t.get("created") or "") >= (now_ts - _dt.timedelta(days=90)).isoformat()]
+
+    # Resolution time for solved P1s
+    def _res_days(t: dict) -> float | None:
+        c = t.get("created") or ""
+        u = t.get("updated") or ""
+        if c and u:
+            try:
+                d = (_dt.datetime.fromisoformat(u[:19]) - _dt.datetime.fromisoformat(c[:19])).days
+                return max(d, 0)
+            except Exception:
+                pass
+        return None
+
+    solved_p1 = [t for t in p1_12mo if (t.get("status") or "").lower() in ("solved", "closed")]
+    p1_res = [_res_days(t) for t in solved_p1 if _res_days(t) is not None]
+    avg_p1_res = f"{sum(p1_res)/len(p1_res):.1f}d" if p1_res else "—"
+
+    # Monthly volume — last 10 months
+    monthly: dict[str, int] = defaultdict(int)
+    for t in all_t:
+        c = t.get("created") or ""
+        if len(c) >= 7:
+            monthly[c[:7]] += 1
+    sorted_months = sorted(monthly.keys())[-10:]
+    month_counts = [monthly[m] for m in sorted_months]
+    max_cnt = max(month_counts, default=1) or 1
+    month_labels = [_dt.datetime.strptime(m, "%Y-%m").strftime("%b") for m in sorted_months]
+
+    trend_bars_html = ""
+    for i, (lbl, cnt) in enumerate(zip(month_labels, month_counts)):
+        cls = "trend-bar current" if i == len(month_labels) - 1 else "trend-bar"
+        pct = max(int(cnt / max_cnt * 100), 4)
+        trend_bars_html += f'      <div class="trend-col"><div class="{cls}" style="height:{pct}%;"><span class="trend-bar-val">{cnt}</span></div></div>\n'
+    trend_labels_html = "".join(f'      <span class="trend-lbl">{l}</span>\n' for l in month_labels)
+
+    # Priority mix bar
+    tot_nonzero = max(sum(priority_counts.values()), 1)
+    def _pct(k): return f"{priority_counts.get(k, 0) / tot_nonzero * 100:.1f}"
+    mix_bar_html = f"""
+      <div class="mix-seg" style="width:{_pct('P1')}%;background:var(--crit);" title="P1:{priority_counts.get('P1',0)}">P1</div>
+      <div class="mix-seg" style="width:{_pct('P2')}%;background:var(--warn);" title="P2:{priority_counts.get('P2',0)}">P2</div>
+      <div class="mix-seg" style="width:{_pct('P3')}%;background:var(--cb);" title="P3:{priority_counts.get('P3',0)}">P3</div>
+      <div class="mix-seg" style="width:{_pct('P4')}%;background:var(--neutral);" title="P4:{priority_counts.get('P4',0)}">P4</div>"""
+
+    mix_legend_html = "".join(
+        f'      <div class="mix-legend-item"><span class="mix-swatch" style="background:var(--{col});"></span> {pri} — {priority_counts.get(pri,0)} ({_pct(pri)}%)</div>\n'
+        for pri, col in [("P1","crit"),("P2","warn"),("P3","cb"),("P4","neutral")]
+    )
+
+    # Feature area bars — top 6 lifetime
+    area_counter: Counter = Counter()
+    for t in all_t:
+        fa = (t.get("feature_area") or "").strip()
+        if fa:
+            area_counter[fa] += 1
+    top_areas = area_counter.most_common(6)
+    max_area = top_areas[0][1] if top_areas else 1
+    hbar_html = ""
+    for area, cnt in top_areas:
+        pct = int(cnt / max_area * 100)
+        hbar_html += f'    <div class="hbar-row"><div class="hbar-label">{area}</div><div class="hbar-track"><div class="hbar-fill" style="width:{pct}%;"></div></div><div class="hbar-val">{cnt}</div></div>\n'
+
+    # Recent 90-day feature areas
+    cutoff_90 = (now_ts - _dt.timedelta(days=90)).isoformat()
+    recent_t = [t for t in all_t if (t.get("created") or "") >= cutoff_90]
+    recent_area: Counter = Counter()
+    for t in recent_t:
+        fa = (t.get("feature_area") or "").strip()
+        if fa:
+            recent_area[fa] += 1
+    top_recent = recent_area.most_common(4)
+    max_recent = top_recent[0][1] if top_recent else 1
+    hbar_recent_html = ""
+    for area, cnt in top_recent:
+        pct = int(cnt / max_recent * 100)
+        hbar_recent_html += f'    <div class="hbar-row"><div class="hbar-label">{area}</div><div class="hbar-track"><div class="hbar-fill recent" style="width:{pct}%;"></div></div><div class="hbar-val">{cnt}</div></div>\n'
+
+    # P1 incident log
+    p1_rows_html = ""
+    for t in sorted(p1_12mo, key=lambda x: x.get("created") or "", reverse=True)[:10]:
+        tid = t.get("ticket_id", "")
+        subj = (t.get("subject") or "—")[:70]
+        assignee = t.get("assignee") or "—"
+        opened = (t.get("created") or "")[:10]
+        status = (t.get("status") or "").lower()
+        if status in ("solved", "closed"):
+            rd = _res_days(t)
+            rd_str = f"{rd:.0f} days" if rd is not None else "—"
+            pill_cls = "days-fast" if rd is not None and rd < 2 else ("days-mid" if rd is not None and rd < 14 else "days-slow")
+            res_cell = f'<span class="days-pill {pill_cls}">{rd_str}</span>'
+        else:
+            res_cell = '<span class="days-pill days-open">Open</span>'
+        p1_rows_html += f"          <tr><td>#{tid}</td><td><strong>{subj}</strong></td><td>{assignee}</td><td>{opened}</td><td>{res_cell}</td></tr>\n"
+
+    # Open ticket list
+    open_rows_html = ""
+    for t in sorted(open_t, key=lambda x: x.get("created") or "")[:8]:
+        tid = t.get("ticket_id", "")
+        subj = (t.get("subject") or "—")[:65]
+        pri = _priority(t)
+        pri_cls = {"P1":"crit","P2":"warn","P3":"cb","P4":"neutral"}.get(pri, "neutral")
+        created = t.get("created") or ""
+        age_days = (now_ts - _dt.datetime.fromisoformat(created[:19])).days if created else 0
+        age_str = f"{age_days} days old"
+        open_rows_html += f'      <div class="mini-row"><span class="mini-id">#{tid}</span><span class="mini-subject">{subj}</span><span class="pill pill-{pri_cls}">{pri}</span><span class="mini-age">{age_str}</span></div>\n'
+
+    # KPI open breakdown
+    open_breakdown = " · ".join(f"{v} {k}" for k, v in sorted(open_priority.items()) if v)
+
+    brand_css = _brand_css_overrides(brand)
+    logo_html = f'<img src="{brand["logo_url"]}" alt="{org} logo" style="height:28px;object-fit:contain;">' if brand.get("logo_url") else ""
+
+    tpl = _load_template("customer_health_report_template.html")
+
+    # Inject brand CSS after <head>
+    if brand_css:
+        tpl = tpl.replace("</head>", f"{brand_css}\n</head>", 1)
+
+    # Simple token replacements
+    tpl = tpl.replace("ORG_NAME", org)
+    tpl = tpl.replace("REPORT_DATE", report_date)
+
+    # Swap in dynamic sections via known sentinel comments in the template
+    # (We regenerate the data sections wholesale rather than per-value substitution)
+    # Replace trend chart
+    import re as _re
+    tpl = _re.sub(
+        r'(<div class="trend-chart">).*?(</div>\s*\n\s*<div class="trend-labels">).*?(</div>\s*\n\s*</div>)',
+        lambda m: f'{m.group(1)}\n{trend_bars_html}    {m.group(2)}\n{trend_labels_html}    {m.group(3)}',
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # Replace mix bar
+    tpl = _re.sub(
+        r'(<div class="mix-bar">).*?(</div>\s*\n\s*<div class="mix-legend">).*?(</div>\s*\n\s*</div>)',
+        lambda m: f'{m.group(1)}{mix_bar_html}\n    {m.group(2)}\n{mix_legend_html}    {m.group(3)}',
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # Inject KPI values (page-subtitle)
+    tpl = _re.sub(
+        r'(<div class="page-subtitle">)[^<]*(</div>)',
+        f'\\g<1>{total} {t_ticket.lower()}s on record · Generated {report_date}\\g<2>',
+        tpl, count=1,
+    )
+
+    # Replace KPI tiles dynamically
+    kpi_block = f"""  <div class="kpi-grid">
+    <div class="kpi-tile"><span class="kpi-val cb">{total}</span><span class="kpi-lbl">Total {t_ticket}s</span></div>
+    <div class="kpi-tile"><span class="kpi-val crit">{len(open_t)}</span><span class="kpi-lbl">Open Now</span><span class="kpi-sub">{open_breakdown or "—"}</span></div>
+    <div class="kpi-tile"><span class="kpi-val warn">{priority_counts.get('P1',0)}</span><span class="kpi-lbl">{t_p1}s Lifetime</span><span class="kpi-sub">{_pct('P1')}% of all tickets</span></div>
+    <div class="kpi-tile"><span class="kpi-val warn">{len(p1_90d)}</span><span class="kpi-lbl">{t_p1}s Last 90 Days</span></div>
+    <div class="kpi-tile"><span class="kpi-val good">{avg_p1_res}</span><span class="kpi-lbl">Avg {t_p1} Resolution</span><span class="kpi-sub">solved in last 12 mo, n={len(solved_p1)}</span></div>
+    <div class="kpi-tile"><span class="kpi-val good">{closed_rate}</span><span class="kpi-lbl">Closed Rate</span><span class="kpi-sub">{len(closed_t)} closed / {total} total</span></div>
+  </div>"""
+    tpl = _re.sub(r'<div class="kpi-grid">.*?</div>\s*\n\s*\n', kpi_block + "\n\n", tpl, flags=_re.DOTALL, count=1)
+
+    # Replace hbar section
+    tpl = _re.sub(
+        r'(<div class="card-title">Feature area — lifetime[^<]*</div>\s*\n)(.*?)(<div class="hbar-group-title"[^>]*>[^<]*</div>)(.*?)(<div class="callout)',
+        lambda m: f'{m.group(1)}{hbar_html}    {m.group(3)}\n{hbar_recent_html}    {m.group(5)}',
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # Replace P1 incident table rows
+    tpl = _re.sub(
+        r'(<tbody>\s*\n)(.*?)(</tbody>)',
+        lambda m: f'{m.group(1)}{p1_rows_html}        {m.group(3)}',
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # Replace open ticket mini-list
+    tpl = _re.sub(
+        r'(<div class="mini-list">\s*\n)(.*?)(</div>\s*\n\s*</div>\s*\n\s*<!--.*?RECOMMENDATIONS)',
+        lambda m: f'{m.group(1)}{open_rows_html}    {m.group(3)}',
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # Update open count in section label
+    tpl = _re.sub(
+        r'Currently Open \(\d+ Tickets?\)',
+        f'Currently Open ({len(open_t)} {t_ticket}s)',
+        tpl, count=1,
+    )
+
+    # Inject logo if brand provides one
+    if logo_html:
+        tpl = tpl.replace(
+            '<div class="fleet-logo">',
+            f'<div class="fleet-logo">{logo_html}',
+            1,
+        )
+
+    return tpl
+
+
+def _build_cadence_report_html(ticket: dict, brand: dict) -> str:
+    """Generate a response cadence visualization for a single ticket."""
+    import datetime as _dt
+
+    tid     = ticket.get("ticket_id", "?")
+    subject = ticket.get("subject", "—")
+    org     = ticket.get("organization", "")
+
+    comments = ticket.get("comments") or []
+    if not comments:
+        return f"<html><body><p>No comment history for ticket #{tid}.</p></body></html>"
+
+    # Parse timestamps and label each comment as CB or CX
+    events: list[dict] = []
+    for c in comments:
+        ts_raw = c.get("created_at") or c.get("timestamp") or ""
+        try:
+            ts = _dt.datetime.fromisoformat(ts_raw[:19])
+        except Exception:
+            continue
+        author = (c.get("author") or c.get("author_name") or "").strip()
+        author_type = c.get("author_type") or ("cb" if c.get("is_internal") or c.get("internal") else "cx")
+        events.append({"ts": ts, "author": author, "type": author_type, "body": (c.get("body") or "")[:120]})
+
+    events.sort(key=lambda e: e["ts"])
+
+    if len(events) < 2:
+        return f"<html><body><p>Insufficient comment history for ticket #{tid}.</p></body></html>"
+
+    # Compute gaps between consecutive events
+    gaps: list[dict] = []
+    for i in range(len(events) - 1):
+        a, b = events[i], events[i + 1]
+        wall_h = (b["ts"] - a["ts"]).total_seconds() / 3600
+        # Rough biz hours: count weekday hours 9-17 UTC in the gap
+        biz_h = 0.0
+        cur = a["ts"]
+        end = b["ts"]
+        while cur < end:
+            nxt = min(cur + _dt.timedelta(hours=1), end)
+            if cur.weekday() < 5 and 9 <= cur.hour < 17:
+                biz_h += (nxt - cur).total_seconds() / 3600
+            cur = nxt
+        off_h = wall_h - biz_h
+        is_switch = b["type"] != a["type"]
+        is_warn = is_switch and biz_h > 8 and b["type"] == "cb"
+        gaps.append({
+            "from": a, "to": b,
+            "wall_h": wall_h, "biz_h": biz_h, "off_h": off_h,
+            "switch": is_switch, "warn": is_warn,
+        })
+
+    max_gap_h = max((g["wall_h"] for g in gaps), default=1) or 1
+    total_h   = (events[-1]["ts"] - events[0]["ts"]).total_seconds() / 3600
+    date_range = f"{events[0]['ts'].strftime('%b %d')} – {events[-1]['ts'].strftime('%b %d, %Y')}"
+
+    cb_engineers = sorted({e["author"] for e in events if e["type"] == "cb"})
+    cx_names     = sorted({e["author"] for e in events if e["type"] == "cx"})
+
+    brand_css = _brand_css_overrides(brand)
+
+    tpl = _load_template("cadence_template.html")
+
+    if brand_css:
+        tpl = tpl.replace("</head>", f"{brand_css}\n</head>", 1) if "</head>" in tpl else brand_css + tpl
+
+    tpl = tpl.replace("TICKET_ID", str(tid))
+    tpl = tpl.replace("TICKET_SUBJECT", subject[:80])
+    tpl = tpl.replace("ORG_NAME", org)
+    tpl = tpl.replace("CB_ENGINEERS", ", ".join(cb_engineers) or "Couchbase Support")
+    tpl = tpl.replace("CX_NAMES", ", ".join(cx_names) or org)
+    tpl = tpl.replace("TIMEZONE_NOTE", "Timestamps UTC")
+    tpl = tpl.replace("BIZ_HOURS_LABEL", "Mon–Fri 09:00–17:00 UTC")
+    tpl = tpl.replace("TOTAL_HOURS", f"{total_h:.1f}h")
+    tpl = tpl.replace("DATE_RANGE", date_range)
+    tpl = tpl.replace("MAX_GAP", f"{max_gap_h:.1f}h")
+
+    # Build gap rows
+    gap_rows_html = ""
+    for g in gaps:
+        biz_pct = int(g["biz_h"] / max_gap_h * 100) if max_gap_h else 0
+        off_pct = int(g["off_h"] / max_gap_h * 100) if max_gap_h else 0
+        wall = f"{g['wall_h']:.1f}h"
+        biz  = f"{g['biz_h']:.1f}h"
+        off  = f"{g['off_h']:.1f}h"
+        who  = g["to"]["author"] or g["to"]["type"].upper()
+        when = g["to"]["ts"].strftime("%b %d %H:%M")
+        note = (g["to"]["body"] or "")[:80]
+
+        row_cls = "gap-row switch" if g["switch"] else "gap-row"
+        if g["warn"]:
+            row_cls += " warn-row"
+
+        side   = g["to"]["type"]
+        arrow  = "↩" if g["switch"] else "↓"
+        seg_cls = "warn-active" if g["warn"] else "active"
+        num_cls = "warn-c" if g["warn"] else "act-c"
+        label_cls = g["to"]["type"]
+
+        gap_rows_html += f"""  <div class="{row_cls}">
+    <div class="gap-label">
+      <span class="gap-who {label_cls}">{arrow} {who}</span>
+      <span class="gap-note">{note}</span>
+    </div>
+    <div class="bar-group">
+      <div class="bar-track">
+        <div class="bar-seg {seg_cls}" style="width:{biz_pct}%"></div>
+        <div class="bar-seg off" style="width:{off_pct}%"></div>
+      </div>
+      <div class="bar-meta">
+        <span>{biz} biz hrs</span><span>·</span><span>{off} off</span>
+        <span style="margin-left:auto">{when}</span>
+      </div>
+    </div>
+    <div class="num-cell {num_cls}">{wall}</div>
+    <div class="num-cell {num_cls}">{biz}</div>
+    <div class="num-cell off-c">{off}</div>
+    <div></div>
+  </div>\n"""
+
+    # Replace example gap rows in template with dynamic rows
+    import re as _re
+    tpl = _re.sub(
+        r'<!-- EXAMPLE:.*?<!-- EXAMPLE: Awaiting.*?</div>\s*\n\n',
+        gap_rows_html + "\n",
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    return tpl
+
+
+@mcp.tool()
+def generate_health_report(
+    organization: str,
+    ae_name: str = "",
+    ae_email: str = "",
+    tse_name: str = "",
+    pse_name: str = "",
+    max_tickets: int = 500,
+) -> str:
+    """
+    Generate a customer health report HTML document from live Couchbase ticket data
+    and save it as an asset. Customer brand colors/logo are applied automatically
+    if a brand kit exists for the org (see save_customer_brand).
+
+    Returns the saved asset ID and a download/view path.
+
+    Args:
+        organization: Customer org name.
+        ae_name:      Account Executive name for the report header.
+        ae_email:     AE email.
+        tse_name:     Technical Support Engineer name.
+        pse_name:     Principal/Field SE name.
+        max_tickets:  Max tickets to pull for stats (default 500).
+    """
+    import datetime as _dt
+    from supportal.agent_tools import _save_asset_to_cb
+
+    cfg  = _cfg()
+    app  = _app()
+    report_date = _dt.date.today().strftime("%B %-d, %Y")
+
+    # Pull tickets
+    try:
+        tickets = app.tool_query_tickets(
+            {"organization": organization, "limit": min(max_tickets, 500)},
+            *_cb_tuple(cfg),
+            limit=min(max_tickets, 500),
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to query tickets: {exc}"})
+
+    if not tickets:
+        return json.dumps({"error": f"No tickets found for organization '{organization}'."})
+
+    # Fetch brand (optional)
+    brand: dict = {}
+    try:
+        raw = get_customer_brand(organization)
+        brand = json.loads(raw)
+        if "error" in brand:
+            brand = {}
+    except Exception:
+        pass
+
+    # Build HTML
+    try:
+        html = _build_health_report_html(organization, tickets, report_date, brand)
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to build report: {exc}"})
+
+    # Stamp in team contacts
+    html = html.replace("AE_NAME", ae_name or "—")
+    html = html.replace("AE_EMAIL", ae_email or "")
+    html = html.replace("TSE_NAME", tse_name or "—")
+    html = html.replace("PSE_NAME", pse_name or "—")
+
+    # Save to CB
+    try:
+        cb_a = (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+                cfg["use_tls"], cfg["scope"])
+        safe_org = organization.lower().replace(" ", "_")
+        fname = f"health_report_{safe_org}_{_dt.date.today().isoformat()}.html"
+        asset_id = _save_asset_to_cb(
+            *cb_a,
+            asset_type="html",
+            title=f"{organization} Health Report — {report_date}",
+            content=html,
+            org=organization,
+            filename=fname,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to save asset: {exc}", "html_length": len(html)})
+
+    return json.dumps({
+        "saved": True,
+        "asset_id": asset_id,
+        "filename": fname,
+        "organization": organization,
+        "ticket_count": len(tickets),
+        "report_date": report_date,
+    })
+
+
+@mcp.tool()
+def generate_ticket_report(ticket_id: str) -> str:
+    """
+    Generate a response cadence visualization for a support ticket and save it as
+    an HTML asset. Shows the back-and-forth timeline between Couchbase engineers
+    and the customer, with gap analysis (wall hours, business hours, off hours).
+    Customer brand is applied automatically if a brand kit exists.
+
+    Args:
+        ticket_id: Zendesk ticket ID (numeric string).
+    """
+    import datetime as _dt
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions
+    from couchbase.auth import PasswordAuthenticator
+    from datetime import timedelta
+    from supportal.agent_tools import _save_asset_to_cb
+
+    cfg = _cfg()
+    app = _app()
+
+    # Fetch full ticket
+    try:
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        cl.wait_until_ready(timedelta(seconds=10))
+        col = cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(cfg["collection"])
+        result = col.get(f"ticket::{ticket_id}")
+        ticket = result.content_as[dict]
+        cl.close()
+    except Exception as exc:
+        return json.dumps({"error": f"Could not fetch ticket {ticket_id}: {exc}"})
+
+    org = ticket.get("organization", "")
+
+    # Fetch brand (optional)
+    brand: dict = {}
+    if org:
+        try:
+            raw = get_customer_brand(org)
+            brand = json.loads(raw)
+            if "error" in brand:
+                brand = {}
+        except Exception:
+            pass
+
+    # Build HTML
+    try:
+        html = _build_cadence_report_html(ticket, brand)
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to build cadence report: {exc}"})
+
+    # Save to CB
+    try:
+        cb_a = (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+                cfg["use_tls"], cfg["scope"])
+        report_date = _dt.date.today().isoformat()
+        fname = f"cadence_{ticket_id}_{report_date}.html"
+        asset_id = _save_asset_to_cb(
+            *cb_a,
+            asset_type="html",
+            title=f"Ticket #{ticket_id} Cadence — {ticket.get('subject','')[:50]}",
+            content=html,
+            org=org,
+            filename=fname,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to save asset: {exc}", "html_length": len(html)})
+
+    comments = ticket.get("comments") or []
+    return json.dumps({
+        "saved": True,
+        "asset_id": asset_id,
+        "filename": fname,
+        "ticket_id": ticket_id,
+        "organization": org,
+        "comment_count": len(comments),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RESOURCES  (read-only data endpoints — appear in clients as browseable sources)
 # ─────────────────────────────────────────────────────────────────────────────
 

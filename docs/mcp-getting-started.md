@@ -249,6 +249,10 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `cancel_scrape_job` | Cancel a running scrape job by job ID |
 | `list_assets` | List saved charts, tables, reports filtered by org/type |
 | `get_asset` | Fetch a single asset with full content |
+| `generate_health_report` | Generate a full customer health report HTML from live CB data, apply brand colors, save as asset |
+| `generate_ticket_report` | Generate a response cadence visualization for a single ticket, save as HTML asset |
+| `save_customer_brand` | Save a customer brand kit (colors, logo, terminology) to CB |
+| `get_customer_brand` | Retrieve a saved brand kit for a customer |
 
 ## VPN requirement
 
