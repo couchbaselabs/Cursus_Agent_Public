@@ -16,23 +16,31 @@ flowchart TD
 
     PW["🎭 Playwright Browser Automation\nHeadless cookie scrape\nHeadful SSO login\nChange-detection pipeline"]
 
-    LLM["🤖 LLM Providers\nCloud: Claude · Gemini · OpenAI\nLocal: LMStudio :1234 · Ollama :11434\nChat + Embedding (1024-dim)"]
+    LLM["🤖 LLM Providers\nCloud: Claude · Gemini · OpenAI\nLocal: LMStudio :1234 · Ollama :11434\nChat + Embedding"]
 
-    CB[("🗄 Couchbase  localhost:8091\n─────────────────────\ntranscripts.tickets\ntranscripts.snapshots\ntranscripts.assets\n─────────────────────\nchat.history  chat.profiles\nchat.threads / steps / elements")]
+    CB[("🗄 Couchbase  localhost:8091\n─────────────────────\ntranscripts.tickets\ntranscripts.snapshots\ntranscripts.assets\ntranscripts.supportal\n─────────────────────\nchat.history  chat.profiles\nchat.threads / steps / elements")]
 
     ST["🖥 Strabo  localhost:8765\nConfiguration & profiles\nScraping (tickets & snapshots)\nAgent chat with ECharts\nScoring & Analytics\nCluster health view"]
 
     CX["💬 Corax  localhost:8766\nPassword auth\nThread sidebar (resume sessions)\nSame agent tools as Strabo\nAsset storage (charts & tables → CB)\nShared history with Strabo"]
 
+    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n14 tools — query · search · score\nrescrape · health · briefing · assets\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients"]
+
+    AI["🤖 AI Clients\nClaude Desktop\nClaude Code (TUI / GUI)\nCursor · Gemini · other MCP hosts"]
+
     EXT -->|"Playwright scraping"| PW
     EXT -->|"Analytics API (direct HTTP)"| ST
     EXT -->|"Analytics API (direct HTTP)"| CX
+    EXT -->|"Supportal API (rescrape)"| MCP
     PW -->|"upsert tickets & snapshots"| CB
     LLM <-->|"chat & embed inference"| ST
     LLM <-->|"chat & embed inference"| CX
+    LLM <-->|"embed & score (pipeline)"| MCP
     CB <-->|"query / FTS / vector search"| ST
     CB <-->|"thread & asset persistence"| CX
+    CB <-->|"read / write tickets & assets"| MCP
     ST <-->|"shared conversation history"| CX
+    AI <-->|"MCP stdio / SSE"| MCP
 ```
 
 ---
@@ -70,6 +78,7 @@ On first run `couchbase-init` configures the cluster (services, memory quotas, b
 |-----|-----|
 | Strabo (dashboard) | http://localhost:8765 |
 | Corax (chat) | http://localhost:8766 |
+| Cursus MCP (SSE) | http://localhost:8768 |
 | Couchbase Admin UI | http://localhost:8091 |
 
 **4. Configure Strabo**
@@ -284,13 +293,14 @@ Switch providers at runtime from the Strabo **AI Models** config tab or the Cora
 ## Project layout
 
 ```
-run_cursus.py              Launch Strabo + Corax with hot-reload (recommended)
+run_cursus.py              Launch Strabo + Corax (+ MCP in SSE mode) with hot-reload
 run_strabo.py              Launch Strabo only
 run_corax.py               Launch Corax only
+run_mcp.py                 Launch Cursus MCP server (stdio or SSE)
 apps/
   strabo/app.py            Strabo dashboard — NiceGUI, all UI logic
   corax/app.py             Corax chat handler — Chainlit, session management
-  mcp/server.py            MCP tool server for Claude Desktop
+  mcp/server.py            Cursus MCP server — 14 tools for Claude Desktop / Code
 supportal/
   agent_tools.py           All 40+ agent tool definitions + LLM tool-calling loop
   api_client.py            Supportal HTTP client (ticket listing, analytics, snapshots)
@@ -303,13 +313,15 @@ supportal/
   llm_providers.py         Multi-provider LLM client (Claude/Gemini/OpenAI/LMStudio/Ollama)
 tools/                     CLI utilities
 docker/
-  couchbase-init.sh        One-shot Couchbase cluster + bucket initialisation
+  couchbase-init.sh        One-shot Couchbase cluster + bucket + index initialisation
 docs/
   architecture.html        Interactive architecture diagram
+  workflow.html            Tool workflow reference
+  mcp-getting-started.md   MCP server setup guide (Claude Desktop & Claude Code)
 public/custom.css          Corax UI theme overrides
 requirements.txt           Python dependencies
-Dockerfile                 App image (python:3.14-slim + Playwright Chromium)
-docker-compose.yml         App + Couchbase + one-shot init service
+Dockerfile                 App image (python:3.12-slim + Playwright Chromium)
+docker-compose.yml         App + Couchbase + one-shot init service (ports 8765/8766/8768)
 .env.example               Environment variable template
 ```
 
@@ -333,8 +345,8 @@ Items below represent the planned development trajectory. Contributors should ch
 - **Fuzzy customer resolution** — 5-step chain (LIKE → local CB → Supportal FTS → per-word → difflib)
 - **Cursus supervisor** — watchfiles-based hot-reload; per-app restart routing; 2s debounce
 - **Fleet analytics** — `query_fleet_tickets`, `list_at_risk_clusters`, `fleet_version_distribution`, `fleet_cbse_impact`
-- **MCP tool server** — Claude Desktop integration via stdio transport
-- **Docker** — single `docker compose up` starts app + fully-initialised Couchbase
+- **MCP tool server** — 14 tools across tickets, customers, scrape jobs, and assets; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation; `get_morning_briefing` fleet briefing tool
+- **Docker** — single `docker compose up` starts app + fully-initialised Couchbase + MCP SSE server on :8768
 
 ### Phase 3 — Fleet dashboard (UI)
 
