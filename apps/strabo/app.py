@@ -10127,11 +10127,21 @@ def _run_rescrape_job_bg(
             _score_batch_sz = 20
             _total_scored = 0
             _scored_at = int(time.time())
-            # Reconnect for score save-back (may reuse _bcol if still open)
+            # Scoring runs after the scrape-phase cluster (_bcluster) has already
+            # been closed above — open a fresh connection rather than reusing it,
+            # the same way the enrich phase opens its own _eclust connection.
+            _scol = None
             try:
-                _scol = _bcluster.bucket(bucket).scope(scope).collection(collection)
-            except Exception:
-                _scol = None
+                from couchbase.cluster import Cluster as _SCl
+                from couchbase.options import ClusterOptions as _SCO
+                from couchbase.auth import PasswordAuthenticator as _SPA
+                _sconn   = _cb_conn_str(cb_url, use_tls)
+                _sclust  = _SCl(_sconn, _SCO(_SPA(username, password)))
+                _sclust.wait_until_ready(timedelta(seconds=10))
+                _scol = _sclust.bucket(bucket).scope(scope).collection(collection)
+            except Exception as exc:
+                job["last_message"] = f"Scoring save-back connection failed: {exc}"
+                job["errors"] += 1
             for _si in range(0, len(refreshed_tickets), _score_batch_sz):
                 _chunk = refreshed_tickets[_si:_si + _score_batch_sz]
                 _set_op(
@@ -10158,14 +10168,25 @@ def _run_rescrape_job_bg(
                                 _sdoc["score"] = {**(_sdoc.get("score") or {}), **_sc, "scored_at": _scored_at}
                                 _scol.upsert(_sdoc_key, _sdoc)
                                 _total_scored += 1
-                            except Exception:
-                                pass
-                    else:
-                        _total_scored += len(_score_results)
+                            except Exception as _wexc:
+                                job["errors"] += 1
+                                job["last_message"] = f"Failed to save score for ticket {_stid}: {_wexc}"
+                    elif _score_results:
+                        # No working CB connection — do not fake success.
+                        job["errors"] += len(_score_results)
+                        job["last_message"] = (
+                            f"Scored {len(_score_results)} tickets but had no CB connection "
+                            f"to save them — see earlier error."
+                        )
                     job["scored"] = _total_scored
                 except Exception as exc:
                     job["last_message"] = f"Scoring batch {_si // _score_batch_sz + 1} failed: {exc}"
                     job["errors"] += 1
+            try:
+                if _scol is not None:
+                    _sclust.close()
+            except Exception:
+                pass
 
         job["status"]      = "done"
         job["phase"]       = None
