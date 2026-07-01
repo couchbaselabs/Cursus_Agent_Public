@@ -42,6 +42,7 @@ _DEBOUNCE = 15.0
 # Files/dirs that trigger a restart of each app
 _STRABO_PATHS = {"apps/strabo", "run_strabo.py"}
 _CORAX_PATHS  = {"apps/corax",  "run_corax.py"}
+_MCP_PATHS    = {"apps/mcp",    "run_mcp.py"}
 _SHARED_PATHS = {"supportal"}   # changes here restart both
 
 
@@ -78,6 +79,15 @@ def _start_strabo(py: str, port: int) -> subprocess.Popen:
 def _start_corax(py: str, port: int) -> subprocess.Popen:
     return subprocess.Popen(
         [py, str(_HERE / "run_corax.py"), "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(_HERE),
+    )
+
+
+def _start_mcp(py: str, port: int) -> subprocess.Popen:
+    return subprocess.Popen(
+        [py, str(_HERE / "run_mcp.py"), "--transport", "sse", "--port", str(port)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=str(_HERE),
@@ -165,27 +175,33 @@ def main() -> None:
     args = sys.argv[1:]
     strabo_port = _parse_port(args, "--strabo-port", 8765)
     corax_port  = _parse_port(args, "--corax-port",  8766)
+    mcp_port    = _parse_port(args, "--mcp-port",    8768)
     no_watch    = "--no-watch" in args
+    run_mcp     = os.environ.get("MCP_TRANSPORT", "").lower() == "sse" or "--mcp" in args
 
     py = sys.executable
 
+    mcp_label = f"  {_GREY}MCP :{mcp_port}{_RESET}" if run_mcp else ""
     print(
         f"\n{_BOLD}Cursus{_RESET}  "
         f"{_BLUE}Strabo :{strabo_port}{_RESET}  "
         f"{_TEAL}Corax :{corax_port}{_RESET}"
+        + mcp_label
         + (f"  {_GREY}(watching for changes){_RESET}" if not no_watch else "")
-        + f"\n{_GREY}Press Ctrl+C to stop both.{_RESET}\n"
+        + f"\n{_GREY}Press Ctrl+C to stop all.{_RESET}\n"
     )
 
     strabo_fn = lambda: _start_strabo(py, strabo_port)
     corax_fn  = lambda: _start_corax(py, corax_port)
+    mcp_fn    = lambda: _start_mcp(py, mcp_port)
 
     strabo_holder: list = [strabo_fn()]
     corax_holder:  list = [corax_fn()]
+    mcp_holder:    list = [mcp_fn() if run_mcp else None]
 
     def _shutdown(sig=None, _frame=None) -> None:
         print(f"\n{_BOLD}[cursus]{_RESET} shutting down…")
-        for h in (strabo_holder, corax_holder):
+        for h in (strabo_holder, corax_holder, mcp_holder):
             p = h[0]
             if p:
                 try:
@@ -203,6 +219,10 @@ def main() -> None:
     threading.Thread(
         target=_stream, args=(corax_holder, "[corax] ", _TEAL), daemon=True
     ).start()
+    if run_mcp:
+        threading.Thread(
+            target=_stream, args=(mcp_holder, "[mcp]   ", _GREY), daemon=True
+        ).start()
 
     # If either process exits unexpectedly, bring down everything.
     # Only shutdown if the process that died is still the *current* one in the
@@ -223,6 +243,8 @@ def main() -> None:
 
     threading.Thread(target=_watch_exit, args=(strabo_holder, "strabo"), daemon=True).start()
     threading.Thread(target=_watch_exit, args=(corax_holder,  "corax"),  daemon=True).start()
+    if run_mcp:
+        threading.Thread(target=_watch_exit, args=(mcp_holder, "mcp"), daemon=True).start()
 
     if not no_watch:
         threading.Thread(

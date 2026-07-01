@@ -7,9 +7,11 @@ services:
     ports:
       - "8765:8765"   # Strabo dashboard
       - "8766:8766"   # Corax chat
+      - "8768:8768"   # Cursus MCP server (SSE transport — for remote MCP clients)
     environment:
       - SUPPORTAL_COOKIE=${SUPPORTAL_COOKIE:-}
       - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET:-}
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}   # stdio or sse; sse recommended inside Docker
     volumes:
       # Persist settings profiles and saved cookies between restarts
       - app-home:/root

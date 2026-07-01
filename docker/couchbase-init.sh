@@ -121,9 +121,15 @@ n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_tickets_org_date${BT} \
 ON ${KS_T}(organization, created DESC) \
 WHERE organization IS NOT MISSING AND ticket_id IS NOT MISSING"
 
-n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_tickets_org_status_priority${BT} \
-ON ${KS_T}(organization, status, priority, created DESC) \
-WHERE organization IS NOT MISSING AND ticket_id IS NOT MISSING"
+n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_active_tickets_lower_org_status${BT} \
+ON ${KS_T}(LOWER(organization), LOWER(status)) \
+WHERE type = 'ticket'"
+
+n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_scrape_jobs_type_started${BT} \
+ON ${KS_T}(type, started_at DESC, status)"
+
+n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_tickets_deleted_ticket_id${BT} \
+ON ${KS_T}(_deleted INCLUDE MISSING, ticket_id)"
 
 # Snapshots indexes
 n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_snaps_org_covering${BT} \
@@ -137,9 +143,11 @@ n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_snaps_ticket_ids${BT} \
 ON ${KS_SN}(DISTINCT ARRAY tid FOR tid IN ticket_ids END) \
 WHERE ticket_ids IS NOT MISSING"
 
-n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_snaps_org_date${BT} \
-ON ${KS_SN}(organization, date) \
-WHERE organization IS NOT MISSING"
+n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_snaps_type_bad_warn${BT} \
+ON ${KS_SN}(type, bad_items, warn_items, cb_version, cluster_name, organization, last_scraped_at)"
+
+n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_snaps_lower_org_date${BT} \
+ON ${KS_SN}(LOWER(organization), date DESC)"
 
 # Primary indexes — assets and chat.profiles (created lazily by the app, pre-created here)
 n1ql "CREATE PRIMARY INDEX IF NOT EXISTS \
