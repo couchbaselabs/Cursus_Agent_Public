@@ -106,8 +106,8 @@ The index is named `tickets_vector_idx` and lives under `rag.transcripts`.
 ### 4. Python environment
 
 ```bash
-git clone https://github.com/couchbaselabs/Cursus_Agent.git
-cd Cursus_Agent
+git clone https://github.com/couchbaselabs/Cursus_Agent_Public.git
+cd Cursus_Agent_Public
 
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
@@ -243,6 +243,7 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `list_customers` | All orgs with ticket counts |
 | `get_customer_health` | Open tickets, P1/P2 counts, top CBSEs for one customer |
 | `get_portfolio_status` | Fleet-wide ranking by P1/P2 open count |
+| `get_morning_briefing` | Fleet briefing across key accounts — active tickets, scores, CBSEs, summaries |
 | `get_scrape_status` | Check running or recent scrape job status |
 | `rescrape_customer_tickets` | Trigger a background Supportal refresh for a customer |
 | `cancel_scrape_job` | Cancel a running scrape job by job ID |

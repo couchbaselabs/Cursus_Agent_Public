@@ -141,6 +141,116 @@ Configure your Couchbase connection and AI models from the Strabo **Configuratio
 
 ---
 
+## First-run walkthrough
+
+After the app is running (Docker or local), complete these steps once to get data flowing.
+
+### Step 1 — Connect to Couchbase
+
+Open **Strabo** at `http://localhost:8765` → **Configuration → Couchbase**.
+
+| Field | Docker value | Local value |
+|---|---|---|
+| URL | `couchbase://couchbase` | `couchbase://localhost` |
+| Username | `Administrator` | your CB admin user |
+| Password | value from your `.env` | your CB admin password |
+| Bucket | `supportal` (or your choice) | same |
+
+Click **Save & Test** — the status dot should turn green. Strabo creates all required scopes, collections, and GSI indexes on first connect.
+
+---
+
+### Step 2 — Authenticate with Supportal
+
+Supportal (`supportal.couchbase.com`) is an internal host — **you must be on the Couchbase VPN**.
+
+Go to **Configuration → Auth** and choose one method:
+
+**Option A — Cookie paste (fastest)**
+1. Open `supportal.couchbase.com` in your browser
+2. Open DevTools → Application → Cookies → copy the `_zendesk_session` value
+3. Paste it into the **Session Cookie** field in Strabo and click **Save**
+
+**Option B — Browser SSO**
+1. Click **Open Browser** in Strabo — a Chromium window launches
+2. Complete the Okta SSO flow
+3. Click **Confirm Login** in Strabo — the cookie is saved automatically
+
+> Cookie sessions expire. If scraping starts failing, repeat this step.
+
+---
+
+### Step 3 — Configure an LLM provider
+
+Go to **Configuration → AI Models**. You need at minimum an **embedding** provider for vector search and a **scoring** provider for LLM analysis. They can be the same or different.
+
+| Provider | What to configure |
+|---|---|
+| **Ollama** (local, free) | Ensure Ollama is running; pull `nomic-embed-text` for embedding |
+| **LMStudio** (local, free) | Load a 1024-dim embed model + a chat model; set the base URL |
+| **Claude** | Paste your Anthropic API key |
+| **Gemini** | Paste your Google API key |
+| **OpenAI** | Paste your OpenAI API key |
+
+Click **Save** after configuring. The **Preflight** tab lets you test connectivity to each provider.
+
+---
+
+### Step 4 — Run your first scrape
+
+Go to **Scraping → Tickets**.
+
+1. Type a customer name in the **Organization** field (e.g. `Western Union`)
+2. Set **Max tickets** — start with `50` for a first run
+3. Click **Scrape** — progress appears in real time
+
+When the scrape finishes, Strabo automatically runs the **embed** and **score** pipeline on the fetched tickets. First run takes longer; subsequent runs use change detection to skip unchanged tickets.
+
+Verify the data landed:
+- Go to **Results** — tickets should appear in the table
+- Go to **Scoring & Analysis** — charts should populate with the scraped org
+
+---
+
+### Step 5 — Verify Couchbase
+
+Open the Couchbase Admin UI at `http://localhost:8091` → **Buckets** → click your bucket → **Documents**. You should see docs keyed `ticket::<zendesk_id>`.
+
+To check counts from the Query workbench:
+
+```sql
+SELECT COUNT(*) FROM `rag`.`transcripts`.`tickets` WHERE type = 'ticket';
+```
+
+---
+
+### Step 6 — (Optional) Wire the MCP server
+
+To use the 14 Cursus MCP tools from Claude Desktop or Claude Code, see **[`docs/mcp-getting-started.md`](docs/mcp-getting-started.md)** for the full setup guide.
+
+Quick summary for Claude Desktop — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "cursus": {
+      "command": "/path/to/Scraper/venv/bin/python",
+      "args": ["/path/to/Scraper/run_mcp.py"],
+      "alwaysAllow": [
+        "check_connectivity", "query_tickets", "get_ticket", "search_tickets",
+        "score_ticket", "list_customers", "get_customer_health", "get_portfolio_status",
+        "get_morning_briefing", "get_scrape_status", "rescrape_customer_tickets",
+        "cancel_scrape_job", "list_assets", "get_asset"
+      ]
+    }
+  }
+}
+```
+
+Restart Claude Desktop — the `cursus` tools appear immediately. Call `check_connectivity` first to confirm VPN and Couchbase are reachable before triggering a rescrape.
+
+---
+
 ## User interfaces
 
 ### Strabo — `localhost:8765`
