@@ -24,7 +24,7 @@ services:
   # couchbase-init services, then set the Strabo CB URL to
   # "couchbase://host.docker.internal" in the Configuration tab.
   couchbase:
-    image: couchbase/server:enterprise-7.6.3
+    image: couchbase/server:enterprise-8.0.1
     restart: unless-stopped
     ports:
       - "8091:8091"     # Admin UI
@@ -46,7 +46,7 @@ services:
   # Creates the cluster, bucket, scopes, collections, and all GSI indexes.
   # Idempotent — safe to restart; skips everything if already initialised.
   couchbase-init:
-    image: couchbase/server:enterprise-7.6.3
+    image: couchbase/server:enterprise-8.0.1
     restart: "no"
     environment:
       - CB_HOST=couchbase

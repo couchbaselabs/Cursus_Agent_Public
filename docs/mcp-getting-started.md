@@ -12,7 +12,7 @@ Cursus stores all ticket and chat data in Couchbase. You need a running instance
 
 | Requirement | Detail |
 |---|---|
-| Version | 7.2+ (Enterprise or Community; 7.6 recommended) |
+| Version | 7.2+ (Enterprise or Community; 8.0.1 recommended) |
 | Services | Data, Query, Search (FTS), Index |
 | Admin credentials | Any username/password with full bucket access |
 | Default bucket | `rag` (configurable — any name works) |
