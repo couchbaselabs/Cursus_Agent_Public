@@ -75,23 +75,29 @@ done
 log "Query service ready."
 
 # ── 8. Scopes ─────────────────────────────────────────────────────────────────
-log "Creating 'chat' scope..."
-curl -sf -u "${CB_USER}:${CB_PASS}" \
-    -X POST "${BASE}/pools/default/buckets/${CB_BUCKET}/scopes" \
-    -d "name=chat"
+log "Creating scopes..."
+SCOPES="${BASE}/pools/default/buckets/${CB_BUCKET}/scopes"
+
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}" -d "name=transcripts"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}" -d "name=chat"
 
 # ── 9. Collections ────────────────────────────────────────────────────────────
 log "Creating collections..."
-SCOPES="${BASE}/pools/default/buckets/${CB_BUCKET}/scopes"
 
-# _default scope: tickets, snapshots, assets
-curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/_default/collections" -d "name=tickets"
-curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/_default/collections" -d "name=snapshots"
-curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/_default/collections" -d "name=assets"
+# transcripts scope: ticket data, snapshots, assets, customer brand kits
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=tickets"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=snapshots"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=assets"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=brands"
 
-# chat scope: history, profiles
+# chat scope: Corax conversation persistence
 curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=history"
 curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=profiles"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=threads"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=steps"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=elements"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=feedback"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=users"
 
 log "Collections created. Waiting for indexer..."
 sleep 5
@@ -101,8 +107,8 @@ log "Creating GSI indexes..."
 
 # Backtick character — avoids shell command-substitution when used in double-quoted strings
 BT='`'
-KS_T="${BT}${CB_BUCKET}${BT}.${BT}_default${BT}.${BT}tickets${BT}"
-KS_SN="${BT}${CB_BUCKET}${BT}.${BT}_default${BT}.${BT}snapshots${BT}"
+KS_T="${BT}${CB_BUCKET}${BT}.${BT}transcripts${BT}.${BT}tickets${BT}"
+KS_SN="${BT}${CB_BUCKET}${BT}.${BT}transcripts${BT}.${BT}snapshots${BT}"
 
 n1ql() {
     curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${N1QL}" --data-urlencode "statement=$1"
@@ -149,9 +155,12 @@ ON ${KS_SN}(type, bad_items, warn_items, cb_version, cluster_name, organization,
 n1ql "CREATE INDEX IF NOT EXISTS ${BT}idx_snaps_lower_org_date${BT} \
 ON ${KS_SN}(LOWER(organization), date DESC)"
 
-# Primary indexes — assets and chat.profiles (created lazily by the app, pre-created here)
+# Primary indexes — assets, brands, chat.profiles (created lazily by the app, pre-created here)
 n1ql "CREATE PRIMARY INDEX IF NOT EXISTS \
-ON ${BT}${CB_BUCKET}${BT}.${BT}_default${BT}.${BT}assets${BT}"
+ON ${BT}${CB_BUCKET}${BT}.${BT}transcripts${BT}.${BT}assets${BT}"
+
+n1ql "CREATE PRIMARY INDEX IF NOT EXISTS \
+ON ${BT}${CB_BUCKET}${BT}.${BT}transcripts${BT}.${BT}brands${BT}"
 
 n1ql "CREATE PRIMARY INDEX IF NOT EXISTS \
 ON ${BT}${CB_BUCKET}${BT}.${BT}chat${BT}.${BT}profiles${BT}"

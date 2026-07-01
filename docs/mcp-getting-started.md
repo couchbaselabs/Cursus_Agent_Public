@@ -40,6 +40,7 @@ The following are created automatically by Strabo or Corax on first run. If you 
 | `transcripts` | `tickets` | Support ticket documents (one doc per ticket) |
 | `transcripts` | `snapshots` | Cluster topology snapshots linked to tickets |
 | `transcripts` | `assets` | Saved charts, tables, reports, images, PDFs |
+| `transcripts` | `brands` | Customer brand kits (colors, logo, terminology) |
 | `chat` | `users` | Corax user accounts |
 | `chat` | `threads` | Corax conversation threads |
 | `chat` | `steps` | Corax message steps (tool calls, messages) |
@@ -73,7 +74,7 @@ cm  = bkt.collections()
 existing = {s.name: {col.name for col in s.collections} for s in cm.get_all_scopes()}
 
 for scope, cols in {
-    "transcripts": ["tickets", "snapshots", "assets"],
+    "transcripts": ["tickets", "snapshots", "assets", "brands"],
     "chat":        ["users", "threads", "steps", "elements", "feedback", "assets"],
 }.items():
     if scope not in existing:
