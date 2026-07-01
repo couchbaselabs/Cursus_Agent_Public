@@ -709,7 +709,7 @@ def rescrape_customer_tickets(
         }
         result = app._execute_agent_tool(
             "rescrape_customer_tickets",
-            {"organization": organization, "max_tickets": max_tickets, "stale_hours": stale_hours},
+            {"customer": organization, "max_tickets": max_tickets, "stale_hours": stale_hours},
             *_cb_tuple(cfg),
             ctx=ctx,
         )
