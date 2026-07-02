@@ -14979,15 +14979,55 @@ def classify_ticket_feature(ticket: dict) -> str:
             or "component__search" in tags or "full-text" in subject or "fts" in subject):
         return "Full-Text Search"
     if ("query" in comp or "n1ql" in comp
-            or "component__query" in tags or "n1ql" in subject or "sql++" in subject):
+            or "component__query" in tags or "component__n1ql__" in tags
+            or "component__server__query" in tags
+            or "n1ql" in subject or "sql++" in subject):
         return "Query / N1QL / SQL++"
-    if ("index" in comp or "component__index" in tags or "index" in subject):
+    if ("index" in comp or "component__index" in tags
+            or "component__server__secondary_index" in tags or "index" in subject):
         return "Indexing"
     if ("kv" in comp or "key_value" in comp or "bucket" in comp
-            or "component__server__couchbase_bucket" in tags or "key value" in subject):
+            or "component__server__couchbase_bucket" in tags
+            or "component__server__service__data" in tags or "key value" in subject):
         return "Data / KV"
     if "eventing" in comp or "eventing" in tags or "eventing" in subject:
         return "Eventing"
+    if "component__client__" in tags or "component__framework_and_library__" in tags:
+        return "SDK"
+    if "component__sync_gateway__" in tags:
+        return "Sync Gateway / App Services"
+    if "component__server__tools__cbbackup" in tags or "component__server__tools__cbrestore" in tags:
+        return "Backup / Restore"
+    if ("component__server__tools__" in tags or "component__tools__cbtools" in tags):
+        return "CLI Tools"
+    if "component__server__cluster_manager" in tags:
+        return "Cluster Management"
+    if "component__server__rebalance" in tags:
+        return "Rebalance / Cluster Ops"
+    if "component__server__installer" in tags:
+        return "Installation / Upgrade"
+    if "component__server__certificates" in tags or "component__server__ldap" in tags:
+        return "Security / Certificates"
+    if "component__server__ui" in tags:
+        return "Web UI"
+    if "component__server__views" in tags:
+        return "Views"
+    if "component__server__storage_engine__" in tags:
+        return "Storage Engine"
+    if "component__server__rest_api" in tags:
+        return "REST API"
+    if "component__kubernetes_operator__" in tags:
+        return "Kubernetes / Operator"
+    if "component__connector__" in tags:
+        return "Connectors"
+    if "component__lite__" in tags:
+        return "Couchbase Lite"
+    if "component__documentation" in tags:
+        return "Documentation"
+    if "component__other__sizing" in tags:
+        return "Sizing / Capacity Planning"
+    if "component__other__networking" in tags:
+        return "Networking"
     return "Other / General"
 
 

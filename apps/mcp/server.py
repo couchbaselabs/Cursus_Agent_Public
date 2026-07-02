@@ -37,6 +37,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -284,7 +285,7 @@ def score_ticket(ticket_id: str) -> str:
         doc.pop("embedding", None)
         scores = app.score_tickets_batch(
             [doc],
-            cfg["score_provider"], cfg["score_model"],
+            (cfg["score_provider"] or "").lower().strip(), cfg["score_model"],
             cfg["score_api_key"],  cfg["score_base_url"],
         )
         # Save score back to CB
@@ -753,6 +754,40 @@ def cancel_scrape_job(job_id: str) -> str:
     return json.dumps({"error": f"Job '{job_id}' not running or not found."})
 
 
+@mcp.tool()
+def query_supportal_analytics(statement: str, limit_rows: int = 100) -> str:
+    """
+    Run a read-only SQL++ statement against the LIVE Supportal Analytics API
+    (POST /api/support360/query) — the production system of record, not the
+    local Couchbase cache this MCP server otherwise reads from.
+
+    Use this to independently cross-check numbers computed from the local
+    Couchbase copy (e.g. ticket counts, per-customer aggregates) against
+    Supportal's own live data. As of v2.6.2 the endpoint requires no auth.
+
+    Schema note: this queries Supportal's own collections (ticket, snapshot,
+    cluster, customer), which use different field/collection names than the
+    local `supportal` collection this MCP server scrapes into — don't assume
+    field names carry over 1:1.
+
+    Args:
+        statement:  A SELECT-only SQL++ statement (mutating statements are rejected).
+        limit_rows: Max rows to return (default 100, max 500).
+    """
+    stmt = statement.strip()
+    if not stmt.lower().startswith("select"):
+        return json.dumps({"error": "Only SELECT statements are allowed against the live Supportal Analytics API."})
+
+    app = _app()
+    try:
+        rows = app.query_supportal_analytics(stmt, "")
+    except Exception as exc:
+        return json.dumps({"error": f"Supportal Analytics query failed: {exc}"})
+
+    rows = rows[: min(int(limit_rows or 100), 500)]
+    return json.dumps({"row_count": len(rows), "rows": rows}, default=str)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ASSETS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -932,7 +967,7 @@ def _brand_css_overrides(brand: dict) -> str:
     return f"\n<style>\n  :root {{\n{inner}\n  }}\n</style>"
 
 
-def _build_health_report_html(org: str, tickets: list[dict], report_date: str, brand: dict) -> str:
+def _build_health_report_html(org: str, tickets: list[dict], report_date: str, brand: dict, org_meta: dict | None = None) -> str:
     """Generate a full health report HTML document from live CB ticket data."""
     import datetime as _dt
     from collections import Counter, defaultdict
@@ -969,7 +1004,9 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     # Resolution time for solved P1s
     def _res_days(t: dict) -> float | None:
         c = t.get("created") or ""
-        u = t.get("updated") or ""
+        # "solved" is the actual resolution timestamp; "updated" is frequently null
+        # on these ticket docs and should only be used as a last-resort fallback.
+        u = t.get("solved") or t.get("updated") or ""
         if c and u:
             try:
                 d = (_dt.datetime.fromisoformat(u[:19]) - _dt.datetime.fromisoformat(c[:19])).days
@@ -1148,6 +1185,155 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         r'Currently Open \(\d+ Tickets?\)',
         f'Currently Open ({len(open_t)} {t_ticket}s)',
         tpl, count=1,
+    )
+
+    # ── Conditional renewal badge (only if any ticket is actually tagged critical_renewal) ──
+    # Authoritative critical_renewal comes from the live zdorg record (org_meta),
+    # NOT from ticket tags — a ticket's "critical_renewal" tag reflects the org's
+    # status at ticket-creation time and can be stale. Fall back to the tag-scan
+    # heuristic only if the live lookup wasn't available.
+    if org_meta and "critical_renewal" in org_meta:
+        is_critical_renewal = bool(org_meta.get("critical_renewal"))
+    else:
+        is_critical_renewal = any("critical_renewal" in (t.get("tags") or "") for t in all_t)
+    renewal_badge_html = '<span class="renewal-badge internal-only">⚠ Critical Renewal</span>' if is_critical_renewal else ""
+    tpl = tpl.replace('<span class="renewal-badge internal-only">⚠ Critical Renewal</span>', renewal_badge_html, 1)
+
+    # ── Dynamic narrative (previously static example prose leaked from the WU template) ──
+    open_p1_ct = open_priority.get('P1', 0)
+    health_word = "stable" if open_p1_ct == 0 and float(closed_rate.rstrip('%') or 0) >= 90 else "needs attention"
+    lede = (
+        f"{org}'s account health is <strong>{health_word}</strong>. "
+        f"{len(open_t)} {t_ticket.lower()}{'s' if len(open_t) != 1 else ''} currently open"
+        f"{' (' + open_breakdown + ')' if open_breakdown else ''}, "
+        f"against a lifetime closed rate of {closed_rate}."
+    )
+
+    if p1_res:
+        point1 = (
+            f"<strong>{t_p1} resolution is tracked.</strong> Average resolution across the last "
+            f"{len(solved_p1)} solved {t_p1}{'s' if len(solved_p1) != 1 else ''} is {avg_p1_res}."
+        )
+        point1_icon_cls = "good"
+        point1_icon = "✓"
+    else:
+        point1 = f"<strong>No {t_p1}s solved in the last 12 months</strong> — insufficient data to assess resolution speed."
+        point1_icon_cls = "cb"
+        point1_icon = "ℹ"
+
+    if top_recent:
+        top_area, top_area_cnt = top_recent[0]
+        recent_share = top_area_cnt / max(len(recent_t), 1) * 100
+        lifetime_share = area_counter.get(top_area, 0) / max(total, 1) * 100
+        point2 = (
+            f"<strong>'{top_area}' leads recent volume.</strong> {top_area_cnt} of {len(recent_t)} tickets "
+            f"in the last 90 days ({recent_share:.0f}%) vs a {lifetime_share:.0f}% lifetime share."
+        )
+    else:
+        point2 = "<strong>No ticket volume in the last 90 days</strong> to establish a feature-area trend."
+
+    if open_t:
+        oldest = min(open_t, key=lambda t: t.get("created") or "")
+        o_created = oldest.get("created") or ""
+        try:
+            o_age = (now_ts - _dt.datetime.fromisoformat(o_created[:19])).days
+        except Exception:
+            o_age = None
+        point3 = (
+            f"<strong>Oldest open item is #{oldest.get('ticket_id','')}.</strong> "
+            f"{(oldest.get('subject') or '—')[:70]}"
+            + (f" — open {o_age} days." if o_age is not None else ".")
+        )
+    else:
+        point3 = f"<strong>No open {t_ticket.lower()}s.</strong> Queue is clear as of this report."
+
+    exec_block = f"""  <div class="card exec-summary">
+    <p class="exec-lede">{lede}</p>
+
+    <div class="exec-points">
+      <div class="exec-point">
+        <span class="exec-point-icon {point1_icon_cls}">{point1_icon}</span>
+        <div class="exec-point-body">{point1}</div>
+      </div>
+      <div class="exec-point">
+        <span class="exec-point-icon warn">↗</span>
+        <div class="exec-point-body">{point2}</div>
+      </div>
+      <div class="exec-point">
+        <span class="exec-point-icon cb">→</span>
+        <div class="exec-point-body">{point3}</div>
+      </div>
+    </div>
+  </div>"""
+    tpl = _re.sub(
+        r'<div class="card exec-summary">.*?(?=\n\s*<!-- ── KPI STRIP)',
+        exec_block + "\n", tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # Feature-area trend callout (reuses point2's computed numbers, worded as a standalone note)
+    if top_recent:
+        trend_note = (
+            f"<strong>Trend:</strong> '{top_area}' accounts for {recent_share:.0f}% of the last 90 days of tickets "
+            f"({top_area_cnt} of {len(recent_t)}), vs a {lifetime_share:.0f}% lifetime share."
+        )
+    else:
+        trend_note = "<strong>Trend:</strong> not enough recent ticket volume to establish a feature-area shift."
+    tpl = _re.sub(
+        r'<div class="callout callout-info">.*?</div>\s*\n\s*</div>',
+        f'<div class="callout callout-info">\n    <span class="callout-icon">ℹ</span>\n    <div class="callout-body">{trend_note}</div>\n  </div>',
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # P1 log card title — dynamic count
+    tpl = _re.sub(
+        r'<div class="card-title">\d+ P1s since [^<]*</div>',
+        f'<div class="card-title">{len(p1_12mo)} {t_p1}s in the last 12 months</div>',
+        tpl, count=1,
+    )
+
+    # P1 health callout — dynamic
+    if p1_res:
+        p1_callout_body = (
+            f"<strong>{t_p1} response {'is healthy' if float(avg_p1_res.rstrip('d') or 999) < 5 else 'is tracked'}.</strong> "
+            f"Average resolution across the last {len(solved_p1)} solved {t_p1}{'s' if len(solved_p1) != 1 else ''} is {avg_p1_res}."
+        )
+        p1_callout_cls, p1_callout_icon = "callout-good", "✓"
+    else:
+        p1_callout_body = f"<strong>No {t_p1}s solved in the last 12 months</strong> — nothing to measure resolution time against yet."
+        p1_callout_cls, p1_callout_icon = "callout-info", "ℹ"
+    tpl = _re.sub(
+        r'<div class="callout callout-good">.*?</div>\s*\n\s*</div>',
+        f'<div class="callout {p1_callout_cls}">\n    <span class="callout-icon">{p1_callout_icon}</span>\n    <div class="callout-body">{p1_callout_body}</div>\n  </div>',
+        tpl, flags=_re.DOTALL, count=1,
+    )
+
+    # Recommendations — built from real signals only, no hardcoded ticket refs
+    rec_items: list[tuple[str, str]] = []
+    if open_t:
+        oldest = min(open_t, key=lambda t: t.get("created") or "")
+        rec_items.append((
+            "both",
+            f"<strong>Review oldest open item #{oldest.get('ticket_id','')}.</strong> "
+            f"{(oldest.get('subject') or '—')[:80]} — open since {(oldest.get('created') or '')[:10]}.",
+        ))
+    if open_p1_ct > 0:
+        rec_items.append((
+            "cb",
+            f"<strong>{open_p1_ct} open {t_p1.lower()}{'s' if open_p1_ct != 1 else ''} need active tracking</strong> until resolved.",
+        ))
+    if not rec_items:
+        rec_items.append((
+            "both",
+            f"<strong>No urgent action items.</strong> Queue is clear and recent {t_p1.lower()} resolution has been timely.",
+        ))
+    rec_html = "\n".join(
+        f'      <div class="next-step">\n        <span class="step-owner {owner}">{owner.upper() if owner != "both" else "CB + Customer"}</span>\n        <div class="step-body">{body}</div>\n      </div>'
+        for owner, body in rec_items
+    )
+    tpl = _re.sub(
+        r'<div class="next-steps">.*?(?=\n\n</div>\s*\n</body>)',
+        f'<div class="next-steps">\n{rec_html}\n    </div>\n  </div>',
+        tpl, flags=_re.DOTALL, count=1,
     )
 
     # Inject logo if brand provides one
@@ -1336,6 +1522,39 @@ def generate_health_report(
     if not tickets:
         return json.dumps({"error": f"No tickets found for organization '{organization}'."})
 
+    # ── Authoritative account metadata from live Supportal (zdorg) ──────────
+    # Ticket-level tags (e.g. a stale "critical_renewal" tag copied at ticket-creation
+    # time) are NOT reliable for current account status — always prefer the live
+    # zdorg.organization_fields record, which is Zendesk's current source of truth.
+    org_meta: dict = {}
+    try:
+        safe_org_name = organization.replace('"', '\\"')
+        meta_stmt = f"""
+SELECT zo.`organization_fields`.`critical_renewal` AS critical_renewal,
+       zo.`organization_fields`.`strategic` AS strategic,
+       zo.`organization_fields`.`carr` AS carr,
+       zo.`organization_fields`.`ase` AS ase,
+       zo.`organization_fields`.`account_owner` AS account_owner,
+       zo.`organization_fields`.`account_owner_email` AS account_owner_email
+FROM customer cu
+LEFT JOIN zdorg zo ON META(zo).id = ("ZendeskSupport/organizations::" || TO_STRING(cu.`zendeskorg`))
+WHERE cu.`name` = "{safe_org_name}"
+LIMIT 1
+""".strip()
+        meta_rows = app.query_supportal_analytics(meta_stmt, "")
+        if meta_rows:
+            org_meta = meta_rows[0]
+    except Exception:
+        pass  # Live lookup is best-effort — fall back to caller-supplied args / no badge.
+
+    # Auto-fill AE/TSE from the authoritative record if the caller didn't specify them.
+    if not ae_name and org_meta.get("account_owner"):
+        ae_name = org_meta["account_owner"]
+    if not ae_email and org_meta.get("account_owner_email"):
+        ae_email = org_meta["account_owner_email"]
+    if not tse_name and org_meta.get("ase"):
+        tse_name = org_meta["ase"]
+
     # Fetch brand (optional)
     brand: dict = {}
     try:
@@ -1348,7 +1567,7 @@ def generate_health_report(
 
     # Build HTML
     try:
-        html = _build_health_report_html(organization, tickets, report_date, brand)
+        html = _build_health_report_html(organization, tickets, report_date, brand, org_meta)
     except Exception as exc:
         return json.dumps({"error": f"Failed to build report: {exc}"})
 
@@ -1462,6 +1681,579 @@ def generate_ticket_report(ticket_id: str) -> str:
         "ticket_id": ticket_id,
         "organization": org,
         "comment_count": len(comments),
+    })
+
+
+def _version_currency(version_history: list[str]) -> tuple[str, int]:
+    """Rough version-currency classification from the latest known CB version.
+    Boundaries are approximate (Couchbase's public EOL policy, not a live feed)
+    — good enough to flag clearly-outdated clusters, not a precise SLA check."""
+    import re as _re2
+    if not version_history:
+        return ("Unknown", 50)
+    m = _re2.match(r"(\d+)\.(\d+)", version_history[-1] or "")
+    if not m:
+        return ("Unknown", 50)
+    major, minor = int(m.group(1)), int(m.group(2))
+    if major < 7 or (major == 7 and minor < 2):
+        return ("End of Life", 20)
+    if major == 7 and minor < 6:
+        return ("Aging", 60)
+    return ("Current", 100)
+
+
+def _cluster_priority(t: dict) -> str:
+    p = (t.get("priority") or "").lower()
+    return {"urgent": "P1", "p1": "P1", "high": "P2", "p2": "P2",
+            "normal": "P3", "p3": "P3", "low": "P4", "p4": "P4"}.get(p, "P?")
+
+
+_GA_VERSION_CACHE: dict[str, Any] = {"version": None, "fetched_at": 0.0}
+_GA_VERSION_CACHE_TTL = 6 * 3600  # refetch at most every 6h
+
+
+def _current_ga_version() -> str | None:
+    """Latest published Couchbase Server GA version, per Docker Hub's official
+    `couchbase` image tags — the closest thing to a live feed for "what's
+    the current release on couchbase.com" without scraping the marketing site.
+    """
+    now = time.time()
+    if _GA_VERSION_CACHE["version"] and (now - _GA_VERSION_CACHE["fetched_at"]) < _GA_VERSION_CACHE_TTL:
+        return _GA_VERSION_CACHE["version"]
+    import re as _re
+
+    def _ver_tuple(v: str) -> tuple[int, int, int]:
+        m = _re.match(r"(\d+)\.(\d+)\.(\d+)$", v or "")
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
+
+    try:
+        req = urllib.request.Request(
+            "https://hub.docker.com/v2/repositories/library/couchbase/tags?page_size=100",
+            headers={"User-Agent": "supportal-scraper/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.load(resp)
+        tags = [r["name"] for r in data.get("results", []) if _re.match(r"^\d+\.\d+\.\d+$", r.get("name", ""))]
+        latest = max(tags, key=_ver_tuple, default=None)
+        if latest:
+            _GA_VERSION_CACHE["version"] = latest
+            _GA_VERSION_CACHE["fetched_at"] = now
+        return latest
+    except Exception:
+        return _GA_VERSION_CACHE["version"]  # stale cache beats nothing on a transient failure
+
+
+def _build_cluster_health_chart_html(org: str, health: dict, report_date: str, max_clusters: int) -> str:
+    """Render an HTML cluster-health report: composite health score (issues +
+    version currency + ticket correlation) with a transparent breakdown, named
+    recurring issues, and a bad/warn-over-time SVG chart. Worst clusters first."""
+    import html as _html
+    import datetime as _dt
+    import re as _re
+
+    ci = health.get("cluster_index") or {}
+    by_cluster = health.get("by_cluster") or {}
+    ticket_by_cid = health.get("ticket_by_cid") or {}
+
+    def _snap_index(snap_id: str) -> int:
+        try:
+            return int(str(snap_id).rsplit("::", 1)[-1])
+        except Exception:
+            return -1
+
+    def _latest_point(cid: str) -> dict | None:
+        """The true most-recent snapshot for a cluster. Prefers the real
+        collection `date` (Supportal's snapshot.timestamp) when present —
+        that's ground truth and immune to rescrapes reassigning snap_id
+        suffixes out of chronological order. Falls back to snapshot index
+        (ClusterUUID::N) only for older docs scraped before `date` was
+        backfilled — never list order or version_history, which only
+        records the FIRST-seen (often oldest) distinct version."""
+        points = by_cluster.get(cid) or []
+        if not points:
+            return None
+        dated = [p for p in points if p.get("date")]
+        if dated:
+            return max(dated, key=lambda p: p["date"])
+        return max(points, key=lambda p: _snap_index(p.get("snap_id", "")))
+
+    def _version_since(cid: str, version: str) -> str | None:
+        """Date the cluster's current version first appeared, walking back
+        from the latest snapshot while the version stays the same. Used to
+        scope ticket correlation to the cluster's CURRENT version — tickets
+        from a prior version aren't this version's problem."""
+        points = sorted(
+            [p for p in (by_cluster.get(cid) or []) if p.get("date")],
+            key=lambda p: p["date"],
+        )
+        since = None
+        for p in reversed(points):
+            if p.get("cb_version") == version:
+                since = p["date"]
+            else:
+                break
+        return since
+
+    scored = []
+    for c in ci.values():
+        cid = c.get("cluster_id", "")
+
+        # Only report against the latest snapshot, not whatever happens to be
+        # first/last in version_history (which is oldest-seen, not newest).
+        latest = _latest_point(cid)
+        latest_version = latest.get("cb_version") if latest else (c.get("version_history") or ["—"])[0] if c.get("version_history") else "—"
+        latest_nodes = latest.get("node_count") if latest else c.get("node_count_last")
+        version_since = _version_since(cid, latest_version) if latest_version and latest_version != "—" else None
+
+        # 1. Issue health — point-in-time snapshot of the latest bad/warn
+        # counts only, not a history-wide average (a health score should
+        # reflect the cluster's current state, not penalize it forever for
+        # issues that were already resolved in earlier snapshots).
+        latest_bad = latest.get("bad_count", 0) if latest else 0
+        latest_warn = latest.get("warn_count", 0) if latest else 0
+        issue_score = max(0, 100 - latest_bad * 15 - latest_warn * 3)
+
+        # 2. Version currency — from the latest snapshot only.
+        ver_label, ver_score = _version_currency([latest_version] if latest_version and latest_version != "—" else [])
+
+        # 3. Ticket correlation — linked ticket volume + P1 weight, scoped to
+        # tickets filed since the cluster started running its CURRENT
+        # version. A ticket from two major versions ago isn't this version's
+        # problem and shouldn't count against it.
+        all_linked = ticket_by_cid.get(cid) or []
+        linked = (
+            [t for t in all_linked if (t.get("created") or "") >= version_since]
+            if version_since else all_linked
+        )
+        p1_count = sum(1 for t in linked if _cluster_priority(t) == "P1")
+        ticket_score = max(0, 100 - len(linked) * 4 - p1_count * 15)
+
+        # Weighting: version currency is the dominant driver of health (EOL
+        # software is the biggest real risk), issue counts are a minor signal
+        # (checker noise fluctuates snapshot to snapshot), tickets matter but
+        # less than running an unsupported version.
+        composite = round(issue_score * 0.05 + ver_score * 0.65 + ticket_score * 0.30)
+        if composite >= 80:
+            grade, grade_cls = "Healthy", "pill-good"
+        elif composite >= 60:
+            grade, grade_cls = "Watch", "pill-warn"
+        elif composite >= 40:
+            grade, grade_cls = "At Risk", "pill-warn"
+        else:
+            grade, grade_cls = "Critical", "pill-crit"
+
+        # Likely-deprecated: not already flagged via successor detection, but
+        # BOTH snapshot activity and ticket activity have gone quiet for a long
+        # stretch (~10 months) — reads as abandoned infra, not "just stale".
+        _DEPRECATION_QUIET_DAYS = 300
+        last_ticket_date = max((t.get("created") or "" for t in linked), default="")
+        _now = _dt.datetime.now(_dt.timezone.utc)
+        def _days_since(iso: str) -> float | None:
+            if not iso:
+                return None
+            try:
+                d = _dt.datetime.fromisoformat(iso[:19])
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=_dt.timezone.utc)
+                return (_now - d).days
+            except Exception:
+                return None
+        snap_quiet_days = _days_since(c.get("last_seen") or "")
+        ticket_quiet_days = _days_since(last_ticket_date)
+        is_likely_deprecated = (
+            not c.get("is_deprecated")
+            and not c.get("is_active")
+            and (snap_quiet_days is None or snap_quiet_days > _DEPRECATION_QUIET_DAYS)
+            and (ticket_quiet_days is None or ticket_quiet_days > _DEPRECATION_QUIET_DAYS)
+        )
+
+        scored.append({
+            **c,
+            "_composite": composite, "_grade": grade, "_grade_cls": grade_cls,
+            "_issue_score": round(issue_score), "_ver_label": ver_label, "_ver_score": ver_score,
+            "_ticket_score": round(ticket_score), "_linked_tickets": len(linked), "_p1_count": p1_count,
+            "_is_likely_deprecated": is_likely_deprecated,
+            "_quiet_days": min(d for d in (snap_quiet_days, ticket_quiet_days) if d is not None) if (snap_quiet_days or ticket_quiet_days) else None,
+            "_latest_version": latest_version, "_latest_nodes": latest_nodes,
+            "_latest_bad": latest_bad, "_latest_warn": latest_warn,
+            "_version_since": version_since,
+        })
+
+    # Report only against unique, genuinely active clusters — a deprecated or
+    # long-quiet cluster's bad score isn't actionable, it's noise.
+    active_scored = [c for c in scored if c.get("is_active") and not c.get("is_deprecated") and not c["_is_likely_deprecated"]]
+    excluded_count = len(scored) - len(active_scored)
+
+    # Most-recent version actually observed in this org's active fleet — a
+    # grounded reference point, not a claim about Couchbase's official release
+    # calendar (we have no live feed for that).
+    def _ver_tuple(v: str) -> tuple[int, int, int]:
+        m = _re.match(r"(\d+)\.(\d+)\.(\d+)", v or "")
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
+    fleet_versions = [c["_latest_version"] for c in active_scored if c.get("_latest_version") and c["_latest_version"] != "—"]
+    fleet_latest_version = max(fleet_versions, key=_ver_tuple, default=None)
+    fleet_latest_tuple = _ver_tuple(fleet_latest_version) if fleet_latest_version else (0, 0, 0)
+
+    # Current Couchbase Server GA release, per the official Docker Hub image
+    # tags — an actual "what's shipping today on couchbase.com" reference,
+    # distinct from fleet_latest_version above (which is just this org's own
+    # newest-observed version, not the product's release calendar).
+    current_ga_version = _current_ga_version()
+    current_ga_tuple = _ver_tuple(current_ga_version) if current_ga_version else (0, 0, 0)
+
+    clusters = sorted(active_scored, key=lambda c: c["_composite"])[:max_clusters]
+
+    def _bar_chart_svg(cid: str) -> str:
+        points = by_cluster.get(cid) or []
+        if not points:
+            return '<div class="callout callout-info"><span class="callout-icon">ℹ</span><div class="callout-body">No snapshot history to chart.</div></div>'
+        w, h, pad_l, pad_b, pad_t = 700, 160, 34, 26, 10
+        plot_w, plot_h = w - pad_l - 10, h - pad_t - pad_b
+        max_val = max((p.get("bad_count", 0) + p.get("warn_count", 0) for p in points), default=1) or 1
+        n = len(points)
+        bw = max(plot_w / n * 0.6, 3)
+        gap = plot_w / n
+        bars = []
+        labels = []
+        for i, p in enumerate(points):
+            x = pad_l + i * gap + (gap - bw) / 2
+            bad = p.get("bad_count", 0)
+            warn = p.get("warn_count", 0)
+            bad_h = (bad / max_val) * plot_h
+            warn_h = (warn / max_val) * plot_h
+            y_bad = pad_t + plot_h - bad_h
+            y_warn = y_bad - warn_h
+            if bad:
+                bars.append(f'<rect x="{x:.1f}" y="{y_bad:.1f}" width="{bw:.1f}" height="{bad_h:.1f}" fill="var(--crit)" stroke="#7A1A1A" stroke-width="0.5"><title>{_html.escape(p.get("date","")[:10])}: {bad} bad</title></rect>')
+            if warn:
+                bars.append(f'<rect x="{x:.1f}" y="{y_warn:.1f}" width="{bw:.1f}" height="{warn_h:.1f}" fill="var(--warn)" stroke="#7A4A06" stroke-width="0.5"><title>{_html.escape(p.get("date","")[:10])}: {warn} warn</title></rect>')
+            if n <= 12 or i % max(1, n // 10) == 0:
+                labels.append(f'<text x="{x + bw/2:.1f}" y="{h - 8}" font-size="9" fill="var(--text-3)" text-anchor="middle">{_html.escape(p.get("date","")[5:10])}</text>')
+        axis = f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{w - 10}" y2="{pad_t + plot_h}" stroke="var(--border)" stroke-width="1"/>'
+        return (
+            f'<svg viewBox="0 0 {w} {h}" width="100%" height="{h}" xmlns="http://www.w3.org/2000/svg">'
+            f'{axis}{"".join(bars)}{"".join(labels)}</svg>'
+        )
+
+    def _score_chip_cls(score: int) -> str:
+        if score >= 80: return "score-good"
+        if score >= 50: return "score-warn"
+        return "score-crit"
+
+    def _named_issues_html(c: dict) -> str:
+        bad_items = (c.get("top_bad_items") or [])[:5]
+        warn_items = (c.get("top_warn_items") or [])[:5]
+        if not bad_items and not warn_items:
+            return '<span style="font-size:11px; color:var(--text-3);">No recurring named issues.</span>'
+        chips = "".join(f'<span class="issue-chip issue-chip-bad">{_html.escape(x)}</span>' for x in bad_items)
+        chips += "".join(f'<span class="issue-chip issue-chip-warn">{_html.escape(x)}</span>' for x in warn_items)
+        return chips
+
+    def _letter_grade(score: int) -> str:
+        if score >= 85: return "A"
+        if score >= 70: return "B"
+        if score >= 55: return "C"
+        if score >= 40: return "D"
+        return "F"
+
+    def _cause_phrase(c: dict) -> str:
+        drivers = [
+            ("Issues", c["_issue_score"], f'high issue volume in latest snapshot ({c.get("_latest_bad",0)} bad / {c.get("_latest_warn",0)} warn)'),
+            ("Version", c["_ver_score"], f'an {c["_ver_label"].lower()} version ({c.get("_latest_version") or "—"})'),
+            ("Tickets", c["_ticket_score"], f'ticket correlation on current version ({c["_linked_tickets"]} linked, {c["_p1_count"]} P1)'),
+        ]
+        drivers.sort(key=lambda d: d[1])
+        worst = drivers[0]
+        second = drivers[1]
+        phrase = f"driven by {worst[2]}"
+        if second[1] < 50:
+            phrase += f", plus {second[2]}"
+        return phrase
+
+    def _issue_trend(points: list[dict]) -> tuple[str, str, str]:
+        """Compare issue-severity score (bad/warn only) across the first vs
+        second half of snapshot history. Returns (label, css_class, arrow)."""
+        if len(points) < 4:
+            return ("Not enough history", "trend-flat", "—")
+        def _issue_score_pt(p: dict) -> float:
+            return max(0, 100 - p.get("bad_count", 0) * 15 - p.get("warn_count", 0) * 3)
+        mid = len(points) // 2
+        first_avg = sum(_issue_score_pt(p) for p in points[:mid]) / mid
+        second_avg = sum(_issue_score_pt(p) for p in points[mid:]) / (len(points) - mid)
+        delta = second_avg - first_avg
+        if delta > 8:
+            return ("Improving", "trend-good", "↑")
+        if delta < -8:
+            return ("Worsening", "trend-bad", "↓")
+        return ("Stable", "trend-flat", "→")
+
+    def _version_gap_note(c: dict) -> str:
+        if not c.get("_latest_version"):
+            return ""
+        this_tuple = _ver_tuple(c["_latest_version"])
+        if current_ga_version and this_tuple < current_ga_tuple:
+            return f' <span style="color:var(--text-3);">(current GA: {_html.escape(current_ga_version)})</span>'
+        if fleet_latest_version and this_tuple < fleet_latest_tuple:
+            return f' <span style="color:var(--text-3);">(fleet newest: {_html.escape(fleet_latest_version)})</span>'
+        return ""
+
+    def _sdk_note(cid: str) -> str:
+        """Best-effort only — SDK version isn't tracked in snapshot health-check
+        data at all, only sporadically on individual tickets. Don't imply
+        systematic SDK-deprecation coverage; just surface what's mentioned."""
+        linked = ticket_by_cid.get(cid) or []
+        sdks = set()
+        for t in linked:
+            raw_fields = t.get("ticket_fields")
+            if isinstance(raw_fields, str):
+                try:
+                    raw_fields = json.loads(raw_fields)
+                except Exception:
+                    raw_fields = {}
+            sdk = (raw_fields or {}).get("Couchbase_Server_SDK_or_Connector")
+            if sdk:
+                sdks.add(sdk)
+        if not sdks:
+            return ""
+        chips = "".join(f'<span class="issue-chip issue-chip-warn">{_html.escape(s)}</span>' for s in sorted(sdks))
+        return f'<div style="margin-top:6px; font-size:10px; color:var(--text-3);">SDKs mentioned in linked tickets (not systematically tracked): {chips}</div>'
+
+    cluster_cards = []
+    for c in clusters:
+        cid = c.get("cluster_id", "")
+        name = c.get("cluster_name") or cid[:12]
+        if c.get("is_deprecated"):
+            lifecycle = "Deprecated"
+        elif c.get("_is_likely_deprecated"):
+            lifecycle = "Likely Deprecated"
+        elif c.get("is_active"):
+            lifecycle = "Active"
+        else:
+            lifecycle = "Stale"
+        lifecycle_cls = {
+            "Active": "pill-good", "Stale": "pill-warn",
+            "Deprecated": "pill-neutral", "Likely Deprecated": "pill-neutral",
+        }[lifecycle]
+        nodes = c.get("_latest_nodes") or c.get("node_count_last") or "?"
+        last_seen = (c.get("last_seen") or "")[:10]
+        quiet_note = (
+            f' <span style="font-size:10px; color:var(--text-3); font-weight:400; text-transform:none;">(~{c["_quiet_days"]//30}mo quiet)</span>'
+            if lifecycle == "Likely Deprecated" and c.get("_quiet_days") else ""
+        )
+        ticket_note = (
+            f' · <strong>{c["_linked_tickets"]}</strong> linked tickets'
+            + (f' (<strong style="color:var(--crit);">{c["_p1_count"]} P1</strong>)' if c["_p1_count"] else "")
+        ) if c["_linked_tickets"] else " · no linked tickets"
+
+        trend_label, trend_cls, trend_arrow = _issue_trend(by_cluster.get(cid) or [])
+
+        cluster_cards.append(f"""
+  <div class="card">
+    <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+      <span>{_html.escape(name)} <span style="font-family: var(--mono); font-weight: 400; color: var(--text-3);">({_html.escape(cid[:16])})</span></span>
+      <span style="display:flex; gap:6px; align-items:center;">
+        <span class="pill {lifecycle_cls}">{lifecycle}</span>{quiet_note}
+        <span class="score-badge {c['_grade_cls']}">{_letter_grade(c['_composite'])}</span>
+        <span class="pill {c['_grade_cls']}">{c['_grade']} · {c['_composite']}/100</span>
+        <span class="trend-pill {trend_cls}">{trend_arrow} {trend_label}</span>
+      </span>
+    </div>
+    <div class="cause-phrase">{_html.escape(_cause_phrase(c))}</div>
+    <div class="score-breakdown">
+      <div class="score-item"><span class="score-chip {_score_chip_cls(c['_issue_score'])}">{c['_issue_score']}</span><span class="score-lbl">Issues (5%)<br><span style="color:var(--text-3);">latest: {c.get('_latest_bad',0)} bad / {c.get('_latest_warn',0)} warn</span></span></div>
+      <div class="score-item"><span class="score-chip {_score_chip_cls(c['_ver_score'])}">{c['_ver_score']}</span><span class="score-lbl">Version (65%)<br><span style="color:var(--text-3);">{_html.escape(c['_ver_label'])} — {_html.escape(str(c.get('_latest_version') or '—'))}</span>{_version_gap_note(c)}</span></div>
+      <div class="score-item"><span class="score-chip {_score_chip_cls(c['_ticket_score'])}">{c['_ticket_score']}</span><span class="score-lbl">Tickets (30%)<br><span style="color:var(--text-3);">{c['_linked_tickets']} linked, {c['_p1_count']} P1{f" (since {_html.escape(c['_version_since'][:10])})" if c.get('_version_since') else ""}</span></span></div>
+    </div>
+    <div class="ticket-meta" style="margin: 10px 0 6px;">
+      <span class="ticket-meta-item">Nodes <strong>{nodes}</strong></span>
+      <span class="ticket-meta-item">Snapshots <strong>{c.get("snapshot_count", 0)}</strong></span>
+      <span class="ticket-meta-item">Last Seen <strong>{_html.escape(last_seen)}</strong></span>
+    </div>
+    <div class="named-issues">{_named_issues_html(c)}</div>
+    {_sdk_note(cid)}
+    {_bar_chart_svg(cid)}
+  </div>""")
+
+    kpi = f"""  <div class="kpi-grid">
+    <div class="kpi-tile"><span class="kpi-val cb">{health.get("total_clusters",0)}</span><span class="kpi-lbl">Total Clusters</span></div>
+    <div class="kpi-tile"><span class="kpi-val good">{health.get("active_clusters",0)}</span><span class="kpi-lbl">Active</span></div>
+    <div class="kpi-tile"><span class="kpi-val warn">{health.get("stale_clusters",0)}</span><span class="kpi-lbl">Stale</span></div>
+    <div class="kpi-tile"><span class="kpi-val cb">{health.get("deprecated_clusters",0)}</span><span class="kpi-lbl">Deprecated</span></div>
+    <div class="kpi-tile"><span class="kpi-val {'good' if current_ga_version else 'warn'}" style="font-size:16px;">{_html.escape(current_ga_version or "unavailable")}</span><span class="kpi-lbl">Current GA Version</span><span class="kpi-sub" style="font-size:10px; color:var(--text-3);">latest Couchbase Server release (Docker Hub)</span></div>
+    <div class="kpi-tile"><span class="kpi-val good" style="font-size:16px;">{_html.escape(fleet_latest_version or "—")}</span><span class="kpi-lbl">Newest Fleet Version</span><span class="kpi-sub" style="font-size:10px; color:var(--text-3);">most recent seen in this org's active clusters</span></div>
+  </div>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{_html.escape(org)} — Cluster Health · {_html.escape(report_date)}</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  :root {{
+    --bg: #F0F3F7; --surface: #FFFFFF; --text: #0D1926; --text-2: #5C6880; --text-3: #8C96A8;
+    --border: #D4DAE6; --border-light: #E6EAF2; --cb: #1A6FD4; --cb-light: #EAF1FB;
+    --good: #1DAA72; --good-light: #E6F7F0; --warn: #E8920A; --warn-light: #FEF3E2;
+    --crit: #CC2E2E; --crit-light: #FDEAEA; --neutral: #6B7A99; --neutral-light: #EEF0F5;
+    --mono: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  }}
+  body {{ font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif; font-size: 14px; line-height: 1.6; color: var(--text); background: var(--bg); }}
+  .page {{ max-width: 860px; margin: 0 auto; padding: 28px 24px 64px; display: flex; flex-direction: column; gap: 12px; }}
+  .page-title {{ font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }}
+  .page-subtitle {{ font-size: 13px; color: var(--text-2); margin-top: 3px; }}
+  .section-label {{ font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.09em; color: #fff; background: var(--cb); padding: 7px 14px; border-radius: 6px; margin-top: 8px; }}
+  .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }}
+  .kpi-tile {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }}
+  .kpi-val {{ font-size: 22px; font-weight: 800; line-height: 1; }}
+  .kpi-val.crit {{ color: var(--crit); }} .kpi-val.warn {{ color: var(--warn); }} .kpi-val.good {{ color: var(--good); }} .kpi-val.cb {{ color: var(--cb); }}
+  .kpi-lbl {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); font-weight: 600; }}
+  .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; }}
+  .card-title {{ font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 6px; }}
+  .ticket-meta {{ display: flex; gap: 16px; flex-wrap: wrap; font-size: 11px; color: var(--text-2); }}
+  .ticket-meta-item strong {{ color: var(--text); font-weight: 600; }}
+  .pill {{ display: inline-flex; align-items: center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 8px; border-radius: 3px; }}
+  .pill-good {{ background: var(--good-light); color: var(--good); border: 1px solid #A8DFC6; }}
+  .pill-warn {{ background: var(--warn-light); color: var(--warn); border: 1px solid #F5D89A; }}
+  .pill-neutral {{ background: var(--neutral-light); color: var(--neutral); border: 1px solid #C8CEDC; }}
+  .pill-crit {{ background: var(--crit-light); color: var(--crit); border: 1px solid #F0BABA; }}
+  .callout {{ border-radius: 6px; padding: 12px 14px; display: flex; gap: 10px; font-size: 12px; }}
+  .callout-info {{ background: var(--cb-light); border: 1px solid #AECDF5; color: #0D3A6B; }}
+  .score-breakdown {{ display: flex; gap: 16px; padding: 10px 0; border-top: 1px solid var(--border-light); border-bottom: 1px solid var(--border-light); }}
+  .score-item {{ display: flex; align-items: center; gap: 8px; flex: 1; }}
+  .score-chip {{ width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800; flex-shrink: 0; }}
+  .score-good {{ background: var(--good-light); color: var(--good); }}
+  .score-warn {{ background: var(--warn-light); color: var(--warn); }}
+  .score-crit {{ background: var(--crit-light); color: var(--crit); }}
+  .score-lbl {{ font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-2); line-height: 1.5; }}
+  .named-issues {{ display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }}
+  .issue-chip {{ font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 3px; }}
+  .issue-chip-bad {{ background: var(--crit-light); color: var(--crit); border: 1px solid #F0BABA; }}
+  .issue-chip-warn {{ background: var(--warn-light); color: var(--warn); border: 1px solid #F5D89A; }}
+  .score-badge {{ width: 24px; height: 24px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800; }}
+  .score-badge.pill-good {{ background: var(--good); color: #fff; }}
+  .score-badge.pill-warn {{ background: var(--warn); color: #fff; }}
+  .score-badge.pill-crit {{ background: var(--crit); color: #fff; }}
+  .score-badge.pill-neutral {{ background: var(--neutral); color: #fff; }}
+  .cause-phrase {{ font-size: 12px; color: var(--text-2); font-style: italic; margin: 6px 0 10px; }}
+  .trend-pill {{ display: inline-flex; align-items: center; gap: 3px; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 3px; }}
+  .trend-good {{ background: var(--good-light); color: var(--good); }}
+  .trend-bad {{ background: var(--crit-light); color: var(--crit); }}
+  .trend-flat {{ background: var(--neutral-light); color: var(--neutral); }}
+</style>
+</head>
+<body>
+<div class="page">
+  <div>
+    <div class="page-title">Cluster Health — {_html.escape(org)}</div>
+    <div class="page-subtitle">Generated {_html.escape(report_date)} · showing {len(clusters)} of {len(active_scored)} active clusters (lowest composite score first) · {excluded_count} stale/deprecated clusters excluded from ranking</div>
+  </div>
+  <div class="section-label">Fleet Summary</div>
+{kpi}
+  <div class="section-label">Cluster Health — Worst First (score = 5% issues + 65% version + 30% tickets)</div>
+{"".join(cluster_cards) if cluster_cards else '<div class="callout callout-info"><span class="callout-icon">ℹ</span><div class="callout-body">No cluster data found.</div></div>'}
+</div>
+</body>
+</html>
+"""
+
+
+@mcp.tool()
+def generate_cluster_health_chart(organization: str, max_clusters: int = 8) -> str:
+    """
+    Generate a cluster health report with per-cluster bad/warn-issue timeline
+    charts, from local Couchbase snapshot + ticket data, and save it as an
+    HTML asset.
+
+    Shows fleet-wide KPIs (total/active/stale/deprecated clusters, total
+    snapshots) plus one chart per cluster (most problematic first) showing
+    checker "bad"/"warn" counts over time, alongside version/node/last-seen
+    metadata.
+
+    Args:
+        organization: Customer org name (partial match).
+        max_clusters: Max number of clusters to chart, most issues first (default 8).
+    """
+    import datetime as _dt
+    from datetime import timedelta
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions, QueryOptions
+    from couchbase.auth import PasswordAuthenticator
+    from supportal.agent_tools import _save_asset_to_cb
+
+    cfg = _cfg()
+    app = _app()
+    report_date = _dt.date.today().strftime("%B %-d, %Y")
+
+    try:
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        cl.wait_until_ready(timedelta(seconds=15))
+        snap_ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`snapshots`"
+        snapshots = list(cl.query(
+            f"SELECT s.* FROM {snap_ks} AS s WHERE LOWER(s.organization) LIKE $org "
+            f"ORDER BY s.date DESC LIMIT 500",
+            QueryOptions(named_parameters={"org": f"%{organization.lower()}%"}, timeout=timedelta(seconds=30)),
+        ))
+        cl.close()
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to load snapshots: {exc}"})
+
+    if not snapshots:
+        return json.dumps({"error": f"No snapshot data found for '{organization}'."})
+
+    try:
+        tickets = app.tool_query_tickets(
+            {"organization": organization, "limit": 500}, *_cb_tuple(cfg), limit=500,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to load tickets: {exc}"})
+
+    health = app.build_cluster_health_data(snapshots, tickets)
+
+    # Enrich with live, human-assigned cluster names from Supportal Analytics
+    # (cluster.ui_name) — local snapshot data usually only has the raw UUID.
+    try:
+        safe_org = organization.replace('"', '\\"')
+        name_stmt = f"""
+SELECT cl.`uuid` AS cluster_uuid, cl.`ui_name` AS ui_name
+FROM cluster cl
+JOIN customer cu ON cl.`customer` = cu.`name`
+WHERE cu.`name` = "{safe_org}"
+""".strip()
+        name_rows = app.query_supportal_analytics(name_stmt, "")
+        ci = health.get("cluster_index") or {}
+        for r in name_rows:
+            cid = r.get("cluster_uuid") or ""
+            ui_name = r.get("ui_name") or ""
+            # Only override when Supportal has a real friendly name, not the UUID fallback.
+            if cid in ci and ui_name and ui_name != cid:
+                ci[cid]["cluster_name"] = ui_name
+    except Exception:
+        pass  # Live enrichment is best-effort — local names/UUIDs still work as a fallback.
+
+    html = _build_cluster_health_chart_html(organization, health, report_date, max_clusters)
+
+    try:
+        cb_a = (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"], cfg["use_tls"], cfg["scope"])
+        safe_org = organization.lower().replace(" ", "_")
+        fname = f"cluster_health_{safe_org}_{_dt.date.today().isoformat()}.html"
+        asset_id = _save_asset_to_cb(
+            *cb_a, asset_type="html",
+            title=f"{organization} Cluster Health — {report_date}",
+            content=html, org=organization, filename=fname,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to save asset: {exc}"})
+
+    return json.dumps({
+        "saved": True,
+        "asset_id": asset_id,
+        "filename": fname,
+        "organization": organization,
+        "total_clusters": health.get("total_clusters", 0),
+        "charted_clusters": min(max_clusters, health.get("total_clusters", 0)),
+        "report_date": report_date,
     })
 
 

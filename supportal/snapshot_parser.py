@@ -1516,6 +1516,23 @@ def scrape_snapshots_for_customer(
                 "ticket_ids":   _snap.get("ticket_ids") or [],
             })
 
+    # The legacy listing endpoint above doesn't return a real collection
+    # timestamp, so `date` is normally None here. Backfill it from the
+    # Supportal analytics API's `snapshot.timestamp` field (the actual
+    # "Collection time of first node" per the v1 data model, aliased `date`
+    # by fetch_snapshots_via_analytics) — the one field that reliably
+    # reflects true recency, independent of scrape/ingestion order.
+    if summaries:
+        try:
+            from supportal.api_client import fetch_snapshots_via_analytics  # noqa: PLC0415
+            _analytics_rows = fetch_snapshots_via_analytics(org_name, cookie, limit=5000)
+            _date_by_snap_id = {r["snap_id"]: r["date"] for r in _analytics_rows if r.get("snap_id") and r.get("date")}
+            for _s in summaries:
+                if not _s.get("date") and _date_by_snap_id.get(_s["snap_id"]):
+                    _s["date"] = _date_by_snap_id[_s["snap_id"]]
+        except Exception as _date_exc:
+            print(f"[SNAP] Could not backfill snapshot timestamps from analytics: {_date_exc}")
+
     new_summaries = [s for s in summaries if s["snap_id"] not in skip_ids]
     log(f"Listing: {len(summaries)} snapshots found, {len(new_summaries)} new", 0.40)
     if max_snapshots > 0 and len(new_summaries) > max_snapshots:

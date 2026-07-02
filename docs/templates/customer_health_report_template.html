@@ -453,7 +453,28 @@
   .step-body strong { color: var(--text); font-weight: 600; }
 
   /* ── Print ── */
+  /* ── Internal/customer view toggle ── */
+  .view-toggle {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    z-index: 200;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--text-2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  }
+  .view-toggle input { margin: 0; }
+  body.hide-internal .internal-only { display: none !important; }
+
   @media print {
+    .view-toggle { display: none !important; }
     @page { margin: 18mm 16mm; size: A4; }
     body { background: #fff; font-size: 11px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     .fleet-banner { position: static; border-bottom: 2px solid var(--border); margin-bottom: 12pt; box-shadow: none; }
@@ -484,6 +505,11 @@
 </head>
 <body>
 
+<label class="view-toggle">
+  <input type="checkbox" id="hideInternalToggle" onchange="document.body.classList.toggle('hide-internal', this.checked)">
+  Hide internal-only info (for customer copy)
+</label>
+
 <div class="fleet-banner">
   <div class="fleet-banner-inner">
     <div class="fleet-logo">
@@ -501,7 +527,7 @@
       </div>
     </div>
     <div class="fleet-divider"></div>
-    <span class="renewal-badge">⚠ Critical Renewal</span>
+    <span class="renewal-badge internal-only">⚠ Critical Renewal</span>
     <div class="fleet-contacts">
       <strong>AE:</strong> AE_NAME · AE_EMAIL<br>
       <strong>TSE:</strong> TSE_NAME · <strong>Principal SE:</strong> PSE_NAME
