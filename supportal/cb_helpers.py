@@ -665,6 +665,7 @@ def embed_text(
     num_ctx: int | None = None,
 ) -> list[float]:
     """Dispatch to the correct embedding provider and return a float vector."""
+    provider = (provider or "").lower().strip()
     if provider == "ollama":
         return embed_text_ollama(text, model, base_url or "http://localhost:11434", num_ctx=num_ctx)
 
@@ -835,7 +836,7 @@ def embed_all_tickets(
     cluster.wait_until_ready(timedelta(seconds=15))
     col = cluster.bucket(bucket).scope(scope).collection(collection)
 
-    if embed_provider == "mlx":
+    if (embed_provider or "").lower().strip() == "mlx":
         max_workers = 1
         if not _MLX_EMB_AVAILABLE:
             raise RuntimeError(
