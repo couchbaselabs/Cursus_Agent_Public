@@ -788,6 +788,104 @@ def query_supportal_analytics(statement: str, limit_rows: int = 100) -> str:
     return json.dumps({"row_count": len(rows), "rows": rows}, default=str)
 
 
+def _ensure_markers_collection(cluster: Any, bucket: str, scope: str = "transcripts") -> None:
+    try:
+        cm = cluster.bucket(bucket).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if "markers" not in existing.get(scope, set()):
+            from couchbase.management.collections import CollectionSpec
+            cm.create_collection(CollectionSpec("markers", scope_name=scope))
+    except Exception:
+        pass
+
+
+@mcp.tool()
+def check_data_freshness(organization: str) -> str:
+    """
+    Verify the local ticket cache against LIVE Supportal data and persist a
+    freshness marker documenting the result.
+
+    Compares the set of ticket IDs referenced by the org's live snapshots
+    (snapshot.zendesk[] via the Supportal Analytics API) against ticket IDs
+    present in the local Couchbase cache. Any ID present live but missing
+    locally means the local cache is behind and a rescrape is warranted.
+
+    Note the check is one-directional by design: local tickets that never
+    produced a snapshot won't appear in live snapshot.zendesk[] arrays, so
+    "local has more than live" is normal and NOT treated as drift.
+
+    Writes a marker doc `freshness::<org>` (collection `markers`) with
+    checked_at, live/local counts, missing IDs, and a status of
+    fresh | stale — so downstream reports and automations can verify when
+    the data was last reconciled instead of trusting the cache blindly.
+
+    Args:
+        organization: Customer org name (same matching rules as rescrape).
+    """
+    import datetime as _dt
+
+    cfg = _cfg()
+    app = _app()
+    try:
+        from supportal.api_client import fetch_snapshots_via_analytics
+        live_rows = fetch_snapshots_via_analytics(organization, cfg["cookie"], limit=5000)
+    except Exception as exc:
+        return json.dumps({"error": f"Live Supportal lookup failed: {exc}", "organization": organization})
+
+    live_ids: set[str] = set()
+    for r in live_rows:
+        for tid in r.get("ticket_ids") or []:
+            if tid:
+                live_ids.add(str(tid))
+
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions, QueryOptions
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
+        rows = list(cl.query(
+            f"SELECT RAW TO_STRING(t.ticket_id) FROM {ks} t WHERE LOWER(t.organization) = $org",
+            QueryOptions(named_parameters={"org": organization.lower().strip()}),
+        ))
+        local_ids = {r for r in rows if r}
+    except Exception as exc:
+        return json.dumps({"error": f"Local Couchbase lookup failed: {exc}", "organization": organization})
+
+    missing = sorted(live_ids - local_ids, key=lambda x: int(x) if x.isdigit() else 0)
+    status = "fresh" if not missing else "stale"
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    marker = {
+        "type":            "freshness",
+        "organization":    organization,
+        "checked_at":      now_iso,
+        "live_ticket_ids": len(live_ids),
+        "local_tickets":   len(local_ids),
+        "missing_count":   len(missing),
+        "missing_ids":     missing[:50],
+        "status":          status,
+        "source":          "snapshot.zendesk[] via Supportal Analytics API",
+    }
+    try:
+        _ensure_markers_collection(cl, cfg["bucket"], cfg["scope"])
+        key = f"freshness::{organization.lower().replace(' ', '_')}"
+        cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("markers").upsert(key, marker)
+        marker["marker_key"] = key
+        marker["saved"] = True
+    except Exception as exc:
+        marker["saved"] = False
+        marker["save_error"] = str(exc)
+
+    if status == "stale":
+        marker["recommendation"] = (
+            f"{len(missing)} live-referenced ticket(s) missing locally — run "
+            f"rescrape_customer_tickets('{organization}') then re-check."
+        )
+    return json.dumps(marker, default=str)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ASSETS
 # ─────────────────────────────────────────────────────────────────────────────
