@@ -24,7 +24,7 @@ flowchart TD
 
     CX["💬 Corax  localhost:8766\nPassword auth\nThread sidebar (resume sessions)\nSame agent tools as Strabo\nAsset storage (charts & tables → CB)\nShared history with Strabo"]
 
-    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n14 tools — query · search · score\nrescrape · health · briefing · assets\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients"]
+    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n22 tools — query · search · score\nrescrape · health · briefing · assets\nbrand kits · reports · freshness check\nquery_supportal_analytics\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients"]
 
     AI["🤖 AI Clients\nClaude Desktop\nClaude Code (TUI / GUI)\nCursor · Gemini · other MCP hosts"]
 
@@ -226,7 +226,7 @@ SELECT COUNT(*) FROM `rag`.`transcripts`.`tickets` WHERE type = 'ticket';
 
 ### Step 6 — (Optional) Wire the MCP server
 
-To use the 14 Cursus MCP tools from Claude Desktop or Claude Code, see **[`docs/mcp-getting-started.md`](docs/mcp-getting-started.md)** for the full setup guide.
+To use the 22 Cursus MCP tools from Claude Desktop or Claude Code, see **[`docs/mcp-getting-started.md`](docs/mcp-getting-started.md)** for the full setup guide.
 
 Quick summary for Claude Desktop — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -410,7 +410,7 @@ run_mcp.py                 Launch Cursus MCP server (stdio or SSE)
 apps/
   strabo/app.py            Strabo dashboard — NiceGUI, all UI logic
   corax/app.py             Corax chat handler — Chainlit, session management
-  mcp/server.py            Cursus MCP server — 14 tools for Claude Desktop / Code
+  mcp/server.py            Cursus MCP server — 22 tools for Claude Desktop / Code
 supportal/
   agent_tools.py           All 40+ agent tool definitions + LLM tool-calling loop
   api_client.py            Supportal HTTP client (ticket listing, analytics, snapshots)
@@ -455,7 +455,7 @@ Items below represent the planned development trajectory. Contributors should ch
 - **Fuzzy customer resolution** — 5-step chain (LIKE → local CB → Supportal FTS → per-word → difflib)
 - **Cursus supervisor** — watchfiles-based hot-reload; per-app restart routing; 2s debounce
 - **Fleet analytics** — `query_fleet_tickets`, `list_at_risk_clusters`, `fleet_version_distribution`, `fleet_cbse_impact`
-- **MCP tool server** — 14 tools across tickets, customers, scrape jobs, and assets; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation; `get_morning_briefing` fleet briefing tool
+- **MCP tool server** — 22 tools across tickets, customers, scrape jobs, assets, brand kits, and report generation; `generate_health_report`, `generate_ticket_report`, `generate_cluster_health_report`, `check_data_freshness`, `query_supportal_analytics`, `save/get_customer_brand`; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation
 - **Docker** — single `docker compose up` starts app + fully-initialised Couchbase + MCP SSE server on :8768
 
 ### Phase 3 — Fleet dashboard (UI)

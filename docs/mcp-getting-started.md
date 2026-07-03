@@ -252,8 +252,11 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `get_asset` | Fetch a single asset with full content |
 | `generate_health_report` | Generate a full customer health report HTML from live CB data, apply brand colors, save as asset |
 | `generate_ticket_report` | Generate a response cadence visualization for a single ticket, save as HTML asset |
+| `generate_cluster_health_report` | Build a per-cluster health chart enriched with live Supportal cluster names, save as asset |
 | `save_customer_brand` | Save a customer brand kit (colors, logo, terminology) to CB |
 | `get_customer_brand` | Retrieve a saved brand kit for a customer |
+| `check_data_freshness` | Compare live Supportal ticket IDs vs local CB cache; write a freshness marker; flag orgs needing rescrape |
+| `query_supportal_analytics` | Run a SELECT-only SQL++ query against the live Supportal Analytics API to cross-check local data |
 
 ## VPN requirement
 
