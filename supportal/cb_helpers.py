@@ -655,6 +655,109 @@ def embed_text_ollama(text: str, model: str, base_url: str,
     return resp.json()["embedding"]
 
 
+def save_feedback(
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+    source: str,             # mcp | chat | ui | scheduled
+    kind: str,               # correction | rating | preference
+    subject_kind: str,       # score | report | answer | tool_call | data
+    subject_ref: str,        # e.g. "ticket:78964", "asset:<id>", "org:Western Union"
+    verdict: str,            # positive | negative | corrected
+    details: str = "",
+    correction: dict | None = None,   # {"field":..., "old":..., "new":...}
+    organization: str = "",
+    session_id: str = "",
+) -> str:
+    """Shared writer for the human-feedback knowledge base (`feedback`
+    collection). Every capture surface (MCP tool, chat agent tool, future UI
+    affordances) MUST write through this one function so the schema stays
+    uniform — the data's long-term value (few-shot examples, eval sets,
+    DPO/fine-tune pairs for local models) depends on consistency.
+
+    Returns the doc key, or raises on failure (callers surface the error —
+    silently dropped feedback is worse than an error the user can see).
+    """
+    import datetime as _dt
+    import uuid as _uuid
+
+    if not _CB_AVAILABLE:
+        raise RuntimeError("Couchbase SDK not available")
+    cluster = Cluster(
+        _cb_conn_str(cb_url, use_tls),
+        ClusterOptions(PasswordAuthenticator(username, password)),
+    )
+    cluster.wait_until_ready(timedelta(seconds=10))
+    try:
+        cm = cluster.bucket(bucket).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if "feedback" not in existing.get(scope, set()):
+            from couchbase.management.collections import CollectionSpec
+            cm.create_collection(CollectionSpec("feedback", scope_name=scope))
+            import time as _t
+            _t.sleep(1)
+    except Exception:
+        pass
+
+    key = f"feedback::{_uuid.uuid4().hex[:12]}"
+    doc = {
+        "type":         "feedback",
+        "source":       (source or "").lower().strip(),
+        "kind":         (kind or "").lower().strip(),
+        "subject_kind": (subject_kind or "").lower().strip(),
+        "subject_ref":  subject_ref or "",
+        "verdict":      (verdict or "").lower().strip(),
+        "details":      (details or "")[:2000],
+        "correction":   correction or None,
+        "organization": organization or "",
+        "session_id":   session_id or "",
+        "at":           _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    cluster.bucket(bucket).scope(scope).collection("feedback").upsert(key, doc)
+    cluster.close()
+    return key
+
+
+def classify_error(err) -> dict:
+    """Classify a failure into an abridged, aggregatable form for the
+    failure-knowledge base: {error_type, error_code, abridged}.
+
+    error_type: the exception class name (or "str" for plain messages).
+    error_code: coarse bucket usable in GROUP BY queries — the point is
+                insight into recurring failure modes, not full fidelity.
+    abridged:   first line of the message, trimmed.
+    """
+    etype = type(err).__name__ if isinstance(err, BaseException) else "str"
+    msg = str(err)
+    low = msg.lower()
+    first = msg.splitlines()[0][:160] if msg else ""
+
+    if "unknown embedding provider" in low or "unknown llm provider" in low or "unknown provider" in low:
+        code = "PROVIDER_CONFIG"
+    elif "model" in low and ("not loaded" in low or "not found" in low or "no model" in low):
+        code = "MODEL_MISSING"
+    elif "timed out" in low or "timeout" in low:
+        code = "TIMEOUT"
+    elif "connection refused" in low or "connect call failed" in low or "failed to establish" in low or "connection error" in low:
+        code = "CONN_REFUSED"
+    elif "name or service not known" in low or "nodename nor servname" in low or "getaddrinfo" in low:
+        code = "DNS"
+    elif "401" in low or "403" in low or "unauthorized" in low or "forbidden" in low or "authentication" in low:
+        code = "AUTH"
+    elif "document_not_found" in low or "documentnotfound" in low or "key_enoent" in low:
+        code = "DOC_NOT_FOUND"
+    elif "404" in low or "not found" in low:
+        code = "NOT_FOUND"
+    elif "500" in low or "502" in low or "503" in low or "internal server error" in low:
+        code = "HTTP_5XX"
+    elif "jsondecode" in low or "expecting value" in low or "parse" in low:
+        code = "PARSE"
+    elif "dims" in low or "dimension" in low:
+        code = "EMBED_DIMS"
+    else:
+        code = "UNKNOWN"
+    return {"error_type": etype, "error_code": code, "abridged": first}
+
+
 def embed_text(
     text: str,
     provider: str,
@@ -822,8 +925,14 @@ def embed_all_tickets(
     cancel_event: threading.Event | None = None,
     embed_num_ctx: int | None = None,
     max_workers: int = 1,
+    error_sink: list | None = None,
 ) -> tuple[int, int]:
-    """For each ticket: build embed text → embed → upsert. Returns (done, errors)."""
+    """For each ticket: build embed text → embed → upsert. Returns (done, errors).
+
+    error_sink: optional list — per-ticket failure detail dicts are appended
+    ({ticket_id, stage, error}) so callers can persist failure knowledge
+    instead of only receiving an opaque error count.
+    """
     import traceback as _tb
     from couchbase.subdocument import upsert as _SD_upsert
 
@@ -901,6 +1010,9 @@ def embed_all_tickets(
                     error_count += 1
                     if not first_error:
                         first_error.append(err)
+                    if error_sink is not None and len(error_sink) < 200:
+                        error_sink.append({"ticket_id": str(tid), "stage": "embed",
+                                           **classify_error(err)})
                     progress_cb(f"Skipped ticket {tid}: {err.splitlines()[0]}", done_count / total)
                 continue
 

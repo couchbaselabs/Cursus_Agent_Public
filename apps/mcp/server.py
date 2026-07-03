@@ -207,6 +207,7 @@ def get_ticket(ticket_id: str) -> str:
         doc.pop("embedding", None)  # strip vector — too large for tool output
         return json.dumps(doc, default=str)
     except Exception as exc:
+        _log_tool_failure("score_ticket", exc, f"ticket:{ticket_id}")
         return json.dumps({"error": str(exc), "ticket_id": ticket_id})
 
 
@@ -589,10 +590,45 @@ def check_connectivity() -> str:
             "fix": "Connect to the Couchbase corporate VPN — Supportal is an internal host.",
         }
 
+    # ── LLM provider (embedding + scoring) ────────────────────────────────────
+    # The rescrape pipeline's embed/score stages need the local model server
+    # up with the configured models actually loaded — probe it so failures are
+    # caught (and loggable) BEFORE a pipeline run silently degrades.
+    emb_provider   = (cfg.get("emb_provider") or "").lower().strip()
+    score_provider = (cfg.get("score_provider") or "").lower().strip()
+    if "lmstudio" in (emb_provider, score_provider):
+        lms_base = (cfg.get("emb_base_url") or cfg.get("score_base_url") or "http://localhost:1234").rstrip("/")
+        if not lms_base.startswith("http"):
+            lms_base = f"http://{lms_base}"
+        probe: dict = {"provider": "lmstudio", "base_url": lms_base,
+                       "emb_model": cfg.get("emb_model") or "",
+                       "score_model": cfg.get("score_model") or ""}
+        try:
+            import urllib.request as _ur
+            models_url = lms_base + ("/v1/models" if not lms_base.endswith("/v1") else "/models")
+            with _ur.urlopen(_ur.Request(models_url), timeout=5) as resp:
+                loaded = {m.get("id") for m in json.load(resp).get("data", [])}
+            probe["reachable"] = True
+            probe["loaded_models"] = sorted(loaded)
+            missing = [m for m in (probe["emb_model"], probe["score_model"])
+                       if m and m not in loaded]
+            probe["models_ok"] = not missing
+            if missing:
+                probe["missing_models"] = missing
+                probe["fix"] = "Load the missing model(s) in LMStudio before running embed/score pipelines."
+        except Exception as exc:
+            probe["reachable"] = False
+            probe["models_ok"] = False
+            probe["error"] = str(exc)
+            probe["fix"] = "Start LMStudio (or its server) — embed/score stages will fail until it is up."
+        result["llm_provider"] = probe
+
     # ── Summary ───────────────────────────────────────────────────────────────
     vpn_ok       = result.get("vpn_services", {}).get("connected")
     cb_ok        = result.get("couchbase", {}).get("reachable", False)
     supportal_ok = result.get("supportal", {}).get("reachable", False)
+    llm          = result.get("llm_provider")
+    llm_ok       = llm.get("models_ok", False) if llm else None
 
     if cb_ok and supportal_ok:
         result["summary"] = "All systems reachable. Scrape tools are ready."
@@ -602,6 +638,8 @@ def check_connectivity() -> str:
         result["summary"] = "Couchbase unreachable — check CB is running and credentials are correct."
     else:
         result["summary"] = "No connectivity — check VPN and local services."
+    if llm is not None and not llm_ok:
+        result["summary"] += " WARNING: LLM provider not ready — embed/score stages will fail (see llm_provider)."
 
     return json.dumps(result, indent=2)
 
@@ -721,6 +759,7 @@ def rescrape_customer_tickets(
         suffix = f" [{', '.join(stages)}]" if stages else ""
         return json.dumps({"result": result, "pipeline": suffix.strip("[]") or "full"}, default=str)
     except Exception as exc:
+        _log_tool_failure("rescrape_customer_tickets", exc, organization)
         return json.dumps({"error": str(exc)})
 
 
@@ -782,6 +821,7 @@ def query_supportal_analytics(statement: str, limit_rows: int = 100) -> str:
     try:
         rows = app.query_supportal_analytics(stmt, "")
     except Exception as exc:
+        _log_tool_failure("query_supportal_analytics", exc)
         return json.dumps({"error": f"Supportal Analytics query failed: {exc}"})
 
     rows = rows[: min(int(limit_rows or 100), 500)]
@@ -797,6 +837,197 @@ def _ensure_markers_collection(cluster: Any, bucket: str, scope: str = "transcri
             cm.create_collection(CollectionSpec("markers", scope_name=scope))
     except Exception:
         pass
+
+
+def _log_tool_failure(tool: str, exc, organization: str = "") -> None:
+    """Persist an MCP tool failure to the markers collection so tool errors
+    become queryable failure knowledge instead of a transient return value.
+
+    One doc per tool per day (key toolfailure::<tool>::<YYYY-MM-DD>), entries
+    appended with an abridged error code/message. Never raises — logging must
+    not mask or replace the tool's own error response.
+    """
+    import datetime as _dt
+    try:
+        from supportal.cb_helpers import classify_error
+        cfg = _cfg()
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        _ensure_markers_collection(cl, cfg["bucket"], cfg["scope"])
+        col = cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("markers")
+        now = _dt.datetime.now(_dt.timezone.utc)
+        key = f"toolfailure::{tool}::{now.date().isoformat()}"
+        entry = {"at": now.isoformat().replace("+00:00", "Z"),
+                 "organization": organization, **classify_error(exc)}
+        try:
+            doc = col.get(key).content_as[dict]
+        except Exception:
+            doc = {"type": "tool_failure", "tool": tool, "date": now.date().isoformat(), "entries": []}
+        if len(doc.get("entries", [])) < 100:
+            doc.setdefault("entries", []).append(entry)
+        doc["count"] = doc.get("count", 0) + 1
+        col.upsert(key, doc)
+    except Exception:
+        pass
+
+
+@mcp.tool()
+def record_feedback(
+    subject_kind: str,
+    subject_ref: str,
+    verdict: str,
+    details: str = "",
+    correction_field: str = "",
+    correction_old: str = "",
+    correction_new: str = "",
+    organization: str = "",
+) -> str:
+    """
+    Record human feedback on something this system produced — the raw material
+    for the improvement loop (few-shot examples, eval regression sets, and
+    preference pairs for fine-tuning the local scoring/embedding models).
+
+    Call this whenever the user corrects an output, rates a result, or states
+    a preference — e.g. "that P1 count is wrong", "this report is exactly what
+    I wanted", "stars should be 2 not 4".
+
+    Args:
+        subject_kind:     What kind of output: score | report | answer | tool_call | data
+        subject_ref:      Reference, e.g. "ticket:78964", "asset:<id>", "org:Western Union"
+        verdict:          positive | negative | corrected
+        details:          What the human actually said / what was wrong.
+        correction_field: If a specific field was corrected, its name (e.g. "stars").
+        correction_old:   The system's original value.
+        correction_new:   The human's corrected value.
+        organization:     Customer org for context, if applicable.
+    """
+    cfg = _cfg()
+    correction = None
+    if correction_field or correction_old or correction_new:
+        correction = {"field": correction_field, "old": correction_old, "new": correction_new}
+    try:
+        from supportal.cb_helpers import save_feedback
+        key = save_feedback(
+            cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+            cfg["use_tls"], cfg["scope"],
+            source="mcp", kind="correction" if correction else "rating",
+            subject_kind=subject_kind, subject_ref=subject_ref,
+            verdict=verdict, details=details, correction=correction,
+            organization=organization,
+        )
+        return json.dumps({"saved": True, "key": key})
+    except Exception as exc:
+        _log_tool_failure("record_feedback", exc, organization)
+        return json.dumps({"error": f"Failed to save feedback: {exc}"})
+
+
+@mcp.tool()
+def get_failure_insights(days: int = 7, organization: str = "") -> str:
+    """
+    Observability report over the failure-knowledge base (the `markers`
+    collection) — the governance surface for "how is our own tooling failing
+    and is our data trustworthy?"
+
+    Aggregates all four marker types written by the pipeline and tools:
+      - freshness::<org>            — latest cache-vs-live reconciliation per org
+      - pipelinefailure::<date>     — LMStudio/model preflight failures
+      - failurelog::<job_id>        — per-job scrape/embed/score failures
+      - toolfailure::<tool>::<date> — MCP tool except-path failures
+
+    Returns per-org freshness status, failures grouped by error_code and by
+    stage/tool (so recurring failure modes stand out), and the most recent
+    raw entries for drill-down.
+
+    Args:
+        days:         Lookback window for failure docs (default 7).
+        organization: Optional org filter (partial match, case-insensitive).
+    """
+    import datetime as _dt
+
+    cfg = _cfg()
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`markers`"
+        docs = [r for r in cl.query(f"SELECT META(m).id AS _key, m.* FROM {ks} m")]
+    except Exception as exc:
+        return json.dumps({"error": f"Could not read markers collection: {exc}"})
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff_epoch = (now - _dt.timedelta(days=days)).timestamp()
+    cutoff_date = (now - _dt.timedelta(days=days)).date().isoformat()
+    org_f = organization.lower().strip()
+
+    def _org_match(v: str) -> bool:
+        return not org_f or org_f in (v or "").lower()
+
+    freshness, code_counts, stage_counts, tool_counts = [], {}, {}, {}
+    recent_entries = []
+    pipeline_failures = []
+
+    for d in docs:
+        dtype = d.get("type")
+        if dtype == "freshness" and _org_match(d.get("organization")):
+            freshness.append({k: d.get(k) for k in
+                              ("organization", "status", "checked_at", "missing_count",
+                               "live_ticket_ids", "local_tickets")})
+        elif dtype == "pipeline_failure":
+            if (d.get("checked_at") or "") >= cutoff_date:
+                pipeline_failures.append({"checked_at": d.get("checked_at"),
+                                          "stage": d.get("stage"),
+                                          "impact": d.get("impact")})
+        elif dtype == "failure_log" and _org_match(d.get("organization")):
+            fin = d.get("finished_at") or 0
+            if fin and fin < cutoff_epoch:
+                continue
+            for e in d.get("error_log") or []:
+                code = e.get("error_code", "UNKNOWN")
+                stage = e.get("stage", "?")
+                code_counts[code] = code_counts.get(code, 0) + 1
+                stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                if len(recent_entries) < 25:
+                    recent_entries.append({"source": f"job:{d.get('job_id')}",
+                                           "org": d.get("organization"), **e})
+        elif dtype == "tool_failure":
+            if (d.get("date") or "") < cutoff_date:
+                continue
+            tool = d.get("tool", "?")
+            for e in d.get("entries") or []:
+                if not _org_match(e.get("organization")):
+                    continue
+                code = e.get("error_code", "UNKNOWN")
+                code_counts[code] = code_counts.get(code, 0) + 1
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
+                if len(recent_entries) < 25:
+                    recent_entries.append({"source": f"tool:{tool}", **e})
+
+    freshness.sort(key=lambda f: (f.get("status") != "stale", f.get("organization") or ""))
+    recent_entries.sort(key=lambda e: str(e.get("at") or ""), reverse=True)
+
+    stale = [f["organization"] for f in freshness if f.get("status") == "stale"]
+    total_failures = sum(code_counts.values())
+    summary = (
+        f"Last {days}d: {total_failures} failure(s) recorded"
+        + (f", top code: {max(code_counts, key=code_counts.get)}" if code_counts else "")
+        + (f". STALE cache: {', '.join(stale)}" if stale else ". All checked orgs fresh.")
+        + (f" {len(pipeline_failures)} model-preflight failure(s)." if pipeline_failures else "")
+    )
+    return json.dumps({
+        "window_days":        days,
+        "summary":            summary,
+        "failures_by_code":   dict(sorted(code_counts.items(), key=lambda kv: -kv[1])),
+        "failures_by_stage":  dict(sorted(stage_counts.items(), key=lambda kv: -kv[1])),
+        "failures_by_tool":   dict(sorted(tool_counts.items(), key=lambda kv: -kv[1])),
+        "pipeline_failures":  pipeline_failures,
+        "freshness":          freshness,
+        "recent_entries":     recent_entries,
+    }, default=str)
 
 
 @mcp.tool()
@@ -830,6 +1061,7 @@ def check_data_freshness(organization: str) -> str:
         from supportal.api_client import fetch_snapshots_via_analytics
         live_rows = fetch_snapshots_via_analytics(organization, cfg["cookie"], limit=5000)
     except Exception as exc:
+        _log_tool_failure("check_data_freshness", exc, organization)
         return json.dumps({"error": f"Live Supportal lookup failed: {exc}", "organization": organization})
 
     live_ids: set[str] = set()
@@ -851,6 +1083,7 @@ def check_data_freshness(organization: str) -> str:
         ))
         local_ids = {r for r in rows if r}
     except Exception as exc:
+        _log_tool_failure("check_data_freshness", exc, organization)
         return json.dumps({"error": f"Local Couchbase lookup failed: {exc}", "organization": organization})
 
     missing = sorted(live_ids - local_ids, key=lambda x: int(x) if x.isdigit() else 0)
@@ -1615,6 +1848,7 @@ def generate_health_report(
             limit=min(max_tickets, 500),
         )
     except Exception as exc:
+        _log_tool_failure("generate_health_report", exc, organization)
         return json.dumps({"error": f"Failed to query tickets: {exc}"})
 
     if not tickets:
@@ -1667,6 +1901,7 @@ LIMIT 1
     try:
         html = _build_health_report_html(organization, tickets, report_date, brand, org_meta)
     except Exception as exc:
+        _log_tool_failure("generate_health_report", exc, organization)
         return json.dumps({"error": f"Failed to build report: {exc}"})
 
     # Stamp in team contacts
@@ -1733,6 +1968,7 @@ def generate_ticket_report(ticket_id: str) -> str:
         ticket = result.content_as[dict]
         cl.close()
     except Exception as exc:
+        _log_tool_failure("generate_ticket_report", exc, f"ticket:{ticket_id}")
         return json.dumps({"error": f"Could not fetch ticket {ticket_id}: {exc}"})
 
     org = ticket.get("organization", "")
@@ -1752,6 +1988,7 @@ def generate_ticket_report(ticket_id: str) -> str:
     try:
         html = _build_cadence_report_html(ticket, brand)
     except Exception as exc:
+        _log_tool_failure("generate_ticket_report", exc, f"ticket:{ticket_id}")
         return json.dumps({"error": f"Failed to build cadence report: {exc}"})
 
     # Save to CB
@@ -2295,6 +2532,7 @@ def generate_cluster_health_chart(organization: str, max_clusters: int = 8) -> s
         ))
         cl.close()
     except Exception as exc:
+        _log_tool_failure("generate_cluster_health_chart", exc, organization)
         return json.dumps({"error": f"Failed to load snapshots: {exc}"})
 
     if not snapshots:
@@ -2305,6 +2543,7 @@ def generate_cluster_health_chart(organization: str, max_clusters: int = 8) -> s
             {"organization": organization, "limit": 500}, *_cb_tuple(cfg), limit=500,
         )
     except Exception as exc:
+        _log_tool_failure("generate_cluster_health_chart", exc, organization)
         return json.dumps({"error": f"Failed to load tickets: {exc}"})
 
     health = app.build_cluster_health_data(snapshots, tickets)

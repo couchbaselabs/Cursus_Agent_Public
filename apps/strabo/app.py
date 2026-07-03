@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.6.4"
+__version__ = "2.7.0"
 
 import asyncio
 import threading
@@ -9672,6 +9672,68 @@ def main_page():
 
 
 
+def _job_fail(job: dict, stage: str, err, ticket_id: str | None = None) -> None:
+    """Record a pipeline failure on the job: bump the error counter AND capture
+    detail into job["error_log"] (capped) so failures become durable knowledge
+    instead of an opaque count. Never raises."""
+    try:
+        from supportal.cb_helpers import classify_error
+        job["errors"] = job.get("errors", 0) + 1
+        log = job.setdefault("error_log", [])
+        if len(log) < 200:
+            entry = {"stage": stage, "at": time.time(), **classify_error(err)}
+            if ticket_id:
+                entry["ticket_id"] = str(ticket_id)
+            log.append(entry)
+    except Exception:
+        pass
+
+
+def _persist_failure_log(
+    job: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+) -> None:
+    """If the job had any errors, write a PERMANENT failure-knowledge doc to the
+    `markers` collection (unlike scrape_job:: docs, which expire after 48h).
+    Key: failurelog::<job_id>. Never raises."""
+    if not job.get("errors") and not job.get("error_log"):
+        return
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        _c = _Cl(_cb_conn_str(cb_url, use_tls), _CO(_PA(username, password)))
+        _c.wait_until_ready(timedelta(seconds=5))
+        try:
+            cm = _c.bucket(bucket).collections()
+            existing = {s.name: {cc.name for cc in s.collections} for s in cm.get_all_scopes()}
+            if "markers" not in existing.get(scope, set()):
+                from couchbase.management.collections import CollectionSpec
+                cm.create_collection(CollectionSpec("markers", scope_name=scope))
+        except Exception:
+            pass
+        doc = {
+            "type":         "failure_log",
+            "job_id":       job.get("job_id"),
+            "organization": job.get("org"),
+            "mode":         job.get("mode"),
+            "finished_at":  job.get("finished_at"),
+            "total":        job.get("total"),
+            "errors":       job.get("errors", 0),
+            "error_log":    (job.get("error_log") or [])[:200],
+            "last_message": job.get("last_message", ""),
+        }
+        _c.bucket(bucket).scope(scope).collection("markers").upsert(
+            f"failurelog::{job.get('job_id')}", doc
+        )
+        _c.close()
+    except Exception:
+        pass
+
+
 def _upsert_job_doc(job: dict, col) -> None:
     """Write job state using an already-open CB collection handle. Never raises."""
     if col is None:
@@ -9808,12 +9870,12 @@ def _run_scrape_job_bg(
                 try:
                     _col.upsert(f"ticket::{tid}", {**t, "type": "ticket", "last_scraped_at": now_epoch})
                     _saved += 1
-                except Exception:
-                    job["errors"] += 1
+                except Exception as _texc:
+                    _job_fail(job, "save", _texc, ticket_id=tid)
             _upsert_job_doc(job, _col)   # persist end-of-save state
             _cluster.close()
         except Exception as exc:
-            job["errors"] += 1
+            _job_fail(job, "save", f"CB save failed: {exc}")
             job["last_message"] = f"CB save failed: {exc}"
         job["saved"] = _saved
         _set_op(f"Saved {_saved} tickets — embedding…", 0.55)
@@ -9840,18 +9902,20 @@ def _run_scrape_job_bg(
                     _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
                     _OP_STATUS["progress"] = 0.55 + pct * 0.30  # embed = 55–85%
 
+                _emb_errs: list = job.setdefault("error_log", [])
                 _done_emb, _errs_emb = embed_all_tickets(
                     _saved_data, cb_url, bucket, username, password,
                     use_tls, scope, collection,
                     emb_p, emb_m, emb_k, emb_u, emb_d,
                     _emb_prog,
                     max_workers=emb_workers,
+                    error_sink=_emb_errs,
                 )
                 job["embedded"] = _done_emb
                 job["errors"]  += _errs_emb
             except Exception as exc:
                 job["last_message"] = f"Embedding failed: {exc}"
-                job["errors"] += 1
+                _job_fail(job, "embed", exc)
         _set_op(f"Embedded {job['embedded']} tickets — scoring…", 0.85)
 
         # ── Phase 4: score ──────────────────────────────────────────────────
@@ -9872,7 +9936,7 @@ def _run_scrape_job_bg(
                 job["scored"] = len(_scores)
             except Exception as exc:
                 job["last_message"] = f"Scoring failed: {exc}"
-                job["errors"] += 1
+                _job_fail(job, "score", exc)
 
         # ── Done ────────────────────────────────────────────────────────────
         job["status"]       = "done"
@@ -9886,15 +9950,17 @@ def _run_scrape_job_bg(
         job["last_message"] = summary
         _set_op(summary, 1.0, done=True)
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
 
     except Exception as exc:
         job["status"]      = "error"
         job["phase"]       = None
         job["finished_at"] = time.time()
         job["last_message"] = f"Fatal error: {exc}"
-        job["errors"] += 1
+        _job_fail(job, "fatal", exc)
         _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
 
 
 def _run_rescrape_job_bg(
@@ -9999,6 +10065,11 @@ def _run_rescrape_job_bg(
             except Exception as exc:
                 errors += 1
                 job["errors"] = errors
+                _log = job.setdefault("error_log", [])
+                if len(_log) < 200:
+                    from supportal.cb_helpers import classify_error as _clf
+                    _log.append({"stage": "scrape", "ticket_id": str(tid),
+                                 "at": time.time(), **_clf(exc)})
             job["processed"] = i
             pct = i / total * 0.80   # scrape phase = 0–80%
             if i % 10 == 0 or i == total:
@@ -10079,7 +10150,7 @@ def _run_rescrape_job_bg(
                     pass
             except Exception as exc:
                 job["last_message"] = f"Enrichment failed: {exc}"
-                job["errors"] += 1
+                _job_fail(job, "enrich", exc)
 
         # ── Embed refreshed tickets ────────────────────────────────────────
         emb_p = (emb_params or {}).get("provider", "").lower().strip()
@@ -10108,12 +10179,13 @@ def _run_rescrape_job_bg(
                     emb_p, emb_m, emb_k, emb_u, emb_d,
                     _emb_prog,
                     max_workers=emb_workers,
+                    error_sink=job.setdefault("error_log", []),
                 )
                 job["embedded"] = _done_emb
                 job["errors"]  += _errs_emb
             except Exception as exc:
                 job["last_message"] = f"Embedding failed: {exc}"
-                job["errors"] += 1
+                _job_fail(job, "embed", exc)
 
         # ── Score refreshed tickets ───────────────────────────────────────
         s_prov    = (emb_params or {}).get("score_provider", "").lower().strip()
@@ -10141,7 +10213,7 @@ def _run_rescrape_job_bg(
                 _scol = _sclust.bucket(bucket).scope(scope).collection(collection)
             except Exception as exc:
                 job["last_message"] = f"Scoring save-back connection failed: {exc}"
-                job["errors"] += 1
+                _job_fail(job, "score", exc)
             for _si in range(0, len(refreshed_tickets), _score_batch_sz):
                 _chunk = refreshed_tickets[_si:_si + _score_batch_sz]
                 _set_op(
@@ -10169,11 +10241,17 @@ def _run_rescrape_job_bg(
                                 _scol.upsert(_sdoc_key, _sdoc)
                                 _total_scored += 1
                             except Exception as _wexc:
-                                job["errors"] += 1
+                                _job_fail(job, "score_save", _wexc, ticket_id=_stid)
                                 job["last_message"] = f"Failed to save score for ticket {_stid}: {_wexc}"
                     elif _score_results:
                         # No working CB connection — do not fake success.
                         job["errors"] += len(_score_results)
+                        _log = job.setdefault("error_log", [])
+                        if len(_log) < 200:
+                            _log.append({"stage": "score_save", "error_type": "str",
+                                         "error_code": "CONN_REFUSED",
+                                         "abridged": f"{len(_score_results)} scores lost — no CB connection",
+                                         "at": time.time()})
                         job["last_message"] = (
                             f"Scored {len(_score_results)} tickets but had no CB connection "
                             f"to save them — see earlier error."
@@ -10181,7 +10259,7 @@ def _run_rescrape_job_bg(
                     job["scored"] = _total_scored
                 except Exception as exc:
                     job["last_message"] = f"Scoring batch {_si // _score_batch_sz + 1} failed: {exc}"
-                    job["errors"] += 1
+                    _job_fail(job, "score", exc)
             try:
                 if _scol is not None:
                     _sclust.close()
@@ -10203,15 +10281,17 @@ def _run_rescrape_job_bg(
         job["last_message"] = summary
         _set_op(summary, 1.0, done=True)
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
 
     except Exception as exc:
         job["status"]      = "error"
         job["phase"]       = None
         job["finished_at"] = time.time()
         job["last_message"] = f"Fatal error: {exc}"
-        job["errors"] += 1
+        _job_fail(job, "fatal", exc)
         _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
 
 
 _PROFILE_SCOPE      = "chat"
@@ -12245,6 +12325,29 @@ LIMIT {limit}
             return "\n".join(lines)
         except Exception as exc:
             return f"CBSE impact query error: {exc}"
+
+    elif name == "record_feedback":
+        try:
+            from supportal.cb_helpers import save_feedback
+            _corr = None
+            if args.get("correction_field") or args.get("correction_old") or args.get("correction_new"):
+                _corr = {"field": args.get("correction_field", ""),
+                         "old": args.get("correction_old", ""),
+                         "new": args.get("correction_new", "")}
+            _fb_key = save_feedback(
+                cb_url, bucket, username, password, use_tls, scope,
+                source="chat",
+                kind="correction" if _corr else "rating",
+                subject_kind=str(args.get("subject_kind") or ""),
+                subject_ref=str(args.get("subject_ref") or ""),
+                verdict=str(args.get("verdict") or ""),
+                details=str(args.get("details") or ""),
+                correction=_corr,
+                organization=default_customer or "",
+            )
+            return f"Feedback recorded ({_fb_key}). It will feed future eval and training data."
+        except Exception as exc:
+            return f"Failed to record feedback: {exc}"
 
     elif name == "tag_ticket":
         tid  = str(args.get("ticket_id") or "").strip()

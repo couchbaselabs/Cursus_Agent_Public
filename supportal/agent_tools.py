@@ -1059,6 +1059,33 @@ _AGENT_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "record_feedback",
+            "description": (
+                "Record human feedback on an output this system produced — a correction, "
+                "rating, or preference. ALWAYS call this when the user corrects a score, "
+                "report number, or answer (e.g. 'that count is wrong', 'stars should be 2'), "
+                "or clearly praises/criticizes a result. This feeds the improvement loop: "
+                "corrections become eval sets and training pairs for the local models."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject_kind": {"type": "string", "enum": ["score", "report", "answer", "tool_call", "data"],
+                                     "description": "What kind of output the feedback is about."},
+                    "subject_ref": {"type": "string", "description": "Reference, e.g. 'ticket:78964', 'asset:<id>', 'org:Western Union'."},
+                    "verdict": {"type": "string", "enum": ["positive", "negative", "corrected"]},
+                    "details": {"type": "string", "description": "What the human said / what was wrong."},
+                    "correction_field": {"type": "string", "description": "Corrected field name, if specific (e.g. 'stars')."},
+                    "correction_old": {"type": "string", "description": "System's original value."},
+                    "correction_new": {"type": "string", "description": "Human's corrected value."},
+                },
+                "required": ["subject_kind", "subject_ref", "verdict"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tag_ticket",
             "description": (
                 "Add user-defined tags to a ticket stored in Couchbase. "
