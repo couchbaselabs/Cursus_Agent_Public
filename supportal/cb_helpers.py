@@ -728,15 +728,22 @@ def classify_error(err) -> dict:
     """
     etype = type(err).__name__ if isinstance(err, BaseException) else "str"
     msg = str(err)
-    low = msg.lower()
     first = msg.splitlines()[0][:160] if msg else ""
+    # Classify on the FIRST LINE only — error strings often carry a full
+    # traceback, and matching keywords against source lines in the traceback
+    # misclassifies (e.g. `dims=vector_dims` in a code line made every embed
+    # connection failure look like EMBED_DIMS on the framework's first day).
+    low = first.lower()
 
     if "unknown embedding provider" in low or "unknown llm provider" in low or "unknown provider" in low:
         code = "PROVIDER_CONFIG"
-    elif "model" in low and ("not loaded" in low or "not found" in low or "no model" in low):
+    elif ("model" in low and ("not loaded" in low or "not found" in low or "no model" in low)) \
+            or "failed to load model" in low or "error loading model" in low:
         code = "MODEL_MISSING"
     elif "timed out" in low or "timeout" in low:
         code = "TIMEOUT"
+    elif "connection closed" in low or "connection reset" in low or "broken pipe" in low or "server disconnected" in low:
+        code = "CONN_CLOSED"
     elif "connection refused" in low or "connect call failed" in low or "failed to establish" in low or "connection error" in low:
         code = "CONN_REFUSED"
     elif "name or service not known" in low or "nodename nor servname" in low or "getaddrinfo" in low:
@@ -749,6 +756,8 @@ def classify_error(err) -> dict:
         code = "NOT_FOUND"
     elif "500" in low or "502" in low or "503" in low or "internal server error" in low:
         code = "HTTP_5XX"
+    elif "400" in low or "bad request" in low:
+        code = "HTTP_4XX"
     elif "jsondecode" in low or "expecting value" in low or "parse" in low:
         code = "PARSE"
     elif "dims" in low or "dimension" in low:
