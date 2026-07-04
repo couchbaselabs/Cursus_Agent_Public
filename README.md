@@ -455,7 +455,8 @@ Items below represent the planned development trajectory. Contributors should ch
 - **Fuzzy customer resolution** — 5-step chain (LIKE → local CB → Supportal FTS → per-word → difflib)
 - **Cursus supervisor** — watchfiles-based hot-reload; per-app restart routing; 2s debounce
 - **Fleet analytics** — `query_fleet_tickets`, `list_at_risk_clusters`, `fleet_version_distribution`, `fleet_cbse_impact`
-- **MCP tool server** — 22 tools across tickets, customers, scrape jobs, assets, brand kits, and report generation; `generate_health_report`, `generate_ticket_report`, `generate_cluster_health_report`, `check_data_freshness`, `query_supportal_analytics`, `save/get_customer_brand`; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation
+- **MCP tool server** — 25 tools across tickets, customers, scrape jobs, assets, brand kits, report generation, and observability; `generate_health_report`, `generate_ticket_report`, `generate_cluster_health_report`, `check_data_freshness`, `query_supportal_analytics`, `save/get_customer_brand`, `get_failure_insights`, `record_feedback`, `record_insight`, `record_automation_run`; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation
+- **Observability & governance framework (v2.7.x)** — durable failure-knowledge base in the `markers` collection (`failurelog::` per-job pipeline failures with per-ticket detail, `toolfailure::` MCP tool errors, `pipelinefailure::` LMStudio preflight, `freshness::` live-vs-local reconciliation, `cronrun::` automation run records); `classify_error()` stamps every entry with an aggregatable `error_code`; `get_failure_insights` is the one-call governance report; LMStudio preflight in `check_connectivity` (verifies configured models are loaded); human-feedback capture via `record_feedback` (MCP) + `record_feedback` agent tool (Strabo/Corax) into a uniform `feedback` collection; `insights` collection for observed customer/ticket patterns with candidate→validated promotion governance (`record_insight`)
 - **Docker** — single `docker compose up` starts app + fully-initialised Couchbase + MCP SSE server on :8768
 
 ### Phase 3 — Fleet dashboard (UI)
@@ -509,6 +510,17 @@ Items below represent the planned development trajectory. Contributors should ch
 - [ ] **Cron-compatible** — exits 0/1; structured JSON log to stdout
 - [ ] **Change detection** — only re-embed/re-score when status changed or data is stale
 - [ ] **`_OP_STATUS` via CB** — persist pipeline progress to a CB doc so Strabo/Corax can display in-progress state from a detached run
+
+### Phase 5 — Observability-driven governance (Jarvis loop)
+
+**Goal:** The system learns from its own behavior and human feedback, with validation gates preventing self-reinforcing drift. Everything stays Couchbase-native — no external observability databases.
+
+- [ ] **Agent tracing (layer 2)** — OTel GenAI semantic-convention docs in a CB `traces` collection (`trace::` / `span::` per LLM call and tool execution); instrument `call_llm_with_tools`; FTS + vector search over trace summaries for semantic search of agent behavior history
+- [ ] **Watchers** — scheduled evaluators over traces/markers/tickets that emit *candidate* insights (`record_insight`); never self-validating
+- [ ] **Validation gate** — human / judge-quorum / precedent promotion of candidate feedback and insights to validated; only validated knowledge may influence behavior
+- [ ] **Orchestrator** — turns validated feedback into *proposed* `guardrail::` docs; staged rollout: human-approve → shadow mode → enforce after track record
+- [ ] **Improvement loop consumption** — validated corrections become few-shot examples and eval regression sets; correction pairs exported as DPO/fine-tune data for local LMStudio models
+- [ ] **Client portability** — split the support-ticket monitor into deterministic steps (pure Python, any cron scheduler) and judgment steps (local LMStudio); interactive clients (Claude, Antigravity, Cursor) remain interchangeable frontends, never load-bearing
 
 ### Future / exploratory
 
