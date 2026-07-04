@@ -41,6 +41,8 @@ The following are created automatically by Strabo or Corax on first run. If you 
 | `transcripts` | `snapshots` | Cluster topology snapshots linked to tickets |
 | `transcripts` | `assets` | Saved charts, tables, reports, images, PDFs |
 | `transcripts` | `brands` | Customer brand kits (colors, logo, terminology) |
+| `transcripts` | `markers` | Freshness checks, failure logs, pipeline errors, automation run records |
+| `transcripts` | `insights` | Observed customer/ticket patterns (candidate → validated) |
 | `chat` | `users` | Corax user accounts |
 | `chat` | `threads` | Corax conversation threads |
 | `chat` | `steps` | Corax message steps (tool calls, messages) |
@@ -74,7 +76,7 @@ cm  = bkt.collections()
 existing = {s.name: {col.name for col in s.collections} for s in cm.get_all_scopes()}
 
 for scope, cols in {
-    "transcripts": ["tickets", "snapshots", "assets", "brands"],
+    "transcripts": ["tickets", "snapshots", "assets", "brands", "markers", "insights"],
     "chat":        ["users", "threads", "steps", "elements", "feedback", "assets"],
 }.items():
     if scope not in existing:
@@ -257,6 +259,10 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `get_customer_brand` | Retrieve a saved brand kit for a customer |
 | `check_data_freshness` | Compare live Supportal ticket IDs vs local CB cache; write a freshness marker; flag orgs needing rescrape |
 | `query_supportal_analytics` | Run a SELECT-only SQL++ query against the live Supportal Analytics API to cross-check local data |
+| `get_failure_insights` | One-call governance report — pipeline failures, tool errors, error classification, automation run health |
+| `record_insight` | Capture an observed customer/ticket pattern as a candidate insight in CB for later validation |
+| `record_feedback` | Persist human feedback on a tool response or agent output to the feedback collection |
+| `record_automation_run` | Log the outcome of a scheduled automation run (success/failure, counts, errors) for health tracking |
 
 ## VPN requirement
 

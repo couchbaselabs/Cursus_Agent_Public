@@ -18,13 +18,13 @@ flowchart TD
 
     LLM["🤖 LLM Providers\nCloud: Claude · Gemini · OpenAI\nLocal: LMStudio :1234 · Ollama :11434\nChat + Embedding"]
 
-    CB[("🗄 Couchbase  localhost:8091\n─────────────────────\ntranscripts.tickets\ntranscripts.snapshots\ntranscripts.assets\ntranscripts.brands\n─────────────────────\nchat.history  chat.profiles\nchat.threads / steps / elements")]
+    CB[("🗄 Couchbase  localhost:8091\n─────────────────────\ntranscripts.tickets\ntranscripts.snapshots\ntranscripts.assets\ntranscripts.brands\ntranscripts.markers\ntranscripts.insights\n─────────────────────\nchat.history  chat.profiles\nchat.threads / steps / elements\nchat.feedback")]
 
     ST["🖥 Strabo  localhost:8765\nConfiguration & profiles\nScraping (tickets & snapshots)\nAgent chat with ECharts\nScoring & Analytics\nCluster health view"]
 
     CX["💬 Corax  localhost:8766\nPassword auth\nThread sidebar (resume sessions)\nSame agent tools as Strabo\nAsset storage (charts & tables → CB)\nShared history with Strabo"]
 
-    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n22 tools — query · search · score\nrescrape · health · briefing · assets\nbrand kits · reports · freshness check\nquery_supportal_analytics\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients"]
+    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n25 tools — query · search · score\nrescrape · health · briefing · assets\nbrand kits · reports · freshness check\nquery_supportal_analytics\nobservability: insights · feedback\nrecord_automation_run · failure KB\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients"]
 
     AI["🤖 AI Clients\nClaude Desktop\nClaude Code (TUI / GUI)\nCursor · Gemini · other MCP hosts"]
 
@@ -226,7 +226,7 @@ SELECT COUNT(*) FROM `rag`.`transcripts`.`tickets` WHERE type = 'ticket';
 
 ### Step 6 — (Optional) Wire the MCP server
 
-To use the 22 Cursus MCP tools from Claude Desktop or Claude Code, see **[`docs/mcp-getting-started.md`](docs/mcp-getting-started.md)** for the full setup guide.
+To use the 25 Cursus MCP tools from Claude Desktop or Claude Code, see **[`docs/mcp-getting-started.md`](docs/mcp-getting-started.md)** for the full setup guide.
 
 Quick summary for Claude Desktop — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -410,7 +410,7 @@ run_mcp.py                 Launch Cursus MCP server (stdio or SSE)
 apps/
   strabo/app.py            Strabo dashboard — NiceGUI, all UI logic
   corax/app.py             Corax chat handler — Chainlit, session management
-  mcp/server.py            Cursus MCP server — 22 tools for Claude Desktop / Code
+  mcp/server.py            Cursus MCP server — 25 tools for Claude Desktop / Code
 supportal/
   agent_tools.py           All 40+ agent tool definitions + LLM tool-calling loop
   api_client.py            Supportal HTTP client (ticket listing, analytics, snapshots)
