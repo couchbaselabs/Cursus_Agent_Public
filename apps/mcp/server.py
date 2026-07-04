@@ -925,6 +925,71 @@ def record_feedback(
 
 
 @mcp.tool()
+def record_insight(
+    pattern: str,
+    summary: str,
+    evidence: str = "",
+    organizations: str = "",
+    proposed_action: str = "",
+    source: str = "watcher",
+) -> str:
+    """
+    Persist a CANDIDATE insight — an observed pattern in customer/ticket data
+    worth remembering across sessions (e.g. "backup failures recurring across
+    4 orgs"). Insights are the substrate for next-step suggestions.
+
+    Governance: anything recorded here starts as status="candidate". It must
+    be promoted to "validated" by a human (or a validation gate) before any
+    automation treats it as truth — machine-generated insights never
+    self-promote. Docs land in the `insights` collection (key insight::<id>).
+
+    Args:
+        pattern:         Short snake_case pattern name (e.g. "recurring_backup_failures").
+        summary:         One-paragraph statement of the observation.
+        evidence:        Comma-separated refs, e.g. "ticket:78641,cluster:3f18...".
+        organizations:   Comma-separated org names involved.
+        proposed_action: Suggested next step, if any.
+        source:          watcher | session | scheduled (human-validated inserts happen elsewhere).
+    """
+    import datetime as _dt
+    import uuid as _uuid
+
+    cfg = _cfg()
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        try:
+            cm = cl.bucket(cfg["bucket"]).collections()
+            existing = {s.name: {cc.name for cc in s.collections} for s in cm.get_all_scopes()}
+            if "insights" not in existing.get(cfg["scope"], set()):
+                from couchbase.management.collections import CollectionSpec
+                cm.create_collection(CollectionSpec("insights", scope_name=cfg["scope"]))
+        except Exception:
+            pass
+        key = f"insight::{_uuid.uuid4().hex[:12]}"
+        doc = {
+            "type":            "insight",
+            "status":          "candidate",
+            "source":          (source or "watcher").lower().strip(),
+            "pattern":         pattern.strip(),
+            "summary":         summary.strip()[:2000],
+            "evidence":        [e.strip() for e in evidence.split(",") if e.strip()],
+            "organizations":   [o.strip() for o in organizations.split(",") if o.strip()],
+            "proposed_action": proposed_action.strip()[:1000],
+            "created_at":      _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("insights").upsert(key, doc)
+        return json.dumps({"saved": True, "key": key, "status": "candidate",
+                           "note": "Requires human validation before automations may act on it."})
+    except Exception as exc:
+        _log_tool_failure("record_insight", exc, organizations)
+        return json.dumps({"error": f"Failed to save insight: {exc}"})
+
+
+@mcp.tool()
 def get_failure_insights(days: int = 7, organization: str = "") -> str:
     """
     Observability report over the failure-knowledge base (the `markers`
