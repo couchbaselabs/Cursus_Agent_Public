@@ -925,6 +925,86 @@ def record_feedback(
 
 
 @mcp.tool()
+def record_automation_run(
+    task_id: str,
+    outcome: str,
+    run_kind: str = "",
+    summary: str = "",
+    errors_observed: str = "",
+    metrics: str = "",
+    notification_sent: str = "",
+) -> str:
+    """
+    Persist a durable record of an automation run (scheduled task, watcher,
+    orchestrator cycle) to the `markers` collection — the native way for any
+    automation to make its behavior auditable, instead of hand-assembling
+    docs via generic upserts.
+
+    Key: cronrun::<task_id>::<UTC timestamp to the minute>. Doc type:
+    "automation_run". These records feed get_failure_insights and are the
+    raw material for run-over-run anomaly detection (candidate insights).
+
+    Args:
+        task_id:           Automation identifier, e.g. "support-ticket-monitor".
+        outcome:           ok | degraded | failed. "degraded" = completed but with
+                           tool errors/timeouts or skipped sub-steps.
+        run_kind:          Optional label, e.g. "9am-full" | "intraday".
+        summary:           One-line human-readable result of the run.
+        errors_observed:   Optional JSON array string of error objects hit during
+                           the run, e.g. '[{"step":"freshness","error_code":"HTTP_5XX","abridged":"..."}]'.
+        metrics:           Optional JSON object string of run metrics, e.g.
+                           '{"customer_replies_found":0,"rescrapes_triggered":["GoDaddy"]}'.
+        notification_sent: "true" | "false" | "suppressed-user-active" | "".
+    """
+    import datetime as _dt
+
+    outcome_n = (outcome or "").lower().strip()
+    if outcome_n not in ("ok", "degraded", "failed"):
+        return json.dumps({"error": f"outcome must be ok|degraded|failed, got {outcome!r}"})
+
+    def _lenient_json(s: str, fallback):
+        if not (s or "").strip():
+            return fallback
+        try:
+            return json.loads(s)
+        except Exception:
+            return [{"raw": s[:500]}] if isinstance(fallback, list) else {"raw": s[:500]}
+
+    cfg = _cfg()
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        _ensure_markers_collection(cl, cfg["bucket"], cfg["scope"])
+        now = _dt.datetime.now(_dt.timezone.utc)
+        key = f"cronrun::{task_id.strip()}::{now.strftime('%Y-%m-%dT%H:%M')}"
+        errs = _lenient_json(errors_observed, [])
+        if not isinstance(errs, list):
+            errs = [errs]
+        mets = _lenient_json(metrics, {})
+        if not isinstance(mets, dict):
+            mets = {"value": mets}
+        doc = {
+            "type":              "automation_run",
+            "task_id":           task_id.strip(),
+            "ran_at":            now.isoformat().replace("+00:00", "Z"),
+            "run_kind":          run_kind.strip(),
+            "outcome":           outcome_n,
+            "summary":           summary.strip()[:1000],
+            "errors_observed":   errs[:50],
+            "metrics":           mets,
+            "notification_sent": notification_sent.strip(),
+        }
+        cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("markers").upsert(key, doc)
+        return json.dumps({"saved": True, "key": key, "outcome": outcome_n})
+    except Exception as exc:
+        _log_tool_failure("record_automation_run", exc, task_id)
+        return json.dumps({"error": f"Failed to save automation run: {exc}"})
+
+
+@mcp.tool()
 def record_insight(
     pattern: str,
     summary: str,
@@ -1035,10 +1115,20 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
     freshness, code_counts, stage_counts, tool_counts = [], {}, {}, {}
     recent_entries = []
     pipeline_failures = []
+    run_outcomes: dict = {}
+    recent_runs = []
 
     for d in docs:
         dtype = d.get("type")
-        if dtype == "freshness" and _org_match(d.get("organization")):
+        if dtype == "automation_run":
+            if (d.get("ran_at") or "") < cutoff_date:
+                continue
+            run_outcomes[d.get("outcome", "?")] = run_outcomes.get(d.get("outcome", "?"), 0) + 1
+            recent_runs.append({k: d.get(k) for k in ("task_id", "ran_at", "run_kind", "outcome", "summary")})
+            for e in d.get("errors_observed") or []:
+                if isinstance(e, dict) and len(recent_entries) < 25:
+                    recent_entries.append({"source": f"run:{d.get('task_id')}", "at": d.get("ran_at"), **e})
+        elif dtype == "freshness" and _org_match(d.get("organization")):
             freshness.append({k: d.get(k) for k in
                               ("organization", "status", "checked_at", "missing_count",
                                "live_ticket_ids", "local_tickets")})
@@ -1074,14 +1164,17 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
 
     freshness.sort(key=lambda f: (f.get("status") != "stale", f.get("organization") or ""))
     recent_entries.sort(key=lambda e: str(e.get("at") or ""), reverse=True)
+    recent_runs.sort(key=lambda r: str(r.get("ran_at") or ""), reverse=True)
 
     stale = [f["organization"] for f in freshness if f.get("status") == "stale"]
     total_failures = sum(code_counts.values())
+    not_ok_runs = sum(v for k, v in run_outcomes.items() if k != "ok")
     summary = (
         f"Last {days}d: {total_failures} failure(s) recorded"
         + (f", top code: {max(code_counts, key=code_counts.get)}" if code_counts else "")
         + (f". STALE cache: {', '.join(stale)}" if stale else ". All checked orgs fresh.")
         + (f" {len(pipeline_failures)} model-preflight failure(s)." if pipeline_failures else "")
+        + (f" Automation runs: {sum(run_outcomes.values())} ({not_ok_runs} degraded/failed)." if run_outcomes else "")
     )
     return json.dumps({
         "window_days":        days,
@@ -1090,6 +1183,7 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
         "failures_by_stage":  dict(sorted(stage_counts.items(), key=lambda kv: -kv[1])),
         "failures_by_tool":   dict(sorted(tool_counts.items(), key=lambda kv: -kv[1])),
         "pipeline_failures":  pipeline_failures,
+        "automation_runs":    {"by_outcome": run_outcomes, "recent": recent_runs[:20]},
         "freshness":          freshness,
         "recent_entries":     recent_entries,
     }, default=str)
