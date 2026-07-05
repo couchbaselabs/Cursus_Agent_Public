@@ -151,17 +151,22 @@ def _resolve_customer_name(customer_name: str, _log=None) -> str:
     ]
     for expr in attempts:
         rows = query_supportal_analytics(
-            f"SELECT DISTINCT cu.`name` AS n FROM customer cu WHERE {expr} LIMIT 10"
+            "SELECT cu.`name` AS n, ARRAY_LENGTH(cu.`clusters`) AS nc "
+            f"FROM customer cu WHERE {expr} LIMIT 10"
         )
-        names = sorted({r["n"] for r in rows if r.get("n")})
-        if names:
-            # Case-variant duplicates exist live (e.g. 'american express az' vs
-            # 'American Express AZ'); LOWER() equality in the caller covers both.
-            if len({n.lower() for n in names}) > 1:
-                log(f"Ambiguous name {name!r} → candidates {names}; using {names[0]!r}")
-            resolved = names[0]
-            if resolved.lower() != name.lower():
+        cands = {r["n"]: (r.get("nc") or 0) for r in rows if r.get("n")}
+        if cands:
+            # Duplicate/stub docs exist live (e.g. empty 'amex' and
+            # 'american express az' beside the real 'American Express AZ') —
+            # the doc that actually owns clusters wins, then name as tiebreak.
+            resolved = max(sorted(cands), key=lambda n: cands[n])
+            if len(cands) > 1:
+                log(f"Ambiguous name {name!r} → {cands}; using {resolved!r}")
+            elif resolved.lower() != name.lower():
                 log(f"Resolved {name!r} → {resolved!r}")
+            if cands[resolved] == 0:
+                log(f"Warning: {resolved!r} matched but owns no clusters — continuing search")
+                continue
             return resolved
 
     # Fuzzy fallback: suggest close matches, still customer-collection only.
