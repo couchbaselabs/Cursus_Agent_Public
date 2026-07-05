@@ -1229,6 +1229,14 @@ def check_data_freshness(organization: str) -> str:
             if tid:
                 live_ids.add(str(tid))
 
+    # The live lookup resolves imprecise names (v2.7.4) — compare and mark
+    # under the RESOLVED org name, else "American Express" vs local
+    # "American Express AZ" reports the entire cache as missing.
+    resolved_org = next(
+        (r.get("organization") for r in live_rows if r.get("organization")),
+        organization,
+    )
+
     try:
         from couchbase.auth import PasswordAuthenticator
         from couchbase.cluster import Cluster
@@ -1237,8 +1245,10 @@ def check_data_freshness(organization: str) -> str:
         cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
         ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
         rows = list(cl.query(
-            f"SELECT RAW TO_STRING(t.ticket_id) FROM {ks} t WHERE LOWER(t.organization) = $org",
-            QueryOptions(named_parameters={"org": organization.lower().strip()}),
+            f"SELECT RAW TO_STRING(t.ticket_id) FROM {ks} t WHERE LOWER(t.organization) IN $orgs",
+            QueryOptions(named_parameters={"orgs": sorted(
+                {organization.lower().strip(), resolved_org.lower().strip()}
+            )}),
         ))
         local_ids = {r for r in rows if r}
     except Exception as exc:
@@ -1251,7 +1261,8 @@ def check_data_freshness(organization: str) -> str:
 
     marker = {
         "type":            "freshness",
-        "organization":    organization,
+        "organization":    resolved_org,
+        "requested_as":    organization,
         "checked_at":      now_iso,
         "live_ticket_ids": len(live_ids),
         "local_tickets":   len(local_ids),
@@ -1262,7 +1273,7 @@ def check_data_freshness(organization: str) -> str:
     }
     try:
         _ensure_markers_collection(cl, cfg["bucket"], cfg["scope"])
-        key = f"freshness::{organization.lower().replace(' ', '_')}"
+        key = f"freshness::{resolved_org.lower().replace(' ', '_')}"
         cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("markers").upsert(key, marker)
         marker["marker_key"] = key
         marker["saved"] = True
@@ -1273,7 +1284,7 @@ def check_data_freshness(organization: str) -> str:
     if status == "stale":
         marker["recommendation"] = (
             f"{len(missing)} live-referenced ticket(s) missing locally — run "
-            f"rescrape_customer_tickets('{organization}') then re-check."
+            f"rescrape_customer_tickets('{resolved_org}') then re-check."
         )
     return json.dumps(marker, default=str)
 
