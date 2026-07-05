@@ -129,6 +129,64 @@ def query_supportal_analytics(statement: str, cookie: str = "") -> list[dict]:
 # Snapshot listing
 # ---------------------------------------------------------------------------
 
+def _resolve_customer_name(customer_name: str, _log=None) -> str:
+    """Resolve a possibly-imprecise customer name to the canonical live name.
+
+    All lookups hit only the small `customer` collection (~1s) — never the
+    snapshot JOIN. Order: exact → case-insensitive → LIKE prefix → LIKE
+    contains → difflib fuzzy suggestion. Raises ValueError with suggestions
+    when nothing matches.
+    """
+    def log(msg: str):
+        if _log:
+            _log(msg, 0.1)
+
+    name = customer_name.strip().strip("\"'")
+    esc = name.lower().replace("%", "\\%").replace("_", "\\_")
+    attempts = [
+        f"cu.`name` = {json.dumps(name)}",
+        f"LOWER(cu.`name`) = {json.dumps(name.lower())}",
+        f"LOWER(cu.`name`) LIKE {json.dumps(esc + '%')}",
+        f"LOWER(cu.`name`) LIKE {json.dumps('%' + esc + '%')}",
+    ]
+    for expr in attempts:
+        rows = query_supportal_analytics(
+            f"SELECT DISTINCT cu.`name` AS n FROM customer cu WHERE {expr} LIMIT 10"
+        )
+        names = sorted({r["n"] for r in rows if r.get("n")})
+        if names:
+            # Case-variant duplicates exist live (e.g. 'american express az' vs
+            # 'American Express AZ'); LOWER() equality in the caller covers both.
+            if len({n.lower() for n in names}) > 1:
+                log(f"Ambiguous name {name!r} → candidates {names}; using {names[0]!r}")
+            resolved = names[0]
+            if resolved.lower() != name.lower():
+                log(f"Resolved {name!r} → {resolved!r}")
+            return resolved
+
+    # Fuzzy fallback: suggest close matches, still customer-collection only.
+    _close: list[str] = []
+    try:
+        import difflib as _dl
+        _all_rows = query_supportal_analytics(
+            "SELECT DISTINCT cu.`name` AS n FROM customer cu WHERE LENGTH(cu.`name`) > 2 LIMIT 15000",
+        )
+        _all_names = [r["n"] for r in _all_rows if r.get("n")]
+        _close = _dl.get_close_matches(name, _all_names, n=3, cutoff=0.5)
+    except Exception:
+        pass
+    if _close:
+        _names = ", ".join(f"'{n}'" for n in _close)
+        raise ValueError(
+            f"Customer {name!r} not found. Did you mean: {_names}? "
+            "Use the exact name and try again."
+        )
+    raise ValueError(
+        f"Customer {name!r} not found in the analytics database. "
+        "Check the spelling or use list_supportal_customers to browse all customers."
+    )
+
+
 def fetch_snapshots_via_analytics(
     customer_name: str,
     cookie: str | None = None,
@@ -166,43 +224,17 @@ def fetch_snapshots_via_analytics(
             f"LIMIT {int(limit)}"
         )
 
+    # Resolve the canonical name FIRST via cheap queries against the small
+    # `customer` collection. A non-matching predicate on the 3-way snapshot
+    # JOIN forces a full scan that times out (>60s) and 500s server-side, so
+    # the heavy query must only ever run once, with a name known to exist.
+    resolved = _resolve_customer_name(customer_name, _log)
     rows = query_supportal_analytics(
-        _make_statement(f"cu.`name` = {json.dumps(customer_name)}"), cookie
+        _make_statement(f"LOWER(cu.`name`) = {json.dumps(resolved.lower())}"), cookie
     )
     if not rows:
-        _log(f"No exact match for {customer_name!r} — retrying with LOWER() match …", 0.1)
-        rows = query_supportal_analytics(
-            _make_statement(f"LOWER(cu.`name`) = {json.dumps(customer_name.lower())}"), cookie
-        )
-    if not rows:
-        like_val = customer_name.lower().replace("%", "\\%").replace("_", "\\_") + "%"
-        _log(f"No case-insensitive match — retrying with LIKE {like_val!r} …", 0.15)
-        rows = query_supportal_analytics(
-            _make_statement(f"LOWER(cu.`name`) LIKE {json.dumps(like_val)}"), cookie
-        )
-
-    if not rows:
-        # Fuzzy fallback: load all customer names and use difflib to suggest close matches.
-        # No LLM tokens — one extra analytics query, zero UX dead-ends.
-        _close: list[str] = []
-        try:
-            import difflib as _dl
-            _all_rows = query_supportal_analytics(
-                "SELECT DISTINCT cu.`name` AS n FROM customer cu WHERE LENGTH(cu.`name`) > 2 LIMIT 15000",
-            )
-            _all_names = [r["n"] for r in _all_rows if r.get("n")]
-            _close = _dl.get_close_matches(customer_name, _all_names, n=3, cutoff=0.5)
-        except Exception:
-            pass
-        if _close:
-            _names = ", ".join(f"'{n}'" for n in _close)
-            raise ValueError(
-                f"Customer {customer_name!r} not found. Did you mean: {_names}? "
-                "Use the exact name and try again."
-            )
         raise ValueError(
-            f"No snapshots found for customer {customer_name!r} in the analytics database. "
-            "Check the spelling or use list_supportal_customers to browse all customers."
+            f"No snapshots found for customer {resolved!r} in the analytics database."
         )
     _log(f"Analytics returned {len(rows)} snapshot records.", 0.5)
 
