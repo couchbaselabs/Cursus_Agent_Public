@@ -2316,6 +2316,15 @@ def _build_cadence_report_html(ticket: dict, brand: dict) -> str:
     if brand_css:
         tpl = tpl.replace("</head>", f"{brand_css}\n</head>", 1) if "</head>" in tpl else brand_css + tpl
 
+    # Customer logo in the header, same as the health report banner
+    if brand.get("logo_url"):
+        tpl = tpl.replace(
+            '<div class="header">',
+            f'<div class="header"><img src="{brand["logo_url"]}" alt="{org} logo" '
+            f'style="height:24px;object-fit:contain;vertical-align:middle;margin-right:10px;">',
+            1,
+        )
+
     tpl = tpl.replace("TICKET_ID", str(tid))
     tpl = tpl.replace("TICKET_SUBJECT", subject[:80])
     tpl = tpl.replace("ORG_NAME", org)
