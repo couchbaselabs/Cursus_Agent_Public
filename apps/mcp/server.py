@@ -1636,23 +1636,46 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     p1_res = [_res_days(t) for t in solved_p1 if _res_days(t) is not None]
     avg_p1_res = f"{sum(p1_res)/len(p1_res):.1f}d" if p1_res else "—"
 
-    # Monthly volume — last 10 months
+    # Monthly volume — last 10 months, stacked by priority so P1/P2 presence
+    # per month is visible (validates window claims like "0 P1s last 90d").
     monthly: dict[str, int] = defaultdict(int)
+    monthly_pri: dict[str, Counter] = defaultdict(Counter)
     for t in all_t:
         c = t.get("created") or ""
         if len(c) >= 7:
             monthly[c[:7]] += 1
+            monthly_pri[c[:7]][_priority(t)] += 1
     sorted_months = sorted(monthly.keys())[-10:]
     month_counts = [monthly[m] for m in sorted_months]
     max_cnt = max(month_counts, default=1) or 1
     month_labels = [_dt.datetime.strptime(m, "%Y-%m").strftime("%b") for m in sorted_months]
 
+    _PRI_SEGS = [("P1", "var(--crit)"), ("P2", "var(--warn)"),
+                 ("P3", "var(--cb)"), ("P4", "var(--neutral)"), ("P?", "#C9D0DC")]
     trend_bars_html = ""
-    for i, (lbl, cnt) in enumerate(zip(month_labels, month_counts)):
-        cls = "trend-bar current" if i == len(month_labels) - 1 else "trend-bar"
+    for i, (mkey, cnt) in enumerate(zip(sorted_months, month_counts)):
         pct = max(int(cnt / max_cnt * 100), 4)
-        trend_bars_html += f'      <div class="trend-col"><div class="{cls}" style="height:{pct}%;"><span class="trend-bar-val">{cnt}</span></div></div>\n'
+        cur = "border-color:#0D4FA0;" if i == len(sorted_months) - 1 else ""
+        segs = "".join(
+            f'<div style="height:{monthly_pri[mkey][pri] / cnt * 100:.1f}%;background:{color};" '
+            f'title="{pri}: {monthly_pri[mkey][pri]}"></div>'
+            for pri, color in _PRI_SEGS if monthly_pri[mkey].get(pri)
+        ) if cnt else ""
+        trend_bars_html += (
+            f'      <div class="trend-col"><div style="position:relative;width:100%;max-width:36px;height:{pct}%;">'
+            f'<span class="trend-bar-val">{cnt}</span>'
+            f'<div class="trend-bar" style="height:100%;{cur}display:flex;flex-direction:column;'
+            f'justify-content:flex-end;overflow:hidden;background:var(--bg);">{segs}</div></div></div>\n'
+        )
     trend_labels_html = "".join(f'      <span class="trend-lbl">{l}</span>\n' for l in month_labels)
+    _any_unknown = any(monthly_pri[m].get("P?") for m in sorted_months)
+    trend_legend_html = (
+        '<div style="display:flex;gap:14px;margin-top:8px;font-size:10px;color:var(--text-2);">'
+        + "".join(f'<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;'
+                  f'background:{c};margin-right:4px;"></span>{p if p != "P?" else "No priority"}</span>'
+                  for p, c in _PRI_SEGS if p != "P?" or _any_unknown)
+        + "</div>"
+    )
 
     # ── Time-window breakdown (30/60/90/YTD/lifetime) ───────────────────────
     # Marker/window colors are deliberately FIXED hex values, never brand vars,
@@ -1836,7 +1859,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         r'(<div class="trend-chart">).*?(</div>\s*\n\s*<div class="trend-labels">).*?(</div>\s*\n\s*</div>)',
         lambda m: (f'<div class="trend-chart" style="position:relative;margin-top:30px;">\n'
                    f'{trend_bars_html}{trend_markers_html}    {m.group(2)}\n'
-                   f'{trend_labels_html}    </div>\n  {window_chips_html}\n  </div>'),
+                   f'{trend_labels_html}    </div>\n  {trend_legend_html}\n  {window_chips_html}\n  </div>'),
         tpl, flags=_re.DOTALL, count=1,
     )
 
@@ -1938,13 +1961,33 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         point1_icon_cls = "cb"
         point1_icon = "ℹ"
 
+    # Component drill-down for the leading area — broad classifier buckets like
+    # 'Capella / Cloud Platform' break down by the ticket's full Component path
+    # (e.g. Capella::Private Networking::Private endpoints).
+    trend_breakdown = ""
     if top_recent:
         top_area, top_area_cnt = top_recent[0]
+        _comp_counter: Counter = Counter()
+        for t in recent_t:
+            if (t.get("feature_area") or "").strip() == top_area:
+                comp = ((t.get("ticket_fields") or {}).get("Component") or "").strip()
+                if comp:
+                    parts = comp.split("::")
+                    _comp_counter[" › ".join(parts[1:]) or parts[0]] += 1
+        _subs = _comp_counter.most_common(4)
+        if len(_subs) >= 2:
+            trend_breakdown = (" Within it: "
+                               + ", ".join(f"{s} ({n})" for s, n in _subs)
+                               + ("." if sum(n for _, n in _subs) >= top_area_cnt
+                                  else f" — plus {top_area_cnt - sum(n for _, n in _subs)} untagged."))
+
+    if top_recent:
         recent_share = top_area_cnt / max(len(recent_t), 1) * 100
         lifetime_share = area_counter.get(top_area, 0) / max(total, 1) * 100
         point2 = (
             f"<strong>'{top_area}' leads recent volume.</strong> {top_area_cnt} of {len(recent_t)} tickets "
             f"in the last 90 days ({recent_share:.0f}%) vs a {lifetime_share:.0f}% share of {'the analyzed window' if windowed else 'lifetime'}."
+            + trend_breakdown
         )
     else:
         point2 = "<strong>No ticket volume in the last 90 days</strong> to establish a feature-area trend."
@@ -1992,6 +2035,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         trend_note = (
             f"<strong>Trend:</strong> '{top_area}' accounts for {recent_share:.0f}% of the last 90 days of tickets "
             f"({top_area_cnt} of {len(recent_t)}), vs a {lifetime_share:.0f}% share of {'the analyzed window' if windowed else 'lifetime'}."
+            + trend_breakdown
         )
     else:
         trend_note = "<strong>Trend:</strong> not enough recent ticket volume to establish a feature-area shift."
@@ -2024,19 +2068,56 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         tpl, flags=_re.DOTALL, count=1,
     )
 
-    # Recommendations — built from real signals only, no hardcoded ticket refs
+    # Recommendations — built from real signals only, no hardcoded ticket refs.
+    # Each ticket-specific item carries enough detail to act on without opening
+    # the ticket: priority, area, age, last activity, assignee, concrete ask.
     rec_items: list[tuple[str, str]] = []
     if open_t:
         oldest = min(open_t, key=lambda t: t.get("created") or "")
+        o_pri = _priority(oldest)
+        o_area = (oldest.get("feature_area") or "").strip()
+        o_assignee = (oldest.get("assignee") or "").strip() or "unassigned"
+        o_last_act = (oldest.get("last_comment_at") or "")[:10]
+        try:
+            o_age_days = (now_ts - _dt.datetime.fromisoformat((oldest.get("created") or "")[:19])).days
+            _age_txt = f"open {o_age_days} days (since {(oldest.get('created') or '')[:10]})"
+        except Exception:
+            _age_txt = f"open since {(oldest.get('created') or '')[:10]}"
         rec_items.append((
             "both",
-            f"<strong>Review oldest open item #{oldest.get('ticket_id','')}.</strong> "
-            f"{(oldest.get('subject') or '—')[:80]} — open since {(oldest.get('created') or '')[:10]}.",
+            f"<strong>Review oldest open item #{oldest.get('ticket_id','')}"
+            f" ({o_pri}{', ' + o_area if o_area else ''}).</strong> "
+            f"“{(oldest.get('subject') or '—')[:80]}” — {_age_txt}; "
+            f"last activity {o_last_act or 'not recorded'}; assigned to {o_assignee}. "
+            f"Ask: confirm it is still reproducible and agree a close-or-escalate path.",
         ))
-    if open_p1_ct > 0:
+    _stall_cut = (now_ts - _dt.timedelta(days=7)).isoformat()
+    stalled = sorted(
+        [t for t in open_t if (t.get("last_comment_at") or t.get("created") or "") < _stall_cut],
+        key=lambda t: t.get("last_comment_at") or "",
+    )
+    _oldest_id = (min(open_t, key=lambda t: t.get("created") or "").get("ticket_id") if open_t else None)
+    stalled = [t for t in stalled if t.get("ticket_id") != _oldest_id]
+    if stalled:
+        _refs = ", ".join(
+            f"#{t.get('ticket_id','')} ({_priority(t)}, quiet since {(t.get('last_comment_at') or '')[:10] or '?'})"
+            for t in stalled[:3]
+        )
+        _more = f" and {len(stalled) - 3} more" if len(stalled) > 3 else ""
         rec_items.append((
             "cb",
-            f"<strong>{open_p1_ct} open {t_p1.lower()}{'s' if open_p1_ct != 1 else ''} need active tracking</strong> until resolved.",
+            f"<strong>{len(stalled)} open item{'s' if len(stalled) != 1 else ''} with no activity in 7+ days:</strong> "
+            f"{_refs}{_more}. Post a status update or confirm the blocker on each.",
+        ))
+    if open_p1_ct > 0:
+        _p1_refs = ", ".join(
+            f"#{t.get('ticket_id','')} ({(t.get('subject') or '')[:45]}…)"
+            for t in open_t if _priority(t) == "P1"
+        )[:220]
+        rec_items.append((
+            "cb",
+            f"<strong>{open_p1_ct} open {t_p1.lower()}{'s' if open_p1_ct != 1 else ''} need active tracking:</strong> "
+            f"{_p1_refs} — daily check-ins until resolved.",
         ))
     if not rec_items:
         rec_items.append((
