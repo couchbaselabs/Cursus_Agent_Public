@@ -1654,6 +1654,69 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         trend_bars_html += f'      <div class="trend-col"><div class="{cls}" style="height:{pct}%;"><span class="trend-bar-val">{cnt}</span></div></div>\n'
     trend_labels_html = "".join(f'      <span class="trend-lbl">{l}</span>\n' for l in month_labels)
 
+    # ── Time-window breakdown (30/60/90/YTD/lifetime) ───────────────────────
+    # Marker/window colors are deliberately FIXED hex values, never brand vars,
+    # so they stay distinguishable from any customer color scheme.
+    _WINDOW_COLORS = {"30d": "#7C3AED", "60d": "#DB2777", "90d": "#0891B2", "YTD": "#475569"}
+    ytd_start = f"{now_ts.year}-01-01"
+    window_bounds = {
+        "30d": (now_ts - _dt.timedelta(days=30)).isoformat(),
+        "60d": (now_ts - _dt.timedelta(days=60)).isoformat(),
+        "90d": (now_ts - _dt.timedelta(days=90)).isoformat(),
+        "YTD": ytd_start,
+    }
+    window_stats: dict[str, dict] = {}
+    for wlbl, wcut in window_bounds.items():
+        w_t = [t for t in all_t if (t.get("created") or "") >= wcut]
+        window_stats[wlbl] = {
+            "count": len(w_t),
+            "p1":    sum(1 for t in w_t if _priority(t) == "P1"),
+            "open":  sum(1 for t in w_t if (t.get("status") or "").lower() in ("open", "pending", "on-hold", "hold")),
+        }
+
+    def _chip(lbl: str, cnt, p1c, opn, color: str) -> str:
+        return (f'<div style="flex:1;min-width:88px;border:1px solid var(--border-light);'
+                f'border-left:3px solid {color};border-radius:6px;padding:6px 10px;">'
+                f'<div style="font-size:15px;font-weight:800;font-variant-numeric:tabular-nums;">{cnt}</div>'
+                f'<div style="font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-3);font-weight:700;">{lbl}</div>'
+                f'<div style="font-size:9.5px;color:var(--text-2);">{p1c} {t_p1} · {opn} open</div></div>')
+
+    window_chips_html = (
+        '<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">'
+        + "".join(_chip(f"Last {w}" if w != "YTD" else "Year to date",
+                        window_stats[w]["count"], window_stats[w]["p1"],
+                        window_stats[w]["open"], _WINDOW_COLORS[w])
+                  for w in ("30d", "60d", "90d", "YTD"))
+        + _chip("Lifetime", true_total, priority_counts.get("P1", 0),
+                len(open_t), "var(--text-3)")
+        + "</div>"
+    )
+
+    # Vertical marker lines on the trend chart at each window boundary —
+    # dashed, arrow-labelled, fixed colors distinct from the brand palette.
+    trend_markers_html = ""
+    if sorted_months:
+        span_start = _dt.datetime.strptime(sorted_months[0], "%Y-%m")
+        span_days = max((now_ts - span_start).days, 1)
+        stagger = 0
+        for wlbl in ("YTD", "90d", "60d", "30d"):
+            try:
+                bdate = _dt.datetime.fromisoformat(window_bounds[wlbl][:19])
+            except ValueError:
+                continue
+            if bdate <= span_start:
+                continue
+            pos = (bdate - span_start).days / span_days * 100
+            color = _WINDOW_COLORS[wlbl]
+            top_off = -30 - (stagger % 2) * 12
+            stagger += 1
+            trend_markers_html += (
+                f'      <div style="position:absolute;left:{pos:.1f}%;top:0;bottom:0;'
+                f'border-left:2px dashed {color};z-index:5;pointer-events:none;">'
+                f'<span style="position:absolute;top:{top_off}px;left:-8px;font-size:9px;'
+                f'font-weight:800;color:{color};white-space:nowrap;">▼ {wlbl}</span></div>\n'
+            )
+
     # Priority mix bar
     tot_nonzero = max(sum(priority_counts.values()), 1)
     def _pct(k): return f"{priority_counts.get(k, 0) / tot_nonzero * 100:.1f}"
@@ -1695,6 +1758,29 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     for area, cnt in top_recent:
         pct = int(cnt / max_recent * 100)
         hbar_recent_html += f'    <div class="hbar-row"><div class="hbar-label">{area}</div><div class="hbar-track"><div class="hbar-fill recent" style="width:{pct}%;"></div></div><div class="hbar-val">{cnt}</div></div>\n'
+
+    # YTD feature areas with a lifetime view of the same causes — the near-term
+    # signal (what's biting NOW) shown against how chronic each cause is.
+    # Slate fill is fixed, not brand-derived, matching the YTD window marker.
+    ytd_t = [t for t in all_t if (t.get("created") or "") >= ytd_start]
+    ytd_area: Counter = Counter()
+    for t in ytd_t:
+        fa = (t.get("feature_area") or "").strip()
+        if fa:
+            ytd_area[fa] += 1
+    top_ytd = ytd_area.most_common(5)
+    max_ytd = top_ytd[0][1] if top_ytd else 1
+    hbar_ytd_html = ""
+    for area, cnt in top_ytd:
+        pct = int(cnt / max_ytd * 100)
+        life = area_counter.get(area, 0)
+        life_pct = f"{cnt / life * 100:.0f}%" if life else "—"
+        hbar_ytd_html += (
+            f'    <div class="hbar-row"><div class="hbar-label">{area} '
+            f'<span style="color:var(--text-3);font-size:10px;">· {life} lifetime ({life_pct} of them YTD)</span></div>'
+            f'<div class="hbar-track"><div class="hbar-fill" style="width:{pct}%;background:#475569;"></div></div>'
+            f'<div class="hbar-val">{cnt}</div></div>\n'
+        )
 
     # P1 incident log
     p1_rows_html = ""
@@ -1743,11 +1829,14 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
 
     # Swap in dynamic sections via known sentinel comments in the template
     # (We regenerate the data sections wholesale rather than per-value substitution)
-    # Replace trend chart
+    # Replace trend chart — position:relative hosts the window marker lines
+    # (extra top margin clears the arrow labels); window chips render below.
     import re as _re
     tpl = _re.sub(
         r'(<div class="trend-chart">).*?(</div>\s*\n\s*<div class="trend-labels">).*?(</div>\s*\n\s*</div>)',
-        lambda m: f'{m.group(1)}\n{trend_bars_html}    {m.group(2)}\n{trend_labels_html}    {m.group(3)}',
+        lambda m: (f'<div class="trend-chart" style="position:relative;margin-top:30px;">\n'
+                   f'{trend_bars_html}{trend_markers_html}    {m.group(2)}\n'
+                   f'{trend_labels_html}    </div>\n  {window_chips_html}\n  </div>'),
         tpl, flags=_re.DOTALL, count=1,
     )
 
@@ -1784,10 +1873,13 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
   </div>"""
     tpl = _re.sub(r'<div class="kpi-grid">.*?</div>\s*\n\s*\n', kpi_block + "\n\n", tpl, flags=_re.DOTALL, count=1)
 
-    # Replace hbar section
+    # Replace hbar section — lifetime, last-90d, and the YTD-vs-lifetime group
     tpl = _re.sub(
         r'(<div class="card-title">Feature area — lifetime[^<]*</div>\s*\n)(.*?)(<div class="hbar-group-title"[^>]*>[^<]*</div>)(.*?)(<div class="callout)',
-        lambda m: f'{m.group(1)}{hbar_html}    {m.group(3)}\n{hbar_recent_html}    {m.group(5)}',
+        lambda m: (f'{m.group(1)}{hbar_html}    {m.group(3)}\n{hbar_recent_html}'
+                   f'    <div class="hbar-group-title" style="margin-top:12px;color:#475569;">'
+                   f'Year to date — near-term causes vs their lifetime totals</div>\n'
+                   f'{hbar_ytd_html}    {m.group(5)}'),
         tpl, flags=_re.DOTALL, count=1,
     )
 
@@ -2111,6 +2203,8 @@ def generate_health_report(
     tse_name: str = "",
     pse_name: str = "",
     max_tickets: int = 2000,
+    date_from: str = "",
+    date_to: str = "",
 ) -> str:
     """
     Generate a customer health report HTML document from live Couchbase ticket data
@@ -2129,6 +2223,11 @@ def generate_health_report(
                       If the org has more lifetime tickets than this, the
                       report analyzes the most recent N and discloses the
                       from→to date window on every lifetime-sounding figure.
+        date_from:    Optional ISO date (YYYY-MM-DD) — analyze only tickets
+                      created on/after this date ("last 3 years", "July→August"
+                      style reports). The window is disclosed in the report.
+        date_to:      Optional ISO date — analyze only tickets created on/before
+                      this date.
     """
     import datetime as _dt
     from supportal.agent_tools import _save_asset_to_cb
@@ -2151,6 +2250,16 @@ def generate_health_report(
 
     if not tickets:
         return json.dumps({"error": f"No tickets found for organization '{organization}'."})
+
+    # Optional explicit date range — the true_total stays lifetime, so the
+    # windowed-disclosure path in the builder announces the range automatically.
+    if date_from:
+        tickets = [t for t in tickets if (t.get("created") or "")[:10] >= date_from[:10]]
+    if date_to:
+        tickets = [t for t in tickets if (t.get("created") or "")[:10] <= date_to[:10]]
+    if not tickets:
+        return json.dumps({"error": f"No tickets for '{organization}' between "
+                                    f"'{date_from or 'beginning'}' and '{date_to or 'now'}'."})
 
     # True lifetime count — never present a capped window as full history.
     true_total = len(tickets)
