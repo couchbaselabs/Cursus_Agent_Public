@@ -1573,8 +1573,14 @@ def _brand_css_overrides(brand: dict) -> str:
     return f"\n<style>\n  :root {{\n{inner}\n  }}\n</style>"
 
 
-def _build_health_report_html(org: str, tickets: list[dict], report_date: str, brand: dict, org_meta: dict | None = None) -> str:
-    """Generate a full health report HTML document from live CB ticket data."""
+def _build_health_report_html(org: str, tickets: list[dict], report_date: str, brand: dict, org_meta: dict | None = None, true_total: int = 0) -> str:
+    """Generate a full health report HTML document from live CB ticket data.
+
+    true_total is the org's real lifetime ticket count. When it exceeds
+    len(tickets), the analyzed set is a most-recent window and every
+    lifetime-sounding figure must disclose the from→to date range instead
+    of implying full history.
+    """
     import datetime as _dt
     from collections import Counter, defaultdict
 
@@ -1587,6 +1593,11 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
 
     # ── Aggregate stats ──────────────────────────────────────────────────────
     total = len(all_t)
+    true_total = max(true_total or total, total)
+    windowed = true_total > total
+    _dates = sorted((t.get("created") or "")[:10] for t in all_t if t.get("created"))
+    window_from, window_to = (_dates[0], _dates[-1]) if _dates else ("?", "?")
+    window_note = f"{window_from} → {window_to}"
     open_t = [t for t in all_t if (t.get("status") or "").lower() in ("open", "pending", "on-hold", "hold")]
     closed_t = [t for t in all_t if (t.get("status") or "").lower() in ("solved", "closed")]
     closed_rate = f"{len(closed_t)/total*100:.1f}%" if total else "—"
@@ -1747,21 +1758,29 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         tpl, flags=_re.DOTALL, count=1,
     )
 
-    # Inject KPI values (page-subtitle)
+    # Inject KPI values (page-subtitle) — disclose the analysis window when
+    # the ticket set is a most-recent subset rather than full history.
+    if windowed:
+        _subtitle = (f"{true_total} {t_ticket.lower()}s lifetime · analyzing the {total} most recent "
+                     f"({window_note}) · Generated {report_date}")
+    else:
+        _subtitle = f"{total} {t_ticket.lower()}s on record · Generated {report_date}"
     tpl = _re.sub(
         r'(<div class="page-subtitle">)[^<]*(</div>)',
-        f'\\g<1>{total} {t_ticket.lower()}s on record · Generated {report_date}\\g<2>',
+        f'\\g<1>{_subtitle}\\g<2>',
         tpl, count=1,
     )
 
+    _p1_scope_lbl = f"{t_p1}s Since {window_from}" if windowed else f"{t_p1}s Lifetime"
+    _p1_scope_sub = f"{_pct('P1')}% of analyzed" if windowed else f"{_pct('P1')}% of all tickets"
     # Replace KPI tiles dynamically
     kpi_block = f"""  <div class="kpi-grid">
-    <div class="kpi-tile"><span class="kpi-val cb">{total}</span><span class="kpi-lbl">Total {t_ticket}s</span></div>
+    <div class="kpi-tile"><span class="kpi-val cb">{true_total}</span><span class="kpi-lbl">Total {t_ticket}s</span>{f'<span class="kpi-sub">{total} analyzed: {window_note}</span>' if windowed else ''}</div>
     <div class="kpi-tile"><span class="kpi-val crit">{len(open_t)}</span><span class="kpi-lbl">Open Now</span><span class="kpi-sub">{open_breakdown or "—"}</span></div>
-    <div class="kpi-tile"><span class="kpi-val warn">{priority_counts.get('P1',0)}</span><span class="kpi-lbl">{t_p1}s Lifetime</span><span class="kpi-sub">{_pct('P1')}% of all tickets</span></div>
+    <div class="kpi-tile"><span class="kpi-val warn">{priority_counts.get('P1',0)}</span><span class="kpi-lbl">{_p1_scope_lbl}</span><span class="kpi-sub">{_p1_scope_sub}</span></div>
     <div class="kpi-tile"><span class="kpi-val warn">{len(p1_90d)}</span><span class="kpi-lbl">{t_p1}s Last 90 Days</span></div>
     <div class="kpi-tile"><span class="kpi-val good">{avg_p1_res}</span><span class="kpi-lbl">Avg {t_p1} Resolution</span><span class="kpi-sub">solved in last 12 mo, n={len(solved_p1)}</span></div>
-    <div class="kpi-tile"><span class="kpi-val good">{closed_rate}</span><span class="kpi-lbl">Closed Rate</span><span class="kpi-sub">{len(closed_t)} closed / {total} total</span></div>
+    <div class="kpi-tile"><span class="kpi-val good">{closed_rate}</span><span class="kpi-lbl">Closed Rate</span><span class="kpi-sub">{len(closed_t)} closed / {total} {"analyzed" if windowed else "total"}</span></div>
   </div>"""
     tpl = _re.sub(r'<div class="kpi-grid">.*?</div>\s*\n\s*\n', kpi_block + "\n\n", tpl, flags=_re.DOTALL, count=1)
 
@@ -1833,7 +1852,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         lifetime_share = area_counter.get(top_area, 0) / max(total, 1) * 100
         point2 = (
             f"<strong>'{top_area}' leads recent volume.</strong> {top_area_cnt} of {len(recent_t)} tickets "
-            f"in the last 90 days ({recent_share:.0f}%) vs a {lifetime_share:.0f}% lifetime share."
+            f"in the last 90 days ({recent_share:.0f}%) vs a {lifetime_share:.0f}% share of {'the analyzed window' if windowed else 'lifetime'}."
         )
     else:
         point2 = "<strong>No ticket volume in the last 90 days</strong> to establish a feature-area trend."
@@ -1880,7 +1899,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     if top_recent:
         trend_note = (
             f"<strong>Trend:</strong> '{top_area}' accounts for {recent_share:.0f}% of the last 90 days of tickets "
-            f"({top_area_cnt} of {len(recent_t)}), vs a {lifetime_share:.0f}% lifetime share."
+            f"({top_area_cnt} of {len(recent_t)}), vs a {lifetime_share:.0f}% share of {'the analyzed window' if windowed else 'lifetime'}."
         )
     else:
         trend_note = "<strong>Trend:</strong> not enough recent ticket volume to establish a feature-area shift."
@@ -2091,7 +2110,7 @@ def generate_health_report(
     ae_email: str = "",
     tse_name: str = "",
     pse_name: str = "",
-    max_tickets: int = 500,
+    max_tickets: int = 2000,
 ) -> str:
     """
     Generate a customer health report HTML document from live Couchbase ticket data
@@ -2106,7 +2125,10 @@ def generate_health_report(
         ae_email:     AE email.
         tse_name:     Technical Support Engineer name.
         pse_name:     Principal/Field SE name.
-        max_tickets:  Max tickets to pull for stats (default 500).
+        max_tickets:  Max tickets to analyze (default 2000, ceiling 5000).
+                      If the org has more lifetime tickets than this, the
+                      report analyzes the most recent N and discloses the
+                      from→to date window on every lifetime-sounding figure.
     """
     import datetime as _dt
     from supportal.agent_tools import _save_asset_to_cb
@@ -2114,13 +2136,14 @@ def generate_health_report(
     cfg  = _cfg()
     app  = _app()
     report_date = _dt.date.today().strftime("%B %-d, %Y")
+    cap = min(max_tickets, 5000)
 
     # Pull tickets
     try:
         tickets = app.tool_query_tickets(
-            {"organization": organization, "limit": min(max_tickets, 500)},
+            {"organization": organization, "limit": cap},
             *_cb_tuple(cfg),
-            limit=min(max_tickets, 500),
+            limit=cap,
         )
     except Exception as exc:
         _log_tool_failure("generate_health_report", exc, organization)
@@ -2128,6 +2151,26 @@ def generate_health_report(
 
     if not tickets:
         return json.dumps({"error": f"No tickets found for organization '{organization}'."})
+
+    # True lifetime count — never present a capped window as full history.
+    true_total = len(tickets)
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions, QueryOptions
+        _conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        _cl = Cluster(_conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        _ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
+        _orgs = sorted({organization.lower().strip(),
+                        (tickets[0].get("organization") or organization).lower().strip()})
+        _rows = list(_cl.query(
+            f"SELECT RAW COUNT(*) FROM {_ks} t WHERE LOWER(t.organization) IN $orgs",
+            QueryOptions(named_parameters={"orgs": _orgs}),
+        ))
+        if _rows and isinstance(_rows[0], int):
+            true_total = max(_rows[0], len(tickets))
+    except Exception:
+        pass  # best-effort — fall back to analyzed count
 
     # ── Authoritative account metadata from live Supportal (zdorg) ──────────
     # Ticket-level tags (e.g. a stale "critical_renewal" tag copied at ticket-creation
@@ -2174,7 +2217,7 @@ LIMIT 1
 
     # Build HTML
     try:
-        html = _build_health_report_html(organization, tickets, report_date, brand, org_meta)
+        html = _build_health_report_html(organization, tickets, report_date, brand, org_meta, true_total=true_total)
     except Exception as exc:
         _log_tool_failure("generate_health_report", exc, organization)
         return json.dumps({"error": f"Failed to build report: {exc}"})
