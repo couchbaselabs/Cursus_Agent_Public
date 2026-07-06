@@ -1396,6 +1396,61 @@ def get_asset(asset_id: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
+@mcp.tool()
+def export_asset(asset_id: str, output_path: str) -> str:
+    """
+    Write an asset's content from Couchbase directly to a local file and
+    return verification data (bytes written, sha256, extracted <title> for
+    HTML). This is the ONLY sanctioned path for getting report HTML onto
+    disk for publishing — never copy content by hand between tool outputs,
+    which risks silently dropping or staling fields.
+
+    Args:
+        asset_id:    Asset UUID (from list_assets or a generate_* result).
+        output_path: Absolute path to write the file to.
+    """
+    import hashlib
+    import re as _re2
+    from supportal.agent_tools import _get_asset_content_from_cb
+    cfg  = _cfg()
+    cb_a = (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+            cfg["use_tls"], cfg["scope"])
+    try:
+        doc = _get_asset_content_from_cb(*cb_a, asset_id)
+        if not doc or not doc.get("content"):
+            return json.dumps({"error": f"Asset '{asset_id}' not found or has no content."})
+        content = doc["content"]
+        atype = doc.get("asset_type", "")
+        p = Path(output_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if atype in ("image", "pdf"):
+            import base64
+            raw = base64.b64decode(content)
+            p.write_bytes(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            size = len(raw)
+            title = ""
+        else:
+            p.write_text(content, encoding="utf-8")
+            digest = hashlib.sha256(content.encode()).hexdigest()
+            size = len(content.encode())
+            m = _re2.search(r"<title>([^<]*)</title>", content)
+            title = m.group(1) if m else ""
+        return json.dumps({
+            "exported":   True,
+            "asset_id":   asset_id,
+            "filename":   doc.get("filename", ""),
+            "output_path": str(p),
+            "bytes":      size,
+            "sha256":     digest,
+            "title":      title,
+            "organization": doc.get("organization", ""),
+        })
+    except Exception as exc:
+        _log_tool_failure("export_asset", exc)
+        return json.dumps({"error": str(exc)})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BRAND / REPORTS
 # ─────────────────────────────────────────────────────────────────────────────
