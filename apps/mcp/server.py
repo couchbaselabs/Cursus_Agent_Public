@@ -3193,6 +3193,17 @@ WHERE cu.`name` = "{safe_org}"
 
     html = _build_cluster_health_chart_html(organization, health, report_date, max_clusters)
 
+    # Account-scoped reports always carry the account's brand colors (Austin,
+    # Jul 6 2026). Window/marker colors stay fixed hex and are unaffected.
+    try:
+        brand = json.loads(get_customer_brand(organization))
+        if "error" not in brand:
+            brand_css = _brand_css_overrides(brand)
+            if brand_css and "</head>" in html:
+                html = html.replace("</head>", f"{brand_css}\n</head>", 1)
+    except Exception:
+        pass
+
     try:
         cb_a = (cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"], cfg["use_tls"], cfg["scope"])
         safe_org = organization.lower().replace(" ", "_")
