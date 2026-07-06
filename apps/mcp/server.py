@@ -1479,6 +1479,10 @@ def _logo_to_data_uri(source: str) -> str:
     to an embedded data: URI. Reports must self-contain images — remote URLs are
     blocked by the Artifact CSP and unreliable in printed PDFs.
 
+    Fetched logos are cached permanently in the `brands` collection
+    (logo::<domain-or-url>), so a logo hits the network exactly once —
+    later brand saves and re-provisioning resolve from Couchbase.
+
     For a bare domain, tries the Clearbit logo API then the Google favicon
     service. Returns "" when nothing resolves."""
     import base64
@@ -1487,19 +1491,49 @@ def _logo_to_data_uri(source: str) -> str:
     if not source or source.startswith("data:"):
         return source
     if source.startswith("http"):
+        cache_slug = source
         candidates = [source]
     else:
         dom = source.lower().removeprefix("https://").removeprefix("http://").removeprefix("www.").split("/")[0]
+        cache_slug = dom
         candidates = [
             f"https://logo.clearbit.com/{dom}",
             f"https://www.google.com/s2/favicons?domain={dom}&sz=128",
         ]
+    cache_key = f"logo::{cache_slug.lower().replace('/', '_')}"[:240]
+
+    # Cache lookup — brands collection, permanent
+    _col = None
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        cfg = _cfg()
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        _col = cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("brands")
+        cached = _col.get(cache_key).content_as[dict]
+        if cached.get("data_uri"):
+            return cached["data_uri"]
+    except Exception:
+        pass  # miss or CB unavailable — fetch live
+
     for url in candidates:
         try:
             r = _rq.get(url, timeout=10)
             ctype = (r.headers.get("content-type") or "").split(";")[0].strip()
             if r.ok and r.content and ctype.startswith("image/") and len(r.content) > 500:
-                return f"data:{ctype};base64,{base64.b64encode(r.content).decode()}"
+                uri = f"data:{ctype};base64,{base64.b64encode(r.content).decode()}"
+                if _col is not None:
+                    try:
+                        _col.upsert(cache_key, {
+                            "type": "logo_cache", "source": cache_slug,
+                            "fetched_from": url, "fetched_at": int(time.time()),
+                            "data_uri": uri,
+                        })
+                    except Exception:
+                        pass
+                return uri
         except Exception:
             continue
     return ""
