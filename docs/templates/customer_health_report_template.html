@@ -477,6 +477,10 @@
     .view-toggle { display: none !important; }
     @page { margin: 18mm 16mm; size: A4; }
     body { background: #fff; font-size: 11px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    /* Chrome cannot fragment flex/grid containers across pages — a flex .page
+       prints as a single truncated page. Flatten to block flow for print. */
+    .page { display: block; }
+    .page > * { margin-bottom: 10pt; }
     .fleet-banner { position: static; border-bottom: 2px solid var(--border); margin-bottom: 12pt; box-shadow: none; }
     .page { padding: 0; gap: 10pt; }
     .card, .kpi-tile, .callout, .exec-point, .mini-row, .inc-table tr {
