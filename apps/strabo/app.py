@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.7.7"
+__version__ = "2.7.8"
 
 import asyncio
 import threading
@@ -9743,6 +9743,97 @@ def _persist_failure_log(
         pass
 
 
+_JOBRUN_DEFAULT_TTL_S = 45 * 60   # reap deadline when total is unknown
+_JOBRUN_PER_TICKET_S  = 6         # scrape+embed+score allowance per ticket
+_JOBRUN_MARGIN_S      = 15 * 60
+
+
+def _jobrun_deadline(started_at: float, total: int | None) -> float:
+    """Computed conclude-by time: past this, a still-'started' jobrun is
+    presumed lost (process died / silently dropped) and gets reaped."""
+    if total:
+        return started_at + max(_JOBRUN_DEFAULT_TTL_S,
+                                total * _JOBRUN_PER_TICKET_S + _JOBRUN_MARGIN_S)
+    return started_at + _JOBRUN_DEFAULT_TTL_S
+
+
+def _persist_job_run(
+    job: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str = "",
+    conclude: bool = False,
+) -> None:
+    """PERMANENT jobrun::<job_id> lifecycle record in `markers`.
+
+    Written once at job start (status 'started' + computed conclude-by
+    deadline) and again at conclusion. A jobrun still 'started' past its
+    deadline is evidence of a silently dropped job — the start record is the
+    only witness, since scrape_job:: docs expire and in-memory state dies
+    with the process. On conclusion of an org-scoped job, also re-verifies
+    freshness so drift → rescrape → VERIFIED fresh, not assumed. Never raises.
+    """
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        _c = _Cl(_cb_conn_str(cb_url, use_tls), _CO(_PA(username, password)))
+        _c.wait_until_ready(timedelta(seconds=5))
+        try:
+            from supportal.cb_helpers import _ensure_collection
+            _ensure_collection(_c, bucket, scope, "markers")
+        except Exception:
+            pass
+        col = _c.bucket(bucket).scope(scope).collection("markers")
+        key = f"jobrun::{job.get('job_id')}"
+        doc = {
+            "type":         "job_run",
+            "job_id":       job.get("job_id"),
+            "organization": job.get("org"),
+            "mode":         job.get("mode"),
+            "status":       job.get("status") if conclude else "started",
+            "started_at":   job.get("started_at"),
+            "expected_deadline": _jobrun_deadline(
+                job.get("started_at") or time.time(), job.get("total")),
+        }
+        if conclude:
+            doc.update({
+                "finished_at":  job.get("finished_at"),
+                "total":        job.get("total"),
+                "processed":    job.get("processed", 0),
+                "saved":        job.get("saved", 0),
+                "embedded":     job.get("embedded", 0),
+                "scored":       job.get("scored", 0),
+                "errors":       job.get("errors", 0),
+                "last_message": job.get("last_message", ""),
+            })
+        col.upsert(key, doc)
+
+        # Post-job freshness verification — only on a real conclusion of an
+        # org-scoped job that saved something (skip fatal-at-startup noise).
+        if conclude and job.get("org") and job.get("status") == "done" and collection:
+            try:
+                from supportal.cb_helpers import compute_and_mark_freshness
+                fresh = compute_and_mark_freshness(
+                    job["org"], cb_url, bucket, username, password,
+                    use_tls, scope, collection,
+                    verified_by=f"jobrun::{job.get('job_id')}",
+                )
+                doc["freshness_after"] = {
+                    "status": fresh.get("status"),
+                    "missing_count": fresh.get("missing_count"),
+                    "checked_at": fresh.get("checked_at"),
+                }
+                col.upsert(key, doc)
+            except Exception as exc:
+                doc["freshness_after"] = {"status": "unverified", "error": str(exc)[:160]}
+                col.upsert(key, doc)
+        _c.close()
+    except Exception:
+        pass
+
+
 def _upsert_job_doc(job: dict, col) -> None:
     """Write job state using an already-open CB collection handle. Never raises."""
     if col is None:
@@ -9841,6 +9932,7 @@ def _run_scrape_job_bg(
         _OP_STATUS["done"]     = done
 
     try:
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope)
         # ── Phase 1: scrape ─────────────────────────────────────────────────
         job["phase"] = "scraping"
         _set_op(f"Scraping tickets for '{org}'…", 0.0)
@@ -9960,6 +10052,7 @@ def _run_scrape_job_bg(
         _set_op(summary, 1.0, done=True)
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
         _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
 
     except Exception as exc:
         job["status"]      = "error"
@@ -9970,6 +10063,7 @@ def _run_scrape_job_bg(
         _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
         _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
 
 
 def _run_rescrape_job_bg(
@@ -10003,6 +10097,7 @@ def _run_rescrape_job_bg(
         _OP_STATUS["done"]     = done
 
     try:
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope)
         job["phase"] = "scraping"
         _set_op(f"Rescraping 0/{total} tickets for '{org}'…", 0.0)
 
@@ -10034,6 +10129,7 @@ def _run_rescrape_job_bg(
                     f"the {ok} already-refreshed tickets will be skipped automatically."
                 )
                 _upsert_job_doc(job, _bcol)
+                _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
                 return
 
             tid = str(t.get("ticket_id") or "").strip()
@@ -10291,6 +10387,7 @@ def _run_rescrape_job_bg(
         _set_op(summary, 1.0, done=True)
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
         _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
 
     except Exception as exc:
         job["status"]      = "error"
@@ -10301,6 +10398,7 @@ def _run_rescrape_job_bg(
         _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
         _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
         _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
 
 
 _PROFILE_SCOPE      = "chat"

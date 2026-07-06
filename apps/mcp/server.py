@@ -691,6 +691,104 @@ def get_scrape_status(job_id: str = "") -> str:
 
 
 @mcp.tool()
+def wait_for_scrape(job_id: str = "", timeout_s: int = 240) -> str:
+    """
+    Block until a scrape/rescrape job concludes (done/error/cancelled), then
+    return its final state — so callers get start-job → await-result semantics
+    instead of hand-rolled polling loops.
+
+    Waits on ALL running jobs when job_id is omitted. Returns current progress
+    if the timeout elapses first (timed_out: true) — safe to call again.
+    Also reaps lost job runs: any permanent jobrun:: record still 'started'
+    past its computed deadline is marked lost, so silently dropped jobs are
+    recorded rather than vanishing.
+
+    Args:
+        job_id:    Specific 6-char job ID. Omit to wait for all running jobs.
+        timeout_s: Max seconds to block (default 240, capped at 570 to stay
+                   under typical MCP client timeouts).
+    """
+    app = _app()
+    timeout_s = min(max(int(timeout_s), 5), 570)
+    deadline = time.time() + timeout_s
+
+    def _watched() -> list[dict]:
+        jobs = app._SCRAPE_JOBS
+        if job_id:
+            return [jobs[job_id]] if job_id in jobs else []
+        return [j for j in jobs.values()]
+
+    if job_id and not _watched():
+        return json.dumps({"error": f"Job '{job_id}' not found.",
+                           "recent_ids": list(app._SCRAPE_JOBS)[-5:]})
+
+    while time.time() < deadline:
+        running = [j for j in _watched() if j.get("status") == "running"]
+        if not running:
+            break
+        time.sleep(3)
+
+    reaped = _reap_lost_jobruns()
+    still_running = [j["job_id"] for j in _watched() if j.get("status") == "running"]
+    out = {
+        "timed_out": bool(still_running),
+        "still_running": still_running,
+        "jobs": [{
+            "job_id": j["job_id"], "org": j["org"], "mode": j["mode"],
+            "status": j["status"], "processed": j.get("processed", 0),
+            "total": j.get("total"), "saved": j.get("saved", 0),
+            "embedded": j.get("embedded", 0), "scored": j.get("scored", 0),
+            "errors": j.get("errors", 0), "last_message": j.get("last_message"),
+        } for j in _watched()],
+    }
+    if reaped:
+        out["reaped_lost_jobs"] = reaped
+    return json.dumps(out, default=str)
+
+
+def _reap_lost_jobruns() -> list[str]:
+    """Mark jobrun:: records still 'started' past their computed deadline as
+    lost — the durable evidence of a silently dropped job. A job whose
+    in-memory record is still heartbeating gets its deadline extended instead.
+    Returns reaped job_ids. Never raises."""
+    reaped: list[str] = []
+    try:
+        cfg = _cfg()
+        app = _app()
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`markers`"
+        now = time.time()
+        rows = list(cl.query(
+            f"SELECT META(m).id AS k, m.* FROM {ks} m "
+            f"WHERE m.`type` = 'job_run' AND m.`status` = 'started' "
+            f"AND m.`expected_deadline` < {now}"
+        ))
+        col = cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("markers")
+        for r in rows:
+            jid = r.get("job_id", "")
+            live = app._SCRAPE_JOBS.get(jid)
+            doc = {k: v for k, v in r.items() if k != "k"}
+            if live and now - live.get("heartbeat_at", 0) < 600:
+                doc["expected_deadline"] = now + 1800  # still heartbeating — extend
+            else:
+                doc.update({
+                    "status":    "lost",
+                    "reaped_at": now,
+                    "reason":    "no conclusion recorded by computed deadline "
+                                 "— job presumed silently dropped",
+                })
+                reaped.append(jid)
+            col.upsert(r["k"], doc)
+    except Exception:
+        pass
+    return reaped
+
+
+@mcp.tool()
 def rescrape_customer_tickets(
     organization: str,
     max_tickets: int = 50,
@@ -1100,6 +1198,7 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
         conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
         cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
         ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`markers`"
+        _reap_lost_jobruns()
         docs = [r for r in cl.query(f"SELECT META(m).id AS _key, m.* FROM {ks} m")]
     except Exception as exc:
         return json.dumps({"error": f"Could not read markers collection: {exc}"})
@@ -1117,10 +1216,20 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
     pipeline_failures = []
     run_outcomes: dict = {}
     recent_runs = []
+    job_outcomes: dict = {}
+    lost_jobs = []
 
     for d in docs:
         dtype = d.get("type")
-        if dtype == "automation_run":
+        if dtype == "job_run" and _org_match(d.get("organization")):
+            started = d.get("started_at") or 0
+            if started and started < cutoff_epoch:
+                continue
+            job_outcomes[d.get("status", "?")] = job_outcomes.get(d.get("status", "?"), 0) + 1
+            if d.get("status") == "lost":
+                lost_jobs.append({k: d.get(k) for k in
+                                  ("job_id", "organization", "mode", "started_at", "reason")})
+        elif dtype == "automation_run":
             if (d.get("ran_at") or "") < cutoff_date:
                 continue
             run_outcomes[d.get("outcome", "?")] = run_outcomes.get(d.get("outcome", "?"), 0) + 1
@@ -1175,6 +1284,7 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
         + (f". STALE cache: {', '.join(stale)}" if stale else ". All checked orgs fresh.")
         + (f" {len(pipeline_failures)} model-preflight failure(s)." if pipeline_failures else "")
         + (f" Automation runs: {sum(run_outcomes.values())} ({not_ok_runs} degraded/failed)." if run_outcomes else "")
+        + (f" ⚠ {len(lost_jobs)} LOST job(s) — started but never concluded." if lost_jobs else "")
     )
     return json.dumps({
         "window_days":        days,
@@ -1184,6 +1294,7 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
         "failures_by_tool":   dict(sorted(tool_counts.items(), key=lambda kv: -kv[1])),
         "pipeline_failures":  pipeline_failures,
         "automation_runs":    {"by_outcome": run_outcomes, "recent": recent_runs[:20]},
+        "scrape_job_runs":    {"by_status": job_outcomes, "lost": lost_jobs[:20]},
         "freshness":          freshness,
         "recent_entries":     recent_entries,
     }, default=str)
@@ -1212,81 +1323,20 @@ def check_data_freshness(organization: str) -> str:
     Args:
         organization: Customer org name (same matching rules as rescrape).
     """
-    import datetime as _dt
-
     cfg = _cfg()
-    app = _app()
     try:
-        from supportal.api_client import fetch_snapshots_via_analytics
-        live_rows = fetch_snapshots_via_analytics(organization, cfg["cookie"], limit=5000)
-    except Exception as exc:
-        _log_tool_failure("check_data_freshness", exc, organization)
-        return json.dumps({"error": f"Live Supportal lookup failed: {exc}", "organization": organization})
-
-    live_ids: set[str] = set()
-    for r in live_rows:
-        for tid in r.get("ticket_ids") or []:
-            if tid:
-                live_ids.add(str(tid))
-
-    # The live lookup resolves imprecise names (v2.7.4) — compare and mark
-    # under the RESOLVED org name, else "American Express" vs local
-    # "American Express AZ" reports the entire cache as missing.
-    resolved_org = next(
-        (r.get("organization") for r in live_rows if r.get("organization")),
-        organization,
-    )
-
-    try:
-        from couchbase.auth import PasswordAuthenticator
-        from couchbase.cluster import Cluster
-        from couchbase.options import ClusterOptions, QueryOptions
-        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
-        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
-        ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
-        rows = list(cl.query(
-            f"SELECT RAW TO_STRING(t.ticket_id) FROM {ks} t WHERE LOWER(t.organization) IN $orgs",
-            QueryOptions(named_parameters={"orgs": sorted(
-                {organization.lower().strip(), resolved_org.lower().strip()}
-            )}),
-        ))
-        local_ids = {r for r in rows if r}
-    except Exception as exc:
-        _log_tool_failure("check_data_freshness", exc, organization)
-        return json.dumps({"error": f"Local Couchbase lookup failed: {exc}", "organization": organization})
-
-    missing = sorted(live_ids - local_ids, key=lambda x: int(x) if x.isdigit() else 0)
-    status = "fresh" if not missing else "stale"
-    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-
-    marker = {
-        "type":            "freshness",
-        "organization":    resolved_org,
-        "requested_as":    organization,
-        "checked_at":      now_iso,
-        "live_ticket_ids": len(live_ids),
-        "local_tickets":   len(local_ids),
-        "missing_count":   len(missing),
-        "missing_ids":     missing[:50],
-        "status":          status,
-        "source":          "snapshot.zendesk[] via Supportal Analytics API",
-    }
-    try:
-        _ensure_markers_collection(cl, cfg["bucket"], cfg["scope"])
-        key = f"freshness::{resolved_org.lower().replace(' ', '_')}"
-        cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("markers").upsert(key, marker)
-        marker["marker_key"] = key
-        marker["saved"] = True
-    except Exception as exc:
-        marker["saved"] = False
-        marker["save_error"] = str(exc)
-
-    if status == "stale":
-        marker["recommendation"] = (
-            f"{len(missing)} live-referenced ticket(s) missing locally — run "
-            f"rescrape_customer_tickets('{resolved_org}') then re-check."
+        from supportal.cb_helpers import compute_and_mark_freshness
+        marker = compute_and_mark_freshness(
+            organization,
+            cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+            cfg.get("use_tls", False), cfg["scope"], cfg["collection"],
+            cookie=cfg["cookie"],
+            verified_by="tool:check_data_freshness",
         )
-    return json.dumps(marker, default=str)
+        return json.dumps(marker, default=str)
+    except Exception as exc:
+        _log_tool_failure("check_data_freshness", exc, organization)
+        return json.dumps({"error": f"Freshness check failed: {exc}", "organization": organization})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

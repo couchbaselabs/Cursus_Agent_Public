@@ -2307,3 +2307,95 @@ def hybrid_retrieval(
     if _final_k < top_k:
         notes.append(f"elbow@{_final_k}")
     return resolved[:_final_k], " | ".join(notes)
+
+
+def compute_and_mark_freshness(
+    organization: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    cookie: str = "",
+    verified_by: str = "",
+) -> dict:
+    """Live-vs-local ticket-ID reconciliation; writes the freshness::<org> marker.
+
+    Single shared writer for the freshness lifecycle — used by the MCP
+    check_data_freshness tool AND the pipeline's post-job completion hook, so
+    a rescrape always concludes with a VERIFIED freshness state rather than an
+    assumed one. verified_by records what produced this check (e.g. a job id).
+
+    One-directional by design: live-referenced IDs missing locally = drift;
+    local-not-in-live is normal. Raises on live-lookup or CB failure —
+    callers decide how to log.
+    """
+    import datetime as _dt
+    from supportal.api_client import fetch_snapshots_via_analytics
+
+    live_rows = fetch_snapshots_via_analytics(organization, cookie, limit=5000)
+    live_ids: set[str] = set()
+    for r in live_rows:
+        for tid in r.get("ticket_ids") or []:
+            if tid:
+                live_ids.add(str(tid))
+    resolved_org = next(
+        (r.get("organization") for r in live_rows if r.get("organization")),
+        organization,
+    )
+
+    from couchbase.auth import PasswordAuthenticator
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions, QueryOptions
+    conn = cb_url if "://" in cb_url else ("couchbases://" if use_tls else "couchbase://") + cb_url
+    cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    ks = f"`{bucket}`.`{scope}`.`{collection}`"
+    rows = list(cl.query(
+        f"SELECT RAW TO_STRING(t.ticket_id) FROM {ks} t WHERE LOWER(t.organization) IN $orgs",
+        QueryOptions(named_parameters={"orgs": sorted(
+            {organization.lower().strip(), resolved_org.lower().strip()}
+        )}),
+    ))
+    local_ids = {r for r in rows if r}
+
+    missing = sorted(live_ids - local_ids, key=lambda x: int(x) if x.isdigit() else 0)
+    status = "fresh" if not missing else "stale"
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    marker = {
+        "type":            "freshness",
+        "organization":    resolved_org,
+        "requested_as":    organization,
+        "checked_at":      now_iso,
+        "live_ticket_ids": len(live_ids),
+        "local_tickets":   len(local_ids),
+        "missing_count":   len(missing),
+        "missing_ids":     missing[:50],
+        "status":          status,
+        "source":          "snapshot.zendesk[] via Supportal Analytics API",
+    }
+    if verified_by:
+        marker["verified_by"] = verified_by
+    try:
+        _ensure_collection(cl, bucket, scope, "markers")
+        key = f"freshness::{resolved_org.lower().replace(' ', '_')}"
+        cl.bucket(bucket).scope(scope).collection("markers").upsert(key, marker)
+        marker["marker_key"] = key
+        marker["saved"] = True
+    except Exception as exc:
+        marker["saved"] = False
+        marker["save_error"] = str(exc)
+    if status == "stale":
+        marker["recommendation"] = (
+            f"{len(missing)} live-referenced ticket(s) missing locally — run "
+            f"rescrape_customer_tickets('{resolved_org}') then re-check."
+        )
+    return marker
+
+
+def _ensure_collection(cluster, bucket_name: str, scope_name: str, coll_name: str) -> None:
+    """Create a collection if missing. Never raises."""
+    try:
+        from couchbase.management.collections import CollectionSpec
+        cm = cluster.bucket(bucket_name).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if coll_name not in existing.get(scope_name, set()):
+            cm.create_collection(CollectionSpec(coll_name, scope_name=scope_name))
+    except Exception:
+        pass
