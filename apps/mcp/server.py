@@ -1636,6 +1636,56 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     p1_res = [_res_days(t) for t in solved_p1 if _res_days(t) is not None]
     avg_p1_res = f"{sum(p1_res)/len(p1_res):.1f}d" if p1_res else "—"
 
+    # ── P1 year-over-year comparison — count + avg resolution per calendar
+    # year, so long-term accounts can see whether P1 frequency AND response
+    # speed are improving. Uses the same solved-date resolution math.
+    p1_by_year: dict[str, list] = defaultdict(list)
+    for t in all_t:
+        if _priority(t) == "P1" and (t.get("created") or "")[:4].isdigit():
+            p1_by_year[(t.get("created") or "")[:4]].append(t)
+    p1_year_html = ""
+    if len(p1_by_year) >= 2:
+        years = sorted(p1_by_year.keys())[-10:]
+        year_stats = []
+        for y in years:
+            yt = p1_by_year[y]
+            res = [_res_days(t) for t in yt
+                   if (t.get("status") or "").lower() in ("solved", "closed")]
+            res = [r for r in res if r is not None]
+            year_stats.append({
+                "year": y, "count": len(yt),
+                "avg_res": (sum(res) / len(res)) if res else None,
+                "n_solved": len(res),
+            })
+        max_y_cnt = max(s["count"] for s in year_stats) or 1
+        cols = ""
+        for s in year_stats:
+            hpct = max(int(s["count"] / max_y_cnt * 100), 4)
+            res_lbl = f'{s["avg_res"]:.0f}d' if s["avg_res"] is not None else "—"
+            cols += (
+                f'      <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;">'
+                f'<span style="font-size:10px;font-weight:700;color:var(--text-2);font-variant-numeric:tabular-nums;">{s["count"]}</span>'
+                f'<div style="width:100%;max-width:34px;height:{hpct}px;background:var(--crit);'
+                f'border-radius:3px 3px 0 0;opacity:.85;" title="{s["count"]} P1s in {s["year"]}"></div>'
+                f'<span style="font-size:10px;color:var(--text-3);font-weight:600;">{s["year"]}</span>'
+                f'<span style="font-size:9.5px;font-weight:700;color:#475569;" '
+                f'title="avg resolution, n={s["n_solved"]} solved">⌀ {res_lbl}</span></div>\n'
+            )
+        _yr_note = ""
+        _resolved_years = [s for s in year_stats if s["avg_res"] is not None]
+        if len(_resolved_years) >= 2:
+            _first, _last = _resolved_years[0], _resolved_years[-1]
+            _dirn = "improved" if _last["avg_res"] < _first["avg_res"] else "slowed"
+            _yr_note = (f'<div style="font-size:11px;color:var(--text-2);margin-top:10px;">'
+                        f'Avg resolution has <strong>{_dirn}</strong> from {_first["avg_res"]:.0f}d '
+                        f'({_first["year"]}) to {_last["avg_res"]:.0f}d ({_last["year"]}). '
+                        f'⌀ = avg days to resolve the {t_p1}s opened that year.</div>')
+        p1_year_html = (
+            f'\n  <div class="card">\n    <div class="card-title">{t_p1}s by year — volume and resolution speed</div>\n'
+            f'    <div style="display:flex;align-items:flex-end;gap:6px;">\n{cols}    </div>\n'
+            f'    {_yr_note}\n  </div>\n'
+        )
+
     # Monthly volume — last 10 months, stacked by priority so P1/P2 presence
     # per month is visible (validates window claims like "0 P1s last 90d").
     monthly: dict[str, int] = defaultdict(int)
@@ -2044,6 +2094,15 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         f'<div class="callout callout-info">\n    <span class="callout-icon">ℹ</span>\n    <div class="callout-body">{trend_note}</div>\n  </div>',
         tpl, flags=_re.DOTALL, count=1,
     )
+
+    # P1 year-over-year card — inserted just before the P1 log card (only
+    # when the account spans 2+ years of P1 history).
+    if p1_year_html:
+        tpl = _re.sub(
+            r'(<div class="card">\s*<div class="card-title">\d+ P1s since)',
+            lambda m: p1_year_html + m.group(1),
+            tpl, count=1,
+        )
 
     # P1 log card title — dynamic count
     tpl = _re.sub(
