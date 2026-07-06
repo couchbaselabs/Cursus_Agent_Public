@@ -601,7 +601,11 @@
     .page {
       padding: 0;
       gap: 10pt;
+      /* Chrome cannot fragment flex containers across print pages — flatten
+         to block flow or the report prints as one truncated page. */
+      display: block;
     }
+    .page > * { margin-bottom: 10pt; }
 
     .page-header {
       padding-bottom: 10pt;
