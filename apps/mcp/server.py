@@ -1474,6 +1474,37 @@ def _ensure_brands_collection(cluster: Any, bucket: str, scope: str = "transcrip
 
 
 @mcp.tool()
+def _logo_to_data_uri(source: str) -> str:
+    """Resolve a logo source (bare domain like 'westernunion.com' or an http URL)
+    to an embedded data: URI. Reports must self-contain images — remote URLs are
+    blocked by the Artifact CSP and unreliable in printed PDFs.
+
+    For a bare domain, tries the Clearbit logo API then the Google favicon
+    service. Returns "" when nothing resolves."""
+    import base64
+    import requests as _rq
+    source = (source or "").strip()
+    if not source or source.startswith("data:"):
+        return source
+    if source.startswith("http"):
+        candidates = [source]
+    else:
+        dom = source.lower().removeprefix("https://").removeprefix("http://").removeprefix("www.").split("/")[0]
+        candidates = [
+            f"https://logo.clearbit.com/{dom}",
+            f"https://www.google.com/s2/favicons?domain={dom}&sz=128",
+        ]
+    for url in candidates:
+        try:
+            r = _rq.get(url, timeout=10)
+            ctype = (r.headers.get("content-type") or "").split(";")[0].strip()
+            if r.ok and r.content and ctype.startswith("image/") and len(r.content) > 500:
+                return f"data:{ctype};base64,{base64.b64encode(r.content).decode()}"
+        except Exception:
+            continue
+    return ""
+
+
 def save_customer_brand(
     organization: str,
     primary_color: str = "",
@@ -1486,14 +1517,17 @@ def save_customer_brand(
     """
     Save a customer brand kit to Couchbase. The kit is applied when generating
     health or ticket reports for that organization (colors override the default
-    Couchbase blue palette; terminology replaces generic labels like 'ticket').
+    Couchbase blue palette; terminology replaces generic labels like 'ticket';
+    the logo renders in the report's title banner).
 
     Args:
         organization:    Customer org name (exact match used for lookups).
         primary_color:   CSS color for the brand's primary shade (e.g. '#0050A0').
         secondary_color: CSS color for the secondary accent.
         accent_color:    CSS color for highlights/CTAs.
-        logo_url:        URL or data-URI for the customer logo image.
+        logo_url:        Customer logo — pass a bare domain (e.g. 'westernunion.com')
+                         or an image URL and it is fetched and embedded as a data:
+                         URI so reports stay self-contained; data: URIs pass through.
         font_family:     CSS font-family string to override the default sans-serif.
         terminology:     Dict of label overrides, e.g. {'ticket': 'case', 'P1': 'Sev1'}.
     """
@@ -1508,6 +1542,15 @@ def save_customer_brand(
         cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
         cl.wait_until_ready(timedelta(seconds=10))
         _ensure_brands_collection(cl, cfg["bucket"], cfg["scope"])
+        logo_note = ""
+        if logo_url and not logo_url.startswith("data:"):
+            resolved = _logo_to_data_uri(logo_url)
+            if resolved:
+                logo_note = f"logo fetched and embedded ({len(resolved) // 1024} KB data URI)"
+                logo_url = resolved
+            else:
+                logo_note = f"could not fetch a logo from '{logo_url}' — saved without one"
+                logo_url = ""
         doc = {
             "type":            "brand",
             "organization":    organization,
@@ -1522,7 +1565,10 @@ def save_customer_brand(
         key = f"brand::{organization.lower().replace(' ', '_')}"
         cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("brands").upsert(key, doc)
         cl.close()
-        return json.dumps({"saved": True, "organization": organization, "key": key})
+        out = {"saved": True, "organization": organization, "key": key}
+        if logo_note:
+            out["logo"] = logo_note
+        return json.dumps(out)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
