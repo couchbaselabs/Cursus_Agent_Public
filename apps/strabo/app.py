@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.7.6"
+__version__ = "2.7.7"
 
 import asyncio
 import threading
@@ -906,6 +906,15 @@ def _filter_changed_tickets(
             changed_tickets.append(s)
         else:
             skipped += 1
+
+    # Newest first — when max_tickets truncates, recent/active tickets must
+    # survive the cap rather than years-old backfill (a 50-cap silently
+    # dropped two live Amex P-tickets while scraping 2018-era IDs).
+    def _tid_num(s: dict) -> int:
+        tid = str(s.get("ticket_id") or "")
+        return int(tid) if tid.isdigit() else 0
+    new_tickets.sort(key=_tid_num, reverse=True)
+    changed_tickets.sort(key=_tid_num, reverse=True)
 
     to_scrape = new_tickets + changed_tickets
     if max_tickets > 0:
