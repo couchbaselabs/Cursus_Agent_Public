@@ -26,6 +26,23 @@ import threading
 import time
 from pathlib import Path
 
+
+def _free_port(port: int) -> None:
+    """Kill any process currently bound to *port* so a fresh start never races."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-ti", f"tcp:{port}"], stderr=subprocess.DEVNULL
+        ).decode().split()
+        for pid_str in out:
+            try:
+                os.kill(int(pid_str), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+        if out:
+            time.sleep(0.4)  # give the kernel a moment to release the socket
+    except subprocess.CalledProcessError:
+        pass  # lsof exits non-zero when no process holds the port — that's fine
+
 _HERE = Path(__file__).parent
 
 _BOLD  = "\033[1m"
@@ -68,6 +85,7 @@ def _parse_port(args: list[str], flag: str, default: int) -> int:
 
 
 def _start_strabo(py: str, port: int) -> subprocess.Popen:
+    _free_port(port)
     return subprocess.Popen(
         [py, str(_HERE / "run_strabo.py"), "--port", str(port)],
         stdout=subprocess.PIPE,
@@ -77,6 +95,7 @@ def _start_strabo(py: str, port: int) -> subprocess.Popen:
 
 
 def _start_corax(py: str, port: int) -> subprocess.Popen:
+    _free_port(port)
     return subprocess.Popen(
         [py, str(_HERE / "run_corax.py"), "--port", str(port)],
         stdout=subprocess.PIPE,
@@ -86,6 +105,7 @@ def _start_corax(py: str, port: int) -> subprocess.Popen:
 
 
 def _start_mcp(py: str, port: int) -> subprocess.Popen:
+    _free_port(port)
     return subprocess.Popen(
         [py, str(_HERE / "run_mcp.py"), "--transport", "sse", "--port", str(port)],
         stdout=subprocess.PIPE,
@@ -101,11 +121,15 @@ def _restart(proc_holder: list, name: str, start_fn, label: str, color: str) -> 
         try:
             old.terminate()
             old.wait(timeout=5)
-        except Exception:
+        except subprocess.TimeoutExpired:
             try:
                 old.kill()
+                old.wait(timeout=2)
             except Exception:
                 pass
+        except Exception:
+            pass
+    # start_fn calls _free_port internally — port is guaranteed clear
     new = start_fn()
     proc_holder[0] = new
     print(f"{_YELL}{_BOLD}[cursus]{_RESET} {name} restarted (pid {new.pid})")
@@ -201,12 +225,24 @@ def main() -> None:
 
     def _shutdown(sig=None, _frame=None) -> None:
         print(f"\n{_BOLD}[cursus]{_RESET} shutting down…")
-        for h in (strabo_holder, corax_holder, mcp_holder):
-            p = h[0]
-            if p:
+        procs = [h[0] for h in (strabo_holder, corax_holder, mcp_holder) if h[0]]
+        # Graceful SIGTERM first
+        for p in procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+        # Wait up to 6s for clean exit, then SIGKILL anything still running
+        deadline = time.monotonic() + 6.0
+        for p in procs:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                p.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
                 try:
-                    p.terminate()
-                except OSError:
+                    p.kill()
+                    p.wait(timeout=2)
+                except Exception:
                     pass
         sys.exit(0)
 
