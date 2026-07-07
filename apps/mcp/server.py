@@ -1636,14 +1636,28 @@ def get_customer_brand(organization: str) -> str:
 # ── Report HTML builders ──────────────────────────────────────────────────────
 
 def _brand_css_overrides(brand: dict) -> str:
-    """Return a <style> block overriding CSS vars from the brand kit (empty if no brand)."""
+    """Return a <style> block overriding CSS vars from the brand kit (empty if no brand).
+
+    Near-white brand colors are skipped: Amex's secondary is #FFFFFF, and
+    mapping it onto --good rendered every 'good' value white-on-white. A
+    color too light to read on the white surface keeps the default var."""
+    def _too_light(c: str) -> bool:
+        h = c.strip().lstrip("#")
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except ValueError:
+            return False  # named/other CSS color — trust it
+        return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.72
+
     lines = []
-    if brand.get("primary_color"):
+    if brand.get("primary_color") and not _too_light(brand["primary_color"]):
         lines.append(f"    --cb: {brand['primary_color']};")
         lines.append(f"    --cb-light: {brand['primary_color']}22;")
-    if brand.get("secondary_color"):
+    if brand.get("secondary_color") and not _too_light(brand["secondary_color"]):
         lines.append(f"    --good: {brand['secondary_color']};")
-    if brand.get("accent_color"):
+    if brand.get("accent_color") and not _too_light(brand["accent_color"]):
         lines.append(f"    --warn: {brand['accent_color']};")
     if brand.get("font_family"):
         lines.append(f"    font-family: {brand['font_family']}, -apple-system, sans-serif;")
@@ -1954,7 +1968,12 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         status = (t.get("status") or "").lower()
         if status in ("solved", "closed"):
             rd = _res_days(t)
-            rd_str = f"{rd:.0f} days" if rd is not None else "—"
+            if rd is None:
+                rd_str = "—"
+            elif rd < 1:
+                rd_str = "Same day"
+            else:
+                rd_str = f"{rd:.0f} day{'s' if rd >= 2 else ''}"
             pill_cls = "days-fast" if rd is not None and rd < 2 else ("days-mid" if rd is not None and rd < 14 else "days-slow")
             res_cell = f'<span class="days-pill {pill_cls}">{rd_str}</span>'
         else:
@@ -2146,8 +2165,23 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     else:
         point3 = f"<strong>No open {t_ticket.lower()}s.</strong> Queue is clear as of this report."
 
+    # Health status pill — reads at a glance before the lede prose; darker
+    # text via color-mix for contrast on the light band.
+    _h_ok = health_word == "stable"
+    _h_base = "var(--good)" if _h_ok else "var(--warn)"
+    _h_bg = "var(--good-light)" if _h_ok else "var(--warn-light)"
+    health_pill = (
+        f'<span style="display:inline-flex;align-items:center;gap:6px;padding:3px 12px;'
+        f'border-radius:999px;font-size:10px;font-weight:800;text-transform:uppercase;'
+        f'letter-spacing:.08em;background:{_h_bg};border:1px solid {_h_base};'
+        f'color:color-mix(in srgb, {_h_base} 60%, black);margin-right:10px;vertical-align:middle;'
+        f'white-space:nowrap;">'
+        f'<span style="width:7px;height:7px;border-radius:50%;background:{_h_base};"></span>'
+        f'{"Stable" if _h_ok else "Needs attention"}</span>'
+    )
+
     exec_block = f"""  <div class="card exec-summary">
-    <p class="exec-lede">{lede}</p>
+    <p class="exec-lede">{health_pill}{lede}</p>
 
     <div class="exec-points">
       <div class="exec-point">

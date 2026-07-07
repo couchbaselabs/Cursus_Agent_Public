@@ -339,7 +339,8 @@
   .callout-warn { background: var(--warn-light); border: 1px solid #F5D89A; color: #7A4A06; }
   .callout-info { background: var(--cb-light); border: 1px solid #AECDF5; color: #0D3A6B; }
   .callout-good { background: var(--good-light); border: 1px solid #A8DFC6; color: #0E6040; }
-  .callout-icon { font-size: 15px; flex-shrink: 0; line-height: 1.4; }
+  .callout-icon { font-size: 15px; font-weight: 900; flex-shrink: 0; line-height: 1.4;
+                  color: color-mix(in srgb, currentColor 60%, black); }
   .callout-body { flex: 1; }
   .callout-body strong { font-weight: 700; }
 
@@ -371,10 +372,11 @@
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
-  .days-fast { background: var(--good-light); color: var(--good); }
-  .days-mid { background: var(--warn-light); color: var(--warn); }
-  .days-slow { background: var(--crit-light); color: var(--crit); }
-  .days-open { background: var(--neutral-light); color: var(--neutral); }
+  /* Pill text mixed 65% toward black for contrast on the light backgrounds */
+  .days-fast { background: var(--good-light); color: color-mix(in srgb, var(--good) 65%, black); }
+  .days-mid { background: var(--warn-light); color: color-mix(in srgb, var(--warn) 65%, black); }
+  .days-slow { background: var(--crit-light); color: color-mix(in srgb, var(--crit) 65%, black); }
+  .days-open { background: var(--neutral-light); color: color-mix(in srgb, var(--neutral) 65%, black); }
 
   /* ── Open snapshot mini list ── */
   .mini-list { display: flex; flex-direction: column; gap: 0; }
@@ -430,10 +432,10 @@
     flex-shrink: 0;
     margin-top: 1px;
   }
-  .exec-point-icon.good { background: var(--good-light); color: var(--good); }
-  .exec-point-icon.warn { background: var(--warn-light); color: var(--warn); }
-  .exec-point-icon.crit { background: var(--crit-light); color: var(--crit); }
-  .exec-point-icon.cb { background: var(--cb-light); color: var(--cb); }
+  .exec-point-icon.good { background: var(--good-light); color: color-mix(in srgb, var(--good) 60%, black); }
+  .exec-point-icon.warn { background: var(--warn-light); color: color-mix(in srgb, var(--warn) 60%, black); }
+  .exec-point-icon.crit { background: var(--crit-light); color: color-mix(in srgb, var(--crit) 60%, black); }
+  .exec-point-icon.cb { background: var(--cb-light); color: color-mix(in srgb, var(--cb) 60%, black); }
 
   .exec-point-body { font-size: 13px; color: var(--text-2); line-height: 1.6; }
   .exec-point-body strong { color: var(--text); }
