@@ -2103,8 +2103,19 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         age_str = f"{age_days} days old"
         open_rows_html += f'      <div class="mini-row"><span class="mini-id">#{tid}</span><span class="mini-subject">{subj}</span><span class="pill pill-{pri_cls}">{pri}</span><span class="mini-age">{age_str}</span></div>\n'
 
-    # KPI open breakdown
+    # KPI open breakdown — plain text for prose reuse (exec lede), plus a
+    # swatch-dot variant for the Open Now tile using the EXACT same colors
+    # as the Lifetime Priority Mix legend (var(--crit)/warn/cb/neutral,
+    # no darkening) so the two read as one consistent color language.
     open_breakdown = " · ".join(f"{v} {k}" for k, v in sorted(open_priority.items()) if v)
+    _PRI_VAR = {"P1": "var(--crit)", "P2": "var(--warn)", "P3": "var(--cb)", "P4": "var(--neutral)"}
+    open_breakdown_colored = "".join(
+        f'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:10px;">'
+        f'<span style="width:8px;height:8px;border-radius:2px;flex-shrink:0;'
+        f'background:{_PRI_VAR.get(k, "var(--neutral)")};"></span>'
+        f'<span style="font-weight:700;color:var(--text);">{v} {k}</span></span>'
+        for k, v in sorted(open_priority.items()) if v
+    )
 
     brand_css = _brand_css_overrides(brand)
     logo_html = f'<img src="{brand["logo_url"]}" alt="{org} logo" style="height:28px;object-fit:contain;">' if brand.get("logo_url") else ""
@@ -2169,7 +2180,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     # Replace KPI tiles dynamically
     kpi_block = f"""  <div class="kpi-grid">
     <div class="kpi-tile"><span class="kpi-val cb">{true_total}</span><span class="kpi-lbl">Total {t_ticket}s</span>{f'<span class="kpi-sub">{total} analyzed: {window_note}</span>' if windowed else ''}</div>
-    <div class="kpi-tile"><span class="kpi-val crit">{len(open_t)}</span><span class="kpi-lbl">Open Now</span><span class="kpi-sub">{open_breakdown or "—"}</span></div>
+    <div class="kpi-tile"><span class="kpi-val crit">{len(open_t)}</span><span class="kpi-lbl">Open Now</span><span class="kpi-sub">{open_breakdown_colored or "—"}</span></div>
     <div class="kpi-tile"><span class="kpi-val warn">{priority_counts.get('P1',0)}</span><span class="kpi-lbl">{_p1_scope_lbl}</span><span class="kpi-sub">{_p1_scope_sub}</span></div>
     <div class="kpi-tile"><span class="kpi-val warn">{len(p1_90d)}</span><span class="kpi-lbl">{t_p1}s Last 90 Days</span></div>
     <div class="kpi-tile"><span class="kpi-val good">{avg_p1_res}</span><span class="kpi-lbl">Avg {t_p1} Resolution</span><span class="kpi-sub">solved in last 12 mo, n={len(solved_p1)}</span></div>
