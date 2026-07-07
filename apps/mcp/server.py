@@ -1935,12 +1935,12 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
             f'<div class="hbar-val">{cnt}</div></div>\n'
         )
 
-    # Subjects render in full and wrap in their grid/table cells — a hard slice
-    # chopped mid-word with no ellipsis (Austin, Jul 7). The cap below is only
-    # a runaway guard, and marks itself with a real ellipsis when it fires.
+    # Subjects render in FULL and wrap in their grid/table cells. Zendesk caps
+    # subjects at 255 chars (the source itself can end mid-word), so no display
+    # cap is needed — the 500 guard below only fires on malformed data.
     import html as _htmlmod
 
-    def _subj(t: dict, cap: int = 200) -> str:
+    def _subj(t: dict, cap: int = 500) -> str:
         s = (t.get("subject") or "—").strip()
         return _htmlmod.escape(s[:cap] + ("…" if len(s) > cap else ""))
 
