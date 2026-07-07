@@ -1734,18 +1734,41 @@ def _brand_css_overrides(brand: dict) -> str:
         return f"#{int(r * k):02X}{int(g * k):02X}{int(b * k):02X}"
 
     lines = []
-    if brand.get("primary_color"):
-        main = _adapt(brand["primary_color"])
+    prim = brand.get("primary_color") or ""
+    if prim:
+        rgb = _parse(prim)
+        main = ""
+        if rgb and _lum(*rgb) > 0.72 and (max(rgb) - min(rgb)) / 255 >= 0.12:
+            # Light-but-saturated primary (WU yellow): darkening muddies the
+            # hue (yellow → olive). Do what the brand itself does — a dark
+            # kit color carries structure, the light primary becomes the
+            # tint. Falls back to darkening only if no dark color exists.
+            dark = next(
+                (c for c in (brand.get("secondary_color"), brand.get("accent_color"))
+                 if c and _parse(c) and _lum(*_parse(c)) <= 0.45),
+                "",
+            )
+            main = dark or _adapt(prim)
+            tint = f"{prim}33"  # stronger tint so the brand hue stays present
+        else:
+            main = _adapt(prim)
+            tint = f"{prim}22"
         if main:
             lines.append(f"    --cb: {main};")
-            lines.append(f"    --cb-light: {brand['primary_color']}22;")
+            lines.append(f"    --cb-light: {tint};")
+    # Semantic colors must stay distinguishable: if a kit color collides
+    # with the structural color (WU: secondary AND accent are both black,
+    # same as the adapted primary), keep the default semantic hue instead —
+    # otherwise P2/P3 mix segments and good/warn states become identical.
+    _used = {main.upper()} if prim and main else set()
     if brand.get("secondary_color"):
         good = _adapt(brand["secondary_color"])
-        if good:
+        if good and good.upper() not in _used:
             lines.append(f"    --good: {good};")
+            _used.add(good.upper())
     if brand.get("accent_color"):
         warn = _adapt(brand["accent_color"])
-        if warn:
+        if warn and warn.upper() not in _used:
             lines.append(f"    --warn: {warn};")
     if brand.get("font_family"):
         lines.append(f"    font-family: {brand['font_family']}, -apple-system, sans-serif;")
