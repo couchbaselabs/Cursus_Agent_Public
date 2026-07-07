@@ -691,6 +691,68 @@ def get_scrape_status(job_id: str = "") -> str:
 
 
 @mcp.tool()
+def find_customers(topic: str, limit: int = 20) -> str:
+    """
+    Fleet-wide customer search by product/feature topic — answers questions
+    like "which customers use FTS?", "Capella customers", "who has XDCR
+    issues?". Searches the local ticket cache across feature_area, the full
+    Component path, tags, and subjects, and returns organizations ranked by
+    matching ticket volume with recency signals.
+
+    Scope note: searches YOUR scraped fleet (local cache), not all of
+    Supportal — for customers outside the fleet use query_supportal_analytics.
+
+    Args:
+        topic: Product/feature term ('FTS', 'Capella', 'eventing', 'XDCR',
+               'backup', 'SDK', a version like '7.6', etc.). Case-insensitive
+               substring match.
+        limit: Max organizations to return (default 20).
+    """
+    cfg = _cfg()
+    q = f"%{topic.lower().strip()}%"
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions, QueryOptions
+        import datetime as _dt
+        conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
+        recent_cut = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=90)).isoformat()
+        rows = list(cl.query(
+            f"""
+            SELECT t.organization AS organization,
+                   COUNT(*) AS matching_tickets,
+                   SUM(CASE WHEN t.created >= $recent THEN 1 ELSE 0 END) AS last_90d,
+                   MAX(t.created) AS most_recent,
+                   ARRAY_AGG(DISTINCT t.feature_area) AS areas
+            FROM {ks} t
+            WHERE t.ticket_id IS NOT MISSING AND t.organization IS NOT MISSING AND (
+                  LOWER(IFNULL(t.feature_area, '')) LIKE $q
+               OR LOWER(IFNULL(t.ticket_fields.`Component`, '')) LIKE $q
+               OR LOWER(IFNULL(t.subject, '')) LIKE $q
+               OR ANY tag IN IFNULL(t.tags, []) SATISFIES LOWER(tag) LIKE $q END
+               OR LOWER(IFNULL(t.cb_version, '')) LIKE $q)
+            GROUP BY t.organization
+            ORDER BY COUNT(*) DESC
+            LIMIT $lim
+            """,
+            QueryOptions(named_parameters={"q": q, "recent": recent_cut, "lim": int(limit)}),
+        ))
+        for r in rows:
+            r["areas"] = sorted(a for a in (r.get("areas") or []) if a)[:6]
+        return json.dumps({
+            "topic": topic,
+            "customers": rows,
+            "fleet_note": "Matches from the local scraped fleet only. Fields searched: "
+                          "feature_area, Component path, subject, tags, cb_version.",
+        }, default=str)
+    except Exception as exc:
+        _log_tool_failure("find_customers", exc)
+        return json.dumps({"error": str(exc), "topic": topic})
+
+
+@mcp.tool()
 def wait_for_scrape(job_id: str = "", timeout_s: int = 240) -> str:
     """
     Block until a scrape/rescrape job concludes (done/error/cancelled), then
@@ -1638,27 +1700,53 @@ def get_customer_brand(organization: str) -> str:
 def _brand_css_overrides(brand: dict) -> str:
     """Return a <style> block overriding CSS vars from the brand kit (empty if no brand).
 
-    Near-white brand colors are skipped: Amex's secondary is #FFFFFF, and
-    mapping it onto --good rendered every 'good' value white-on-white. A
-    color too light to read on the white surface keeps the default var."""
-    def _too_light(c: str) -> bool:
+    Light brand colors are ADAPTED, not dropped: a saturated light color
+    (WU yellow #FFDD00) is darkened toward black until readable on the
+    white surface, preserving its hue — dropping it silently reverted the
+    whole report to default blue. Only true near-white NEUTRALS (Amex
+    secondary #FFFFFF: no hue to preserve) keep the default var. The light
+    tint (--cb-light) keeps the ORIGINAL color so backgrounds stay on-brand."""
+    def _parse(c: str):
         h = c.strip().lstrip("#")
         if len(h) == 3:
             h = "".join(ch * 2 for ch in h)
         try:
-            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         except ValueError:
-            return False  # named/other CSS color — trust it
-        return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.72
+            return None
+
+    def _lum(r, g, b):
+        return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+
+    def _adapt(c: str) -> str:
+        """Readable version of c, or '' when it has no usable hue."""
+        rgb = _parse(c)
+        if rgb is None:
+            return c  # named/other CSS color — trust it
+        r, g, b = rgb
+        if _lum(r, g, b) <= 0.72:
+            return c
+        if (max(rgb) - min(rgb)) / 255 < 0.12:
+            return ""  # near-white neutral — keep the default semantic color
+        k = 1.0
+        while k > 0.05 and _lum(int(r * k), int(g * k), int(b * k)) > 0.55:
+            k -= 0.05
+        return f"#{int(r * k):02X}{int(g * k):02X}{int(b * k):02X}"
 
     lines = []
-    if brand.get("primary_color") and not _too_light(brand["primary_color"]):
-        lines.append(f"    --cb: {brand['primary_color']};")
-        lines.append(f"    --cb-light: {brand['primary_color']}22;")
-    if brand.get("secondary_color") and not _too_light(brand["secondary_color"]):
-        lines.append(f"    --good: {brand['secondary_color']};")
-    if brand.get("accent_color") and not _too_light(brand["accent_color"]):
-        lines.append(f"    --warn: {brand['accent_color']};")
+    if brand.get("primary_color"):
+        main = _adapt(brand["primary_color"])
+        if main:
+            lines.append(f"    --cb: {main};")
+            lines.append(f"    --cb-light: {brand['primary_color']}22;")
+    if brand.get("secondary_color"):
+        good = _adapt(brand["secondary_color"])
+        if good:
+            lines.append(f"    --good: {good};")
+    if brand.get("accent_color"):
+        warn = _adapt(brand["accent_color"])
+        if warn:
+            lines.append(f"    --warn: {warn};")
     if brand.get("font_family"):
         lines.append(f"    font-family: {brand['font_family']}, -apple-system, sans-serif;")
     if not lines:
