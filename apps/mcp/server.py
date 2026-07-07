@@ -1935,11 +1935,20 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
             f'<div class="hbar-val">{cnt}</div></div>\n'
         )
 
+    # Subjects render in full and wrap in their grid/table cells — a hard slice
+    # chopped mid-word with no ellipsis (Austin, Jul 7). The cap below is only
+    # a runaway guard, and marks itself with a real ellipsis when it fires.
+    import html as _htmlmod
+
+    def _subj(t: dict, cap: int = 200) -> str:
+        s = (t.get("subject") or "—").strip()
+        return _htmlmod.escape(s[:cap] + ("…" if len(s) > cap else ""))
+
     # P1 incident log
     p1_rows_html = ""
     for t in sorted(p1_12mo, key=lambda x: x.get("created") or "", reverse=True)[:10]:
         tid = t.get("ticket_id", "")
-        subj = (t.get("subject") or "—")[:70]
+        subj = _subj(t)
         assignee = t.get("assignee") or "—"
         opened = (t.get("created") or "")[:10]
         status = (t.get("status") or "").lower()
@@ -1956,7 +1965,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     open_rows_html = ""
     for t in sorted(open_t, key=lambda x: x.get("created") or "")[:8]:
         tid = t.get("ticket_id", "")
-        subj = (t.get("subject") or "—")[:65]
+        subj = _subj(t)
         pri = _priority(t)
         pri_cls = {"P1":"crit","P2":"warn","P3":"cb","P4":"neutral"}.get(pri, "neutral")
         created = t.get("created") or ""
@@ -2131,7 +2140,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
             o_age = None
         point3 = (
             f"<strong>Oldest open item is #{oldest.get('ticket_id','')}.</strong> "
-            f"{(oldest.get('subject') or '—')[:70]}"
+            f"{_subj(oldest)}"
             + (f" — open {o_age} days." if o_age is not None else ".")
         )
     else:
@@ -2226,7 +2235,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
             "both",
             f"<strong>Review oldest open item #{oldest.get('ticket_id','')}"
             f" ({o_pri}{', ' + o_area if o_area else ''}).</strong> "
-            f"“{(oldest.get('subject') or '—')[:80]}” — {_age_txt}; "
+            f"“{_subj(oldest)}” — {_age_txt}; "
             f"last activity {o_last_act or 'not recorded'}; assigned to {o_assignee}. "
             f"Ask: confirm it is still reproducible and agree a close-or-escalate path.",
         ))
@@ -2250,9 +2259,9 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         ))
     if open_p1_ct > 0:
         _p1_refs = ", ".join(
-            f"#{t.get('ticket_id','')} ({(t.get('subject') or '')[:45]}…)"
+            f"#{t.get('ticket_id','')} ({_subj(t, cap=60)})"
             for t in open_t if _priority(t) == "P1"
-        )[:220]
+        )
         rec_items.append((
             "cb",
             f"<strong>{open_p1_ct} open {t_p1.lower()}{'s' if open_p1_ct != 1 else ''} need active tracking:</strong> "
