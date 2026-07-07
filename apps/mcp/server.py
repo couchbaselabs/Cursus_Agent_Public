@@ -2021,10 +2021,22 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         tpl, flags=_re.DOTALL, count=1,
     )
 
-    # Replace mix bar
+    # Replace the ENTIRE priority-mix card atomically. The old regex ended at
+    # the first '</div>\n</div>' — which is last-legend-item + legend close,
+    # NOT legend + card close — leaving an orphan </div> that closed .page
+    # early and let every later section escape to full width. Also fixes the
+    # static '(949 tickets)' title left from the template's authoring data.
+    _mix_title = f"{'Analyzed' if windowed else 'Lifetime'} priority mix ({total} {t_ticket.lower()}s)"
+    mix_card_html = (
+        f'  <div class="card">\n'
+        f'    <div class="card-title">{_mix_title}</div>\n'
+        f'    <div class="mix-bar">{mix_bar_html}\n    </div>\n'
+        f'    <div class="mix-legend">\n{mix_legend_html}    </div>\n'
+        f'  </div>\n'
+    )
     tpl = _re.sub(
-        r'(<div class="mix-bar">).*?(</div>\s*\n\s*<div class="mix-legend">).*?(</div>\s*\n\s*</div>)',
-        lambda m: f'{m.group(1)}{mix_bar_html}\n    {m.group(2)}\n{mix_legend_html}    {m.group(3)}',
+        r'  <div class="card">\s*<div class="card-title">Lifetime priority mix[^<]*</div>.*?\n  </div>\n',
+        lambda m: mix_card_html,
         tpl, flags=_re.DOTALL, count=1,
     )
 
@@ -2062,6 +2074,19 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
                    f'Year to date — near-term causes vs their lifetime totals</div>\n'
                    f'{hbar_ytd_html}    {m.group(5)}'),
         tpl, flags=_re.DOTALL, count=1,
+    )
+    # The group titles above carry the template's static authoring counts
+    # ('top 8 of 949', '28 tickets') — stamp the real ones.
+    tpl = _re.sub(
+        r'<div class="card-title">Feature area — lifetime[^<]*</div>',
+        f'<div class="card-title">Feature area — {"analyzed window" if windowed else "lifetime"} '
+        f'(top {len(top_areas)} of {total})</div>',
+        tpl, count=1,
+    )
+    tpl = _re.sub(
+        r'(<div class="hbar-group-title"[^>]*>)Last 90 days \([^)]*\)[^<]*(</div>)',
+        f'\\g<1>Last 90 days ({len(recent_t)} {t_ticket.lower()}s) — concentration shift\\g<2>',
+        tpl, count=1,
     )
 
     # Replace P1 incident table rows
@@ -2545,7 +2570,8 @@ def generate_health_report(
         _orgs = sorted({organization.lower().strip(),
                         (tickets[0].get("organization") or organization).lower().strip()})
         _rows = list(_cl.query(
-            f"SELECT RAW COUNT(*) FROM {_ks} t WHERE LOWER(t.organization) IN $orgs",
+            f"SELECT RAW COUNT(*) FROM {_ks} t "
+            f"WHERE LOWER(t.organization) IN $orgs AND t.ticket_id IS NOT MISSING",
             QueryOptions(named_parameters={"orgs": _orgs}),
         ))
         if _rows and isinstance(_rows[0], int):

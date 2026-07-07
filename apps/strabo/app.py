@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.7.23"
+__version__ = "2.7.24"
 
 import asyncio
 import threading
