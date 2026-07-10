@@ -1635,7 +1635,11 @@ def structured_search_cb(
     priorities = filters.get("priorities") or []
     date_from  = filters.get("date_from")
     date_to    = filters.get("date_to")
-    statuses   = filters.get("statuses") or []
+    # Accept singular "status" (string) as well as "statuses" (list) — several
+    # agent-tool branches pass the singular form.
+    statuses   = filters.get("statuses") or (
+        [str(filters["status"]).strip().lower()] if filters.get("status") else []
+    )
     limit      = filters.get("limit") or default_limit
 
     if not any([ticket_ids, priorities, date_from, statuses]):
@@ -1747,7 +1751,11 @@ def tool_query_tickets(
             where_parts.append(f"UPPER(TOSTRING(t.priority)) IN [{phs}]")
             params.extend(priorities)
 
-        statuses = filters.get("statuses") or []
+        # Accept singular "status" (string) as well as "statuses" (list) — several
+        # agent-tool branches pass the singular form.
+        statuses = filters.get("statuses") or (
+            [str(filters["status"]).strip().lower()] if filters.get("status") else []
+        )
         if statuses:
             s_idx = len(params) + 1
             phs   = ", ".join(f"${s_idx + i}" for i, _ in enumerate(statuses))
