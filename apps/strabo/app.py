@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.7.27"
+__version__ = "2.7.32"
 
 import asyncio
 import threading
@@ -10912,7 +10912,36 @@ def _execute_agent_tool(
             _rs_filters, cb_url, bucket, username, password,
             use_tls, scope, collection, limit=max_tix * 8,
         )
-        cb_ids = {str(t.get("ticket_id") or "").strip() for t in candidates if t.get("ticket_id")}
+
+        # The candidate list above is capped (stale-refresh pool only); the
+        # new-vs-cached comparison needs the org's COMPLETE local ticket-id set,
+        # otherwise cached tickets beyond the cap get misclassified as "new".
+        cb_ids: set[str] = set()
+        try:
+            _idc = Cluster(
+                _cb_conn_str(cb_url, use_tls),
+                ClusterOptions(PasswordAuthenticator(username, password)),
+            )
+            _idc.wait_until_ready(timedelta(seconds=10))
+            _id_where = ["ticket_id IS NOT MISSING",
+                         "(`_deleted` IS MISSING OR `_deleted` = false)"]
+            _id_params: list = []
+            if cust and cust.lower() != "all customers":
+                _id_params.append(f"%{cust.lower()}%")
+                _id_where.append(f"LOWER(TOSTRING(organization)) LIKE ${len(_id_params)}")
+            _id_rows = list(_idc.query(
+                f"SELECT RAW ticket_id FROM `{bucket}`.`{scope}`.`{collection}` "
+                f"WHERE {' AND '.join(_id_where)}",
+                QueryOptions(positional_parameters=_id_params,
+                             timeout=timedelta(seconds=30)),
+            ))
+            _idc.close()
+            cb_ids = {str(r or "").strip() for r in _id_rows if r}
+        except Exception:
+            cb_ids = set()
+        if not cb_ids:
+            # Fallback: capped candidate set (better than treating everything as new)
+            cb_ids = {str(t.get("ticket_id") or "").strip() for t in candidates if t.get("ticket_id")}
 
         # ── Step 2: Fetch full Supportal listing to discover new tickets ──────
         new_stubs: list[dict] = []
@@ -12106,7 +12135,15 @@ LIMIT {limit}
                     continue
                 try:
                     _ex = _sc_col.get(f"ticket::{_stid}").content_as[dict]
-                    _ex.update({k: v for k, v in s.items() if v is not None})
+                    # Score fields belong nested under doc["score"] (like every
+                    # other scoring path) — a flat update leaves reports reading
+                    # the stale nested score while new values sit top-level.
+                    _sc_data = {k: v for k, v in s.items() if v is not None and k != "ticket_id"}
+                    _ex["score"] = {
+                        **(_ex.get("score") or {}),
+                        **_sc_data,
+                        "scored_at": int(time.time()),
+                    }
                     _sc_col.upsert(f"ticket::{_stid}", _ex)
                     _saved += 1
                 except Exception:

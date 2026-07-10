@@ -2324,8 +2324,10 @@ def compute_and_mark_freshness(
     assumed one. verified_by records what produced this check (e.g. a job id).
 
     One-directional by design: live-referenced IDs missing locally = drift;
-    local-not-in-live is normal. Raises on live-lookup or CB failure —
-    callers decide how to log.
+    local-not-in-live is normal. Missing candidates are validated against the
+    org's own live ticket listing so foreign/deleted snapshot refs surface as
+    unresolvable_snapshot_refs instead of a perpetual stale status. Raises on
+    live-lookup or CB failure — callers decide how to log.
     """
     import datetime as _dt
     from supportal.api_client import fetch_snapshots_via_analytics
@@ -2356,6 +2358,34 @@ def compute_and_mark_freshness(
     local_ids = {r for r in rows if r}
 
     missing = sorted(live_ids - local_ids, key=lambda x: int(x) if x.isdigit() else 0)
+
+    # Old snapshots can carry zendesk[] IDs that belong to OTHER customers or
+    # deleted tickets (cross-era Supportal data). Those would flag the org
+    # stale forever and trigger a pointless rescrape on every monitor run, so
+    # validate each candidate against the org's own live ticket listing:
+    # only IDs the org actually owns count as missing; the rest are reported
+    # separately as unresolvable_snapshot_refs and don't affect status.
+    unresolvable: list[str] = []
+    listing_validated = False
+    listing_error = ""
+    if missing:
+        try:
+            from supportal.api_client import (
+                _get_customer_ticket_listing_api, _make_api_session,
+            )
+            listing = _get_customer_ticket_listing_api(
+                resolved_org, _make_api_session(cookie)
+            )
+            listing_ids = {str(r.get("id") or "").strip() for r in listing if r.get("id")}
+            if listing_ids:
+                unresolvable = [t for t in missing if t not in listing_ids]
+                missing = [t for t in missing if t in listing_ids]
+                listing_validated = True
+            else:
+                listing_error = "org ticket listing came back empty; skipped validation"
+        except Exception as exc:
+            listing_error = f"listing validation unavailable: {exc}"
+
     status = "fresh" if not missing else "stale"
     now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
     marker = {
@@ -2367,9 +2397,14 @@ def compute_and_mark_freshness(
         "local_tickets":   len(local_ids),
         "missing_count":   len(missing),
         "missing_ids":     missing[:50],
+        "unresolvable_snapshot_refs":       unresolvable[:50],
+        "unresolvable_snapshot_ref_count":  len(unresolvable),
+        "listing_validated": listing_validated,
         "status":          status,
         "source":          "snapshot.zendesk[] via Supportal Analytics API",
     }
+    if listing_error:
+        marker["listing_validation_note"] = listing_error
     if verified_by:
         marker["verified_by"] = verified_by
     try:

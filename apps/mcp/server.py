@@ -1601,6 +1601,7 @@ def _logo_to_data_uri(source: str) -> str:
     return ""
 
 
+@mcp.tool()
 def save_customer_brand(
     organization: str,
     primary_color: str = "",

@@ -8,6 +8,7 @@ import datetime
 import json
 import re
 import threading
+import time
 from typing import Callable
 
 import requests
@@ -195,7 +196,18 @@ def call_llm(
         kwargs: dict = {"model": model, "messages": messages, "max_tokens": max_tokens}
         if num_ctx and provider == "ollama":
             kwargs["extra_body"] = {"num_ctx": num_ctx}
-        resp = client.chat.completions.create(**kwargs)
+        # LMStudio's LM Link peer connection times out during idle; the first
+        # request after idle 400s with "peer_keepalive_timeout" and the link
+        # re-establishes itself, so a short-delay retry succeeds.
+        for _attempt in range(3):
+            try:
+                resp = client.chat.completions.create(**kwargs)
+                break
+            except Exception as _exc:
+                if "lm link" in str(_exc).lower() and _attempt < 2:
+                    time.sleep(2 * (_attempt + 1))
+                    continue
+                raise
         _content = resp.choices[0].message.content
         if isinstance(_content, list):
             _content = "".join(
