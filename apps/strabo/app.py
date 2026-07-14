@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.7.33"
+__version__ = "2.7.34"
 
 import asyncio
 import threading
@@ -9829,6 +9829,18 @@ def _persist_job_run(
             except Exception as exc:
                 doc["freshness_after"] = {"status": "unverified", "error": str(exc)[:160]}
                 col.upsert(key, doc)
+            # Contacts enrichment — refresh the org-scoped contacts:: marker
+            # from live zdorg so AE/TSE/renewal flags stay current alongside
+            # the tickets. Org-scoped only; never denormalized per-ticket.
+            try:
+                from supportal.cb_helpers import refresh_org_contacts
+                refresh_org_contacts(
+                    job["org"], cb_url, bucket, username, password,
+                    use_tls, scope,
+                    refreshed_by=f"jobrun::{job.get('job_id')}",
+                )
+            except Exception:
+                pass  # best-effort — never fail a completed job on enrichment
         _c.close()
     except Exception:
         pass

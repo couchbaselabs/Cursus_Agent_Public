@@ -2432,6 +2432,87 @@ def compute_and_mark_freshness(
     return marker
 
 
+def refresh_org_contacts(
+    organization: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+    cookie: str = "",
+    refreshed_by: str = "",
+) -> dict:
+    """Live zdorg → org-scoped `contacts::<org>` marker doc.
+
+    Single shared writer for account contacts (AE/TSE/CSM) and status flags
+    (critical_renewal, strategic, carr, top_50), following the freshness::
+    marker pattern — used by the MCP get_account_contacts tool (on cache miss
+    or expiry) AND the pipeline's post-job completion hook, so a rescrape
+    always leaves current contacts alongside fresh tickets.
+
+    Org-scoped ON PURPOSE: exactly one copy per org, never denormalized onto
+    ticket docs — per-ticket copies freeze at write time and recreate the
+    stale ticket-tag bug that once showed a wrong critical_renewal badge.
+
+    Returns the marker doc; {} when the org has no zdorg record (existing
+    marker is left untouched in that case). Raises on live-lookup failure.
+    """
+    import datetime as _dt
+    from supportal.api_client import query_supportal_analytics as _qsa
+
+    safe_org_name = organization.replace('"', '\\"')
+    stmt = f"""
+SELECT zo.`organization_fields`.`critical_renewal` AS critical_renewal,
+       zo.`organization_fields`.`strategic` AS strategic,
+       zo.`organization_fields`.`carr` AS carr,
+       zo.`organization_fields`.`top_50` AS top_50,
+       zo.`organization_fields`.`ase` AS ase,
+       zo.`organization_fields`.`account_owner` AS account_owner,
+       zo.`organization_fields`.`account_owner_email` AS account_owner_email,
+       zo.`organization_fields`.`csm_email` AS csm_email
+FROM customer cu
+LEFT JOIN zdorg zo ON META(zo).id = ("ZendeskSupport/organizations::" || TO_STRING(cu.`zendeskorg`))
+WHERE cu.`name` = "{safe_org_name}"
+LIMIT 1
+""".strip()
+    rows = _qsa(stmt, cookie)
+    meta = rows[0] if rows else {}
+    if all(meta.get(k) is None for k in
+           ("account_owner", "account_owner_email", "ase", "csm_email")):
+        return {}
+
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    doc = {
+        "type":             "contacts",
+        "organization":     organization,
+        "ae":               meta.get("account_owner"),
+        "ae_email":         meta.get("account_owner_email"),
+        "tse":              meta.get("ase"),
+        "csm_email":        meta.get("csm_email"),
+        "critical_renewal": meta.get("critical_renewal"),
+        "strategic":        meta.get("strategic"),
+        "carr":             meta.get("carr"),
+        "top_50":           meta.get("top_50"),
+        "checked_at":       now_iso,
+        "source":           "zdorg",
+    }
+    if refreshed_by:
+        doc["refreshed_by"] = refreshed_by
+
+    from couchbase.auth import PasswordAuthenticator
+    from couchbase.cluster import Cluster
+    from couchbase.options import ClusterOptions
+    conn = cb_url if "://" in cb_url else ("couchbases://" if use_tls else "couchbase://") + cb_url
+    cl = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+    try:
+        _ensure_collection(cl, bucket, scope, "markers")
+        key = f"contacts::{organization.lower().replace(' ', '_')}"
+        cl.bucket(bucket).scope(scope).collection("markers").upsert(key, doc)
+        doc["marker_key"] = key
+        doc["saved"] = True
+    except Exception as exc:
+        doc["saved"] = False
+        doc["save_error"] = str(exc)
+    return doc
+
+
 def _ensure_collection(cluster, bucket_name: str, scope_name: str, coll_name: str) -> None:
     """Create a collection if missing. Never raises."""
     try:

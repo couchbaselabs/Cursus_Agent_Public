@@ -139,6 +139,38 @@ def _cb_tuple(cfg: dict) -> tuple:
             cfg["use_tls"], cfg["scope"], cfg["collection"])
 
 
+def _fetch_org_meta(app: Any, organization: str) -> dict:
+    """
+    Authoritative account metadata from the live Supportal zdorg record.
+
+    Ticket-level tags (e.g. a stale "critical_renewal" tag copied at
+    ticket-creation time) are NOT reliable for current account status — always
+    prefer zdorg.organization_fields, which is Zendesk's current source of
+    truth. Returns a small flat dict (never the raw zdorg doc); {} on any
+    failure or unknown org.
+    """
+    safe_org_name = organization.replace('"', '\\"')
+    meta_stmt = f"""
+SELECT zo.`organization_fields`.`critical_renewal` AS critical_renewal,
+       zo.`organization_fields`.`strategic` AS strategic,
+       zo.`organization_fields`.`carr` AS carr,
+       zo.`organization_fields`.`top_50` AS top_50,
+       zo.`organization_fields`.`ase` AS ase,
+       zo.`organization_fields`.`account_owner` AS account_owner,
+       zo.`organization_fields`.`account_owner_email` AS account_owner_email,
+       zo.`organization_fields`.`csm_email` AS csm_email
+FROM customer cu
+LEFT JOIN zdorg zo ON META(zo).id = ("ZendeskSupport/organizations::" || TO_STRING(cu.`zendeskorg`))
+WHERE cu.`name` = "{safe_org_name}"
+LIMIT 1
+""".strip()
+    try:
+        rows = app.query_supportal_analytics(meta_stmt, "")
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TICKETS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -509,8 +541,11 @@ def get_morning_briefing(
         p1 = [t for t in tickets if (t.get("priority") or "").lower() in ("urgent", "p1")]
         p2 = [t for t in tickets if (t.get("priority") or "").lower() in ("high", "p2")]
 
+        _meta = _fetch_org_meta(app, org)  # best-effort live AE lookup
+
         briefing.append({
             "organization":   org,
+            "ae":             _meta.get("account_owner"),
             "active_count":   len(tickets),
             "p1_count":       len(p1),
             "p2_count":       len(p2),
@@ -527,6 +562,96 @@ def get_morning_briefing(
         "total_p1":      total_p1,
         "fleet":         briefing,
     }, default=str)
+
+
+@mcp.tool()
+def get_account_contacts(organizations: list[str] | str, max_age_hours: float = 24.0) -> str:
+    """
+    Authoritative account contacts and status flags for one or more orgs.
+
+    Cache-first: reads the org-scoped `contacts::<org>` marker doc (written by
+    the rescrape pipeline's enrichment step); falls back to the LIVE Supportal
+    zdorg record when the doc is missing or older than max_age_hours, and
+    persists the refreshed result. Never infer AE/TSE/critical_renewal from
+    ticket tags — they go stale; zdorg (via this tool) is the system of record.
+
+    Args:
+        organizations: A single org name or a list of org names (must match
+                       customer.name in Supportal, e.g. "Western Union").
+        max_age_hours: Cached contacts older than this trigger a live refresh
+                       (default 24).
+
+    Returns per org: ae, ae_email, tse (may be null — not every account has a
+    formal TSE), csm_email, critical_renewal, strategic, carr, top_50,
+    checked_at, cache ("hit" | "refreshed").
+    """
+    import datetime as _dt
+    from supportal.cb_helpers import refresh_org_contacts
+
+    cfg = _cfg()
+    orgs = [organizations] if isinstance(organizations, str) else list(organizations)
+
+    markers = None
+    try:
+        from couchbase.auth import PasswordAuthenticator
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        _conn = cfg["cb_url"] if "://" in cfg["cb_url"] else f"couchbase://{cfg['cb_url']}"
+        _cl = Cluster(_conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        markers = _cl.bucket(cfg["bucket"]).scope(cfg["scope"]).collection("markers")
+    except Exception:
+        pass  # cache unreachable — every org falls through to a live refresh
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    _FIELDS = ("ae", "ae_email", "tse", "csm_email", "critical_renewal",
+               "strategic", "carr", "top_50", "checked_at")
+
+    results: dict[str, dict] = {}
+    for org in orgs:
+        cached: dict = {}
+        if markers is not None:
+            try:
+                cached = markers.get(f"contacts::{org.lower().replace(' ', '_')}").content_as[dict]
+            except Exception:
+                cached = {}
+
+        fresh_enough = False
+        if cached.get("checked_at"):
+            try:
+                checked = _dt.datetime.fromisoformat(cached["checked_at"].replace("Z", "+00:00"))
+                fresh_enough = (now - checked).total_seconds() < max_age_hours * 3600
+            except Exception:
+                fresh_enough = False
+
+        if fresh_enough:
+            entry = {k: cached.get(k) for k in _FIELDS}
+            entry["cache"] = "hit"
+            results[org] = entry
+            continue
+
+        try:
+            doc = refresh_org_contacts(
+                org, cfg["cb_url"], cfg["bucket"], cfg["username"], cfg["password"],
+                cfg["use_tls"], cfg["scope"],
+                cookie=cfg.get("cookie", ""),
+                refreshed_by="tool:get_account_contacts",
+            )
+        except Exception as exc:
+            _log_tool_failure("get_account_contacts", exc, org)
+            doc = {}
+        if doc:
+            entry = {k: doc.get(k) for k in _FIELDS}
+            entry["cache"] = "refreshed"
+            results[org] = entry
+        elif cached:
+            # Live refresh failed but a (stale) cached doc exists — better than nothing.
+            entry = {k: cached.get(k) for k in _FIELDS}
+            entry["cache"] = "stale"
+            results[org] = entry
+        else:
+            results[org] = {"error": "org not found in Supportal or lookup failed"}
+
+    return json.dumps({"contacts": results}, default=str)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2703,29 +2828,8 @@ def generate_health_report(
         pass  # best-effort — fall back to analyzed count
 
     # ── Authoritative account metadata from live Supportal (zdorg) ──────────
-    # Ticket-level tags (e.g. a stale "critical_renewal" tag copied at ticket-creation
-    # time) are NOT reliable for current account status — always prefer the live
-    # zdorg.organization_fields record, which is Zendesk's current source of truth.
-    org_meta: dict = {}
-    try:
-        safe_org_name = organization.replace('"', '\\"')
-        meta_stmt = f"""
-SELECT zo.`organization_fields`.`critical_renewal` AS critical_renewal,
-       zo.`organization_fields`.`strategic` AS strategic,
-       zo.`organization_fields`.`carr` AS carr,
-       zo.`organization_fields`.`ase` AS ase,
-       zo.`organization_fields`.`account_owner` AS account_owner,
-       zo.`organization_fields`.`account_owner_email` AS account_owner_email
-FROM customer cu
-LEFT JOIN zdorg zo ON META(zo).id = ("ZendeskSupport/organizations::" || TO_STRING(cu.`zendeskorg`))
-WHERE cu.`name` = "{safe_org_name}"
-LIMIT 1
-""".strip()
-        meta_rows = app.query_supportal_analytics(meta_stmt, "")
-        if meta_rows:
-            org_meta = meta_rows[0]
-    except Exception:
-        pass  # Live lookup is best-effort — fall back to caller-supplied args / no badge.
+    # Best-effort: falls back to caller-supplied args / no badge on failure.
+    org_meta = _fetch_org_meta(app, organization)
 
     # Auto-fill AE/TSE from the authoritative record if the caller didn't specify them.
     if not ae_name and org_meta.get("account_owner"):
