@@ -1904,13 +1904,22 @@ def _brand_css_overrides(brand: dict) -> str:
     return f"\n<style>\n  :root {{\n{inner}\n  }}\n</style>"
 
 
-def _build_health_report_html(org: str, tickets: list[dict], report_date: str, brand: dict, org_meta: dict | None = None, true_total: int = 0) -> str:
+def _build_health_report_html(org: str, tickets: list[dict], report_date: str, brand: dict, org_meta: dict | None = None, true_total: int = 0,
+                              full_tickets: list[dict] | None = None, window: tuple = ("", ""),
+                              annotations: dict | None = None) -> str:
     """Generate a full health report HTML document from live CB ticket data.
 
     true_total is the org's real lifetime ticket count. When it exceeds
     len(tickets), the analyzed set is a most-recent window and every
     lifetime-sounding figure must disclose the from→to date range instead
     of implying full history.
+
+    full_tickets is the org's full (pre-window) ticket set; lookback KPIs
+    (P1s last 12mo/90d, avg P1 resolution, year-over-year) are computed from
+    it so an explicit date window never clips history-scoped figures.
+    window is the caller's explicit (date_from, date_to); when set, Closed
+    Rate becomes period-scoped: tickets SOLVED inside the window ÷ tickets
+    OPENED inside the window.
     """
     import datetime as _dt
     from collections import Counter, defaultdict
@@ -1921,6 +1930,9 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
 
     now_ts = _dt.datetime.utcnow()
     all_t = tickets
+    # History set for lookback KPIs — never smaller than the analyzed window.
+    hist_t = full_tickets if full_tickets and len(full_tickets) >= len(all_t) else all_t
+    explicit_window = bool(window[0] or window[1])
 
     # ── Aggregate stats ──────────────────────────────────────────────────────
     total = len(all_t)
@@ -1931,7 +1943,30 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     window_note = f"{window_from} → {window_to}"
     open_t = [t for t in all_t if (t.get("status") or "").lower() in ("open", "pending", "on-hold", "hold")]
     closed_t = [t for t in all_t if (t.get("status") or "").lower() in ("solved", "closed")]
-    closed_rate = f"{len(closed_t)/total*100:.1f}%" if total else "—"
+    if explicit_window:
+        # Period closed rate: tickets SOLVED during the window (from full
+        # history, regardless of when opened) ÷ tickets OPENED in the window.
+        _win_from = window[0] or "0000-00-00"
+        _win_to   = window[1] or "9999-12-31"
+        _win_ids  = {t.get("ticket_id") for t in all_t}
+        # Primary signal: solved timestamp inside the window (any open date).
+        # Fallback: docs frequently lack a solved timestamp — a closed ticket
+        # that was OPENED in the window closed no earlier than the window, so
+        # count it rather than silently reporting 0%.
+        closed_in_window = [
+            t for t in hist_t
+            if (t.get("status") or "").lower() in ("solved", "closed")
+            and (
+                _win_from <= ((t.get("solved") or "")[:10] or "!") <= _win_to
+                or (not t.get("solved") and t.get("ticket_id") in _win_ids)
+            )
+        ]
+        closed_rate = f"{len(closed_in_window)/total*100:.1f}%" if total else "—"
+        closed_rate_sub = f"{len(closed_in_window)} closed in period / {total} opened"
+    else:
+        closed_in_window = closed_t
+        closed_rate = f"{len(closed_t)/total*100:.1f}%" if total else "—"
+        closed_rate_sub = ""
 
     def _priority(t: dict) -> str:
         p = (t.get("priority") or "").lower()
@@ -1944,10 +1979,10 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     priority_counts: Counter = Counter(_priority(t) for t in all_t)
     open_priority: Counter = Counter(_priority(t) for t in open_t)
 
-    # P1 tickets in last 12 months
+    # P1 tickets in last 12 months — from FULL history, not the window subset
     cutoff_12mo = (now_ts - _dt.timedelta(days=365)).isoformat()
-    p1_12mo = [t for t in all_t if _priority(t) == "P1" and (t.get("created") or "") >= cutoff_12mo]
-    p1_90d  = [t for t in all_t if _priority(t) == "P1" and (t.get("created") or "") >= (now_ts - _dt.timedelta(days=90)).isoformat()]
+    p1_12mo = [t for t in hist_t if _priority(t) == "P1" and (t.get("created") or "") >= cutoff_12mo]
+    p1_90d  = [t for t in hist_t if _priority(t) == "P1" and (t.get("created") or "") >= (now_ts - _dt.timedelta(days=90)).isoformat()]
 
     # Resolution time for solved P1s
     def _res_days(t: dict) -> float | None:
@@ -1971,7 +2006,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     # year, so long-term accounts can see whether P1 frequency AND response
     # speed are improving. Uses the same solved-date resolution math.
     p1_by_year: dict[str, list] = defaultdict(list)
-    for t in all_t:
+    for t in hist_t:
         if _priority(t) == "P1" and (t.get("created") or "")[:4].isdigit():
             p1_by_year[(t.get("created") or "")[:4]].append(t)
     p1_year_html = ""
@@ -2227,7 +2262,11 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         created = t.get("created") or ""
         age_days = (now_ts - _dt.datetime.fromisoformat(created[:19])).days if created else 0
         age_str = f"{age_days} days old"
-        open_rows_html += f'      <div class="mini-row"><span class="mini-id">#{tid}</span><span class="mini-subject">{subj}</span><span class="pill pill-{pri_cls}">{pri}</span><span class="mini-age">{age_str}</span></div>\n'
+        _note = (annotations or {}).get(str(tid), "")
+        _note_html = (f'<div style="grid-column:1/-1;font-size:11px;color:var(--text-2);'
+                      f'padding:2px 0 4px 0;border-top:1px dashed var(--border-light);margin-top:4px;">'
+                      f'📌 {_note}</div>') if _note else ""
+        open_rows_html += f'      <div class="mini-row" style="flex-wrap:wrap;"><span class="mini-id">#{tid}</span><span class="mini-subject">{subj}</span><span class="pill pill-{pri_cls}">{pri}</span><span class="mini-age">{age_str}</span>{_note_html}</div>\n'
 
     # KPI open breakdown — plain text for prose reuse (exec lede), plus a
     # swatch-dot variant for the Open Now tile using the EXACT same colors
@@ -2310,7 +2349,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
     <div class="kpi-tile"><span class="kpi-val warn">{priority_counts.get('P1',0)}</span><span class="kpi-lbl">{_p1_scope_lbl}</span><span class="kpi-sub">{_p1_scope_sub}</span></div>
     <div class="kpi-tile"><span class="kpi-val warn">{len(p1_90d)}</span><span class="kpi-lbl">{t_p1}s Last 90 Days</span></div>
     <div class="kpi-tile"><span class="kpi-val good">{avg_p1_res}</span><span class="kpi-lbl">Avg {t_p1} Resolution</span><span class="kpi-sub">solved in last 12 mo, n={len(solved_p1)}</span></div>
-    <div class="kpi-tile"><span class="kpi-val good">{closed_rate}</span><span class="kpi-lbl">Closed Rate</span><span class="kpi-sub">{len(closed_t)} closed / {total} {"analyzed" if windowed else "total"}</span></div>
+    <div class="kpi-tile"><span class="kpi-val good">{closed_rate}</span><span class="kpi-lbl">{"Period Closed Rate" if explicit_window else "Closed Rate"}</span><span class="kpi-sub">{closed_rate_sub or f'{len(closed_t)} closed / {total} {"analyzed" if windowed else "total"}'}</span></div>
   </div>"""
     tpl = _re.sub(r'<div class="kpi-grid">.*?</div>\s*\n\s*\n', kpi_block + "\n\n", tpl, flags=_re.DOTALL, count=1)
 
@@ -2377,7 +2416,7 @@ def _build_health_report_html(org: str, tickets: list[dict], report_date: str, b
         f"{org}'s account health is <strong>{health_word}</strong>. "
         f"{len(open_t)} {t_ticket.lower()}{'s' if len(open_t) != 1 else ''} currently open"
         f"{' (' + open_breakdown + ')' if open_breakdown else ''}, "
-        f"against a lifetime closed rate of {closed_rate}."
+        f"against a {'period' if explicit_window else 'lifetime'} closed rate of {closed_rate}."
     )
 
     if p1_res:
@@ -2750,6 +2789,7 @@ def generate_health_report(
     max_tickets: int = 2000,
     date_from: str = "",
     date_to: str = "",
+    annotations: str = "",
 ) -> str:
     """
     Generate a customer health report HTML document from live Couchbase ticket data
@@ -2773,6 +2813,9 @@ def generate_health_report(
                       style reports). The window is disclosed in the report.
         date_to:      Optional ISO date — analyze only tickets created on/before
                       this date.
+        annotations:  Optional JSON object mapping ticket_id → short note,
+                      rendered under that ticket in the Currently Open list
+                      (e.g. '{"79241": "Root cause identified: incorrect VIP…"}').
     """
     import datetime as _dt
     from supportal.agent_tools import _save_asset_to_cb
@@ -2798,6 +2841,11 @@ def generate_health_report(
 
     # Optional explicit date range — the true_total stays lifetime, so the
     # windowed-disclosure path in the builder announces the range automatically.
+    # Keep the full (pre-window) set: lookback KPIs (P1s last 12mo/90d, avg P1
+    # resolution, year-over-year) must be computed over full org history, not
+    # the window subset — a June→July window otherwise reports "no P1s solved
+    # in the last 12 months" even when there were many.
+    full_tickets = list(tickets)
     if date_from:
         tickets = [t for t in tickets if (t.get("created") or "")[:10] >= date_from[:10]]
     if date_to:
@@ -2851,7 +2899,17 @@ def generate_health_report(
 
     # Build HTML
     try:
-        html = _build_health_report_html(organization, tickets, report_date, brand, org_meta, true_total=true_total)
+        _ann = {}
+        if annotations:
+            try:
+                _ann = {str(k): str(v) for k, v in json.loads(annotations).items()}
+            except Exception:
+                pass  # malformed annotations must never block report generation
+        html = _build_health_report_html(organization, tickets, report_date, brand, org_meta,
+                                         true_total=true_total, full_tickets=full_tickets,
+                                         window=(date_from[:10] if date_from else "",
+                                                 date_to[:10] if date_to else ""),
+                                         annotations=_ann)
     except Exception as exc:
         _log_tool_failure("generate_health_report", exc, organization)
         return json.dumps({"error": f"Failed to build report: {exc}"})
