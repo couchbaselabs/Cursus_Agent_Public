@@ -22,6 +22,16 @@ env/
 # Network capture logs (may contain session tokens)
 network_log_*.json
 
+# Data exports (customer / ticket data — never commit)
+# Narrow on purpose: the repo legitimately tracks config + i18n JSON, so we
+# ignore the known dump artifacts rather than a blanket *.json.
+*.csv
+tickets.json
+sizer_import*.json
+sfdc_graph_discovery.json
+reports/
+docs/reports/
+
 # Debug / scratch outputs
 scratch/
 
