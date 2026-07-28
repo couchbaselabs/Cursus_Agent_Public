@@ -1157,6 +1157,36 @@ def query_supportal_analytics(statement: str, limit_rows: int = 100) -> str:
     return json.dumps({"row_count": len(rows), "rows": rows}, default=str)
 
 
+@mcp.tool()
+def query_cluster_topology(cluster_uuid: str, snapshot_idx: int = -1) -> str:
+    """
+    Return the physical topology of a Couchbase cluster from Supportal's
+    nutshellresults collection — the parsed output of collectinfo processing.
+
+    For each node reports: services running (kv, index, n1ql, fts, …),
+    RAM in GB, disk size and utilisation %, and CB Server version.
+    CPU count is currently unavailable due to an analytics API bug being
+    tracked with the Supportal team.
+
+    Queries are split across three calls (analytics API limit: 2 distinct
+    result fields per query) and merged client-side by node hostname.
+
+    Args:
+        cluster_uuid:  The cluster UUID (matches snapshot.uuid / cluster.uuid
+                       in the Supportal analytics schema).
+        snapshot_idx:  Snapshot sequence number. Pass -1 (default) to use
+                       the latest available snapshot for that cluster.
+    """
+    app = _app()
+    try:
+        idx = None if snapshot_idx < 0 else snapshot_idx
+        result = app.query_cluster_topology(cluster_uuid, snapshot_idx=idx)
+    except Exception as exc:
+        _log_tool_failure("query_cluster_topology", exc, cluster_uuid)
+        return json.dumps({"error": f"query_cluster_topology failed: {exc}"})
+    return json.dumps(result, default=str)
+
+
 def _ensure_markers_collection(cluster: Any, bucket: str, scope: str = "transcripts") -> None:
     try:
         cm = cluster.bucket(bucket).collections()

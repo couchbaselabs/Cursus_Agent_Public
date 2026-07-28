@@ -15,7 +15,7 @@ Usage:
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "2.7.65"
+__version__ = "2.7.66"
 
 import asyncio
 import threading
@@ -1037,6 +1037,160 @@ def _filter_incomplete_snapshots(
         to_scrape = to_scrape[:max_snapshots]
 
     return to_scrape, len(new_snaps), len(incomplete_snaps), skipped
+
+
+def query_cluster_topology(cluster_uuid: str, snapshot_idx: int | None = None) -> dict:
+    """Fetch cluster topology from Supportal nutshellresults for a given cluster UUID.
+
+    Assembles node layout (services, RAM, disk, CB version) via three split queries
+    to stay within the analytics API's 2-distinct-r-*-keys-per-query limit.
+    CPU count is omitted — r-cpus-available causes a 500 in the analytics index
+    (tracked with Supportal team; re-add when fixed).
+
+    Args:
+        cluster_uuid:  Cluster UUID (matches snapshot.uuid / cluster.uuid).
+        snapshot_idx:  Snapshot sequence index. Defaults to the latest available.
+
+    Returns dict with keys:
+        cluster_uuid, snapshot_idx, snapshot_timestamp, node_count,
+        nodes (list of per-node dicts), missing_fields (list of unavailable signals).
+    """
+    from supportal.api_client import query_supportal_analytics as _qsa
+
+    uuid_clean = cluster_uuid.strip()
+
+    # ── Step 1: resolve snapshot index and detect format ─────────────────────
+    # New format: Nutshell::uuid::idx  / Nutshell::uuid::idx::Node::hostname
+    # Old format: Nutshell::uuid::Cluster / Nutshell::uuid::Node::hostname
+    old_format = False
+    if snapshot_idx is None:
+        id_rows = _qsa(
+            f"SELECT META(n).id FROM nutshellresults n "
+            f"WHERE META(n).id LIKE 'Nutshell::{uuid_clean}::%' "
+            f"AND META(n).id NOT LIKE '%::Node::%' "
+            f"ORDER BY META(n).id DESC LIMIT 1"
+        )
+        if not id_rows:
+            return {"error": f"No nutshell results found for cluster {uuid_clean}"}
+        latest_id = id_rows[0].get("id", "")
+        parts = latest_id.split("::")
+        if len(parts) >= 3 and parts[2] == "Cluster":
+            old_format = True
+            snapshot_idx = 0  # sentinel; not used in prefix below
+        else:
+            try:
+                snapshot_idx = int(parts[2]) if len(parts) >= 3 else 0
+            except (ValueError, IndexError):
+                snapshot_idx = 0
+
+    if old_format:
+        snap_prefix  = f"Nutshell::{uuid_clean}::Cluster"
+        node_pattern = f"Nutshell::{uuid_clean}::Node::%"
+    else:
+        snap_prefix  = f"Nutshell::{uuid_clean}::{snapshot_idx}"
+        node_pattern = f"{snap_prefix}::Node::%"
+
+    # ── Step 2: node hostname map from cluster-level doc ──────────────────────
+    cluster_rows = _qsa(
+        f"SELECT META(n).id, n.nodes FROM nutshellresults n "
+        f"WHERE META(n).id = '{snap_prefix}' LIMIT 1"
+    )
+    node_map: dict = cluster_rows[0].get("nodes") or {} if cluster_rows else {}
+
+    # ── Step 3: three split queries (≤2 distinct r-* keys each) ──────────────
+    try:
+        rows_a = _qsa(                              # services + RAM
+            f"SELECT META(n).id, "
+            f"n.results.`r-mds-services-node`.values AS services, "
+            f"n.results.`r-memory-limit`.bytes AS ram "
+            f"FROM nutshellresults n WHERE META(n).id LIKE '{node_pattern}' LIMIT 50"
+        )
+    except Exception:
+        rows_a = []
+
+    try:
+        rows_b = _qsa(                              # disk (two sub-fields, one r-* key)
+            f"SELECT META(n).id, "
+            f"n.results.`r-data-directory`.directories[0].size AS disk_bytes, "
+            f"n.results.`r-data-directory`.directories[0].used_percent AS disk_pct "
+            f"FROM nutshellresults n WHERE META(n).id LIKE '{node_pattern}' LIMIT 50"
+        )
+    except Exception:
+        rows_b = []
+
+    try:
+        rows_c = _qsa(                              # version
+            f"SELECT META(n).id, n.results.`r-cbs-version`.version AS version "
+            f"FROM nutshellresults n WHERE META(n).id LIKE '{node_pattern}' LIMIT 50"
+        )
+    except Exception:
+        rows_c = []
+
+    # ── Step 4: snapshot timestamp ────────────────────────────────────────────
+    try:
+        ts_rows = _qsa(
+            f"SELECT s.timestamp FROM snapshot s "
+            f"WHERE META(s).id = 'Snapshot::{uuid_clean}::{snapshot_idx}' LIMIT 1"
+        )
+        snapshot_timestamp = ts_rows[0].get("timestamp") if ts_rows else None
+    except Exception:
+        snapshot_timestamp = None
+
+    # ── Step 5: merge by node hostname ───────────────────────────────────────
+    def _hostname(doc_id: str) -> str:
+        parts = doc_id.split("::Node::")
+        return parts[1] if len(parts) == 2 else ""
+
+    merged: dict[str, dict] = {}
+
+    for row in rows_a:
+        h = _hostname(row.get("id", ""))
+        if not h:
+            continue
+        merged.setdefault(h, {"hostname": h})
+        if row.get("services") is not None:
+            merged[h]["services"] = sorted(row["services"])
+        if row.get("ram") is not None:
+            merged[h]["ram_gb"] = round(row["ram"] / 1_073_741_824, 1)
+
+    for row in rows_b:
+        h = _hostname(row.get("id", ""))
+        if not h:
+            continue
+        merged.setdefault(h, {"hostname": h})
+        if row.get("disk_bytes") is not None:
+            merged[h]["disk_gb"] = round(row["disk_bytes"] / 1_073_741_824, 0)
+        if row.get("disk_pct") is not None:
+            merged[h]["disk_used_pct"] = row["disk_pct"]
+
+    for row in rows_c:
+        h = _hostname(row.get("id", ""))
+        if not h:
+            continue
+        merged.setdefault(h, {"hostname": h})
+        if row.get("version") is not None:
+            merged[h]["version"] = row["version"]
+
+    # seed any hostnames from the cluster-level map not seen in query results
+    for h in node_map:
+        merged.setdefault(h, {"hostname": h})
+
+    nodes = sorted(merged.values(), key=lambda n: n["hostname"])
+
+    # ── Step 6: report which fields have zero coverage ────────────────────────
+    missing = ["cpus"]  # always missing — analytics API bug, tracked with Supportal
+    for field in ("services", "ram_gb", "disk_gb", "version"):
+        if not any(field in n for n in nodes):
+            missing.append(field)
+
+    return {
+        "cluster_uuid":       uuid_clean,
+        "snapshot_idx":       snapshot_idx,
+        "snapshot_timestamp": snapshot_timestamp,
+        "node_count":         len(nodes),
+        "nodes":              nodes,
+        "missing_fields":     missing,
+    }
 
 
 # ─────────────────────────── Constants ────────────────────────────────────────

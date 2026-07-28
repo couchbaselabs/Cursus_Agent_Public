@@ -967,6 +967,37 @@ _AGENT_TOOLS: list[dict] = [
             },
         },
     },
+    # ── Topology tools ────────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "query_cluster_topology",
+            "description": (
+                "Return the physical topology of a Couchbase cluster from Supportal's "
+                "nutshellresults collection (parsed collectinfo output). "
+                "For each node reports: services (kv, index, n1ql, fts, cbas, eventing, …), "
+                "RAM in GB, disk size and used %, and CB Server version. "
+                "CPU count is unavailable due to an analytics API bug (tracked with Supportal team). "
+                "Use the cluster UUID from snapshot.uuid or cluster.uuid. "
+                "Pass snapshot_idx=-1 (default) to get the latest snapshot for that cluster. "
+                "Useful for topology diagrams, MDS validation, version audits, and sizing context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cluster_uuid": {
+                        "type": "string",
+                        "description": "Cluster UUID (e.g. from snapshot.uuid in the analytics schema).",
+                    },
+                    "snapshot_idx": {
+                        "type": "integer",
+                        "description": "Snapshot sequence number. -1 = latest (default).",
+                    },
+                },
+                "required": ["cluster_uuid"],
+            },
+        },
+    },
     # ── v1.6.0: Feature set tools ─────────────────────────────────────────────
     {
         "type": "function",
