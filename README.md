@@ -28,7 +28,7 @@ flowchart TD
 
     CX["💬 Corax  localhost:8766\nPassword auth\nThread sidebar (resume sessions)\nSame agent tools as Strabo\nAsset storage (charts & tables → CB)\nShared history with Strabo"]
 
-    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n40+ tools — query · search · score\nrescrape · health · briefing · assets\nbrand kits · reports · freshness check\nSFDC: accounts · intelligence · opps\nquery_supportal_analytics\nobservability: insights · feedback\nrecord_automation_run · failure KB\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients"]
+    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n50+ tools — query · search · score\nsmart_refresh · rescrape · health\nbriefing · assets · brand kits · reports\ncluster topology (nutshell) · freshness\nSFDC (read-only): accounts · intel · opps\nquery_supportal_analytics\nobservability: insights · feedback\nrecord_automation_run · failure KB\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients\n(see docs/mcp-architecture.md)"]
 
     AI["🤖 AI Clients\nClaude Desktop\nClaude Code (TUI / GUI)\nCursor · Gemini · other MCP hosts"]
 

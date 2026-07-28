@@ -16,7 +16,17 @@ Hot reload:
 Usage:
     venv/bin/python run_cursus.py
     venv/bin/python run_cursus.py --strabo-port 8765 --corax-port 8766
-    venv/bin/python run_cursus.py --no-watch   # disable file watcher
+    venv/bin/python run_cursus.py --no-watch          # disable file watcher
+    venv/bin/python run_cursus.py --unified --mcp     # also serve Unified + MCP
+
+Optional extra surfaces (off by default; used by the Docker image):
+    --unified          also start Cursus Unified (:8767).  Env: RUN_UNIFIED=1
+    --mcp              also start the MCP server via SSE (:8768).
+                       Env: MCP_TRANSPORT=sse
+    --unified-port N   Unified port (default 8767)
+    --mcp-port N       MCP SSE port (default 8768)
+    Unified and MCP are supervised (restarted on crash) but NOT hot-reloaded —
+    restart Cursus to pick up code changes in apps/unified or apps/mcp.
 """
 import os
 import signal
@@ -57,11 +67,12 @@ _YELL  = "\033[33m"
 # Must be longer than app startup time — Corax imports are heavy.
 _DEBOUNCE = 15.0
 
-# Files/dirs that trigger a restart of each app
+# Files/dirs that trigger a hot-reload restart. Only Strabo and Corax are
+# hot-reloaded; Unified and MCP are supervised (start/stream/restart-on-crash)
+# but not reloaded on save — restart Cursus to pick up changes to those.
 _STRABO_PATHS = {"apps/strabo", "run_strabo.py"}
 _CORAX_PATHS  = {"apps/corax",  "run_corax.py"}
-_MCP_PATHS    = {"apps/mcp",    "run_mcp.py"}
-_SHARED_PATHS = {"supportal"}   # changes here restart both
+_SHARED_PATHS = {"supportal"}   # changes here reload both Strabo and Corax
 
 
 def _stream(proc_holder: list, label: str, color: str) -> None:
@@ -109,6 +120,16 @@ def _start_mcp(py: str, port: int) -> subprocess.Popen:
     _free_port(port)
     return subprocess.Popen(
         [py, str(_HERE / "run_mcp.py"), "--transport", "sse", "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(_HERE),
+    )
+
+
+def _start_unified(py: str, port: int) -> subprocess.Popen:
+    _free_port(port)
+    return subprocess.Popen(
+        [py, str(_HERE / "run_unified.py"), "--port", str(port)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=str(_HERE),
@@ -198,35 +219,43 @@ def _py_filter(change, path: str) -> bool:
 
 def main() -> None:
     args = sys.argv[1:]
-    strabo_port = _parse_port(args, "--strabo-port", 8765)
-    corax_port  = _parse_port(args, "--corax-port",  8766)
-    mcp_port    = _parse_port(args, "--mcp-port",    8768)
-    no_watch    = "--no-watch" in args
-    run_mcp     = os.environ.get("MCP_TRANSPORT", "").lower() == "sse" or "--mcp" in args
+    strabo_port  = _parse_port(args, "--strabo-port",  8765)
+    corax_port   = _parse_port(args, "--corax-port",   8766)
+    mcp_port     = _parse_port(args, "--mcp-port",     8768)
+    unified_port = _parse_port(args, "--unified-port", 8767)
+    no_watch     = "--no-watch" in args
+    # MCP and Unified are opt-in: enabled by CLI flag or env toggle. In Docker,
+    # docker-compose sets both env vars so the container serves all four surfaces.
+    run_mcp      = os.environ.get("MCP_TRANSPORT", "").lower() == "sse" or "--mcp" in args
+    run_unified  = os.environ.get("RUN_UNIFIED", "").lower() in ("1", "true", "yes") or "--unified" in args
 
     py = sys.executable
 
-    mcp_label = f"  {_GREY}MCP :{mcp_port}{_RESET}" if run_mcp else ""
+    unified_label = f"  {_YELL}Unified :{unified_port}{_RESET}" if run_unified else ""
+    mcp_label     = f"  {_GREY}MCP :{mcp_port}{_RESET}" if run_mcp else ""
     print(
         f"\n{_BOLD}Cursus{_RESET}  "
         f"{_BLUE}Strabo :{strabo_port}{_RESET}  "
         f"{_TEAL}Corax :{corax_port}{_RESET}"
+        + unified_label
         + mcp_label
         + (f"  {_GREY}(watching for changes){_RESET}" if not no_watch else "")
         + f"\n{_GREY}Press Ctrl+C to stop all.{_RESET}\n"
     )
 
-    strabo_fn = lambda: _start_strabo(py, strabo_port)
-    corax_fn  = lambda: _start_corax(py, corax_port)
-    mcp_fn    = lambda: _start_mcp(py, mcp_port)
+    strabo_fn  = lambda: _start_strabo(py, strabo_port)
+    corax_fn   = lambda: _start_corax(py, corax_port)
+    mcp_fn     = lambda: _start_mcp(py, mcp_port)
+    unified_fn = lambda: _start_unified(py, unified_port)
 
-    strabo_holder: list = [strabo_fn()]
-    corax_holder:  list = [corax_fn()]
-    mcp_holder:    list = [mcp_fn() if run_mcp else None]
+    strabo_holder:  list = [strabo_fn()]
+    corax_holder:   list = [corax_fn()]
+    mcp_holder:     list = [mcp_fn() if run_mcp else None]
+    unified_holder: list = [unified_fn() if run_unified else None]
 
     def _shutdown(sig=None, _frame=None) -> None:
         print(f"\n{_BOLD}[cursus]{_RESET} shutting down…")
-        procs = [h[0] for h in (strabo_holder, corax_holder, mcp_holder) if h[0]]
+        procs = [h[0] for h in (strabo_holder, corax_holder, mcp_holder, unified_holder) if h[0]]
         # Graceful SIGTERM first
         for p in procs:
             try:
@@ -256,6 +285,10 @@ def main() -> None:
     threading.Thread(
         target=_stream, args=(corax_holder, "[corax] ", _TEAL), daemon=True
     ).start()
+    if run_unified:
+        threading.Thread(
+            target=_stream, args=(unified_holder, "[unified]", _YELL), daemon=True
+        ).start()
     if run_mcp:
         threading.Thread(
             target=_stream, args=(mcp_holder, "[mcp]   ", _GREY), daemon=True
@@ -280,6 +313,8 @@ def main() -> None:
 
     threading.Thread(target=_watch_exit, args=(strabo_holder, "strabo"), daemon=True).start()
     threading.Thread(target=_watch_exit, args=(corax_holder,  "corax"),  daemon=True).start()
+    if run_unified:
+        threading.Thread(target=_watch_exit, args=(unified_holder, "unified"), daemon=True).start()
     if run_mcp:
         threading.Thread(target=_watch_exit, args=(mcp_holder, "mcp"), daemon=True).start()
 

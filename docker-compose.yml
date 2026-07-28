@@ -13,7 +13,16 @@ services:
       - SUPPORTAL_COOKIE=${SUPPORTAL_COOKIE:-}
       - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET:-}
       - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}   # stdio or sse; sse recommended inside Docker
+      - RUN_UNIFIED=1                         # serve Cursus Unified (:8767) in-container
       - UNIFIED_PORT=8767
+      # Point the container apps at the bucket couchbase-init actually creates.
+      # Without this the apps fall back to the code default ("rag"), which does
+      # not exist in the Docker Couchbase, and every query fails.
+      - CB_HOST=${CB_HOST:-couchbase}
+      - CB_URL=${CB_URL:-couchbase://couchbase}
+      - CB_USER=${CB_USER:-Administrator}
+      - CB_PASS=${CB_PASS:-password}
+      - CB_BUCKET=${CB_BUCKET:-supportal}
     volumes:
       # Persist settings profiles and saved cookies between restarts
       - app-home:/root

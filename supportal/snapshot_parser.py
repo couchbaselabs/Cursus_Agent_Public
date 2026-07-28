@@ -76,7 +76,14 @@ _CLUSTER_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
-_SNAP_DEBUG_DIR = Path(os.path.expanduser("~")) / "Downloads" / "Apps" / "Scraper" / "snap_debug"
+# Where snapshot debug dumps are written. Configurable via SNAP_DEBUG_DIR;
+# defaults to <project-root>/snap_debug (this file lives at
+# <project-root>/supportal/snapshot_parser.py). Never assume a fixed clone
+# location — the repo can be checked out anywhere under any directory name.
+_SNAP_DEBUG_DIR = Path(
+    os.environ.get("SNAP_DEBUG_DIR", "")
+    or (Path(__file__).resolve().parent.parent / "snap_debug")
+)
 
 
 # ---------------------------------------------------------------------------

@@ -84,11 +84,16 @@ curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}" -d "name=chat"
 # ── 9. Collections ────────────────────────────────────────────────────────────
 log "Creating collections..."
 
-# transcripts scope: ticket data, snapshots, assets, customer brand kits
+# transcripts scope: ticket data, snapshots, assets, brand kits, observability,
+# insights, and the Salesforce mirror (accounts + opportunities).
 curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=tickets"
 curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=snapshots"
 curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=assets"
 curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=brands"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=markers"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=insights"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=accounts"
+curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/transcripts/collections" -d "name=opportunities"
 
 # chat scope: Corax conversation persistence
 curl -sf -u "${CB_USER}:${CB_PASS}" -X POST "${SCOPES}/chat/collections" -d "name=history"

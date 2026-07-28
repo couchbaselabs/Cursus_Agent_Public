@@ -8,15 +8,24 @@ Usage:
   # SSE — for Gemini, remote clients, or testing via curl
   venv/bin/python run_mcp.py --transport sse --port 8768
 
+This script self-locates (it puts its own directory on sys.path), so the repo
+can live at any path under any directory name — nothing hardcodes a clone
+location. In client config, just point at wherever you cloned it.
+
+Claude Code (easiest):
+  claude mcp add cursus --scope user -- \
+      /abs/path/to/<clone>/venv/bin/python /abs/path/to/<clone>/run_mcp.py
+
 Claude Desktop config  (~/.claude/claude_desktop_config.json):
   {
     "mcpServers": {
       "cursus": {
-        "command": "/Users/austin.gonyou/Downloads/Apps/Scraper/venv/bin/python",
-        "args": ["/Users/austin.gonyou/Downloads/Apps/Scraper/run_mcp.py"]
+        "command": "/abs/path/to/<clone>/venv/bin/python",
+        "args": ["/abs/path/to/<clone>/run_mcp.py"]
       }
     }
   }
+  (replace <clone> with your checkout — e.g. the output of `pwd` in the repo)
 """
 import argparse
 import sys

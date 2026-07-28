@@ -15,7 +15,9 @@ Cursus stores all ticket and chat data in Couchbase. You need a running instance
 | Version | 8.0.1+ Enterprise Edition |
 | Services | Data, Query, Search (FTS), Index |
 | Admin credentials | Any username/password with full bucket access |
-| Default bucket | `rag` (configurable — any name works) |
+| Bucket | `supportal` in the shipped Docker setup; `rag` is the code fallback. Configurable — see note below. |
+
+> **On the bucket name:** the `docker compose` stack creates a bucket named **`supportal`** and the app container is pointed at it automatically (`CB_BUCKET=supportal`). If you run the MCP server standalone with no config, it falls back to **`rag`**. Either way it's overridable via the `CB_BUCKET` env var or your Strabo profile — just make sure the server and the bucket agree. The examples below use `rag`; substitute your bucket name.
 
 **Easiest local setup:** the repo ships a `docker-compose.yml` that starts a pre-configured Couchbase instance:
 
@@ -55,7 +57,7 @@ The following are created automatically by Strabo or Corax on first run. If you 
 **One-shot setup script** (run once against a fresh bucket):
 
 ```bash
-cd /path/to/Scraper
+cd /path/to/your/clone     # wherever you cloned it — the dir name doesn't matter
 venv/bin/python - <<'EOF'
 from datetime import timedelta
 from couchbase.cluster import Cluster
@@ -169,39 +171,69 @@ If no embedding provider is configured, `search_tickets` will error — all othe
 
 ## Claude Code setup
 
-### Step 1 — Add to `~/.claude.json`
+There are two ways to connect: **stdio** (Claude Code launches the server itself — best for local dev) and **SSE** (connect to an already-running server — best when the stack is up via Docker). The `claude mcp add` CLI is the easiest path for both.
 
-Open `~/.claude.json` and add a `cursus` entry under `mcpServers`:
+### Option A — stdio (local, recommended)
+
+Claude Code starts and stops the server for you; no separate process to manage. The repo self-locates, so it can live at **any path under any directory name** — you just tell the client where your clone is.
+
+**Easiest — run this from inside your clone** (`$(pwd)` fills in the absolute path for you):
+
+```bash
+cd /wherever/you/cloned/it
+claude mcp add cursus --scope user -- "$(pwd)/venv/bin/python" "$(pwd)/run_mcp.py"
+```
+
+Or spell the paths out explicitly:
+
+```bash
+claude mcp add cursus --scope user -- \
+  /abs/path/to/<your-clone>/venv/bin/python \
+  /abs/path/to/<your-clone>/run_mcp.py
+```
+
+- `--scope user` makes it available in every project. Use `--scope project` to share it with your team via a checked-in `.mcp.json`, or `--scope local` (default) for just this project.
+- Both paths must be absolute — the venv Python and `run_mcp.py`. `$(pwd)` guarantees that.
+- No `--transport` needed: stdio is the default.
+
+### Option B — SSE (connect to the Docker stack)
+
+If you're running the stack with `docker compose up`, the MCP server is already listening on `:8768`. Point Claude Code at it instead of launching a second copy:
+
+```bash
+claude mcp add --transport sse cursus http://localhost:8768/sse --scope user
+```
+
+### Verify it's connected
+
+```bash
+claude mcp list          # cursus should show ✓ connected
+```
+
+Or inside a Claude Code session, `/mcp` lists connected servers and their tools. If you'd rather edit config by hand, `claude mcp add` writes to `~/.claude.json` (user scope) — the equivalent block is:
 
 ```json
 {
   "mcpServers": {
     "cursus": {
-      "command": "/path/to/Scraper/venv/bin/python",
-      "args": ["/path/to/Scraper/run_mcp.py"]
+      "command": "/absolute/path/to/Cursus_Agent_Public/venv/bin/python",
+      "args": ["/absolute/path/to/Cursus_Agent_Public/run_mcp.py"]
     }
   }
 }
 ```
 
-Replace `/path/to/Scraper` with the absolute path to your clone.
+### Skip the approval prompts (optional)
 
-### Step 2 — Enable the server
-
-Add `"cursus"` to `enabledMcpjsonServers` in `~/.claude/settings.json`:
+To let `mcp__cursus__*` tools run without a per-call permission prompt, add to `~/.claude/settings.json`:
 
 ```json
 {
-  "enabledMcpjsonServers": ["cursus", "couchbase", "github"],
   "permissions": {
     "allow": ["mcp__cursus__*"]
   }
 }
 ```
-
-### Step 3 — Restart Claude Code
-
-MCP servers are loaded at session start. Quit and reopen Claude Code — `mcp__cursus__*` tools will appear.
 
 ---
 
@@ -263,6 +295,18 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `record_insight` | Capture an observed customer/ticket pattern as a candidate insight in CB for later validation |
 | `record_feedback` | Persist human feedback on a tool response or agent output to the feedback collection |
 | `record_automation_run` | Log the outcome of a scheduled automation run (success/failure, counts, errors) for health tracking |
+| `smart_refresh` | Lightweight freshness diff — compares Supportal vs local CB on six signals (new/status/solved/priority/stub/stale-open), pulls only what changed, and kicks off background enrichment. Prefer over `rescrape_customer_tickets` |
+| `query_cluster_topology` | Per-node cluster layout from Supportal nutshellresults — services, RAM, disk, CB version. Handles old/new snapshot formats. (CPU count pending an upstream analytics fix) |
+| `find_customers` | Fuzzy customer search by topic/keyword across feature area, component path, subject, tags, version |
+| `get_account_contacts` | AE / TSE / PSE per org, sourced from live Supportal zdorg |
+| `get_my_sfdc_accounts` | Salesforce accounts where you are the SE (opportunity-level, pre-filtered to your saved SFDC user) |
+| `list_sfdc_accounts` | All synced Salesforce accounts, filterable by account-level SE name |
+| `get_account_opportunities` | Open opportunities + ARR for an account, with per-opportunity Primary SE |
+| `get_account_intelligence` | Blended account view — SFDC account/opps + support health + contacts in one call |
+| `get_se_opportunities` | Opportunities across an SE's book of business |
+| `sync_sfdc_data` | Read-only refresh of the local Salesforce mirror (accounts + opportunities). Never writes to Salesforce |
+
+> **Read-only Salesforce:** all SFDC tools only ever read from Salesforce into the local Couchbase mirror. Nothing writes back to SFDC.
 
 ## VPN requirement
 
