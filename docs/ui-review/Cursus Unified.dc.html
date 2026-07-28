@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:#0f1012;font-family:"IBM Plex Sans",system-ui,sans-serif;color:#1b1d21;-webkit-font-smoothing:antialiased}
+  a{color:#ea2328;text-decoration:none}a:hover{color:#b81a1e}
+  ::selection{background:#ea2328;color:#fff}
+  .cu-scroll::-webkit-scrollbar{width:9px;height:9px}
+  .cu-scroll::-webkit-scrollbar-thumb{background:#cbc6bc;border-radius:20px}
+  .cu-scroll::-webkit-scrollbar-track{background:transparent}
+  @keyframes cuFade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  @keyframes cuBlink{0%,100%{opacity:.25}50%{opacity:1}}
+</style>
+</helmet>
+
+<div style="height:100vh;display:flex;flex-direction:column;background:#ece8e1">
+  <!-- ══ TOP BAR ══ -->
+  <div style="display:flex;align-items:center;gap:14px;padding:11px 20px;background:#141518;color:#fff;flex:none;z-index:5">
+    <div style="display:flex;align-items:center;gap:9px">
+      <div style="width:22px;height:22px;background:#ea2328;border-radius:5px;display:flex;align-items:center;justify-content:center;font-family:'Archivo';font-weight:800;font-size:13px">C</div>
+      <b style="font-family:'Archivo';font-size:16px;letter-spacing:-.01em">Cursus</b>
+    </div>
+    <div style="display:flex;gap:2px;margin-left:16px">
+      <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="4">
+        <button onClick="{{ t.go }}" style="{{ t.style }}" style-hover="background:#26282d;color:#fff">{{ t.label }}</button>
+      </sc-for>
+    </div>
+    <div style="margin-left:auto;display:flex;align-items:center;gap:12px;font-size:13px">
+      <div style="position:relative">
+        <button onClick="{{ toggleCustMenu }}" style="background:#26282d;color:#fff;border:1px solid #34373d;padding:6px 12px;border-radius:20px;font:inherit;font-size:12.5px;cursor:pointer;display:flex;align-items:center;gap:8px;white-space:nowrap" style-hover="border-color:#ea2328">
+          <span style="width:7px;height:7px;border-radius:50%;background:{{ cur.dot }}"></span>{{ customer }}<span style="color:#8a8f98">▾</span>
+        </button>
+        <sc-if value="{{ custMenu }}" hint-placeholder-val="{{ false }}">
+          <div class="cu-scroll" style="position:absolute;top:38px;right:0;width:230px;background:#1b1d21;border:1px solid #34373d;border-radius:10px;padding:6px;z-index:20;box-shadow:0 12px 40px rgba(0,0,0,.5);max-height:280px;overflow:auto;animation:cuFade .12s ease">
+            <sc-for list="{{ customers }}" as="c" hint-placeholder-count="4">
+              <button onClick="{{ c.pick }}" style="{{ c.rowStyle }}" style-hover="background:#26282d">
+                <span style="width:7px;height:7px;border-radius:50%;background:{{ c.dot }};flex:none"></span>
+                <span style="flex:1;text-align:left">{{ c.name }}</span>
+                <span style="font-family:'IBM Plex Mono';font-size:11px;color:#8a8f98">{{ c.health }}</span>
+              </button>
+            </sc-for>
+          </div>
+        </sc-if>
+      </div>
+      <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:#9aa0a8"><span style="width:8px;height:8px;border-radius:50%;background:#4ec27f;box-shadow:0 0 0 3px rgba(78,194,127,.18)"></span>Couchbase</span>
+    </div>
+  </div>
+
+  <!-- ══ BODY ══ -->
+  <div style="flex:1;display:flex;min-height:0">
+    <!-- MAIN CANVAS -->
+    <div class="cu-scroll" style="flex:1;overflow:auto;padding:24px 28px">
+      {{ canvas }}
+    </div>
+
+    <!-- ASSISTANT PANEL -->
+    <div style="{{ panelWrapStyle }}">
+      <sc-if value="{{ panelOpen }}" hint-placeholder-val="{{ true }}">
+        <div style="width:352px;height:100%;background:#fff;border-left:1px solid #ddd8ce;display:flex;flex-direction:column">
+          <div style="padding:12px 15px;border-bottom:1px solid #eee9df;display:flex;align-items:center;gap:9px;flex:none">
+            <span style="width:8px;height:8px;border-radius:50%;background:#ea2328"></span>
+            <b style="font-family:'Archivo';font-size:14px">Assistant</b>
+            <span style="font-size:11px;color:#9a9ea6;font-family:'IBM Plex Mono';background:#f4f2ec;padding:2px 8px;border-radius:10px;white-space:nowrap">scope: {{ scopeLabel }}</span>
+            <button onClick="{{ togglePanel }}" title="Collapse" style="margin-left:auto;background:none;border:none;color:#9a9ea6;cursor:pointer;font-size:16px;padding:2px 4px" style-hover="color:#1b1d21">⟩</button>
+          </div>
+          <div class="cu-scroll" style="flex:1;overflow:auto;padding:14px">
+            <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:14px">
+              <sc-for list="{{ starters }}" as="s" hint-placeholder-count="3">
+                <button onClick="{{ s.run }}" style="background:#f4f2ec;border:1px solid #e4dfd4;border-radius:20px;padding:5px 11px;font:inherit;font-size:11.5px;color:#3c4046;cursor:pointer" style-hover="border-color:#ea2328;color:#ea2328">{{ s.label }}</button>
+              </sc-for>
+            </div>
+            <sc-for list="{{ messages }}" as="m" hint-placeholder-count="2">
+              <div style="{{ m.rowStyle }}">
+                <div style="{{ m.bubbleStyle }}">
+                  <sc-if value="{{ m.tool }}" hint-placeholder-val="{{ false }}">
+                    <div style="font-family:'IBM Plex Mono';font-size:10px;color:#ea2328;margin-bottom:5px">▸ {{ m.tool }}</div>
+                  </sc-if>
+                  {{ m.text }}<sc-if value="{{ m.streaming }}" hint-placeholder-val="{{ false }}"><span style="display:inline-block;width:7px;height:14px;background:#ea2328;margin-left:2px;vertical-align:-2px;animation:cuBlink 1s infinite"></span></sc-if>
+                  <sc-if value="{{ m.chart }}" hint-placeholder-val="{{ false }}">
+                    <div style="margin-top:9px;height:74px;border-radius:7px;background:linear-gradient(180deg,#fdecec,#fff);border:1px solid #f3d3d1;display:flex;align-items:flex-end;gap:5px;padding:9px">
+                      <div style="flex:1;height:55%;background:#ea2328;border-radius:3px 3px 0 0"></div><div style="flex:1;height:80%;background:#ea2328;border-radius:3px 3px 0 0"></div><div style="flex:1;height:40%;background:#f28b82;border-radius:3px 3px 0 0"></div><div style="flex:1;height:66%;background:#f28b82;border-radius:3px 3px 0 0"></div>
+                    </div>
+                  </sc-if>
+                  <sc-if value="{{ m.action }}" hint-placeholder-val="{{ false }}">
+                    <button onClick="{{ m.doAction }}" style="margin-top:9px;background:none;border:1px solid #ea2328;color:#ea2328;border-radius:20px;padding:5px 12px;font:inherit;font-size:11.5px;cursor:pointer;font-weight:600;white-space:nowrap" style-hover="background:#ea2328;color:#fff">{{ m.action }}</button>
+                  </sc-if>
+                </div>
+              </div>
+            </sc-for>
+            <sc-if value="{{ thinking }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;gap:5px;padding:6px 2px">
+                <span style="width:7px;height:7px;border-radius:50%;background:#ea2328;animation:cuBlink 1s infinite"></span>
+                <span style="width:7px;height:7px;border-radius:50%;background:#ea2328;animation:cuBlink 1s infinite .2s"></span>
+                <span style="width:7px;height:7px;border-radius:50%;background:#ea2328;animation:cuBlink 1s infinite .4s"></span>
+              </div>
+            </sc-if>
+          </div>
+          <div style="padding:12px 14px;border-top:1px solid #eee9df;flex:none">
+            <div style="display:flex;align-items:center;gap:8px;background:#f4f2ec;border:1px solid #e4dfd4;border-radius:22px;padding:5px 6px 5px 14px">
+              <input value="{{ input }}" onInput="{{ onInput }}" onKeyDown="{{ onKey }}" placeholder="Ask about {{ customer }}…" style="flex:1;background:none;border:none;outline:none;font:inherit;font-size:13px;color:#1b1d21"/>
+              <button onClick="{{ send }}" style="width:30px;height:30px;border-radius:50%;background:#ea2328;border:none;color:#fff;cursor:pointer;font-size:14px;flex:none" style-hover="background:#c9201d">↑</button>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+      <sc-if value="{{ panelClosed }}" hint-placeholder-val="{{ false }}">
+        <button onClick="{{ togglePanel }}" style="width:44px;height:100%;background:#fff;border:none;border-left:1px solid #ddd8ce;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:10px;padding-top:16px;color:#ea2328" style-hover="background:#faf8f4">
+          <span style="width:8px;height:8px;border-radius:50%;background:#ea2328"></span>
+          <span style="writing-mode:vertical-rl;transform:rotate(180deg);font-family:'Archivo';font-weight:700;font-size:13px;color:#1b1d21;letter-spacing:.04em">Assistant ⟨</span>
+        </button>
+      </sc-if>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1180,&quot;height&quot;:760}}">
+class Component extends DCLogic {
+  state = {
+    tab: 'overview', customer: 'American Express', panelOpen: true,
+    custMenu: false, input: '', thinking: false, filter: null,
+    tFilter: { priority:'', status:'', q:'' },
+    messages: [
+      { id:1, role:'user', text:'Why is Amex health 74?' },
+      { id:2, role:'agent', tool:'get_customer_health_score', text:'3 open P1s on node cbse-4 are dragging the score. XDCR lag is the biggest single factor. Want a customer-ready report?', action:'Generate report' },
+    ],
+    reports: [
+      { id:'r1', icon:'📄', bg:'#fdecec', title:'Amex Q2 customer report', meta:'report · generated by assistant · 2h ago', cta:'Export PDF' },
+      { id:'r2', icon:'📊', bg:'#eef3fa', title:'Fleet version distribution', meta:'chart · pinned to Overview · 1d ago', cta:'⧉ Open' },
+      { id:'r3', icon:'▤', bg:'#eef9f1', title:'Open P1 tickets — all orgs', meta:'table · 3d ago', cta:'CSV' },
+    ],
+  };
+
+  DATA = {
+    'American Express': { dot:'#fb8c00', health:74, openP1:7, nodes:9, version:'7.6.2', atRisk:4, sla:1, open:12 },
+    'Vodafone':         { dot:'#e53935', health:61, openP1:5, nodes:6, version:'7.2.4', atRisk:3, sla:2, open:9 },
+    'Western Union':    { dot:'#4ec27f', health:88, openP1:1, nodes:4, version:'7.6.0', atRisk:0, sla:0, open:4 },
+    'Barclays':         { dot:'#fb8c00', health:70, openP1:3, nodes:7, version:'7.6.2', atRisk:2, sla:0, open:8 },
+  };
+
+  TICKETS = [
+    { id:48213, cust:'American Express', subject:'Indexer OOM after 7.6.2 upgrade', priority:'P1', status:'Open', version:'7.6.2', node:'cbse-4', score:86 },
+    { id:48219, cust:'American Express', subject:'XDCR lag on prod cluster', priority:'P1', status:'Open', version:'7.6.2', node:'cbse-4', score:78 },
+    { id:48224, cust:'American Express', subject:'FTS index build slow', priority:'P2', status:'Pending', version:'7.6.2', node:'cbse-2', score:54 },
+    { id:48231, cust:'American Express', subject:'Backup window overruns SLA', priority:'P2', status:'Open', version:'7.6.2', node:'cbse-1', score:61 },
+    { id:48240, cust:'American Express', subject:'Rebalance stuck at 61%', priority:'P1', status:'Open', version:'7.6.2', node:'cbse-4', score:83 },
+    { id:48255, cust:'American Express', subject:'N1QL query timeout on GSI', priority:'P3', status:'Solved', version:'7.6.2', node:'cbse-6', score:22 },
+    { id:47110, cust:'Vodafone', subject:'Eventing function crash loop', priority:'P1', status:'Open', version:'7.2.4', node:'vf-2', score:80 },
+    { id:47122, cust:'Vodafone', subject:'Memcached connection spikes', priority:'P2', status:'Pending', version:'7.2.4', node:'vf-3', score:57 },
+    { id:47140, cust:'Vodafone', subject:'Analytics dataset drift', priority:'P3', status:'Open', version:'7.2.4', node:'vf-1', score:34 },
+    { id:46001, cust:'Western Union', subject:'Slow warmup after restart', priority:'P3', status:'Solved', version:'7.6.0', node:'wu-1', score:19 },
+    { id:46020, cust:'Western Union', subject:'Certificate rotation failed', priority:'P1', status:'Open', version:'7.6.0', node:'wu-2', score:71 },
+    { id:45300, cust:'Barclays', subject:'GSI disk usage growth', priority:'P2', status:'Open', version:'7.6.2', node:'bc-3', score:52 },
+    { id:45318, cust:'Barclays', subject:'Auto-failover misfire', priority:'P1', status:'Open', version:'7.6.2', node:'bc-1', score:74 },
+    { id:45330, cust:'Barclays', subject:'Query service high latency', priority:'P3', status:'Pending', version:'7.6.2', node:'bc-5', score:38 },
+  ];
+
+  cur(){ return this.DATA[this.state.customer]; }
+
+  setTab = (t) => this.setState({ tab:t });
+  togglePanel = () => this.setState({ panelOpen: !this.state.panelOpen });
+  toggleCustMenu = () => this.setState({ custMenu: !this.state.custMenu });
+  pickCustomer = (name) => this.setState({ customer:name, custMenu:false, filter:null });
+  onInput = (e) => this.setState({ input: e.target.value });
+  onKey = (e) => { if(e.key==='Enter'){ this.send(); } };
+  goTickets = (priority='', status='') => this.setState({ tab:'tickets', tFilter:{ priority, status, q:'' } });
+  toggleTF = (key,val) => this.setState(s => ({ tFilter:{ ...s.tFilter, [key]: s.tFilter[key]===val ? '' : val } }));
+  setTQ = (e) => { const v=e.target.value; this.setState(s => ({ tFilter:{ ...s.tFilter, q:v } })); };
+
+  push = (msg) => this.setState(s => ({ messages:[...s.messages, {id:Date.now()+Math.random(), ...msg}] }));
+
+  agentTools(){
+    const self=this; const cust=this.state.customer; const c=this.cur();
+    const tix=this.TICKETS.filter(t=>t.cust===cust);
+    return [
+      { name:'query_tickets', description:'List support tickets for the current customer, optionally filtered by priority (P1/P2/P3) and/or status (Open/Pending/Solved).',
+        input_schema:{ type:'object', properties:{ priority:{type:'string',description:'P1, P2 or P3'}, status:{type:'string',description:'Open, Pending or Solved'} } },
+        run: async(input={})=>{ let r=tix; if(input.priority)r=r.filter(t=>t.priority===input.priority); if(input.status)r=r.filter(t=>t.status===input.status);
+          return JSON.stringify(r.map(t=>({id:t.id,subject:t.subject,priority:t.priority,status:t.status,version:t.version,node:t.node,score:t.score}))); } },
+      { name:'get_customer_health_score', description:'Health score and fleet stats for the current customer.',
+        input_schema:{ type:'object', properties:{} },
+        run: async()=>JSON.stringify({ customer:cust, health:c.health, openP1:c.openP1, atRiskClusters:c.atRisk, slaBreach:c.sla, nodes:c.nodes, couchbaseVersion:c.version }) },
+      { name:'generate_customer_report', description:'Generate a customer-ready report for the current customer and file it to Reports & Automation. Call this when the user asks for a report.',
+        input_schema:{ type:'object', properties:{} },
+        run: async()=>{ self.addReport(); return JSON.stringify({ status:'filed', customer:cust, location:'Reports & Automation' }); } },
+    ];
+  }
+
+  addReport = () => this.setState(s => ({ reports:[{ id:'r'+Date.now(), icon:'📄', bg:'#fdecec', title:`${this.state.customer} customer report`, meta:'report · generated by assistant · just now', cta:'Export PDF', fresh:true }, ...s.reports] }));
+
+  reply = async (userText) => {
+    this.push({ role:'user', text:userText });
+    this.setState({ input:'', thinking:true });
+    const c = this.cur(); const cust = this.state.customer;
+    if(!(window.claude && window.claude.complete)){ this.fallbackReply(userText); return; }
+    const history = this.state.messages.filter(m=>m.text && !m.streaming)
+      .map(m=>({ role: m.role==='agent'?'assistant':'user', content: m.text }))
+      .concat([{ role:'user', content:userText }]);
+    const used=[];
+    const tools = this.agentTools().map(t=>({ ...t, run: async(i)=>{ used.push(t.name); return t.run(i); } }));
+    const system = `You are the Cursus support assistant, embedded inside a Couchbase fleet-management dashboard. `+
+      `The user is scoped to customer "${cust}" — health ${c.health}, ${c.openP1} open P1s, ${c.atRisk} at-risk clusters, ${c.nodes} nodes, Couchbase ${c.version}. `+
+      `Always ground answers in the tools before responding; never invent ticket IDs or numbers. Reply in 2–4 concise sentences for a support/AE audience. Offer to generate a customer report when it would help.`;
+    try{
+      const text = await window.claude.complete({ model:'claude-sonnet-4-5', max_tokens:600, system, messages:history, tools });
+      this.setState({ thinking:false });
+      const offerReport = /\breport\b/i.test(text) && !used.includes('generate_customer_report');
+      this.streamIn({ tool: used.length ? [...new Set(used)].join(' · ') : 'agent_route', text: (text||'').trim(), action: offerReport ? 'Generate report' : null });
+    }catch(e){ this.setState({ thinking:false }); this.fallbackReply(userText); }
+  };
+
+  cannedAgent = (userText) => {
+    const c=this.cur(); const cust=this.state.customer; const q=userText.toLowerCase();
+    if(q.includes('brief')) return { tool:'query_tickets · rank_portfolio', text:`Morning briefing for ${cust}: ${c.openP1} open P1s, health ${c.health}, ${c.atRisk} at-risk clusters. Vodafone regressed overnight.`, chart:true, action:'Generate report' };
+    if(q.includes('new')) return { tool:'get_recent_changes', text:`Last 24h for ${cust}: 2 new P1s filed, 1 cluster upgraded to ${c.version}, XDCR lag cleared on cbse-2.` };
+    if(q.includes('p1')) return { tool:'query_tickets', text:`${c.openP1} open P1 tickets for ${cust}. Top: indexer OOM after upgrade (48213), XDCR lag on prod (48219).`, chart:true };
+    if(q.includes('report')) return { tool:'generate_customer_report', text:`Drafted a customer-ready report for ${cust} covering health, open P1s and version spread.`, action:'Generate report' };
+    if(q.includes('health')||q.includes('why')) return { tool:'get_customer_health_score', text:`${cust} health is ${c.health}. ${c.openP1} open P1s and ${c.atRisk} at-risk clusters are the main drags.`, action:'Generate report' };
+    return { tool:'agent_route', text:`Looking at ${cust} (health ${c.health}, ${c.openP1} open P1s). Ask me for a briefing, what's new, open P1s, or a customer report.` };
+  };
+  fallbackReply = (userText) => { this.setState({ thinking:false }); setTimeout(()=>this.streamIn(this.cannedAgent(userText)), 450); };
+
+  streamIn = (msg) => {
+    const id = Date.now()+Math.random();
+    this.setState(s => ({ messages:[...s.messages, { id, role:'agent', tool:msg.tool, text:'', action:null, chart:false, streaming:true }] }));
+    const full = msg.text || ''; const stepN = Math.max(2, Math.round(full.length/55)); let i=0;
+    clearTimeout(this._stream);
+    const tick = () => {
+      i += stepN;
+      if(i < full.length){ this.setState(s=>({ messages:s.messages.map(m=>m.id===id?{...m,text:full.slice(0,i)}:m) })); this._stream=setTimeout(tick,26); }
+      else { this.setState(s=>({ messages:s.messages.map(m=>m.id===id?{...m,text:full,streaming:false,action:msg.action||null,chart:!!msg.chart}:m) })); }
+    };
+    tick();
+  };
+
+  send = () => { const t=this.state.input.trim(); if(t) this.reply(t); };
+  primeFrom = (label) => { this.setState({ panelOpen:true }); this.reply(label); };
+
+  genReport = () => {
+    const cust = this.state.customer;
+    this.setState(s => ({
+      reports: [{ id:'r'+Date.now(), icon:'📄', bg:'#fdecec', title:`${cust} customer report`, meta:'report · generated by assistant · just now', cta:'Export PDF', fresh:true }, ...s.reports],
+      tab:'reports',
+    }));
+    this.push({ role:'agent', tool:'generate_customer_report', text:`Report filed to Reports & Automation for ${cust}. Opening it now.` });
+  };
+
+  renderVals(){
+    const { tab, customer, panelOpen, custMenu, input, thinking } = this.state;
+    const c = this.cur();
+    const R = React.createElement;
+
+    const tabDefs = [['overview','Overview'],['customers','Customers'],['tickets','Tickets'],['data','Data'],['reports','Reports & Automation']];
+    const tabBtn = (active) => `background:${active?'#ea2328':'transparent'};color:${active?'#fff':'#c9ccd2'};border:none;padding:6px 13px;border-radius:7px;font:inherit;font-size:13px;font-weight:${active?'600':'500'};cursor:pointer;white-space:nowrap`;
+    const tabs = tabDefs.map(([id,label]) => ({ label, style: tabBtn(tab===id), go: () => this.setTab(id) }));
+
+    const customers = Object.keys(this.DATA).map(name => {
+      const d = this.DATA[name]; const sel = name===customer;
+      return { name, health:d.health, dot:d.dot, pick:()=>this.pickCustomer(name),
+        rowStyle:`display:flex;align-items:center;gap:9px;width:100%;padding:8px 10px;border:none;border-radius:7px;background:${sel?'#26282d':'transparent'};color:#fff;font:inherit;font-size:13px;cursor:pointer` };
+    });
+
+    const starters = [
+      { label:'Morning briefing', run:()=>this.reply('Give me a morning briefing') },
+      { label:"What's new?", run:()=>this.reply("What's new?") },
+      { label:'Open P1s', run:()=>this.reply('Show open P1s') },
+      { label:'Generate report', run:()=>this.reply('Generate a customer report') },
+    ];
+
+    const messages = this.state.messages.map(m => {
+      const user = m.role==='user';
+      return { ...m,
+        rowStyle:`display:flex;margin-bottom:9px;animation:cuFade .2s ease;${user?'justify-content:flex-start':'justify-content:flex-end'}`,
+        bubbleStyle:`max-width:90%;font-size:13px;line-height:1.5;padding:9px 12px;border-radius:${user?'11px 11px 11px 3px':'11px 11px 3px 11px'};${user?'background:#f4f2ec;color:#3c4046':'background:#fff;border:1px solid #eee9df;color:#1b1d21'}`,
+        doAction: m.action ? this.genReport : null };
+    });
+
+    // canvas per tab, built as elements so click handlers bind
+    let canvas;
+    if(tab==='overview') canvas = this.overview(c);
+    else if(tab==='customers') canvas = this.customersTab();
+    else if(tab==='tickets') canvas = this.ticketsTab();
+    else if(tab==='data') canvas = this.dataTab();
+    else canvas = this.reportsTab();
+
+    return {
+      tabs, customer, cur:c, customers, custMenu, toggleCustMenu:this.toggleCustMenu,
+      panelOpen, panelClosed:!panelOpen, togglePanel:this.togglePanel,
+      panelWrapStyle:'flex:none;height:100%',
+      scopeLabel: customer.split(' ')[0],
+      starters, messages, thinking, input,
+      onInput:this.onInput, onKey:this.onKey, send:this.send,
+      canvas,
+    };
+  }
+
+  // ── canvas builders (React.createElement — dynamic, click-wired) ──
+  card(children, extra){ return React.createElement('div',{style:{background:'#fff',border:'1px solid #e0dbd0',borderRadius:'11px',padding:'16px',...extra}},children); }
+  h(t){ return React.createElement('div',{style:{fontFamily:'Archivo',fontWeight:700,fontSize:'13px',color:'#3c4046',marginBottom:'12px'}},t); }
+
+  kpi(label,val,color,onClick,active){
+    return React.createElement('button',{onClick,style:{textAlign:'left',cursor:'pointer',background:active?'#fdecec':'#fff',border:`1px solid ${active?'#ea2328':'#e0dbd0'}`,borderRadius:'11px',padding:'15px',font:'inherit',transition:'all .12s'}},
+      React.createElement('div',{style:{fontFamily:'IBM Plex Mono',fontSize:'10px',letterSpacing:'.06em',color:'#9a9ea6'}},label),
+      React.createElement('div',{style:{fontFamily:'Archivo',fontWeight:800,fontSize:'30px',color,lineHeight:1.05,marginTop:'4px'}},val));
+  }
+
+  overview(c){
+    const R=React.createElement; const cust=this.state.customer;
+    const bars=[['Amex',80,'#ea2328'],['Vodafone',58,'#f28b82'],['Western U.',30,'#f6b8b3'],['Barclays',52,'#f28b82']];
+    return R('div',{style:{maxWidth:'880px'}},
+      R('div',{style:{display:'flex',alignItems:'baseline',justifyContent:'space-between',marginBottom:'16px'}},
+        R('div',null,
+          R('div',{style:{fontFamily:'Archivo',fontWeight:800,fontSize:'22px',lineHeight:1.1,whiteSpace:'nowrap',color:'#1b1d21'}},'Fleet at a glance'),
+          R('div',{style:{fontSize:'13px',color:'#6b6f76',marginTop:'2px'}},'Scoped to ',R('b',null,cust))),
+        R('div',{style:{fontFamily:'IBM Plex Mono',fontSize:'11px',color:'#9a9ea6'}},'last refresh 3m ago · ',R('span',{style:{color:'#2f8f5b'}},'live'))),
+      R('div',{style:{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:'12px',marginBottom:'14px'}},
+        this.kpi('FLEET HEALTH',c.health,'#fb8c00',()=>this.primeFrom(`Why is ${cust} health ${c.health}?`)),
+        this.kpi('OPEN P1',c.openP1,'#e53935',()=>this.goTickets('P1','Open')),
+        this.kpi('AT-RISK CLUSTERS',c.atRisk,'#c98a12',()=>this.primeFrom(`Which clusters are at risk?`)),
+        this.kpi('SLA BREACH',c.sla,'#1b1d21',()=>this.primeFrom(`Any SLA breaches?`))),
+      R('div',{style:{display:'grid',gridTemplateColumns:'1.3fr 1fr',gap:'12px'}},
+        this.card([this.h('Open tickets by org'),
+          R('div',{style:{display:'flex',flexDirection:'column',gap:'9px'}},
+            ...bars.map(([n,p,col])=>R('button',{key:n,onClick:()=>this.pickCustomer(n==='Western U.'?'Western Union':n==='Amex'?'American Express':n),style:{display:'flex',alignItems:'center',gap:'9px',background:'none',border:'none',font:'inherit',cursor:'pointer',padding:0}},
+              R('span',{style:{width:'74px',fontSize:'12px',color:'#3c4046',textAlign:'left'}},n),
+              R('div',{style:{flex:1,height:'13px',background:'#f1ede5',borderRadius:'4px',overflow:'hidden'}},R('div',{style:{width:p+'%',height:'100%',background:col,borderRadius:'4px'}})))))]),
+        this.card([this.h('CB version spread'),
+          R('div',{style:{display:'flex',justifyContent:'center',padding:'6px 0'}},
+            R('div',{style:{width:'104px',height:'104px',borderRadius:'50%',background:'conic-gradient(#ea2328 0 46%,#f28b82 46% 74%,#f6b8b3 74% 100%)'}})),
+          R('div',{style:{display:'flex',justifyContent:'center',gap:'12px',marginTop:'10px',fontSize:'11px',color:'#6b6f76'}},
+            R('span',null,'● 7.6.2'),R('span',{style:{color:'#f28b82'}},'● 7.2.4'),R('span',{style:{color:'#f6b8b3'}},'● 7.6.0'))])),
+      R('div',{style:{marginTop:'12px',fontSize:'11px',color:'#9a9ea6',fontFamily:'IBM Plex Mono'}},'▸ click any KPI or bar → filters the view + primes the assistant'));
+  }
+
+  ticketsTab(){
+    const R=React.createElement; const cust=this.state.customer; const tf=this.state.tFilter;
+    const all=this.TICKETS.filter(t=>t.cust===cust);
+    const q=tf.q.trim().toLowerCase();
+    const rows=all.filter(t=>(!tf.priority||t.priority===tf.priority)&&(!tf.status||t.status===tf.status)&&(!q||(t.subject.toLowerCase().includes(q)||String(t.id).includes(q))));
+    const openP1=rows.filter(t=>t.priority==='P1'&&t.status==='Open').length;
+    const vers=[...new Set(rows.map(t=>t.version))];
+    const pCol={P1:'#e53935',P2:'#fb8c00',P3:'#43a047'};
+    const sCol={Open:'#c02620',Pending:'#c98a12',Solved:'#2f8f5b'};
+    const active=(k,v)=>tf[k]===v;
+    const chip=(k,v,label,col)=>R('button',{key:k+v,onClick:()=>this.toggleTF(k,v),style:{cursor:'pointer',font:'inherit',fontSize:'12px',fontWeight:active(k,v)?600:500,padding:'5px 11px',borderRadius:'20px',border:`1px solid ${active(k,v)?(col||'#ea2328'):'#e0dbd0'}`,background:active(k,v)?(col||'#ea2328'):'#fff',color:active(k,v)?'#fff':'#4a4e54'}},label);
+    const cell='padding:9px 10px;font-size:12.5px;color:#2a2d33;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    const grid='grid-template-columns:64px 1fr 62px 78px 74px 56px';
+    const summary = rows.length
+      ? `${rows.length} ticket${rows.length>1?'s':''} match — ${openP1} open P1${openP1===1?'':'s'}${vers.length?', on '+vers.join(' / '):''}. Top drag: ${[...rows].sort((a,b)=>b.score-a.score)[0].subject}.`
+      : 'No tickets match these filters.';
+    return R('div',{style:{maxWidth:'880px'}},
+      R('div',{style:{display:'flex',alignItems:'baseline',justifyContent:'space-between',marginBottom:'6px'}},
+        R('div',{style:{fontFamily:'Archivo',fontWeight:800,fontSize:'22px',lineHeight:1.1,color:'#1b1d21'}},'Tickets'),
+        R('div',{style:{fontSize:'13px',color:'#6b6f76'}},'Scoped to ',R('b',null,cust))),
+      // agent-written summary banner
+      R('div',{style:{display:'flex',gap:'10px',alignItems:'flex-start',background:'#fff',border:'1px solid #e0dbd0',borderLeft:'3px solid #ea2328',borderRadius:'10px',padding:'12px 14px',margin:'12px 0 14px'}},
+        R('span',{style:{fontFamily:'IBM Plex Mono',fontSize:'10px',color:'#ea2328',flex:'none',marginTop:'2px'}},'▸ assistant'),
+        R('div',{style:{flex:1,fontSize:'13px',lineHeight:1.5,color:'#2a2d33'}},summary),
+        R('button',{onClick:()=>this.primeFrom(`Summarize the ${cust} tickets I'm looking at`),style:{flex:'none',cursor:'pointer',font:'inherit',fontSize:'11.5px',fontWeight:600,color:'#ea2328',background:'none',border:'none',whiteSpace:'nowrap'}},'Ask ↗')),
+      // filter bar
+      R('div',{style:{display:'flex',gap:'7px',alignItems:'center',flexWrap:'wrap',marginBottom:'12px'}},
+        chip('priority','P1','P1',pCol.P1),chip('priority','P2','P2',pCol.P2),chip('priority','P3','P3',pCol.P3),
+        R('span',{style:{width:'1px',height:'20px',background:'#d8d3c8',margin:'0 3px'}}),
+        chip('status','Open','Open'),chip('status','Pending','Pending'),chip('status','Solved','Solved'),
+        R('div',{style:{marginLeft:'auto',display:'flex',gap:'7px',alignItems:'center'}},
+          R('input',{value:tf.q,onInput:this.setTQ,placeholder:'Filter subject or ID…',style:{font:'inherit',fontSize:'12.5px',padding:'6px 11px',borderRadius:'8px',border:'1px solid #e0dbd0',outline:'none',width:'170px',background:'#fff'}}),
+          R('button',{onClick:()=>this.primeFrom(`Export the ${cust} tickets I'm viewing to CSV`),style:{cursor:'pointer',font:'inherit',fontSize:'12px',fontWeight:600,color:'#fff',background:'#2f7d4f',border:'none',borderRadius:'8px',padding:'6px 12px'}},'Export'))),
+      // table
+      R('div',{style:{background:'#fff',border:'1px solid #e0dbd0',borderRadius:'11px',overflow:'hidden'}},
+        R('div',{style:{display:'grid',gridTemplateColumns:'64px 1fr 62px 78px 74px 56px',background:'#f4f2ec',borderBottom:'1px solid #e0dbd0',fontFamily:'IBM Plex Mono',fontSize:'10px',letterSpacing:'.05em',color:'#6b6f76',textTransform:'uppercase'}},
+          R('div',{style:{padding:'9px 10px'}},'ID'),R('div',{style:{padding:'9px 10px'}},'Subject'),R('div',{style:{padding:'9px 6px'}},'Pri'),R('div',{style:{padding:'9px 6px'}},'Status'),R('div',{style:{padding:'9px 6px'}},'CB ver'),R('div',{style:{padding:'9px 6px'}},'Score')),
+        ...rows.map((t,i)=>R('button',{key:t.id,onClick:()=>this.primeFrom(`Explain ticket ${t.id} — ${t.subject}`),title:'Hand to assistant',style:{display:'grid',gridTemplateColumns:'64px 1fr 62px 78px 74px 56px',alignItems:'center',width:'100%',textAlign:'left',border:'none',borderBottom:i<rows.length-1?'1px solid #f1ede5':'none',background:i%2?'#faf8f4':'#fff',cursor:'pointer',font:'inherit'}},
+          R('div',{style:{padding:'9px 10px',fontFamily:'IBM Plex Mono',fontSize:'12px',color:'#ea2328'}},t.id),
+          R('div',{style:{padding:'9px 10px',fontSize:'12.5px',color:'#2a2d33',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},t.subject),
+          R('div',{style:{padding:'9px 6px'}},R('span',{style:{background:pCol[t.priority],color:'#fff',fontSize:'10px',fontWeight:600,padding:'2px 7px',borderRadius:'4px'}},t.priority)),
+          R('div',{style:{padding:'9px 6px',fontSize:'12px',color:sCol[t.status],fontWeight:500}},t.status),
+          R('div',{style:{padding:'9px 6px',fontFamily:'IBM Plex Mono',fontSize:'12px',color:'#6b6f76'}},t.version),
+          R('div',{style:{padding:'9px 6px',fontFamily:'Archivo',fontWeight:700,fontSize:'13px',color:t.score>=70?'#c02620':t.score>=40?'#c98a12':'#6b6f76'}},t.score))),
+        rows.length?null:R('div',{style:{padding:'26px',textAlign:'center',color:'#9a9ea6',fontSize:'13px'}},'No tickets match — clear a filter.')),
+      R('div',{style:{marginTop:'10px',fontSize:'11px',color:'#9a9ea6',fontFamily:'IBM Plex Mono'}},'▸ click a row → hand the ticket to the assistant'));
+  }
+
+  customersTab(){
+    const R=React.createElement; const cust=this.state.customer; const c=this.cur();
+    return R('div',{style:{maxWidth:'880px'}},
+      R('div',{style:{fontFamily:'Archivo',fontWeight:800,fontSize:'22px',marginBottom:'16px'}},'Customers & cluster health'),
+      R('div',{style:{display:'grid',gridTemplateColumns:'260px 1fr',gap:'16px'}},
+        R('div',{style:{display:'flex',flexDirection:'column',gap:'7px'}},
+          ...Object.keys(this.DATA).map(n=>{const d=this.DATA[n];const s=n===cust;return R('button',{key:n,onClick:()=>this.pickCustomer(n),style:{textAlign:'left',cursor:'pointer',font:'inherit',background:'#fff',border:`1px solid ${s?'#ea2328':'#e0dbd0'}`,borderLeft:`3px solid ${s?'#ea2328':'#e0dbd0'}`,borderRadius:'8px',padding:'10px 12px'}},
+            R('div',{style:{fontWeight:600,fontSize:'13px',color:'#1b1d21'}},n),
+            R('div',{style:{fontSize:'11px',color:'#9a9ea6',marginTop:'2px'}},`${d.open} open · health ${d.health}`))})),
+        R('div',null,
+          R('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'11px',marginBottom:'12px'}},
+            this.kpi('HEALTH',c.health,'#fb8c00',()=>this.primeFrom(`Why is ${cust} health ${c.health}?`)),
+            this.kpi('OPEN P1',c.openP1,'#e53935',()=>this.goTickets('P1','Open')),
+            this.kpi('NODES',c.nodes,'#1b1d21',()=>{})),
+          this.card([this.h('Cluster topology · services / RAM'),
+            R('div',{style:{display:'flex',gap:'8px',flexWrap:'wrap'}},
+              ...[0,1,2,3,4,5].map(i=>{const bad=i===2;return R('button',{key:i,onClick:bad?()=>this.primeFrom('Analyze node cbse-4'):()=>{},title:bad?'cbse-4 · degraded':'healthy',style:{width:'88px',height:'56px',cursor:bad?'pointer':'default',background:bad?'#fdeaea':'#eef3fb',border:`1px solid ${bad?'#f0bcbc':'#bcd4f0'}`,borderRadius:'7px',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:'3px',font:'inherit'}},
+                R('span',{style:{fontSize:'11px',fontFamily:'IBM Plex Mono',color:bad?'#c02620':'#3060a0'}},'cbse-'+(i+1)),
+                R('span',{style:{fontSize:'9px',color:bad?'#c02620':'#7ba0cc'}},bad?'degraded':'ok'))})),
+            R('div',{style:{marginTop:'10px',fontSize:'11px',color:'#9a9ea6',fontFamily:'IBM Plex Mono'}},'▸ click a degraded node → hand to assistant')]))));
+  }
+
+  dataTab(){
+    const R=React.createElement; const cust=this.state.customer;
+    return R('div',{style:{maxWidth:'760px'}},
+      R('div',{style:{fontFamily:'Archivo',fontWeight:800,fontSize:'22px',marginBottom:'6px'}},'Data & onboarding'),
+      R('div',{style:{fontSize:'13px',color:'#6b6f76',marginBottom:'16px'}},'Scrape and refresh the ticket + cluster data behind every view.'),
+      this.card([this.h('Scraper'),
+        R('div',{style:{display:'flex',gap:'8px',marginBottom:'11px'}},
+          R('div',{style:{flex:1,height:'38px',background:'#f4f2ec',border:'1px solid #e4dfd4',borderRadius:'8px',display:'flex',alignItems:'center',padding:'0 12px',color:'#3c4046',fontSize:'13px'}},cust),
+          R('div',{style:{width:'38px',height:'38px',background:'#ea2328',borderRadius:'8px',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff'}},'🔍')),
+        R('div',{style:{display:'flex',gap:'8px',alignItems:'center'}},
+          R('div',{style:{padding:'9px 18px',background:'#ea2328',color:'#fff',borderRadius:'8px',fontWeight:600,fontSize:'13px'}},'Scrape'),
+          R('div',{style:{flex:1,height:'9px',background:'#f1ede5',borderRadius:'20px',overflow:'hidden'}},R('div',{style:{width:'62%',height:'100%',background:'#4ec27f'}})),
+          R('span',{style:{fontSize:'12px',color:'#6b6f76',fontFamily:'IBM Plex Mono'}},'62% · 310/500')),
+        R('div',{style:{marginTop:'12px',fontFamily:'IBM Plex Mono',fontSize:'11px',background:'#1b1d21',color:'#8ee0a8',borderRadius:'8px',padding:'11px',lineHeight:1.6}},
+          '▸ fetched ticket::48213 · embed ✓ · score ✓',R('br'),'▸ fetched ticket::48214 · change-detected, skip',R('br'),'▸ fetched ticket::48215 · embed ✓ · score ✓')]),
+      R('div',{style:{marginTop:'12px'}},this.card([this.h('Freshness'),
+        R('div',{style:{display:'flex',gap:'10px'}},
+          R('div',{style:{flex:1,padding:'11px',border:'1px solid #eee9df',borderRadius:'8px'}},R('div',{style:{fontSize:'12px',fontWeight:600}},'Amex'),R('div',{style:{fontSize:'11px',color:'#c98a12',marginTop:'3px',fontFamily:'IBM Plex Mono'}},'STALE 6h')),
+          R('div',{style:{flex:1,padding:'11px',border:'1px solid #eee9df',borderRadius:'8px'}},R('div',{style:{fontSize:'12px',fontWeight:600}},'Western Union'),R('div',{style:{fontSize:'11px',color:'#2f8f5b',marginTop:'3px',fontFamily:'IBM Plex Mono'}},'FRESH')))])));
+  }
+
+  reportsTab(){
+    const R=React.createElement;
+    return R('div',{style:{maxWidth:'880px'}},
+      R('div',{style:{fontFamily:'Archivo',fontWeight:800,fontSize:'22px',marginBottom:'6px'}},'Reports & Automation'),
+      R('div',{style:{fontSize:'13px',color:'#6b6f76',marginBottom:'16px'}},'Every deliverable the assistant produces, plus running and scheduled jobs — one home.'),
+      R('div',{style:{display:'grid',gridTemplateColumns:'1.15fr .85fr',gap:'16px'}},
+        this.card([this.h('Deliverables'),
+          R('div',{style:{display:'flex',flexDirection:'column',gap:'9px'}},
+            ...this.state.reports.map(r=>R('div',{key:r.id,style:{display:'flex',alignItems:'center',gap:'11px',padding:'10px 11px',border:`1px solid ${r.fresh?'#f3d3d1':'#eee9df'}`,background:r.fresh?'#fffafa':'#fff',borderRadius:'9px',animation:r.fresh?'cuFade .3s ease':'none'}},
+              R('span',{style:{width:'32px',height:'32px',background:r.bg,borderRadius:'7px',display:'flex',alignItems:'center',justifyContent:'center',flex:'none'}},r.icon),
+              R('div',{style:{flex:1}},R('div',{style:{fontWeight:600,fontSize:'13px'}},r.title),R('div',{style:{fontSize:'11px',color:'#9a9ea6'}},r.meta)),
+              R('span',{style:{fontSize:'12px',color:'#ea2328',fontWeight:600,whiteSpace:'nowrap'}},r.cta))))]),
+        this.card([this.h('Automation & jobs'),
+          R('div',{style:{display:'flex',flexDirection:'column',gap:'9px'}},
+            R('div',{style:{padding:'11px 12px',border:'1px solid #eee9df',borderRadius:'9px'}},
+              R('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'7px'}},R('span',{style:{fontWeight:600,fontSize:'13px'}},'Scrape · Vodafone'),R('span',{style:{fontSize:'10px',background:'#e8f6ee',color:'#2f8f5b',padding:'2px 8px',borderRadius:'12px',fontFamily:'IBM Plex Mono'}},'RUNNING')),
+              R('div',{style:{height:'7px',background:'#f1ede5',borderRadius:'20px',overflow:'hidden'}},R('div',{style:{width:'48%',height:'100%',background:'#2f8f5b'}}))),
+            R('div',{style:{padding:'11px 12px',border:'1px solid #eee9df',borderRadius:'9px',display:'flex',justifyContent:'space-between',alignItems:'center'}},R('span',{style:{fontWeight:600,fontSize:'13px'}},'Freshness · Amex'),R('span',{style:{fontSize:'10px',background:'#fdf1e3',color:'#c98a12',padding:'2px 8px',borderRadius:'12px',fontFamily:'IBM Plex Mono'}},'STALE 6h')),
+            R('div',{style:{padding:'11px 12px',border:'1px solid #eee9df',borderRadius:'9px',display:'flex',justifyContent:'space-between',alignItems:'center'}},R('span',{style:{fontWeight:600,fontSize:'13px'}},'Nightly portfolio digest'),R('span',{style:{fontSize:'10px',background:'#eef1f5',color:'#5b6572',padding:'2px 8px',borderRadius:'12px',fontFamily:'IBM Plex Mono'}},'SCHEDULED 02:00')),
+            R('button',{onClick:()=>this.primeFrom('Schedule a nightly refresh for Amex'),style:{padding:'11px 12px',border:'1px dashed #d8d3c8',borderRadius:'9px',color:'#9a9ea6',fontSize:'12px',textAlign:'center',background:'none',cursor:'pointer',font:'inherit'}},'＋ Ask the assistant to schedule a refresh'))])));
+  }
+}
+</script>
+</body>
+</html>

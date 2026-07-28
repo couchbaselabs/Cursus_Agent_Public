@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Portfolio Account Status — SE_FULL_NAME</title>
+<style>
+  :root {
+    --cb-red: #EA2328;
+    --cb-red-dark: #C41920;
+    --ink: #1B1F23;
+    --sub: #5C6570;
+    --bg: #F6F7F9;
+    --card: #FFFFFF;
+    --border: #E3E6EA;
+    --green: #1E8E5A;
+    --green-bg: #E8F6EF;
+    --amber: #B4790E;
+    --amber-bg: #FDF3E0;
+    --red-bg: #FCEAEA;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .page { max-width: 1180px; margin: 0 auto; padding: 32px 28px 64px; }
+
+  header.banner {
+    background: linear-gradient(135deg, var(--cb-red) 0%, var(--cb-red-dark) 100%);
+    border-radius: 14px;
+    padding: 28px 32px;
+    color: #fff;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  header.banner .brand { display: flex; align-items: center; gap: 14px; }
+  header.banner .brand svg { width: 34px; height: 34px; flex-shrink: 0; }
+  header.banner h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+  header.banner .sub { margin-top: 2px; font-size: 13px; opacity: 0.9; }
+  header.banner .meta { text-align: right; font-size: 12px; opacity: 0.92; line-height: 1.6; }
+
+  .summary-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin-bottom: 28px;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .stat .label { font-size: 11.5px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  .stat .value { font-size: 26px; font-weight: 700; margin-top: 4px; color: var(--ink); }
+  .stat .value.accent { color: var(--cb-red); }
+
+  h2.section {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--ink);
+    margin: 0 0 12px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--cb-red);
+    display: inline-block;
+  }
+
+  table.accounts {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    font-size: 13px;
+  }
+  table.accounts thead th {
+    background: #FAFAFB;
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--sub);
+    font-weight: 700;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  table.accounts td {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  table.accounts tbody tr:last-child td { border-bottom: none; }
+  table.accounts tbody tr:hover { background: #FCFCFD; }
+
+  .acct-name { font-weight: 700; color: var(--ink); }
+  .acct-people { font-size: 11.5px; color: var(--sub); margin-top: 2px; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .arr { font-weight: 700; color: var(--cb-red-dark); font-family: var(--mono); }
+
+  .badge {
+    display: inline-block;
+    font-size: 10.5px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }
+  .badge.fresh { background: var(--green-bg); color: var(--green); }
+  .badge.approx { background: var(--amber-bg); color: var(--amber); }
+  .badge.unknown { background: #EEF0F3; color: var(--sub); }
+
+  .ticket-count { font-size: 17px; font-weight: 700; }
+  .open-count { font-size: 11px; color: var(--sub); }
+  .open-count .p1 { color: var(--cb-red); font-weight: 700; }
+
+  footer {
+    margin-top: 26px;
+    font-size: 11px;
+    color: var(--sub);
+    line-height: 1.6;
+    border-top: 1px solid var(--border);
+    padding-top: 14px;
+  }
+  footer .cb-mark { color: var(--cb-red); font-weight: 700; }
+
+  @media (max-width: 900px) {
+    .summary-row { grid-template-columns: repeat(2, 1fr); }
+    table.accounts { font-size: 12px; }
+  }
+  @media print {
+    body { background: #fff; }
+    .page { padding: 0; max-width: none; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="banner">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="16" cy="16" r="15" stroke="white" stroke-width="2"/>
+        <circle cx="16" cy="16" r="6.5" fill="white"/>
+      </svg>
+      <div>
+        <h1>Portfolio Account Status</h1>
+        <div class="sub">Assigned accounts &amp; opportunities — Support &amp; Renewal Snapshot</div>
+      </div>
+    </div>
+    <div class="meta">
+      SE_FULL_NAME · SE_TITLE, Couchbase<br>
+      Generated REPORT_DATE
+    </div>
+  </header>
+
+  <div class="summary-row">
+    <div class="stat">
+      <div class="label">Assigned Accounts</div>
+      <div class="value">TOTAL_ACCOUNTS</div>
+    </div>
+    <div class="stat">
+      <div class="label">Open Opportunities</div>
+      <div class="value">TOTAL_OPPS</div>
+    </div>
+    <div class="stat">
+      <div class="label">Total Opportunity Value</div>
+      <div class="value accent">TOTAL_ARR</div>
+    </div>
+    <div class="stat">
+      <div class="label">Total Support Tickets (lifetime)</div>
+      <div class="value">TOTAL_TICKETS</div>
+    </div>
+  </div>
+
+  <h2 class="section">Accounts &amp; Opportunities</h2>
+  <table class="accounts">
+    <thead>
+      <tr>
+        <th>Account</th>
+        <th>AE / TSE</th>
+        <th># Opps</th>
+        <th>Opportunity Value</th>
+        <th>Support Tickets</th>
+        <th>Last TSE/Customer Ticket Activity</th>
+        <th>Last AE/SE SFDC Update</th>
+      </tr>
+    </thead>
+    <tbody>
+
+      <!-- ACCOUNT_ROW: repeat this <tr> block once per account, then delete this comment -->
+      <tr>
+        <td>
+          <div class="acct-name">ORG_NAME</div>
+          <div class="acct-people">ORG_TAGS</div>
+          <!-- ORG_TAGS: short pipe/dot-separated flags, e.g. "Critical Renewal · Strategic · Top 50 · CARR"
+               pulled from mcp__cursus__get_account_contacts (critical_renewal, strategic, top_50, carr).
+               If the org has no zdorg contact record under this name, put a note here instead, e.g.
+               "Not in Supportal zdorg under this name" — see AE_SOURCE_NOTE below. -->
+        </td>
+        <td>AE: AE_NAME<br>TSE: TSE_NAME_OR_DASH</td>
+        <!-- AE/TSE from mcp__cursus__get_account_contacts. If that lookup errors ("org not found"),
+             fall back to mcp__cursus__list_sfdc_accounts (account-level SE) and/or
+             mcp__cursus__get_account_opportunities (opportunity-level Primary_SE__c) — but see the
+             CRITICAL DATA-QUALITY WARNING at the bottom of this template before trusting either. -->
+        <td class="num">OPP_COUNT</td>
+        <td class="arr">OPP_VALUE_FORMATTED</td>
+        <!-- Sum of ARR across this org's open opportunities from mcp__cursus__get_account_opportunities -->
+        <td>
+          <div class="ticket-count">TOTAL_TICKET_COUNT</div>
+          <!-- from mcp__cursus__get_customer_health total_tickets -->
+          <div class="open-count">OPEN_COUNT open · <span class="p1">P1_COUNT P1</span> / P2_COUNT P2</div>
+          <!-- if OPEN_COUNT is 0, replace the whole line with just "0 open" -->
+        </td>
+        <td>
+          LAST_ACTIVITY_DATE <span class="badge CONFIDENCE_CLASS">CONFIDENCE_LABEL</span><br>
+          <span class="acct-people">LAST_ACTIVITY_AUTHOR_OR_NOTE</span>
+          <!-- This column is about the TSE/support engineer and the CUSTOMER commenting on Zendesk tickets —
+               it is NOT the AE or SE. Don't let the label drift back to implying AE/SE here; that mislabeling
+               happened once already and caused confusion about what the column actually measures.
+               CONFIDENCE_CLASS / CONFIDENCE_LABEL:
+                 "fresh" / "active sample"   — date is the most recent comment on this org's currently-OPEN
+                                                tickets (from mcp__cursus__get_morning_briefing active_only=true).
+                                                High confidence.
+                 "approx" / "partial sample" — org has no open tickets, so the date came from a capped
+                                                ticket sample (mcp__cursus__query_tickets / get_morning_briefing
+                                                active_only=false, up to 100-200 tickets). The underlying API
+                                                does NOT guarantee recency ordering — flag as approximate.
+                 "unknown" / "no active tickets" or "sample too sparse" — no reliable signal found; say so,
+                                                don't fabricate a date. Use "—" for LAST_ACTIVITY_DATE. -->
+        </td>
+        <td>
+          SFDC_UPDATE_DATE_OR_NA <span class="badge unknown">SFDC_UPDATE_BADGE</span><br>
+          <span class="acct-people">SFDC_UPDATE_NOTE</span>
+          <!-- This is the AE/SE side: when did the Account Executive or Sales Engineer last touch this
+               opportunity/account IN SALESFORCE ITSELF (LastActivityDate, a Chatter post, a notes field) —
+               as distinct from a support ticket comment (that's the other column).
+               As of this template's writing, NO such field is synced into Couchbase anywhere: check
+               mcp__couchbase__get_schema_for_collection(bucket_name="rag", scope_name="transcripts",
+               collection_name="opportunities") — it only has ae/se names+emails, arr, stage, close_date,
+               products, sfdc ids, and last_synced (the sync's own ingestion time, NOT an SFDC activity date).
+               Until the scraper's SFDC sync pipeline is extended to pull LastActivityDate or similar, put
+               SFDC_UPDATE_DATE_OR_NA = "—", SFDC_UPDATE_BADGE = "not synced", and SFDC_UPDATE_NOTE =
+               "No AE/SE activity field in current SFDC sync — requires scraper pipeline change".
+               Do NOT substitute the ticket-side date here even temporarily — that's presenting a TSE/customer
+               ticket comment as if it were an AE/SE Salesforce update, which is the exact confusion this
+               column exists to prevent. -->
+        </td>
+      </tr>
+      <!-- END ACCOUNT_ROW -->
+
+    </tbody>
+  </table>
+
+  <footer>
+    <span class="cb-mark">Note on "Last TSE/Customer Ticket Activity":</span> where an account currently has open tickets, the date reflects the most recent comment on that account's active ticket queue (high confidence) — this is the TSE and/or customer commenting on Zendesk tickets, not the AE or SE. Where no tickets are open, the date reflects the most recent comment found in a capped ticket sample (up to 100–200 tickets) — the underlying ticket API does not guarantee recency ordering, so these are marked <span class="badge approx" style="vertical-align:middle;">partial sample</span> and may not reflect true latest activity. FOOTER_ZDORG_EXCEPTIONS_NOTE<br>
+    <span class="cb-mark">Note on "Last AE/SE SFDC Update":</span> no field for AE/SE activity (LastActivityDate, Chatter, notes) is currently synced from Salesforce into this system — every account shows "not synced" until the SFDC sync pipeline is extended to pull it. This is intentionally left blank rather than filled in with ticket-side dates.<br>
+    Account list reflects accounts confirmed to have SE_FULL_NAME as Opp SE Primary, verified against direct SFDC review — see the data-quality warning below before trusting synced SE data blindly. Opportunity values reflect open Salesforce opportunities, pulled live at report time. Ticket counts are lifetime totals per Supportal customer health data.
+  </footer>
+
+</div>
+</body>
+</html>
+
+<!--
+====================================================================
+HOW TO USE THIS TEMPLATE (for whoever/whatever fills it in)
+====================================================================
+
+1) DETERMINE THE ACCOUNT LIST
+   - Do NOT trust any single tool's SE field blindly. Cross-check:
+       a. mcp__cursus__get_my_sfdc_accounts        (opportunity-level, filtered to the saved sfdc_user_name)
+       b. mcp__cursus__list_sfdc_accounts(se_name=...) (account-level SE field — a DIFFERENT field from
+          Primary_SE__c; the two can legitimately disagree, e.g. account-team SE vs opp-level SE Primary)
+       c. mcp__cursus__get_account_opportunities(organization=...) (per-account opportunity-level SE)
+   - CRITICAL DATA-QUALITY WARNING: the opportunity-level "SE" field (Primary_SE__c) synced into Couchbase
+     via these tools has been directly confirmed WRONG for specific accounts in the past (see project
+     memory feedback_sfdc_se_field_unreliable.md) — even immediately after running
+     mcp__cursus__sync_sfdc_data. That sync call fixes the ACCOUNT-level SE field but has been observed
+     to NOT fix the OPPORTUNITY-level Primary_SE__c field for at least one record. Never present either
+     field as verified fact in the report. If the user disputes an account's inclusion, ask them to check
+     the live SFDC "SE Opp Primary" panel on that opportunity (Setup > Opportunity > SE Related Information)
+     and defer to what they see over any tool output.
+
+2) FOR EACH CONFIRMED ACCOUNT, GATHER:
+   - AE / TSE:            mcp__cursus__get_account_contacts(organizations=[...])
+                           (falls back to zdorg live lookup; note in ORG_TAGS if "org not found")
+   - Opportunities + ARR:  mcp__cursus__get_account_opportunities(organization=...)
+   - Ticket totals:        mcp__cursus__get_customer_health(organization=...)
+   - Active ticket detail: mcp__cursus__get_morning_briefing(organizations=[...], active_only=true)
+                           -> use for OPEN_COUNT, P1/P2 counts, and "fresh" last-activity date
+   - Fallback last-activity when no open tickets: mcp__cursus__query_tickets or
+     get_morning_briefing(active_only=false) — mark as "approx", NOT "fresh", since these APIs don't
+     sort by recency and a capped sample can miss the true latest ticket.
+   - Freshness check before reporting on tickets: mcp__cursus__check_data_freshness(organization=...);
+     rescrape via mcp__cursus__rescrape_customer_tickets if stale.
+
+   IMPORTANT: the table has TWO separate "last activity" columns that must not be conflated:
+     - "Last TSE/Customer Ticket Activity" = the ticket-side data above (support engineer / customer
+       commenting on a Zendesk ticket).
+     - "Last AE/SE SFDC Update" = a completely different thing — when the Account Executive or Sales
+       Engineer last touched the opportunity/account IN SALESFORCE. As of this writing there is NO
+       synced field for this (checked via get_schema_for_collection on the opportunities collection —
+       only ae/se names, arr, stage, dates, and last_synced exist, no LastActivityDate/Chatter/notes).
+       Always render this column as "—" / "not synced" rather than reusing the ticket date here.
+
+3) COMPUTE SUMMARY STATS
+   TOTAL_ACCOUNTS, TOTAL_OPPS, TOTAL_ARR (sum of all opp ARR across accounts, formatted like "$12.7M"),
+   TOTAL_TICKETS (sum of get_customer_health total_tickets across accounts).
+
+4) PUBLISH
+   Write the filled file to disk, then use the Artifact tool to publish it (never hand-copy HTML between
+   tool outputs — write to disk, verify on-disk content, then publish). Keep re-publishing to the SAME
+   artifact URL on subsequent updates (same file_path in the same conversation, or pass the existing
+   artifact `url` from a different conversation).
+
+5) WHEN THE USER DISPUTES AN ACCOUNT OR PERSON
+   Show them the exact tool call and literal output you based the claim on. If they say it's wrong,
+   believe them over the tool — remove/correct the row immediately, and don't re-litigate. Consider
+   saving a project/feedback memory if the same tool field turns out wrong more than once.
+-->

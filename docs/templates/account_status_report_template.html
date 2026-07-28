@@ -1,0 +1,1103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ORG_NAME — Couchbase Support Status · June 30, 2026</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #F0F3F7;
+    --surface: #FFFFFF;
+    --text: #0D1926;
+    --text-2: #5C6880;
+    --text-3: #8C96A8;
+    --border: #D4DAE6;
+    --border-light: #E6EAF2;
+    --cb: #1A6FD4;
+    --cb-light: #EAF1FB;
+    --good: #1DAA72;
+    --good-light: #E6F7F0;
+    --warn: #E8920A;
+    --warn-light: #FEF3E2;
+    --crit: #CC2E2E;
+    --crit-light: #FDEAEA;
+    --neutral: #6B7A99;
+    --neutral-light: #EEF0F5;
+    --mono: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  }
+
+  body {
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Fleet Banner ── */
+  .fleet-banner {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .fleet-banner-inner {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 10px 24px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  .fleet-logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+
+  .fleet-logo-mark {
+    width: 28px;
+    height: 28px;
+    background: var(--cb);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .fleet-logo-mark svg { display: block; }
+
+  .fleet-org {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+
+  .fleet-date {
+    font-size: 11px;
+    color: var(--text-2);
+    margin-top: 1px;
+  }
+
+  .fleet-divider {
+    width: 1px;
+    height: 28px;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+
+  .fleet-stats {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .fleet-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .fleet-stat-val {
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .fleet-stat-lbl {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-3);
+    font-weight: 600;
+  }
+
+  .fleet-stat.crit .fleet-stat-val { color: var(--crit); }
+  .fleet-stat.warn .fleet-stat-val { color: var(--warn); }
+  .fleet-stat.good .fleet-stat-val { color: var(--good); }
+  .fleet-stat.neutral .fleet-stat-val { color: var(--neutral); }
+
+  .fleet-contacts {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-2);
+    text-align: right;
+    line-height: 1.5;
+  }
+
+  .fleet-contacts strong { color: var(--text); }
+
+  .renewal-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--crit-light);
+    color: var(--crit);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    border: 1px solid #F5C2C2;
+  }
+
+  /* ── Page shell ── */
+  .page {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 28px 24px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .page-header {
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .page-title {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--text);
+    line-height: 1.2;
+    text-wrap: balance;
+  }
+
+  .page-subtitle {
+    font-size: 13px;
+    color: var(--text-2);
+    margin-top: 3px;
+  }
+
+  .prepared-by {
+    font-size: 11px;
+    color: var(--text-3);
+    text-align: right;
+    line-height: 1.6;
+    flex-shrink: 0;
+  }
+
+  .prepared-by strong { color: var(--text-2); }
+
+  /* ── Section label ── */
+  .section-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--text);
+    background: var(--cb);
+    color: #fff;
+    padding: 7px 14px;
+    border-radius: 6px;
+    margin-top: 8px;
+  }
+
+  .section-label:first-of-type { margin-top: 0; }
+
+  /* ── Ticket card ── */
+  .ticket-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .ticket-stripe {
+    display: flex;
+  }
+
+  .ticket-stripe-bar {
+    width: 4px;
+    flex-shrink: 0;
+  }
+
+  .stripe-p1 { background: var(--crit); }
+  .stripe-p3 { background: var(--warn); }
+  .stripe-p4 { background: var(--neutral); }
+  .stripe-good { background: var(--good); }
+
+  .ticket-body {
+    flex: 1;
+    padding: 16px 18px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .ticket-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .ticket-id {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--cb);
+    background: var(--cb-light);
+    padding: 2px 7px;
+    border-radius: 4px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  .ticket-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.01em;
+    flex: 1;
+    min-width: 0;
+    text-wrap: balance;
+  }
+
+  .ticket-pills {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-left: auto;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 2px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  .pill-crit { background: var(--crit-light); color: var(--crit); border: 1px solid #F0BABA; }
+  .pill-warn { background: var(--warn-light); color: var(--warn); border: 1px solid #F5D89A; }
+  .pill-good { background: var(--good-light); color: var(--good); border: 1px solid #A8DFC6; }
+  .pill-neutral { background: var(--neutral-light); color: var(--neutral); border: 1px solid #C8CEDC; }
+  .pill-cb { background: var(--cb-light); color: var(--cb); border: 1px solid #AECDF5; }
+
+  /* ── Ticket meta row ── */
+  .ticket-meta {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--text-2);
+  }
+
+  .ticket-meta-item { display: flex; align-items: center; gap: 4px; }
+  .ticket-meta-item strong { color: var(--text); font-weight: 600; }
+
+  /* ── Topology block ── */
+  .topo-block {
+    background: var(--bg);
+    border: 1px solid var(--border-light);
+    border-radius: 6px;
+    padding: 10px 14px;
+  }
+
+  .topo-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-3);
+    margin-bottom: 8px;
+  }
+
+  .topo-clusters {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .topo-cluster {
+    display: grid;
+    grid-template-columns: minmax(170px, auto) repeat(4, auto);
+    gap: 8px 20px;
+    align-items: center;
+    font-size: 11px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-light);
+  }
+
+  .topo-cluster:last-child { border-bottom: none; padding-bottom: 0; }
+
+  .topo-cluster-name {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .topo-role-tag {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--cb-light);
+    color: var(--cb);
+    white-space: nowrap;
+  }
+
+  .topo-role-tag.dr { background: var(--neutral-light); color: var(--neutral); }
+
+  .topo-kv {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .topo-k {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    font-weight: 600;
+  }
+
+  .topo-v {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Narrative ── */
+  .ticket-narrative {
+    font-size: 13px;
+    color: var(--text-2);
+    line-height: 1.65;
+  }
+
+  .ticket-narrative p { margin-bottom: 8px; }
+  .ticket-narrative p:last-child { margin-bottom: 0; }
+  .ticket-narrative strong { color: var(--text); }
+
+  /* ── Callout box ── */
+  .callout {
+    border-radius: 6px;
+    padding: 12px 14px;
+    display: flex;
+    gap: 10px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .callout-good {
+    background: var(--good-light);
+    border: 1px solid #A8DFC6;
+    color: #0E6040;
+  }
+
+  .callout-warn {
+    background: var(--warn-light);
+    border: 1px solid #F5D89A;
+    color: #7A4A06;
+  }
+
+  .callout-crit {
+    background: var(--crit-light);
+    border: 1px solid #F0BABA;
+    color: #7A1A1A;
+  }
+
+  .callout-info {
+    background: var(--cb-light);
+    border: 1px solid #AECDF5;
+    color: #0D3A6B;
+  }
+
+  .callout-icon {
+    font-size: 15px;
+    flex-shrink: 0;
+    line-height: 1.4;
+  }
+
+  .callout-body { flex: 1; }
+  .callout-body strong { font-weight: 700; }
+
+  /* ── Cadence highlight ── */
+  .cadence-highlight {
+    background: var(--good-light);
+    border: 1px solid #A8DFC6;
+    border-radius: 6px;
+    padding: 12px 16px;
+  }
+
+  .cadence-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--good);
+    margin-bottom: 8px;
+  }
+
+  .cadence-stats {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+
+  .cadence-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .cadence-stat-val {
+    font-size: 20px;
+    font-weight: 800;
+    color: #0E6040;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+
+  .cadence-stat-lbl {
+    font-size: 10px;
+    color: #2E8060;
+    font-weight: 600;
+  }
+
+  .cadence-note {
+    font-size: 11px;
+    color: #2E8060;
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+
+  /* ── Escalation section ── */
+  .esc-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    overflow-x: auto;
+  }
+
+  .esc-table-wrap { overflow-x: auto; }
+
+  .esc-table th {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-3);
+    padding: 6px 12px;
+    text-align: left;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .esc-table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border-light);
+    vertical-align: top;
+    color: var(--text-2);
+  }
+
+  .esc-table tr:last-child td { border-bottom: none; }
+  .esc-table td:first-child { font-family: var(--mono); font-size: 11px; color: var(--cb); font-weight: 600; }
+  .esc-table td strong { color: var(--text); }
+
+  /* ── Next steps ── */
+  .next-steps {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .next-steps-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-3);
+    margin-bottom: 4px;
+  }
+
+  .next-step {
+    display: flex;
+    gap: 10px;
+    font-size: 12.5px;
+    color: var(--text-2);
+    line-height: 1.55;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-light);
+  }
+
+  .next-step:last-child { border-bottom: none; padding-bottom: 0; }
+
+  .step-owner {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    margin-top: 2px;
+    height: fit-content;
+  }
+
+  .step-owner.cb { background: var(--cb-light); color: var(--cb); }
+  .step-owner.wu { background: var(--warn-light); color: #7A4A06; }
+  .step-owner.both { background: var(--neutral-light); color: var(--neutral); }
+
+  .step-body strong { color: var(--text); font-weight: 600; }
+
+  /* ── Print styles ── */
+  @media print {
+    @page {
+      margin: 18mm 16mm;
+      size: A4;
+    }
+
+    body {
+      background: #fff;
+      font-size: 11px;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    /* Un-stick the banner — print it inline at the top */
+    .fleet-banner {
+      position: static;
+      border-bottom: 2px solid var(--border);
+      margin-bottom: 12pt;
+    }
+
+    .page {
+      padding: 0;
+      gap: 10pt;
+      /* Chrome cannot fragment flex containers across print pages — flatten
+         to block flow or the report prints as one truncated page. */
+      display: block;
+    }
+    .page > * { margin-bottom: 10pt; }
+
+    .page-header {
+      padding-bottom: 10pt;
+    }
+
+    /* Keep ticket cards together where possible */
+    .ticket-card {
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+
+    /* Section banners force a new page */
+    .section-label {
+      break-before: page;
+      page-break-before: always;
+      margin-top: 0;
+    }
+
+    /* First section label sits directly under the page header — no break */
+    .section-label.no-break {
+      break-before: auto;
+      page-break-before: auto;
+    }
+
+    /* Keep ticket header glued to the first content block */
+    .ticket-head,
+    .ticket-meta {
+      break-after: avoid;
+      page-break-after: avoid;
+    }
+
+    /* Prevent orphaned callouts at page bottom */
+    .callout,
+    .cadence-highlight {
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+
+    /* Suppress sticky shadow artifacts */
+    .fleet-banner { box-shadow: none; }
+
+    /* Tighten spacing for print density */
+    .ticket-body { padding: 10pt 12pt 12pt; gap: 8pt; }
+    .topo-block { padding: 7pt 10pt; }
+    .cadence-highlight { padding: 8pt 12pt; }
+    .next-steps { padding: 10pt 12pt; }
+    .callout { padding: 8pt 10pt; }
+
+    /* Ensure backgrounds and colors print */
+    .section-label,
+    .pill,
+    .renewal-badge,
+    .fleet-logo-mark,
+    .ticket-stripe-bar,
+    .topo-role-tag,
+    .step-owner,
+    .callout,
+    .cadence-highlight,
+    .topo-block { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Fleet Banner -->
+<div class="fleet-banner">
+  <div class="fleet-banner-inner">
+    <div class="fleet-logo">
+      <div class="fleet-logo-mark">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <rect x="2" y="2" width="5" height="5" rx="1" fill="white"/>
+          <rect x="9" y="2" width="5" height="5" rx="1" fill="white" opacity="0.7"/>
+          <rect x="2" y="9" width="5" height="5" rx="1" fill="white" opacity="0.7"/>
+          <rect x="9" y="9" width="5" height="5" rx="1" fill="white" opacity="0.4"/>
+        </svg>
+      </div>
+      <div>
+        <div class="fleet-org">ORG_NAME</div>
+        <div class="fleet-date">Couchbase Support · REPORT_DATE</div>
+      </div>
+    </div>
+
+    <div class="fleet-divider"></div>
+
+    <div class="fleet-stats">
+      <div class="fleet-stat crit">
+        <span class="fleet-stat-val">1</span>
+        <span class="fleet-stat-lbl">P1 (was)</span>
+      </div>
+      <div class="fleet-stat warn">
+        <span class="fleet-stat-val">1</span>
+        <span class="fleet-stat-lbl">P3 Active</span>
+      </div>
+      <div class="fleet-stat neutral">
+        <span class="fleet-stat-val">3</span>
+        <span class="fleet-stat-lbl">P4 Active</span>
+      </div>
+      <div class="fleet-stat good">
+        <span class="fleet-stat-val">1</span>
+        <span class="fleet-stat-lbl">Resolved/Close</span>
+      </div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:4px; margin-left: 8px;">
+      <span class="renewal-badge">⚠ Critical Renewal</span>
+    </div>
+
+    <div class="fleet-contacts">
+      <strong>AE:</strong> AE_NAME · AE_EMAIL<br>
+      <strong>TSE:</strong> TSE_NAME · <strong>Principal SE:</strong> PSE_NAME
+    </div>
+  </div>
+</div>
+
+<!-- Page Body -->
+<div class="page">
+
+  <div class="page-header">
+    <div>
+      <div class="page-title">Support Status Report — ORG_NAME</div>
+      <div class="page-subtitle">5 active tickets across 6 Capella clusters · all CB 7.6.3</div>
+    </div>
+    <div class="prepared-by">
+      <strong>Prepared by</strong><br>
+      PSE_NAME<br>
+      Couchbase Field Engineering
+    </div>
+  </div>
+
+  <!-- ── ACTIVE TICKETS ── -->
+  <div class="section-label no-break">Active Tickets — by Priority</div>
+
+  <!-- #79105 -->
+  <div class="ticket-card">
+    <div class="ticket-stripe">
+      <div class="ticket-stripe-bar stripe-warn"></div>
+      <div class="ticket-body">
+        <div class="ticket-head">
+          <span class="ticket-id">#79105</span>
+          <span class="ticket-title">Capella OS Upgrade — N1QL Connectivity / NLB Timeout</span>
+          <div class="ticket-pills">
+            <span class="pill pill-cb">P1 → P3</span>
+            <span class="pill pill-warn">Pending Docs</span>
+          </div>
+        </div>
+
+        <div class="ticket-meta">
+          <span class="ticket-meta-item">Opened <strong>Jun 25</strong></span>
+          <span class="ticket-meta-item">Assignee <strong>TSE_NAME</strong></span>
+          <span class="ticket-meta-item">Area <strong>Capella OS Upgrade</strong></span>
+          <span class="ticket-meta-item">Escalation <strong>ESC-3538</strong></span>
+          <span class="ticket-meta-item">CBSE <strong>CBSE-23153</strong></span>
+          <span class="ticket-meta-item">Jira <strong style="font-family: var(--mono);">AV-135643</strong></span>
+        </div>
+
+        <div class="topo-block">
+          <div class="topo-label">Affected Clusters</div>
+          <div class="topo-clusters">
+            <div class="topo-cluster">
+              <div>
+                <div class="topo-cluster-name">WUIB-PROD</div>
+                <div style="margin-top:3px;"><span class="topo-role-tag">Production</span></div>
+              </div>
+              <div class="topo-kv"><span class="topo-k">CB Version</span><span class="topo-v">7.6.3</span></div>
+              <div class="topo-kv"><span class="topo-k">Platform</span><span class="topo-v">Capella</span></div>
+              <div class="topo-kv"><span class="topo-k">Services</span><span class="topo-v">Data · Query · Index</span></div>
+              <div class="topo-kv"><span class="topo-k">Impact</span><span class="topo-v">N1QL unreachable</span></div>
+            </div>
+            <div class="topo-cluster">
+              <div>
+                <div class="topo-cluster-name">Bill-Payment-Prod-DR</div>
+                <div style="margin-top:3px;"><span class="topo-role-tag dr">DR</span></div>
+              </div>
+              <div class="topo-kv"><span class="topo-k">CB Version</span><span class="topo-v">7.6.3</span></div>
+              <div class="topo-kv"><span class="topo-k">Platform</span><span class="topo-v">Capella</span></div>
+              <div class="topo-kv"><span class="topo-k">Services</span><span class="topo-v">Data · Query · Index</span></div>
+              <div class="topo-kv"><span class="topo-k">Impact</span><span class="topo-v">NLB stale entries</span></div>
+            </div>
+            <div class="topo-cluster">
+              <div>
+                <div class="topo-cluster-name">Digital-Payments-Prod-DR</div>
+                <div style="margin-top:3px;"><span class="topo-role-tag dr">DR</span></div>
+              </div>
+              <div class="topo-kv"><span class="topo-k">CB Version</span><span class="topo-v">7.6.3</span></div>
+              <div class="topo-kv"><span class="topo-k">Platform</span><span class="topo-v">Capella</span></div>
+              <div class="topo-kv"><span class="topo-k">Services</span><span class="topo-v">Data · Query · Index</span></div>
+              <div class="topo-kv"><span class="topo-k">Impact</span><span class="topo-v">NLB stale entries</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ticket-narrative">
+          <p><strong>Root Cause:</strong> After an OS patch swap-rebalance, decommissioned nodes were not drained from the AWS Network Load Balancer target group for port 18093 (N1QL). The NLB continued routing ~⅓ of queries to the stale, unhealthy nodes — causing connection resets and timeouts for all services connecting via the NLB endpoint.</p>
+          <p><strong>Resolution:</strong> Couchbase Capella engineering applied a backend fix on Jun 29 to flush the stale NLB target group entries. WU confirmed N1QL connectivity restored. <strong>Ticket remains open</strong> pending CB documentation of the fix procedure — WU requires this before their next OS upgrade cycle can proceed.</p>
+        </div>
+
+        <div class="cadence-highlight">
+          <div class="cadence-title">Response Cadence Highlight</div>
+          <div class="cadence-stats">
+            <div class="cadence-stat">
+              <span class="cadence-stat-val">&lt;10 min</span>
+              <span class="cadence-stat-lbl">First CB response</span>
+            </div>
+            <div class="cadence-stat">
+              <span class="cadence-stat-val">16</span>
+              <span class="cadence-stat-lbl">Exchanges in first 12h</span>
+            </div>
+            <div class="cadence-stat">
+              <span class="cadence-stat-val">4 days</span>
+              <span class="cadence-stat-lbl">Open → root cause</span>
+            </div>
+            <div class="cadence-stat">
+              <span class="cadence-stat-val">ESC-3538</span>
+              <span class="cadence-stat-lbl">Escalation raised</span>
+            </div>
+          </div>
+          <div class="cadence-note">CB engineers maintained sub-hour response gaps throughout the critical period (Jun 25–26). ESC-3538 raised to engage Capella engineering directly. Fix deployed Jun 29, 4 days after open.</div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- #78641 -->
+  <div class="ticket-card">
+    <div class="ticket-stripe">
+      <div class="ticket-stripe-bar stripe-warn"></div>
+      <div class="ticket-body">
+        <div class="ticket-head">
+          <span class="ticket-id">#78641</span>
+          <span class="ticket-title">Full Backup Failing — bucket bdp_variabledata (Recurring)</span>
+          <div class="ticket-pills">
+            <span class="pill pill-warn">P3</span>
+            <span class="pill pill-warn">Near Archive</span>
+          </div>
+        </div>
+
+        <div class="ticket-meta">
+          <span class="ticket-meta-item">Opened <strong>Jun 6</strong></span>
+          <span class="ticket-meta-item">Assignee <strong>TSE_NAME</strong></span>
+          <span class="ticket-meta-item">Area <strong>Capella Backup / Restore</strong></span>
+          <span class="ticket-meta-item">Last WU reply <strong>Jun 8</strong></span>
+        </div>
+
+        <div class="topo-block">
+          <div class="topo-label">Cluster</div>
+          <div class="topo-clusters">
+            <div class="topo-cluster">
+              <div>
+                <div class="topo-cluster-name">Compute-Service-Magma-Prod</div>
+                <div style="margin-top:3px;"><span class="topo-role-tag">Production</span></div>
+              </div>
+              <div class="topo-kv"><span class="topo-k">CB Version</span><span class="topo-v">7.6.3</span></div>
+              <div class="topo-kv"><span class="topo-k">Data Nodes</span><span class="topo-v">9 (svc-d)</span></div>
+              <div class="topo-kv"><span class="topo-k">Backup Node</span><span class="topo-v">m5.2xlarge · 4595 GB disk</span></div>
+              <div class="topo-kv"><span class="topo-k">Bucket Size</span><span class="topo-v">~3.94 TB (bdp_variabledata)</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ticket-narrative">
+          <p><strong>Root Cause:</strong> The backup node disk (originally 4095 GB) was insufficient for the 3.94 TB <code>bdp_variabledata</code> bucket full backup cycle, producing a <em>database or disk is full</em> error. Guna expanded the backup node disk to 4595 GB on Jun 6 and confirmed completion Jun 8.</p>
+          <p><strong>Current situation:</strong> Backups are completing, but <code>bdp_variabledata</code> remains very slow (often stalls near 99.52% for hours) and cascades backup delays to five other buckets (<code>accountentity</code>, <code>customerentity</code>, <code>rmocache</code>, <code>mustang_kafka_retry</code>, <code>sessionentity</code>). RCA sent to WU on Jun 23 — <strong>no response received</strong>. Auto-archive warning sent Jun 29; archive occurs in ~3 days.</p>
+        </div>
+
+        <div class="callout callout-warn">
+          <span class="callout-icon">⚠</span>
+          <div class="callout-body"><strong>Action needed from WU:</strong> Please confirm RCA receipt and advise whether you'd like Couchbase to investigate the ongoing backup stall pattern further. Without a response, this ticket will auto-archive on ~Jul 2.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- #78964 -->
+  <div class="ticket-card">
+    <div class="ticket-stripe">
+      <div class="ticket-stripe-bar stripe-p4"></div>
+      <div class="ticket-body">
+        <div class="ticket-head">
+          <span class="ticket-id">#78964</span>
+          <span class="ticket-title">Query Timeout — UnambiguousTimeoutException (Workflow_Manager)</span>
+          <div class="ticket-pills">
+            <span class="pill pill-neutral">P4</span>
+            <span class="pill pill-neutral">Analysis Delivered</span>
+          </div>
+        </div>
+
+        <div class="ticket-meta">
+          <span class="ticket-meta-item">Opened <strong>Jun 19</strong></span>
+          <span class="ticket-meta-item">Assignee <strong>Ramya Bhaskar</strong></span>
+          <span class="ticket-meta-item">Area <strong>Server · Data Service</strong></span>
+          <span class="ticket-meta-item">Last update <strong>Jun 29</strong></span>
+        </div>
+
+        <div class="topo-block">
+          <div class="topo-label">Cluster — iWatchX / Workflow_Manager</div>
+          <div class="topo-clusters">
+            <div class="topo-cluster">
+              <div>
+                <div class="topo-cluster-name" style="font-size:10px; color: var(--text-2);">f7885917-505d…</div>
+                <div style="margin-top:3px;"><span class="topo-role-tag">Production</span></div>
+              </div>
+              <div class="topo-kv"><span class="topo-k">CB Version</span><span class="topo-v">7.6.3-4211</span></div>
+              <div class="topo-kv"><span class="topo-k">Nodes</span><span class="topo-v">9 (3D / 3Q / 3I)</span></div>
+              <div class="topo-kv"><span class="topo-k">RAM / CPU</span><span class="topo-v">32 GB · 8 vCPU/node</span></div>
+              <div class="topo-kv"><span class="topo-k">Indexes</span><span class="topo-v">346 GSI</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ticket-narrative">
+          <p><strong>Event window:</strong> Jun 19, 4:35–5:05 PM ET. Observed 900–1000 disk read IOPS spike, elevated write IOPS and write queue depth.</p>
+          <p><strong>Root Cause (Ramya's analysis, Jun 29):</strong> A query scanning 1.25 million index entries then fetching 1.25 million full documents (696 MB RAM) to return only 40 results hit the 75-second query timeout. This coincided with heavy concurrent compaction across large buckets plus XDCR pipeline connection errors adding background strain.</p>
+          <p><strong>Recommendation:</strong> The query is severely unoptimized — index selection is working but the fetch phase is doing full-document retrieval where a covering index would eliminate it. Ramya has referred this to <strong>Professional Services</strong> for query and index design review, and notified AM AE_NAME to coordinate engagement.</p>
+        </div>
+
+        <div class="callout callout-info">
+          <span class="callout-icon">ℹ</span>
+          <div class="callout-body"><strong>WU to confirm:</strong> Are timeouts still occurring? Is this a new pattern starting Jun 18 or recurring? Ramya is awaiting confirmation before determining whether to close.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- #78970 -->
+  <div class="ticket-card">
+    <div class="ticket-stripe">
+      <div class="ticket-stripe-bar stripe-good"></div>
+      <div class="ticket-body">
+        <div class="ticket-head">
+          <span class="ticket-id">#78970</span>
+          <span class="ticket-title">Proactive: Scheduled Backup Failed — bucket CustomerProfile</span>
+          <div class="ticket-pills">
+            <span class="pill pill-neutral">P4</span>
+            <span class="pill pill-good">Resolved</span>
+            <span class="pill pill-warn">Archive Imminent</span>
+          </div>
+        </div>
+
+        <div class="ticket-meta">
+          <span class="ticket-meta-item">Opened <strong>Jun 21</strong></span>
+          <span class="ticket-meta-item">Assignee <strong>Pavvan Pradeep</strong></span>
+          <span class="ticket-meta-item">Area <strong>Capella Backup / Restore</strong></span>
+          <span class="ticket-meta-item">Entitlement <strong>Developer Pro</strong></span>
+        </div>
+
+        <div class="topo-block">
+          <div class="topo-label">Cluster</div>
+          <div class="topo-clusters">
+            <div class="topo-cluster">
+              <div>
+                <div class="topo-cluster-name">Pharos-UAT</div>
+                <div style="margin-top:3px;"><span class="topo-role-tag dr">UAT</span></div>
+              </div>
+              <div class="topo-kv"><span class="topo-k">CB Version</span><span class="topo-v">7.6.3</span></div>
+              <div class="topo-kv"><span class="topo-k">Bucket</span><span class="topo-v">CustomerProfile</span></div>
+              <div class="topo-kv"><span class="topo-k">Bucket Quota</span><span class="topo-v">200 MB/node</span></div>
+              <div class="topo-kv"><span class="topo-k">Error</span><span class="topo-v">ETMPFAIL (vBucket 877)</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ticket-narrative">
+          <p><strong>Root Cause:</strong> Transient <code>ETMPFAIL</code> (temporary vBucket failure) on the backup DCP stream — a known intermittent issue in CB 7.6.3. CB 7.6.6 includes a retry improvement (MB-64077) that handles this automatically.</p>
+          <p><strong>Resolution:</strong> Pavvan triggered a manual backup retry which completed successfully (Jun 21). <strong>Recommendations issued:</strong> increase CustomerProfile memory quota above 200 MB/node; plan upgrade path to CB 7.6.6 to prevent recurrence. No response from WU since Jun 21 — ticket auto-archives today.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- #78807 -->
+  <div class="ticket-card">
+    <div class="ticket-stripe">
+      <div class="ticket-stripe-bar stripe-good"></div>
+      <div class="ticket-body">
+        <div class="ticket-head">
+          <span class="ticket-id">#78807</span>
+          <span class="ticket-title">Mandatory Maintenance Upgrade — Track-A-Transfer Prod-DR</span>
+          <div class="ticket-pills">
+            <span class="pill pill-neutral">P4</span>
+            <span class="pill pill-good">Upgrade Complete</span>
+            <span class="pill pill-warn">Needs Close</span>
+          </div>
+        </div>
+
+        <div class="ticket-meta">
+          <span class="ticket-meta-item">Opened <strong>Jun 14</strong></span>
+          <span class="ticket-meta-item">Assignee <strong>Manoj Kumar Pamulapati</strong></span>
+          <span class="ticket-meta-item">Area <strong>Capella Maintenance</strong></span>
+          <span class="ticket-meta-item">WU Confirmed Close <strong>Jun 28</strong></span>
+        </div>
+
+        <div class="topo-block">
+          <div class="topo-label">Cluster</div>
+          <div class="topo-clusters">
+            <div class="topo-cluster">
+              <div>
+                <div class="topo-cluster-name">Track-A-Transfer Prod-DR</div>
+                <div style="margin-top:3px;"><span class="topo-role-tag dr">DR</span></div>
+              </div>
+              <div class="topo-kv"><span class="topo-k">CB Version</span><span class="topo-v">7.6.3</span></div>
+              <div class="topo-kv"><span class="topo-k">Platform</span><span class="topo-v">Capella Enterprise</span></div>
+              <div class="topo-kv"><span class="topo-k">Upgrade Duration</span><span class="topo-v">~21 hours</span></div>
+              <div class="topo-kv"><span class="topo-k">Status</span><span class="topo-v">✓ Healthy</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ticket-narrative">
+          <p><strong>Summary:</strong> Mandatory Capella OS upgrade on Track-A-Transfer Prod-DR completed Jun 15. Initial delay was caused by a faulty kernel (6.17.0-1007-aws; AV-133015) in the original image — Manoj corrected the image to <code>couchbase-cloud-server-7.6.3-4211-arm64-v1.0.101</code> and the upgrade finished without data impact. WU confirmed the cluster is healthy on Jun 16 and requested closure on Jun 28.</p>
+        </div>
+
+        <div class="callout callout-good">
+          <span class="callout-icon">✓</span>
+          <div class="callout-body"><strong>No further action from WU required.</strong> CB to close ticket and complete mandatory resolution fields.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── ESCALATION & ENGINEERING TRACKING ── -->
+  <div class="section-label">Escalation &amp; Engineering Tracking</div>
+
+  <div class="ticket-card">
+    <div class="ticket-body" style="padding-top: 14px; padding-bottom: 14px;">
+      <div class="esc-table-wrap">
+        <table class="esc-table">
+          <thead>
+            <tr>
+              <th>Ticket</th>
+              <th>ESC / CBSE</th>
+              <th>Jira Tracking</th>
+              <th>Trigger / Issue</th>
+              <th>Outcome</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!--
+              One row per ticket that has an ESC, CBSE, or Jira (AV-/MB-/etc.) reference.
+              Omit tickets with no engineering/escalation tracking — don't pad this table.
+              ESC_ID / CBSE_ID: structured fields from the ticket (escalations / cbses).
+              JIRA_ID: search ticket comments for AV-/MB-/CBSE- patterns — these are often only
+              mentioned in free text, not in structured fields.
+            -->
+            <tr>
+              <td>TICKET_ID_1</td>
+              <td>ESC_ID_1<br><span style="font-size:10px; color: var(--text-3);">CBSE_ID_1</span></td>
+              <td><a href="https://jira.issues.couchbase.com/browse/JIRA_ID_1" style="color: var(--cb); font-family: var(--mono); font-size: 11px; text-decoration: none;">JIRA_ID_1</a></td>
+              <td>TRIGGER_DESCRIPTION_1</td>
+              <td>OUTCOME_DESCRIPTION_1</td>
+              <td><span class="pill pill-warn" style="font-size:10px;">STATUS_LABEL_1</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── RECOMMENDED NEXT STEPS ── -->
+  <div class="section-label">Recommended Next Steps</div>
+
+  <div class="next-steps">
+    <div class="next-steps-title">Action Items</div>
+
+    <div class="next-step">
+      <span class="step-owner cb">CB</span>
+      <div class="step-body"><strong>#79105 — Produce OS Upgrade procedure documentation.</strong> WU cannot proceed with their next OS upgrade cycle until CB documents what changed in the NLB target group flush. TSE_NAME to coordinate with Capella Engineering for a written runbook or KB article.</div>
+    </div>
+
+    <div class="next-step">
+      <span class="step-owner wu">WU</span>
+      <div class="step-body"><strong>#78641 — Respond to RCA (sent Jun 23).</strong> Confirm receipt and advise whether the recurring <code>bdp_variabledata</code> backup stall pattern (~99.52% stall with cascading delays) warrants further investigation before ticket archives ~Jul 2.</div>
+    </div>
+
+    <div class="next-step">
+      <span class="step-owner wu">WU</span>
+      <div class="step-body"><strong>#78964 — Confirm timeout status.</strong> Ramya needs to know whether query timeouts are still occurring post-Jun-19. If recurrent, Professional Services engagement for query/index optimization is strongly recommended — the query pulling 1.25M documents to return 40 results is a significant performance risk.</div>
+    </div>
+
+    <div class="next-step">
+      <span class="step-owner both">CB + WU</span>
+      <div class="step-body"><strong>#78970 — Plan upgrade to CB 7.6.6 (Pharos-UAT).</strong> MB-64077 in 7.6.6 adds automatic retries for ETMPFAIL during backups, eliminating this class of failure on CustomerProfile. Consider pairing with a memory quota increase (&gt;200 MB/node).</div>
+    </div>
+
+    <div class="next-step">
+      <span class="step-owner cb">CB</span>
+      <div class="step-body"><strong>#78807 — Close ticket.</strong> WU confirmed resolution and requested close on Jun 28. CB to complete resolution/root-cause fields and mark solved.</div>
+    </div>
+
+  </div>
+
+</div>
+</body>
+</html>

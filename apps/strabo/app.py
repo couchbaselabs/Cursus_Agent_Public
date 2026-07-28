@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Couchbase Supportal Scraper — NiceGUI App
-==========================================
-Single script replacing all previous scraper versions.
+Strabo — Couchbase Supportal Explorer
+======================================
+Multi-tab dashboard for scraping, analysing, and chatting with support data.
 
 Auth modes:
   1. Cookie paste  — copy the Cookie header from browser DevTools, paste here.
@@ -11,11 +11,11 @@ Auth modes:
                      then scrapes headlessly with the saved session.
 
 Usage:
-  ./venv/bin/python supportal_nicegui_app.py
+  ./venv/bin/python run_strabo.py
   # then open http://localhost:8765 in your browser
 """
 
-__version__ = "1.3.8"
+__version__ = "2.7.65"
 
 import asyncio
 import threading
@@ -37,7 +37,184 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 from nicegui import run, ui
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+import subprocess
+
+# When imported as a library (e.g. by the unified app), skip NiceGUI page
+# registration so the importing app's routes are not overwritten.
+_LIBRARY_MODE = os.environ.get("STRABO_LIBRARY_MODE") == "1"
+
+# ── Extracted modules ─────────────────────────────────────────────────────────
+from supportal.prompts import (
+    SYSTEM_PROMPT_TEMPLATE,
+    CLASSIFY_PROMPT,
+    EXTRACT_PROMPT,
+    RERANK_PROMPT,
+    CRITIQUE_PROMPT,
+    SCORING_SYSTEM_PROMPT,
+    _SUMMARY_SYSTEM,
+    _SUMMARY_PROMPT_TMPL,
+)
+from supportal.llm_providers import (
+    fetch_ollama_models,
+    fetch_openai_compat_models,
+    _THINKING_MODEL_PATTERNS,
+    _model_has_thinking_by_name,
+    fetch_ollama_model_info,
+    _parse_num_ctx_from_params,
+    poll_ollama_ps,
+    poll_lmstudio_model_info,
+    lmstudio_load_model,
+    lmstudio_ensure_model_loaded,
+)
+from supportal.constants import BASE_URL, UA, TICKET_HREF_RE, SETTINGS_FILE, COOKIES_FILE, PROFILE_DIR
+from supportal.ticket_parser import (
+    _find_label_value,
+    _DATE_RE,
+    _guess_author_from_text,
+    _extract_comments,
+    _extract_all_dl_fields,
+    _extract_named_section,
+    _normalize_field_key,
+    parse_ticket_detail,
+    _is_deleted_api_ticket,
+    parse_ticket_from_api,
+    _STATUS_MAP,
+    _extract_ticket_links,
+    _extract_ticket_rows,
+    _resolve_customer_input,
+    _normalize_customer_url,
+    _find_customer_url_in_search,
+)
+from supportal.api_client import (
+    _make_api_session,
+    query_supportal_analytics,
+    fetch_snapshots_via_analytics,
+    fetch_ticket_api,
+    _get_customer_ticket_listing_api,
+    _get_customer_snapshot_listing_api,
+    search_customers_on_supportal,
+    search_customers_via_analytics,
+    resolve_customer_name,
+    _find_tickets_tab_url,
+)
+from supportal.snapshot_parser import (
+    _UUID_RE,
+    _SNAP_ID_RE,
+    _SNAP_HREF_RE,
+    _SNAP_DEBUG_DIR,
+    _topo_str,
+    _highest_snap_id,
+    extract_cluster_snapshot_info,
+    _normalize_checker_name,
+    _parse_snapshot_checker_text,
+    _write_snap_debug,
+    _parse_structured_api_json,
+    fetch_snapshot_topology_api,
+    fetch_snapshot_topology,
+    enrich_tickets_with_snapshots,
+    _find_snapshots_tab_url,
+    _extract_snapshot_rows,
+    scrape_snapshots_from_stubs,
+    scrape_snapshots_for_customer,
+)
+from supportal.ticket_parser import _extract_ticket_ids, _parse_ticket_fields
+from supportal.scoring import (
+    _openai_base_url,
+    _tls_openai,
+    _get_openai_client,
+    _APP_CLUSTER_ALIASES_SEED,
+    _cluster_app_dynamic,
+    _app_cluster_dynamic,
+    _get_cluster_to_app,
+    _get_app_cluster_aliases,
+    _FOLLOWUP_TRIGGERS,
+    call_llm,
+    rewrite_query_for_retrieval,
+    _ticket_date,
+    _parse_ticket_date,
+    _ticket_cluster_ids,
+    build_dataset_stats,
+    prefilter_for_query,
+    compute_aggregations,
+    build_rag_context,
+    classify_query,
+    extract_ticket_fields,
+    rerank_tickets,
+    self_critique_answer,
+    run_deep_reasoning,
+    _build_memory_section,
+    contextualize_question,
+    chat_batch_map_reduce,
+)
+from supportal.cb_helpers import (
+    _cb_conn_str,
+    _cb_kv_get_multi,
+    search_orgs_from_cb,
+    load_tickets_for_orgs_from_cb,
+    load_tickets_from_cb,
+    fetch_tickets_by_keys,
+    _make_snap_col,
+    load_to_couchbase,
+    build_embed_text,
+    build_snapshot_embed_text,
+    embed_text_ollama,
+    embed_text,
+    embed_all_snapshots,
+    embed_all_tickets,
+    migrate_ticket_fields_in_cb,
+    create_vector_index,
+    vector_search_cb,
+    _snap_keys_to_ticket_keys,
+    fts_keyword_search_cb,
+    _load_cluster_app_map,
+    _KEYWORD_STOPWORDS,
+    build_structured_query,
+    structured_search_cb,
+    tool_query_tickets,
+    search_tickets_retrieve_rerank,
+    snapshot_topology_search,
+    fetch_snapshots_for_clusters,
+    reciprocal_rank_fusion,
+    hybrid_retrieval,
+    _mlx_emb_cache,
+)
+from supportal.agent_tools import (
+    _AGENT_TOOLS,
+    _SUPPORTAL_TICKET_URL,
+    _SUPPORTAL_CUSTOMER_URL,
+    _ARTIFACT_RE,
+    _CODE_ASSET_RE,
+    _ASSET_MIME,
+    _ASSET_ICONS,
+    _build_agent_echart_option,
+    _agent_filters_from_args,
+    _extract_text_tool_calls,
+    _normalise_tool_args,
+    call_llm_with_tools,
+    _classify_agent_error,
+    _generate_followup_suggestions,
+    _canonical_priority,
+    _compute_health_score,
+    _compute_sla_compliance,
+    _get_digest,
+    _save_query_to_cb,
+    _list_saved_queries,
+    _tag_ticket_in_cb,
+    _generate_customer_report,
+    _make_asset_thumbnail,
+    _ensure_assets_collection,
+    _save_asset_to_cb,
+    _list_assets_from_cb,
+    _get_asset_content_from_cb,
+    _delete_asset_from_cb,
+    _fleet_query,
+    _query_fleet_tickets,
+    _list_at_risk_clusters,
+    _fleet_version_distribution,
+    _fleet_cbse_impact,
+    _compute_health_score_with_cluster,
+)
+from supportal.prompts import build_agent_system_prompt
 
 
 def _safe_notify(client, message: str, type: str = "info") -> None:  # noqa: A002
@@ -55,37 +232,6 @@ def _safe_notify(client, message: str, type: str = "info") -> None:  # noqa: A00
         pass
 
 
-def _run_in_playwright_thread(fn, *args, timeout: int = 90, **kwargs):
-    """
-    Run fn(*args, **kwargs) in a brand-new daemon thread and return its result.
-
-    Playwright's sync_api uses greenlets to bridge sync↔async.  When called
-    from a thread-pool thread (e.g. via asyncio run_in_executor / NiceGUI
-    run.io_bound), the greenlet switch-back targets whichever pool thread
-    started the playwright context.  If that thread is later reused for a
-    different task, the original greenlet's thread appears "exited" and
-    Playwright raises "cannot switch to a different thread".
-
-    Spawning a fresh thread for every playwright call sidesteps reuse entirely.
-    """
-    import queue
-    q: queue.Queue = queue.Queue()
-
-    def _target():
-        try:
-            q.put((True, fn(*args, **kwargs)))
-        except BaseException as exc:       # noqa: BLE001
-            q.put((False, exc))
-
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        raise TimeoutError(f"_run_in_playwright_thread: {fn.__name__} timed out after {timeout}s")
-    ok, val = q.get_nowait()
-    if not ok:
-        raise val
-    return val
 
 
 # Optional — Couchbase SDK (Phase 1 + 2).  Import lazily so the app starts
@@ -164,155 +310,7 @@ class CbConfig:
     snap_collection: str = "snapshots"
 
 
-def fetch_ollama_models(base_url: str) -> list[str]:
-    """Fetch available model names from a running Ollama instance."""
-    try:
-        resp = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=10, verify=False)
-        resp.raise_for_status()
-        return sorted(m["name"] for m in resp.json().get("models", []))
-    except Exception as exc:
-        raise RuntimeError(f"Could not reach Ollama at {base_url}: {exc}") from exc
-
-
-def fetch_openai_compat_models(base_url: str, api_key: str = "") -> list[str]:
-    """Fetch available model IDs from an OpenAI-compatible endpoint (LMStudio, OpenAI, etc.)."""
-    try:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        url = base_url.rstrip("/")
-        if not url.endswith("/v1"):
-            url += "/v1"
-        resp = requests.get(f"{url}/models", headers=headers, timeout=10, verify=False)
-        resp.raise_for_status()
-        return sorted(m["id"] for m in resp.json().get("data", []))
-    except Exception as exc:
-        raise RuntimeError(f"Could not fetch models from {base_url}: {exc}") from exc
-
-
-# Model name fragments that indicate thinking/reasoning capability.
-# Used as fallback when the provider doesn't report capabilities explicitly.
-_THINKING_MODEL_PATTERNS = ["qwen3", "qwq", "deepseek-r1", "deepseek-r2", "o1-", "o3-"]
-
-
-def _model_has_thinking_by_name(model: str) -> bool:
-    name = model.lower()
-    return any(p in name for p in _THINKING_MODEL_PATTERNS)
-
-
-def fetch_ollama_model_info(base_url: str, model: str) -> dict:
-    """Return /api/show details for a model.
-
-    Returned dict keys:
-      num_ctx   – int or None (native context window)
-      thinking  – bool (model supports thinking/reasoning mode)
-      caps      – list[str] (raw capabilities from Ollama, e.g. ['completion','thinking'])
-    """
-    try:
-        resp = requests.post(
-            f"{base_url.rstrip('/')}/api/show",
-            json={"name": model},
-            timeout=15,
-            verify=False,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        # num_ctx: model_info (newer Ollama) or parameters string (older)
-        info   = data.get("model_info", {})
-        params = data.get("parameters", "")
-        num_ctx = (
-            info.get("llama.context_length")
-            or info.get("context_length")
-            or _parse_num_ctx_from_params(params)
-        )
-        # capabilities: Ollama >= 0.6 returns a list e.g. ["completion", "thinking", "tools"]
-        caps     = data.get("capabilities", [])
-        thinking = "thinking" in caps or _model_has_thinking_by_name(model)
-        return {
-            "num_ctx":  int(num_ctx) if num_ctx else None,
-            "thinking": thinking,
-            "caps":     caps,
-        }
-    except Exception as exc:
-        return {
-            "num_ctx":  None,
-            "thinking": _model_has_thinking_by_name(model),  # best-effort fallback
-            "caps":     [],
-            "error":    str(exc),
-        }
-
-
-def _parse_num_ctx_from_params(params: str) -> int | None:
-    """Parse num_ctx from Ollama's parameters string (e.g. 'num_ctx 131072\\n...')."""
-    for line in (params or "").splitlines():
-        parts = line.strip().split()
-        if len(parts) == 2 and parts[0] == "num_ctx":
-            try:
-                return int(parts[1])
-            except ValueError:
-                pass
-    return None
-
-
-def poll_ollama_ps(base_url: str) -> dict:
-    """Return Ollama /api/ps payload (models currently loaded in memory)."""
-    try:
-        resp = requests.get(f"{base_url.rstrip('/')}/api/ps", timeout=3, verify=False)
-        return resp.json()
-    except Exception:
-        return {}
-
-
-def poll_lmstudio_model_info(base_url: str) -> dict:
-    """Query LMStudio's extended API for loaded model info.
-
-    Tries /api/v0/models first (LMStudio ≥0.3), falls back to /v1/models.
-    Returns a dict with keys:
-      models          : list of model info dicts
-      n_parallel      : parallel request count if exposed (None if not)
-      context_length  : context length of first loaded embedding model (None if unknown)
-      api_version     : "v0" | "v1" | None
-    """
-    base = base_url.rstrip("/")
-    result: dict = {"models": [], "n_parallel": None, "context_length": None, "api_version": None}
-
-    # Try extended API first — exposes more fields
-    try:
-        resp = requests.get(f"{base}/api/v0/models", timeout=4, verify=False)
-        if resp.ok:
-            data = resp.json().get("data", [])
-            result["models"]      = data
-            result["api_version"] = "v0"
-            for m in data:
-                # LMStudio may expose n_parallel or num_parallel in model config
-                for key in ("n_parallel", "num_parallel", "parallel_requests",
-                            "concurrent_requests", "max_parallel"):
-                    if m.get(key) is not None:
-                        result["n_parallel"] = int(m[key])
-                        break
-                # Grab context length from first loaded embedding model
-                state = m.get("state", "")
-                mtype = m.get("type", "")
-                if result["context_length"] is None and state == "loaded":
-                    for ctx_key in ("context_length", "max_context_length",
-                                    "ctx_length", "n_ctx"):
-                        if m.get(ctx_key):
-                            result["context_length"] = int(m[ctx_key])
-                            break
-            return result
-    except Exception:
-        pass
-
-    # Fallback: standard OpenAI-compat /v1/models
-    try:
-        resp = requests.get(f"{base}/v1/models", timeout=4, verify=False)
-        if resp.ok:
-            result["models"]      = resp.json().get("data", [])
-            result["api_version"] = "v1"
-    except Exception:
-        pass
-
-    return result
-
-
+# (moved to supportal/ package, imported at top of file)
 # ── RAG chat cache helpers ────────────────────────────────────────────────────
 
 def _chat_cache_key(prefix: str, *parts: str) -> str:
@@ -783,12 +781,15 @@ def fetch_ticket_signals_from_cb(
     cb_url: str, bucket: str, username: str, password: str, use_tls: bool,
     scope: str, collection: str,
 ) -> dict[str, dict]:
-    """Return {ticket_id: {status, solved, is_stub}} for all stored tickets.
+    """Return {ticket_id: {status, solved, priority, last_scraped_at, is_stub,
+    has_score, has_embedding, sfdc_matched, _deleted}} for all stored tickets.
 
-    Used for change detection: if a ticket's status or solved date differs
-    from the listing page, it is re-scraped even though the ID already exists.
-    is_stub=True when the stored record has no requester (detail page was never
-    successfully scraped) so it is re-scraped on the next incremental run.
+    Extended signals power the smart_refresh diff:
+      - priority:        detect priority escalations from the listing
+      - last_scraped_at: proxy for updated_at (Supportal listing has no updated_at)
+      - has_score:       enrichment gap — ticket needs LLM scoring
+      - has_embedding:   enrichment gap — ticket needs vector embedding
+      - sfdc_matched:    enrichment gap — SFDC correlation never run
     """
     if not _CB_AVAILABLE:
         return {}
@@ -798,44 +799,121 @@ def fetch_ticket_signals_from_cb(
         cluster.wait_until_ready(timedelta(seconds=15))
         keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
         rows = list(cluster.query(
-            f"SELECT META(t).id AS doc_id, t.status, t.solved, t.requester, t.`_deleted` "
+            f"SELECT META(t).id AS doc_id, t.status, t.solved, t.priority, "
+            f"t.last_scraped_at, t.requester, t.`_deleted`, "
+            f"(t.score IS NOT MISSING AND t.score IS NOT NULL) AS has_score, "
+            f"(t.embedding IS NOT MISSING AND t.embedding IS NOT NULL) AS has_embedding, "
+            f"t.sfdc_matched "
             f"FROM {keyspace} AS t WHERE META(t).id LIKE 'ticket::%'",
             QueryOptions(timeout=timedelta(seconds=30)),
         ))
         cluster.close()
+        _now = time.time()
         signals: dict[str, dict] = {}
         for row in rows:
             tid = str(row.get("doc_id", "")).split("::")[-1]
             if tid:
+                lsa = row.get("last_scraped_at") or 0
                 signals[tid] = {
-                    "status":   row.get("status"),
-                    "solved":   row.get("solved"),
-                    "is_stub":  not row.get("requester") and not row.get("_deleted"),
-                    "_deleted": bool(row.get("_deleted")),
+                    "status":          row.get("status"),
+                    "solved":          row.get("solved"),
+                    "priority":        (row.get("priority") or "").lower().strip(),
+                    "last_scraped_at": lsa,
+                    "age_hours":       (_now - lsa) / 3600 if lsa else None,
+                    "is_stub":         not row.get("requester") and not row.get("_deleted"),
+                    "has_score":       bool(row.get("has_score")),
+                    "has_embedding":   bool(row.get("has_embedding")),
+                    "sfdc_matched":    row.get("sfdc_matched"),  # None = never run
+                    "_deleted":        bool(row.get("_deleted")),
                 }
         return signals
     except Exception:
         return {}
 
 
+def _reconcile_deleted_tickets(
+    scraped_ids: set[str],
+    customer: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+    progress_cb=None,
+) -> tuple[int, int]:
+    """Delete CB ticket docs for the given org that are absent from scraped_ids.
+
+    Returns (deleted_count, error_count).
+    Only touches docs whose LOWER(organization) matches customer — never
+    deletes tickets belonging to other orgs.
+    """
+    if not _CB_AVAILABLE:
+        return 0, 0
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        from couchbase.options import QueryOptions as _QO
+        from datetime import timedelta as _td
+        conn   = _cb_conn_str(cb_url, use_tls)
+        _clust = _Cl(conn, _CO(_PA(username, password)))
+        _clust.wait_until_ready(_td(seconds=15))
+        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+        cust_pat = customer.lower().replace("'", "''")
+        rows = list(_clust.query(
+            f"SELECT RAW META(t).id FROM {keyspace} AS t "
+            f"WHERE META(t).id LIKE 'ticket::%' "
+            f"AND LOWER(t.organization) LIKE '%{cust_pat}%'",
+            _QO(timeout=_td(seconds=60)),
+        ))
+        cb_ids = {str(k).split("::")[-1] for k in rows if k}
+        orphans = cb_ids - scraped_ids
+        if not orphans:
+            return 0, 0
+        col     = _clust.bucket(bucket).scope(scope).collection(collection)
+        deleted = 0
+        errors  = 0
+        total   = len(orphans)
+        for i, tid in enumerate(sorted(orphans), 1):
+            try:
+                col.remove(f"ticket::{tid}")
+                deleted += 1
+            except Exception:
+                errors += 1
+            if progress_cb and i % 10 == 0:
+                progress_cb(f"Removed {deleted}/{total}…", i / total)
+        _clust.close()
+        return deleted, errors
+    except Exception:
+        return 0, 1
+
+
 def _filter_changed_tickets(
     listing_summaries: list[dict],
     stored_signals: dict[str, dict],
     max_tickets: int = 0,
+    stale_open_hours: float = 4.0,
 ) -> tuple[list[dict], int, int, int]:
     """Partition listing summaries into scrape vs skip based on change signals.
 
-    A ticket is considered changed if its status or solved date differs from
-    what is stored.  New tickets (not in stored_signals) are always scraped.
+    Change reasons detected (in priority order):
+      1. New — ticket ID not in CB at all
+      2. Status changed — listing status ≠ CB status
+      3. Solved date changed — ticket was closed/reopened
+      4. Priority escalated — listing priority ≠ CB priority (e.g. P3→P1)
+      5. Stub — CB record has no requester (detail page never fetched successfully)
+      6. Stale-open — open/pending ticket scraped > stale_open_hours ago (proxy for
+         updated_at since the listing API does not expose updated_at)
 
-    Priority order: new tickets first, then changed tickets.
+    Priority order for the returned list: new → status/solved/priority changed →
+    stub → stale-open. Newest ticket IDs break ties within each group.
 
     Returns:
         (to_scrape, n_new, n_changed, n_skipped)
         to_scrape is truncated to max_tickets if max_tickets > 0.
     """
-    new_tickets:     list[dict] = []
-    changed_tickets: list[dict] = []
+    _OPEN_STATUSES = {"open", "pending", "on-hold", "hold", "new"}
+
+    new_tickets:      list[dict] = []
+    changed_tickets:  list[dict] = []
+    stale_open:       list[dict] = []
     skipped = 0
 
     for s in listing_summaries:
@@ -844,26 +922,51 @@ def _filter_changed_tickets(
             new_tickets.append(s)
             continue
         stored = stored_signals[tid]
-        # Skip permanently deleted tickets — never re-scrape them
+        # Never re-scrape permanently deleted tickets
         if stored.get("_deleted"):
             skipped += 1
             continue
-        listing_status = (s.get("status") or "").strip().lower()
-        stored_status  = (stored.get("status") or "").strip().lower()
-        listing_solved = (s.get("solved") or "").strip()
-        stored_solved  = (stored.get("solved") or "").strip()
-        # Re-scrape stubs: CB record has no requester → detail page never succeeded
-        is_stub = stored.get("is_stub", False)
-        if listing_status != stored_status or listing_solved != stored_solved or is_stub:
+
+        listing_status   = (s.get("status") or "").strip().lower()
+        stored_status    = (stored.get("status") or "").strip().lower()
+        listing_solved   = (s.get("solved") or "").strip()
+        stored_solved    = (stored.get("solved") or "").strip()
+        listing_priority = (s.get("priority") or "").strip().lower()
+        stored_priority  = (stored.get("priority") or "").strip().lower()
+        is_stub          = stored.get("is_stub", False)
+        age_h            = stored.get("age_hours")
+
+        if (listing_status != stored_status
+                or listing_solved != stored_solved
+                or (listing_priority and listing_priority != stored_priority)
+                or is_stub):
+            # Tag the stub with what changed for reporting
+            s["_change_reason"] = (
+                "stub" if is_stub else
+                f"status {stored_status}→{listing_status}" if listing_status != stored_status else
+                f"priority {stored_priority}→{listing_priority}" if listing_priority != stored_priority else
+                "solved date changed"
+            )
             changed_tickets.append(s)
+        elif listing_status in _OPEN_STATUSES and age_h is not None and age_h >= stale_open_hours:
+            s["_change_reason"] = f"stale open ({age_h:.1f}h since last scrape)"
+            stale_open.append(s)
         else:
             skipped += 1
 
-    to_scrape = new_tickets + changed_tickets
+    def _tid_num(s: dict) -> int:
+        tid = str(s.get("ticket_id") or "")
+        return int(tid) if tid.isdigit() else 0
+
+    for group in (new_tickets, changed_tickets, stale_open):
+        group.sort(key=_tid_num, reverse=True)
+
+    to_scrape = new_tickets + changed_tickets + stale_open
     if max_tickets > 0:
         to_scrape = to_scrape[:max_tickets]
 
-    return to_scrape, len(new_tickets), len(changed_tickets), skipped
+    n_changed_total = len(changed_tickets) + len(stale_open)
+    return to_scrape, len(new_tickets), n_changed_total, skipped
 
 
 def fetch_snapshot_signals_from_cb(
@@ -936,19 +1039,9 @@ def _filter_incomplete_snapshots(
     return to_scrape, len(new_snaps), len(incomplete_snaps), skipped
 
 
-# Cached MLX embedding model — loaded once, reused for every ticket
-_mlx_emb_cache: dict = {"model": None, "tokenizer": None, "model_id": None}
-
 # ─────────────────────────── Constants ────────────────────────────────────────
 
-BASE_URL = "https://supportal.couchbase.com"
-PROFILE_DIR = os.path.join(os.path.dirname(__file__), ".playwright_supportal")
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-TICKET_HREF_RE  = re.compile(r"/zendesk/ticket/(\d+)(?:\?.*)?$")
-SETTINGS_FILE   = Path.home() / ".supportal_settings.json"
+# (constants moved to supportal/constants.py)
 
 
 # ── Settings persistence ───────────────────────────────────────────────────────
@@ -998,845 +1091,32 @@ _OP_STATUS: dict = {
     "done":     True,
 }
 
-# The headful browser is kept alive between "Open Browser" and "Confirm Login"
-# by holding a reference here.
+# Background scrape job registry — keyed by short job_id (6-char hex).
+# Kept in insertion order; trimmed to MAX_SCRAPE_JOBS entries.
+_SCRAPE_JOBS: dict[str, dict] = {}
+_MAX_SCRAPE_JOBS = 20
+
+# Cancel signals — set the event to request clean cancellation of a running job.
+_JOB_CANCEL_EVENTS: dict[str, threading.Event] = {}
+
+# Browser-login state — populated by login_browser.py subprocess.
 _browser_state: dict = {
-    "pw": None,       # sync_playwright() handle
-    "ctx": None,      # launch_persistent_context() handle
-    "logged_in": False,
+    "logged_in":     False,
+    "cookie_string": "",
 }
 
 # Coordination events for the browser-login flow.
-# open_browser_thread() blocks on _browser_close_event so it can perform
-# ctx.close()/pw.stop() in the *same* thread that created the playwright
-# instance — switching greenlets across thread boundaries causes the
-# "cannot switch to a different thread (which has exited)" error.
-_browser_close_event:  threading.Event = threading.Event()
 _browser_closed_event: threading.Event = threading.Event()
-_browser_ready_event:  threading.Event = threading.Event()  # set when browser is open & navigated
-
-# Network API logger — captures XHR/fetch calls while user browses Supportal.
-_net_log_state: dict = {
-    "pw":      None,
-    "ctx":     None,
-    "entries": [],   # list of captured call dicts
-    "running": False,
-    "_loop":   None, # asyncio event loop for UI callbacks
-    "_ui_cb":  None, # async coroutine callback(entry) → None
-}
-_net_log_close_event:  threading.Event = threading.Event()
-_net_log_closed_event: threading.Event = threading.Event()
-_net_log_ready_event:  threading.Event = threading.Event()
+_browser_ready_event:  threading.Event = threading.Event()  # set when subprocess has started
 
 # Shared results — written by worker thread, read by UI download handlers.
 _results: list[dict] = []
 
 
-# ─────────────────────────── Extraction helpers ───────────────────────────────
+# (ticket_parser block moved to supportal/ticket_parser.py)
 
-def _find_label_value(soup: BeautifulSoup, *labels: str) -> Optional[str]:
-    """
-    Search for a field by label using multiple strategies:
-      1. dt/dd pairs
-      2. th/td pairs in table rows
-      3. Any element whose text matches the label, then look for a sibling value
-    """
-    for label in labels:
-        pat = re.compile(rf"^\s*{re.escape(label)}\s*:?\s*$", re.I)
+# (api_client block moved to supportal/api_client.py)
 
-        # Strategy 1: dl / dt+dd
-        el = soup.find(string=pat)
-        if el:
-            parent = el.parent
-            if parent:
-                if parent.name in ("dt", "th", "label", "strong", "b"):
-                    sib = parent.find_next_sibling(["dd", "td", "span", "div", "p"])
-                    if sib:
-                        txt = sib.get_text(" ", strip=True)
-                        if txt:
-                            return txt
-                # Embedded in a table row
-                tr = parent.find_parent("tr")
-                if tr:
-                    tds = tr.find_all("td")
-                    if len(tds) >= 2:
-                        txt = tds[1].get_text(" ", strip=True)
-                        if txt:
-                            return txt
-
-        # Strategy 2: explicit dl structure
-        for dl in soup.find_all("dl"):
-            for dt in dl.find_all("dt"):
-                if re.search(rf"\b{re.escape(label)}\b", dt.get_text(), re.I):
-                    dd = dt.find_next_sibling("dd")
-                    if dd:
-                        txt = dd.get_text(" ", strip=True)
-                        if txt:
-                            return txt
-
-        # Strategy 3: th:td in any table
-        for tr in soup.find_all("tr"):
-            th = tr.find(["th", "td"])
-            if th and re.search(rf"^\s*{re.escape(label)}\s*:?\s*$", th.get_text(), re.I):
-                rest = tr.find_all("td")
-                if rest:
-                    txt = rest[-1].get_text(" ", strip=True)
-                    if txt:
-                        return txt
-
-    return None
-
-
-_DATE_RE = re.compile(
-    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}"
-    r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
-    r"|\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?",
-    re.I,
-)
-
-
-def _guess_author_from_text(text: str) -> Optional[str]:
-    """Try to extract an author name from the tail of a comment (e.g. 'Regards,\nPiyush')."""
-    for pat in [
-        re.compile(r"(?:Regards|Thanks|Best|Cheers|Sincerely)[,.]?\s*\n+\s*([A-Z][A-Za-z ]+)", re.I),
-        re.compile(r"(?:^|\n)([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*$"),
-    ]:
-        m = pat.search(text)
-        if m:
-            candidate = m.group(1).strip()
-            # Reject lines that look like sentences rather than names
-            if len(candidate.split()) <= 4 and "." not in candidate:
-                return candidate
-    return None
-
-
-def _extract_comments(soup: BeautifulSoup) -> list[dict]:
-    """
-    Attempt to find comment / conversation thread entries.
-    Uses broad selector coverage and regex fallbacks for author/timestamp.
-    Returns list of {author, timestamp, body}.
-    """
-    # Ordered from most-specific to least-specific
-    comment_selectors = [
-        "[data-comment-id]", "[data-test-id*='comment']",
-        ".comment", ".ticket-comment", ".zd-comment", "article.comment",
-        ".event-container .event", ".activity-item",
-        ".message", ".note", ".post", ".reply",
-        # Broad fallback: any article or section with meaningful text
-        "article", "section.comment",
-    ]
-
-    author_selectors = [
-        ".author", ".comment-author", ".user-name", ".display-name",
-        "[class*='author']", "[class*='user']", "[class*='name']",
-        ".requester", ".from", ".sender",
-        "strong", "b",
-        # Zendesk-specific
-        ".zd-requester", ".ticket-author",
-    ]
-
-    timestamp_selectors = [
-        "time", "[datetime]",
-        "[data-timestamp]", "[data-time]",
-        "[class*='time']", "[class*='date']", "[class*='timestamp']",
-        "abbr[title]", "span[title]",
-    ]
-
-    body_selectors = [
-        ".comment-body", ".body", ".content", ".description",
-        ".zd-comment", ".rich-text", ".markdown",
-        "p", "pre",
-    ]
-
-    for sel in comment_selectors:
-        els = soup.select(sel)
-        if not els:
-            continue
-
-        comments = []
-        for el in els:
-            author, ts, body = None, None, None
-
-            # Author
-            for a_sel in author_selectors:
-                a = el.select_one(a_sel)
-                if a:
-                    txt = a.get_text(strip=True)
-                    if txt and len(txt) < 80:   # sanity-check: names are short
-                        author = txt
-                        break
-
-            # Timestamp — try attribute first, then text
-            for t_sel in timestamp_selectors:
-                t = el.select_one(t_sel)
-                if t:
-                    ts = (t.get("datetime") or t.get("data-timestamp")
-                          or t.get("title") or t.get_text(strip=True))
-                    if ts:
-                        break
-            # Regex fallback for timestamp embedded in element text
-            if not ts:
-                m = _DATE_RE.search(el.get_text(" ", strip=True))
-                if m:
-                    ts = m.group(0)
-
-            # Body — prefer dedicated body element, fall back to whole element text
-            for b_sel in body_selectors:
-                b = el.select_one(b_sel)
-                if b:
-                    txt = b.get_text("\n", strip=True)
-                    if txt:
-                        body = txt
-                        break
-            if not body:
-                body = el.get_text("\n", strip=True)
-
-            if not body or not body.strip():
-                continue
-
-            body = body.strip()
-
-            # Author fallback: try to guess from the body text itself
-            if not author:
-                author = _guess_author_from_text(body)
-
-            comments.append({"author": author, "timestamp": ts, "body": body})
-
-        if comments:
-            return comments
-
-    return []
-
-
-def _extract_all_dl_fields(soup: BeautifulSoup) -> dict:
-    """Harvest every dt/dd pair and every th/td row into a flat dict."""
-    fields: dict = {}
-    for dl in soup.find_all("dl"):
-        for dt in dl.find_all("dt"):
-            dd = dt.find_next_sibling("dd")
-            if dd:
-                key = dt.get_text(strip=True).rstrip(":").strip()
-                val = dd.get_text(" ", strip=True)
-                if key and val:
-                    fields[key] = val
-    for tr in soup.find_all("tr"):
-        cells = tr.find_all(["th", "td"])
-        if len(cells) == 2:
-            key = cells[0].get_text(strip=True).rstrip(":")
-            val = cells[1].get_text(" ", strip=True)
-            if key and val and key not in fields:
-                fields[key] = val
-    return fields
-
-
-def _extract_named_section(soup: BeautifulSoup, *heading_patterns: str) -> Optional[str]:
-    """
-    Find a section whose heading text matches any of the given patterns (case-insensitive),
-    then return all text content inside that section container.
-    Looks for headings (h1–h4) then walks to the next sibling container.
-    """
-    for pat in heading_patterns:
-        regex = re.compile(pat, re.I)
-        for tag in ["h1", "h2", "h3", "h4", "h5", "strong", "b", "th", "dt", "label"]:
-            for el in soup.find_all(tag):
-                if regex.search(el.get_text(strip=True)):
-                    # Collect content from the parent container or next siblings
-                    container = el.find_parent(["section", "div", "article", "td", "dd"])
-                    if container:
-                        # Exclude the heading itself
-                        parts = []
-                        for child in container.children:
-                            if child == el:
-                                continue
-                            if hasattr(child, "get_text"):
-                                t = child.get_text("\n", strip=True)
-                                if t:
-                                    parts.append(t)
-                        text = "\n".join(parts).strip()
-                        if text:
-                            return text
-                    # Fall back: grab all following siblings until next heading
-                    parts = []
-                    for sib in el.find_next_siblings():
-                        if sib.name and sib.name in ["h1","h2","h3","h4","h5"]:
-                            break
-                        t = sib.get_text("\n", strip=True) if hasattr(sib, "get_text") else ""
-                        if t:
-                            parts.append(t)
-                    text = "\n".join(parts).strip()
-                    if text:
-                        return text
-    return None
-
-
-def _normalize_field_key(k: str) -> str:
-    """
-    Normalize a ticket_fields key to a clean, dot-navigable identifier.
-
-    Rules (applied in order):
-      1. ' (EOL)' suffix → '_EOL'   (before general replacement so parens vanish cleanly)
-      2. Any non-alphanumeric/underscore character → '_'
-      3. Collapse runs of underscores to one
-      4. Strip leading/trailing underscores
-
-    Examples:
-      'Bug ID'                              → 'Bug_ID'
-      'Node Count'                          → 'Node_Count'
-      'Couchbase Server (EOL)'              → 'Couchbase_Server_EOL'
-      'Environment / Current Impact'        → 'Environment_Current_Impact'
-      'Mitigated (do not set directly)'     → 'Mitigated_do_not_set_directly'
-      'CBSE'                                → 'CBSE'
-    """
-    k = k.replace(" (EOL)", "_EOL")
-    k = re.sub(r"[^A-Za-z0-9_]", "_", k)
-    k = re.sub(r"_+", "_", k)
-    return k.strip("_")
-
-
-def parse_ticket_detail(html: str, url: str) -> dict:
-    """
-    Parse a Supportal ticket detail page rendered by ticket.js (Vue SPA).
-
-    Page structure (each section is a div.box with h3.box-title):
-      - Ticket Information : strong→p label/value pairs
-      - Ticket Fields      : table.table-striped with td/td rows
-      - Ticket Tags        : plain text
-      - Escalations        : ESC-NNNN links
-      - Snapshots          : timestamp list
-      - Ticket Timeline    : ul.timeline with comment li items
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    m = TICKET_HREF_RE.search(urllib.parse.urlparse(url).path)
-    ticket_id = m.group(1) if m else url.rsplit("/", 1)[-1]
-
-    # ── Subject ───────────────────────────────────────────────────────────────
-    subject = None
-    h1 = soup.select_one("section.content-header h1")
-    if h1:
-        subject = h1.get_text(" ", strip=True)
-    if not subject:
-        t = soup.find("title")
-        if t:
-            subject = re.sub(r"^Supportal\s*-\s*", "", t.get_text(strip=True))
-    # Strip the "<Customer Name> ZD-NNNNN " prefix that Supportal prepends to h1
-    if subject:
-        subject = re.sub(r"^.*?\bZD-\d+\s+", "", subject, count=1).strip() or subject
-
-    # ── Per-box extraction ────────────────────────────────────────────────────
-    status = priority = created = assignee = requester = organization = None
-    ticket_group = tags_text = escalations_text = snapshots_text = None
-    ticket_fields: dict = {}
-    cbses: list[str] = []
-    jira_issues: list[str] = []
-    comments: list[dict] = []
-
-    for box in soup.select("div.box"):
-        title_el = box.select_one("h3.box-title")
-        if not title_el:
-            continue
-        box_title = title_el.get_text(strip=True).lower()
-        body = box.select_one("div.box-body")
-        if not body:
-            continue
-
-        # ── Ticket Information ────────────────────────────────────────────────
-        if "ticket information" in box_title:
-            # Fields are <strong>Label</strong> followed by <p>Value</p>
-            # Walk direct children looking for strong→p pairs
-            nodes = [n for n in body.children if getattr(n, "name", None) or str(n).strip()]
-            i = 0
-            while i < len(nodes):
-                node = nodes[i]
-                tag = getattr(node, "name", None)
-                # Handle <span> wrapper around <strong>
-                strong = None
-                if tag == "strong":
-                    strong = node
-                elif tag == "span":
-                    strong = node.find("strong")
-                if strong:
-                    label = strong.get_text(" ", strip=True).lower()
-                    # Find the next <p>
-                    for j in range(i + 1, min(i + 6, len(nodes))):
-                        sib = nodes[j]
-                        if getattr(sib, "name", None) == "p":
-                            if "ticket status" in label or "status" in label:
-                                spans = sib.select("span.ticket-status")
-                                if len(spans) >= 2:
-                                    priority = spans[0].get_text(strip=True)
-                                    status   = spans[1].get_text(strip=True)
-                                elif spans:
-                                    status = spans[0].get_text(strip=True)
-                            elif "date created" in label or "created" in label:
-                                created = sib.get_text(strip=True)
-                            elif "assignee" in label:
-                                assignee = sib.get_text(" ", strip=True).strip()
-                            elif "requester" in label:
-                                org_a = sib.select_one("a[href*='/customer/']")
-                                if org_a:
-                                    organization = org_a.get_text(strip=True)
-                                full = sib.get_text(" ", strip=True)
-                                m2 = re.match(r"^(.+?)\s+at\s+", full)
-                                requester = m2.group(1).strip() if m2 else full.split("\n")[0].strip()
-                            elif "group" in label:
-                                ticket_group = sib.get_text(strip=True)
-                            break
-                i += 1
-
-        # ── Ticket Fields ─────────────────────────────────────────────────────
-        elif "ticket fields" in box_title:
-            for row in body.select("tr"):
-                cells = row.select("td")
-                if len(cells) >= 2:
-                    k = cells[0].get_text(strip=True)
-                    v = cells[1].get_text(strip=True)
-                    if k:
-                        ticket_fields[_normalize_field_key(k)] = v
-
-        # ── Ticket Tags ───────────────────────────────────────────────────────
-        elif "ticket tags" in box_title:
-            # Tag spans each have a "Follow" button — strip those words out
-            raw = body.get_text(" ", strip=True)
-            tags_text = re.sub(r"\s*Follow\s*", " ", raw).strip() or None
-
-        # ── Escalations ───────────────────────────────────────────────────────
-        elif "escalation" in box_title:
-            escs = [a.get_text(strip=True) for a in body.select("a")
-                    if re.match(r"ESC-\d+", a.get_text(strip=True))]
-            escalations_text = ", ".join(escs) if escs else None
-
-        # ── CBSEs ──────────────────────────────────────────────────────────────
-        elif box_title.strip().lower() in ("cbses", "cbse"):
-            raw_body = body.get_text(" ", strip=True)
-            # Collect from links first, fall back to text scan
-            found = [a.get_text(strip=True) for a in body.select("a")
-                     if re.search(r"CBSE-\d+", a.get_text(strip=True), re.IGNORECASE)]
-            if not found:
-                found = re.findall(r"CBSE-\d+", raw_body, re.IGNORECASE)
-            cbses = [c.upper() for c in found]
-
-        # ── JIRA Issues ────────────────────────────────────────────────────────
-        elif "jira" in box_title:
-            raw_body = body.get_text(" ", strip=True)
-            # Jira keys: PROJECT-NUMBER (e.g. MB-12345, CB-12345, JMSE-456)
-            found = [a.get_text(strip=True) for a in body.select("a")
-                     if re.match(r"[A-Z]+-\d+", a.get_text(strip=True))]
-            if not found:
-                found = re.findall(r"\b[A-Z]{2,}-\d+\b", raw_body)
-            # Exclude CBSEs that may appear in the Jira box by accident
-            jira_issues = [j for j in found
-                           if not j.upper().startswith("CBSE-")
-                           and not j.upper().startswith("ESC-")]
-
-        # ── Snapshots ─────────────────────────────────────────────────────────
-        elif "snapshot" in box_title:
-            lines = [t.strip() for t in body.get_text("\n").splitlines() if t.strip()
-                     and not t.strip().lower().startswith("link")
-                     and not t.strip().lower().startswith("no snapshot")
-                     and t.strip() != "No snapshots"]
-            snapshots_text = "\n".join(lines) if lines else None
-
-        # ── Ticket Timeline ───────────────────────────────────────────────────
-        elif "ticket timeline" in box_title:
-            for li in body.select("ul.timeline li"):
-                # Date label rows
-                label_span = li.select_one("li.time-label span, span.bg-red, span.bg-green, span.bg-blue")
-                # Comment rows have div.timeline-item
-                item = li.select_one("div.timeline-item")
-                if not item:
-                    continue
-                time_el = item.select_one("span.time")
-                author_el = item.select_one("h3.timeline-header a")
-                body_el = item.select_one("div.timeline-body")
-                timestamp = time_el.get_text(strip=True) if time_el else None
-                author    = author_el.get_text(strip=True) if author_el else None
-                body_text = body_el.get_text("\n", strip=True) if body_el else None
-                if author or body_text:
-                    comments.append({
-                        "timestamp": timestamp,
-                        "author":    author,
-                        "body":      body_text,
-                    })
-
-    # ── First comment as description ──────────────────────────────────────────
-    description = comments[0]["body"] if comments else None
-
-    return {
-        "ticket_id":     ticket_id,
-        "url":           url,
-        "subject":       subject,
-        "status":        status,
-        "priority":      priority,
-        "requester":     requester,
-        "assignee":      assignee,
-        "organization":  organization,
-        "ticket_group":  ticket_group,
-        "created":       created,
-        "tags":          tags_text,
-        "escalations":   escalations_text,
-        "cbses":         cbses if cbses else None,
-        "jira_issues":   jira_issues if jira_issues else None,
-        "snapshots":     snapshots_text,
-        "ticket_fields": ticket_fields if ticket_fields else None,
-        "description":   description,
-        "comment_count": len(comments),
-        "comments":      comments if comments else None,
-    }
-
-
-# ─────────────────────────── Listing / navigation helpers ─────────────────────
-
-_STATUS_MAP = {"O": "Open", "P": "Pending", "S": "Solved", "C": "Closed", "H": "Hold"}
-
-
-def _extract_ticket_links(html: str) -> list[tuple[str, str]]:
-    """Return unique (ticket_id, canonical_url) pairs found on a listing page."""
-    seen: set[str] = set()
-    out: list[tuple[str, str]] = []
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        m = TICKET_HREF_RE.search(a["href"])
-        if m:
-            tid = m.group(1)
-            canonical = f"{BASE_URL}/zendesk/ticket/{tid}"
-            if canonical not in seen:
-                out.append((tid, canonical))
-                seen.add(canonical)
-    return out
-
-
-def _extract_ticket_rows(html: str) -> dict[str, dict]:
-    """
-    Extract summary row data from the ticket listing table.
-    Returns a dict keyed by ticket_id with listing-level fields:
-    status, priority, subject, created, solved.
-    Handles the Supportal listing format:
-      Ticket | Status | Priority | Subject | Created | Solved
-      76866  |   O    |    P2    | ...     | date    | N/A
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    summaries: dict[str, dict] = {}
-
-    # Find the main ticket table — look for a table with these header keywords
-    target_table = None
-    for table in soup.find_all("table"):
-        header_text = table.get_text(" ", strip=True).lower()
-        if "ticket" in header_text and ("status" in header_text or "priority" in header_text):
-            target_table = table
-            break
-
-    # Also try a generic approach: any <tr> containing a zendesk ticket link
-    if not target_table:
-        # Find rows that have ticket links directly
-        rows_with_links = [
-            tr for tr in soup.find_all("tr")
-            if any(TICKET_HREF_RE.search(a.get("href", "")) for a in tr.find_all("a", href=True))
-        ]
-    else:
-        rows_with_links = target_table.find_all("tr")
-
-    # Parse column headers to map positions
-    header_map: dict[str, int] = {}
-    for tr in (rows_with_links[:1] if not target_table else (target_table.find_all("tr")[:1])):
-        cells = tr.find_all(["th", "td"])
-        for i, cell in enumerate(cells):
-            label = cell.get_text(strip=True).lower().rstrip(":")
-            if label:
-                header_map[label] = i
-
-    # Fallback column positions if no headers found
-    # Default: Ticket=0, Status=1, Priority=2, Subject=3, Created=4, Solved=5
-    col = {
-        "ticket":   header_map.get("ticket", 0),
-        "status":   header_map.get("status", 1),
-        "priority": header_map.get("priority", 2),
-        "subject":  header_map.get("subject", 3),
-        "created":  header_map.get("created", 4),
-        "solved":   header_map.get("solved", 5),
-    }
-
-    for tr in rows_with_links:
-        cells = tr.find_all(["td", "th"])
-        if not cells:
-            continue
-
-        # Find ticket ID via link in the row
-        ticket_link = None
-        ticket_id = None
-        for a in tr.find_all("a", href=True):
-            m = TICKET_HREF_RE.search(a["href"])
-            if m:
-                ticket_id = m.group(1)
-                ticket_link = a
-                break
-        if not ticket_id:
-            continue
-
-        def cell_text(idx: int) -> Optional[str]:
-            if 0 <= idx < len(cells):
-                t = cells[idx].get_text(strip=True)
-                return t if t else None
-            return None
-
-        raw_status = cell_text(col["status"]) or ""
-        status = _STATUS_MAP.get(raw_status.upper(), raw_status) or None
-        solved_raw = cell_text(col["solved"])
-        solved = None if solved_raw in ("N/A", "n/a", "-", "") else solved_raw
-
-        summaries[ticket_id] = {
-            "ticket_id": ticket_id,
-            "url":       f"{BASE_URL}/zendesk/ticket/{ticket_id}",
-            "status":    status,
-            "priority":  cell_text(col["priority"]),
-            "subject":   cell_text(col["subject"]),
-            "created":   cell_text(col["created"]),
-            "solved":    solved,
-        }
-
-    return summaries
-
-
-def _resolve_customer_input(raw: str) -> tuple[str, str]:
-    """
-    Accept either a full Supportal customer URL or a plain name.
-    Returns (customer_name, customer_url) with correct encoding.
-
-    Examples:
-      "https://supportal.couchbase.com/customer/American%20Express%20AZ"
-        → ("American Express AZ", "https://.../customer/American%20Express%20AZ")
-      "American Express AZ"
-        → ("American Express AZ", "https://.../customer/American%20Express%20AZ")
-    """
-    raw = raw.strip().strip('"\'')
-    # If it looks like a URL, extract the /customer/<name> path segment
-    m = re.search(r"/customer/([^/?#]+)", raw, re.I)
-    if m:
-        # Decode percent-encoding to get the display name, then re-encode cleanly
-        name = urllib.parse.unquote(m.group(1))
-        url  = f"{BASE_URL}/customer/{urllib.parse.quote(name, safe='')}"
-        return name, url
-    # Plain name — encode directly
-    name = urllib.parse.unquote(raw)   # handle if someone pastes partial %20 etc.
-    url  = f"{BASE_URL}/customer/{urllib.parse.quote(name, safe='')}"
-    return name, url
-
-
-def _normalize_customer_url(href: str) -> str:
-    """
-    Normalize Supportal customer hrefs to a clean, navigable URL.
-
-    The search page emits malformed absolute hrefs like:
-        https://supportal.couchbase.com:/customer/american express az
-    (extra colon after domain, unencoded spaces in path).
-
-    This function returns a proper URL:
-        https://supportal.couchbase.com/customer/American%20Express%20AZ
-    """
-    if not href:
-        return ""
-    # Strip the rogue colon that appears after the hostname
-    # e.g. "https://supportal.couchbase.com:/customer/foo" → proper URL
-    href = re.sub(r"(https?://[^/:]+):/", r"\1/", href)
-    # Split into scheme+host and path
-    if href.startswith("http"):
-        # Reconstruct with properly encoded path
-        m = re.match(r"(https?://[^/]+)(/.*)$", href)
-        if m:
-            scheme_host = m.group(1)
-            path = m.group(2)
-            # Encode any unencoded spaces/special chars in the path
-            path = urllib.parse.quote(urllib.parse.unquote(path), safe="/-_.")
-            return scheme_host + path
-        return href
-    # Relative path
-    path = urllib.parse.quote(urllib.parse.unquote(href), safe="/-_.")
-    return BASE_URL + path
-
-
-def _find_customer_url_in_search(html: str, query: str) -> Optional[str]:
-    """
-    Parse Supportal search results to find the best Customer match.
-    Search hrefs use lowercase names which the server may reject; we only use
-    this function to CONFIRM a match exists, then return None so the caller
-    builds the URL from the original query string (preserving capitalisation).
-    Returns None always — caller uses the query-based canonical URL.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    query_words = [w.lower() for w in query.split() if w]
-
-    def _matches(text: str) -> bool:
-        t = text.lower()
-        return all(w in t for w in query_words)
-
-    # Build list of (score, url) — higher score = better match
-    candidates: list[tuple[int, str]] = []
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/customer/" not in href.lower():
-            continue
-        url = _normalize_customer_url(href)
-
-        # Walk up to the result container (up to 6 levels) to get all visible text
-        container = a.parent
-        for _ in range(6):
-            if container is None:
-                break
-            text = container.get_text(" ", strip=True)
-            # Must contain the query words somewhere in the result block
-            if _matches(text):
-                # Prefer alias matches (the alias label appears near the match)
-                score = 2 if "alias" in text.lower() else 1
-                candidates.append((score, url))
-                break
-            container = container.parent
-
-    # Always return None — search hrefs are lowercase and case-sensitive server
-    # will reject them. The caller uses the user-provided name to build the URL.
-    return None
-
-
-def search_customers_on_supportal(
-    query: str,
-    cookie: Optional[str],
-    max_results: int = 30,
-) -> list[dict]:
-    """
-    Search Supportal /search/{query} and return Customer-type results.
-    Returns list of {slug, display_name, url} sorted by relevance.
-
-    Uses Playwright (headless) because the search results page is Vue.js
-    client-side rendered — a plain requests GET only returns the HTML shell
-    with no result entries.
-    """
-    if not query.strip():
-        return []
-
-    search_url = f"{BASE_URL}/search/{urllib.parse.quote(query.strip(), safe='')}"
-
-    parsed_cookies = []
-    if cookie:
-        for part in cookie.split(";"):
-            part = part.strip()
-            if "=" in part:
-                name, _, value = part.partition("=")
-                parsed_cookies.append({
-                    "name": name.strip(), "value": value.strip(), "url": BASE_URL,
-                })
-
-    html = ""
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
-            if parsed_cookies:
-                ctx.add_cookies(parsed_cookies)
-            page = ctx.new_page()
-            page.set_default_timeout(30_000)
-            try:
-                page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-                # Wait for Vue to render at least one customer link
-                try:
-                    page.wait_for_selector("a[href*='/customer/']", timeout=10_000)
-                except Exception:
-                    pass
-                # Small extra wait for remaining results to render
-                page.wait_for_timeout(800)
-                html = page.content()
-            finally:
-                ctx.close()
-                browser.close()
-    except Exception as exc:
-        print(f"[CUST-SEARCH] Playwright error: {exc}")
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    results: list[dict] = []
-    seen_slugs: set[str] = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/customer/" not in href:
-            continue
-        m = re.search(r"/customer/([^/?#]+)", href)
-        if not m:
-            continue
-        slug = urllib.parse.unquote(m.group(1))
-        if not slug or slug in seen_slugs:
-            continue
-
-        # Walk up the DOM (max 6 levels) looking for a block that contains the
-        # word "Customer" as a type label.  Stop before we reach elements whose
-        # text is so long they must be the full page body (avoid false positives
-        # from nav bars / footers that also mention "Customer").
-        container = a.parent
-        found_customer_type = False
-        for _ in range(6):
-            if container is None:
-                break
-            txt = container.get_text(" ", strip=True)
-            if len(txt) > 500:          # too large — we've left the result block
-                break
-            if re.search(r"\bCustomer\b", txt):
-                found_customer_type = True
-                break
-            container = container.parent
-
-        if not found_customer_type:
-            continue
-
-        seen_slugs.add(slug)
-
-        # Extract alias (human display name).
-        # Rendered structure: "Customer  alias  Royal Caribbean  name  royal-caribbean-cruise-line"
-        container_text = container.get_text(" ", strip=True) if container else ""
-        alias: Optional[str] = None
-        alias_m = re.search(r"\balias\s+(.+?)\s+(?:name\b|$)", container_text, re.I)
-        if alias_m:
-            candidate = alias_m.group(1).strip()
-            if candidate and len(candidate) < 120:
-                alias = candidate
-
-        display_name = alias or slug.replace("-", " ").title()
-
-        results.append({
-            "slug":         slug,
-            "display_name": display_name,
-            "url":          f"{BASE_URL}/customer/{urllib.parse.quote(slug, safe='')}",
-        })
-
-        if len(results) >= max_results:
-            break
-
-    return results
-
-
-def _find_tickets_tab_url(html: str, current_url: str) -> Optional[str]:
-    """
-    Find the Tickets tab link on a customer page.
-    Only considers links that are sub-paths of the current customer URL so that
-    global nav links (e.g. dashboard#tickets) are never mistakenly returned.
-    Returns the absolute URL or None.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    customer_base = current_url.rstrip("/")  # e.g. ".../customer/convera"
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(strip=True).lower()
-
-        # Resolve to absolute URL so we can compare paths properly
-        abs_href = href if href.startswith("http") else urllib.parse.urljoin(current_url, href)
-
-        # Skip any link that doesn't sit under the customer's own path
-        if not abs_href.startswith(customer_base):
-            continue
-
-        # Match /tickets sub-path or link text "tickets"
-        if text == "tickets" or re.search(r"/tickets(?:/|\?|$|#)", abs_href, re.I):
-            return abs_href
-
-    return None
 
 
 def _parse_all_page_urls(html: str, base_url: str) -> list[str]:
@@ -2188,6 +1468,92 @@ def scrape_with_cookie(
     return out
 
 
+def scrape_with_cookie(
+    cookie: str,
+    customer: str,
+    max_pages: int,
+    progress_cb: Callable[[str, float], None],
+    skip_ids: set | None = None,
+    change_signals: dict | None = None,
+    max_tickets: int = 0,
+) -> list[dict]:
+    """Scrape all tickets for a customer using REST APIs only (no browser required)."""
+    customer = customer.strip().strip('"\'')
+    session  = _make_api_session(cookie)
+    customer_url = f"{BASE_URL}/customer/{urllib.parse.quote(customer, safe='')}"
+
+    # ── Step 1: get ticket listing ─────────────────────────────────────────
+    progress_cb("Fetching ticket listing via REST API…", 0.02)
+    raw_listing = _get_customer_ticket_listing_api(customer, session, progress_cb)
+
+    listing_summaries: list[dict] = []
+    _skipped_deleted = 0
+    for item in raw_listing:
+        tid = str(item.get("id") or "").strip()
+        if not tid:
+            continue
+        item_status = str(item.get("status") or "").lower()
+        if item_status == "deleted":
+            _skipped_deleted += 1
+            continue
+        listing_summaries.append({
+            "ticket_id": tid,
+            "url":       f"{BASE_URL}/zendesk/ticket/{tid}",
+            "status":    item.get("status", ""),
+            "priority":  item.get("Priority", ""),
+            "subject":   item.get("subject", ""),
+            "created":   item.get("created_at", ""),
+            "solved":    item.get("solved_at", ""),
+        })
+
+    _deleted_note = f" ({_skipped_deleted} deleted skipped)" if _skipped_deleted else ""
+    progress_cb(f"Listing complete — {len(listing_summaries)} tickets found{_deleted_note}. Fetching details…", 0.15)
+
+    # ── Step 2: change detection / incremental filtering ──────────────────
+    if change_signals is not None:
+        listing_summaries, n_new, n_changed, n_skipped = _filter_changed_tickets(
+            listing_summaries, change_signals, max_tickets
+        )
+        progress_cb(
+            f"Change detection: {n_new} new, {n_changed} changed, {n_skipped} unchanged (skipped)"
+            + (f", capped at {max_tickets}" if max_tickets > 0 else "") + ".",
+            0.15,
+        )
+    elif skip_ids:
+        all_count = len(listing_summaries)
+        listing_summaries = [s for s in listing_summaries if str(s.get("ticket_id", "")) not in skip_ids]
+        if max_tickets > 0:
+            listing_summaries = listing_summaries[:max_tickets]
+        skipped = all_count - len(listing_summaries)
+        progress_cb(
+            f"Incremental mode: {len(listing_summaries)} new tickets, {skipped} skipped.",
+            0.15,
+        )
+    elif max_tickets > 0:
+        listing_summaries = listing_summaries[:max_tickets]
+        progress_cb(f"Capped at {max_tickets} tickets.", 0.15)
+
+    # ── Step 3: fetch full ticket details via /status API ─────────────────
+    total = len(listing_summaries)
+    results: list[dict] = []
+    for i, summary in enumerate(listing_summaries):
+        tid = str(summary.get("ticket_id", ""))
+        if not tid:
+            continue
+        pct = 0.15 + 0.84 * (i / max(total, 1))
+        progress_cb(f"Detail {i + 1}/{total}  ticket #{tid}", pct)
+        rec = fetch_ticket_api(tid, session)
+        for field in ("status", "priority", "subject", "created", "solved"):
+            if not rec.get(field) and summary.get(field):
+                rec[field] = summary[field]
+        rec.setdefault("customer_url", customer_url)
+        results.append(rec)
+        time.sleep(0.05)
+
+    progress_cb("Done", 1.0)
+    return results
+
+
 def scrape_with_cookie_playwright(
     cookie: str,
     customer: str,
@@ -2197,104 +1563,8 @@ def scrape_with_cookie_playwright(
     change_signals: dict | None = None,
     max_tickets: int = 0,
 ) -> list[dict]:
-    """Auth mode C: headless Playwright with cookie injection.
-
-    Uses Playwright for the listing phase (JS-rendered SPA requires it) and
-    for ticket detail pages (Vue renders ticket fields via XHR).  The captured
-    cookie string is injected directly into the browser context so no saved
-    profile directory is needed.
-    """
-    # Parse "name=value; name2=value2" into Playwright cookie objects.
-    # Playwright requires either url OR domain+path — use url only.
-    parsed_cookies: list[dict] = []
-    for part in cookie.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, _, value = part.partition("=")
-            parsed_cookies.append({
-                "name":  name.strip(),
-                "value": value.strip(),
-                "url":   BASE_URL,
-            })
-
-    results: list[dict] = []
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
-        if parsed_cookies:
-            ctx.add_cookies(parsed_cookies)
-
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
-
-        listing_summaries, customer_url = _scrape_listing_playwright(page, customer, max_pages, progress_cb)
-        progress_cb(f"Listing complete — {len(listing_summaries)} tickets found. Fetching details…", 0.15)
-
-        if change_signals is not None:
-            listing_summaries, n_new, n_changed, n_skipped = _filter_changed_tickets(
-                listing_summaries, change_signals, max_tickets
-            )
-            progress_cb(
-                f"Change detection: {n_new} new, {n_changed} changed, {n_skipped} unchanged (skipped)"
-                + (f", capped at {max_tickets}" if max_tickets > 0 else "") + ".",
-                0.15,
-            )
-        elif skip_ids:
-            all_count = len(listing_summaries)
-            listing_summaries = [s for s in listing_summaries if str(s.get("ticket_id", "")) not in skip_ids]
-            if max_tickets > 0:
-                listing_summaries = listing_summaries[:max_tickets]
-            skipped = all_count - len(listing_summaries)
-            progress_cb(
-                f"Incremental mode: {len(listing_summaries)} new tickets, {skipped} skipped.",
-                0.15,
-            )
-        elif max_tickets > 0:
-            listing_summaries = listing_summaries[:max_tickets]
-            progress_cb(f"Capped at {max_tickets} tickets.", 0.15)
-
-        total = len(listing_summaries)
-        for i, summary in enumerate(listing_summaries):
-            tid = str(summary.get("ticket_id", ""))
-            if not tid:
-                continue
-            url  = f"{BASE_URL}/zendesk/ticket/{tid}"
-            pct  = 0.15 + 0.84 * (i / max(total, 1))
-            progress_cb(f"Detail {i + 1}/{total}  ticket #{tid}", pct)
-            try:
-                page.goto(url, wait_until="commit", timeout=60_000)
-                try:
-                    page.wait_for_function(
-                        """() => {
-                            const sec = document.querySelector('section.content');
-                            return sec && sec.innerText && sec.innerText.trim().length > 50;
-                        }""",
-                        timeout=30_000,
-                    )
-                except PWTimeoutError:
-                    pass
-                html = page.content()
-                if _is_deleted_ticket_page(200, html):
-                    rec = {**summary, "url": url, "_deleted": True}
-                else:
-                    rec = parse_ticket_detail(html, url)
-                    for field in ("status", "priority", "subject", "created", "solved"):
-                        if not rec.get(field) and summary.get(field):
-                            rec[field] = summary[field]
-            except PWTimeoutError:
-                rec = {**summary, "url": url, "error": "timeout"}
-            except Exception as exc:
-                rec = {**summary, "url": url, "error": str(exc)}
-            rec.setdefault("customer_url", customer_url)
-            results.append(rec)
-            time.sleep(0.15)
-
-        ctx.close()
-        browser.close()
-
-    progress_cb("Done", 1.0)
-    return results
+    """Alias for scrape_with_cookie (Playwright no longer used)."""
+    return scrape_with_cookie(cookie, customer, max_pages, progress_cb, skip_ids, change_signals, max_tickets)
 
 
 def _scrape_listing_playwright(
@@ -2303,217 +1573,10 @@ def _scrape_listing_playwright(
     max_pages: int,
     progress_cb: Callable[[str, float], None],
     debug: bool = False,
-) -> list[dict]:
-    """
-    Playwright-native listing: navigates with proper wait_for_selector calls at
-    each step so JS-rendered content is available before we parse.
-    """
-    # Strip any accidental surrounding quotes from the input
-    customer = customer.strip().strip('"\'')
-
-    all_tickets: list[tuple[str, str]] = []
-    seen_urls: set[str] = set()
-    visited_pages: set[str] = set()
-
-    def log(msg: str, pct: float):
-        print(f"[SCRAPE] {msg}")
-        progress_cb(msg, pct)
-
-    # ── Step 1: search ────────────────────────────────────────────────────────
-    # The SPA makes continuous background XHR requests so "networkidle" never
-    # fires.  Use "domcontentloaded" + explicit wait for Vue to render results.
-    _customer_decoded = urllib.parse.unquote(customer)
-    search_url = f"{BASE_URL}/search/{urllib.parse.quote(_customer_decoded)}"
-    log(f"Search: {search_url}", 0.01)
-    page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-    # Wait for Vue to inject search results (customer links appear after JS runs)
-    try:
-        page.wait_for_selector("a[href*='/customer/']", timeout=15_000)
-    except PWTimeoutError:
-        log("Timeout waiting for /customer/ links — waiting 4s for Vue render", 0.01)
-        page.wait_for_timeout(4000)
-    search_html = page.content()
-    if debug:
-        _save_debug("01_search", search_url, search_html)
-
-    soup_s = BeautifulSoup(search_html, "html.parser")
-    clinks = [a["href"] for a in soup_s.find_all("a", href=True) if "/customer/" in a["href"]]
-    log(f"Search: {len(clinks)} /customer/ links found. First 5: {clinks[:5]}", 0.015)
-
-    # ── Step 2: find and navigate to customer page ────────────────────────────
-    customer_url = _find_customer_url_in_search(search_html, customer)
-
-    if not customer_url and clinks:
-        # Search hrefs use lowercase names (e.g. "american express az") which the
-        # server may not accept. Confirm a match exists, then build the URL from
-        # the user-supplied name (which preserves original capitalisation).
-        try:
-            loc = page.locator("a[href*='/customer/']").filter(
-                has_text=re.compile(re.escape(_customer_decoded), re.I)
-            )
-            if loc.count() > 0:
-                customer_url = f"{BASE_URL}/customer/{urllib.parse.quote(_customer_decoded, safe='')}"
-                log(f"Search confirmed customer exists → using canonical URL: {customer_url}", 0.02)
-        except Exception as exc:
-            log(f"Locator match failed: {exc}", 0.02)
-
-    if not customer_url:
-        customer_url = f"{BASE_URL}/customer/{urllib.parse.quote(_customer_decoded, safe='')}"
-        log(f"No search match — using direct URL: {customer_url}", 0.02)
-
-    log(f"Navigating to customer page: {customer_url}", 0.03)
-    page.goto(customer_url, wait_until="domcontentloaded", timeout=30_000)
-
-    # Vue (customer.js) renders ALL content into the page after load.
-    # Vue (customer.js) loads ticket data via XHR after domcontentloaded.
-    # For large customers (1650 tickets) this can take >30s.
-    # Strategy: try a short wait first; if it times out check for a zero-ticket
-    # state before committing to the full 90s wait.
-    log("Waiting for pagination widget (Vue data load)…", 0.03)
-    try:
-        page.wait_for_selector("ul.pagination", timeout=15_000)
-        log("Pagination widget visible — data loaded", 0.035)
-    except PWTimeoutError:
-        # Check if this is a zero-ticket customer so we don't wait 90s for nothing
-        body = page.inner_text("body") if page.query_selector("body") else ""
-        if re.search(r'0\s+matching|no\s+tickets|no\s+results|0\s+tickets', body, re.I):
-            log("No tickets found for customer — proceeding", 0.035)
-        else:
-            # Large customer still loading — wait the rest of the full timeout
-            try:
-                page.wait_for_selector("ul.pagination", timeout=75_000)
-                log("Pagination widget visible — data loaded (slow load)", 0.035)
-            except PWTimeoutError:
-                log("Timeout waiting for pagination — proceeding with whatever rendered", 0.035)
-
-    if debug:
-        _save_debug("02_customer", customer_url, page.content())
-
-    # The customer URL base — used to detect when pagination navigates away
-    customer_base = customer_url.split("?")[0].split("#")[0]
-
-    def _collect_current_page() -> list[dict]:
-        """Extract ticket summaries from the currently rendered page."""
-        current = page.url.split("?")[0].split("#")[0]
-        # Compare case-insensitively — Supportal canonicalises slugs to title-case
-        # (e.g. navigating to /customer/apple → redirects to /customer/Apple)
-        if customer_base and customer_base.lower() not in current.lower() and "/zendesk/ticket/" not in current:
-            log(f"Context guard: URL drifted to {page.url} — skipping", 0.0)
-            return []
-        html = page.content()
-        rows = _extract_ticket_rows(html)
-        new = [r for r in rows.values() if r["url"] not in seen_urls]
-        if not new:
-            for tid, turl in _extract_ticket_links(html):
-                if turl not in seen_urls:
-                    new.append({"ticket_id": tid, "url": turl})
-        return new
-
-    # Dismiss any intro.js tutorial overlay before interacting
-    try:
-        page.evaluate("""() => {
-            document.querySelectorAll(
-                '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                '[class*="introjs"], .modal-backdrop'
-            ).forEach(el => el.remove());
-        }""")
-    except Exception:
-        pass
-
-    # ── Collect page 1 ────────────────────────────────────────────────────────
-    new_items = _collect_current_page()
-    for item in new_items:
-        all_tickets.append(item)
-        seen_urls.add(item["url"])
-    log(f"Page 1: {len(new_items)} tickets ({len(all_tickets)} total)", 0.06)
-
-    if debug:
-        _save_debug("03_tickets_page1", page.url, page.content())
-
-    # ── Step 4: paginate ──────────────────────────────────────────────────────
-    # Pagination: <ul class="pagination pagination-sm no-margin pull-right">
-    #   <li><a>First</a></li> <li class="active"><a>1</a></li>
-    #   <li class=""><a>2</a></li> … <li><a>Last</a></li>
-    # NOTE: <a> tags have NO href — Vue uses click handlers.
-    # Page change detected by waiting for li.active a text to equal new page num.
-
-    def _parse_total_from_page() -> int | None:
-        # "Showing 15 of 1650 matching items (out of total 1650)"
-        m = re.search(r"Showing\s+\d+\s+of\s+(\d+)\s+matching", page.content(), re.I)
-        return int(m.group(1)) if m else None
-
-    def _tickets_per_page() -> int:
-        rows = _extract_ticket_rows(page.content())
-        return len(rows) if rows else 15
-
-    import math
-    total_tickets = _parse_total_from_page()
-    per_page = _tickets_per_page() or 15
-    if total_tickets:
-        total_pages = math.ceil(total_tickets / per_page)
-        log(f"Total: {total_tickets} tickets → {total_pages} pages ({per_page}/page)", 0.07)
-    else:
-        total_pages = 9999
-        log("Could not parse total — paginating until no more buttons", 0.07)
-
-    page_num = 1
-    while page_num < total_pages:
-        if max_pages and page_num >= max_pages:
-            break
-
-        next_page_num = page_num + 1
-        pct = min(0.07 + 0.88 * (page_num / max(total_pages, 1)), 0.94)
-
-        # Find the page button inside ul.pagination — <a> with exact text
-        btn = page.locator("ul.pagination li a").filter(
-            has_text=re.compile(rf"^\s*{next_page_num}\s*$")
-        )
-        if btn.count() == 0:
-            log(f"No button for page {next_page_num} — done at page {page_num}", 0.95)
-            break
-
-        log(f"Clicking page {next_page_num}…", pct)
-        try:
-            # Dismiss intro.js / tutorial overlays that block pointer events
-            page.evaluate("""() => {
-                document.querySelectorAll(
-                    '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                    '[class*="introjs"], .modal-backdrop, .overlay'
-                ).forEach(el => el.remove());
-            }""")
-            btn.first.scroll_into_view_if_needed()
-            try:
-                btn.first.click(timeout=10_000)
-            except Exception:
-                # Re-dismiss in case overlay re-appeared, then force-click
-                page.evaluate("document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())")
-                btn.first.click(force=True, timeout=10_000)
-
-            # Wait for ul.pagination li.active to show the new page number
-            try:
-                page.wait_for_function(
-                    """(n) => {
-                        const active = document.querySelector('ul.pagination li.active a');
-                        return active && active.innerText.trim() === String(n);
-                    }""",
-                    arg=next_page_num,
-                    timeout=15_000,
-                )
-            except Exception:
-                page.wait_for_timeout(2000)
-
-            new_items = _collect_current_page()
-            for item in new_items:
-                all_tickets.append(item)
-                seen_urls.add(item["url"])
-            log(f"Page {next_page_num}: +{len(new_items)} → {len(all_tickets)} total", pct)
-            page_num = next_page_num
-            time.sleep(0.3)
-        except Exception as exc:
-            log(f"Page {next_page_num} error: {exc}", pct)
-            break
-
-    return all_tickets, customer_url
+) -> tuple[list[dict], str]:
+    """Stub — Playwright listing removed; callers should use scrape_with_cookie instead."""
+    progress_cb("Playwright listing not available — use cookie auth.", 0.0)
+    return [], f"{BASE_URL}/customer/{urllib.parse.quote(customer.strip(), safe='')}"
 
 
 def scrape_with_playwright(
@@ -2524,90 +1587,11 @@ def scrape_with_playwright(
     change_signals: dict | None = None,
     max_tickets: int = 0,
 ) -> list[dict]:
-    """Auth mode B: headless Playwright using the saved session profile.
-
-    Ticket detail pages are Vue.js rendered so they require Playwright navigation.
-    The listing phase now works with pagination (intro.js overlay dismissed), and
-    detail pages are fetched sequentially in the same browser context.
-    """
-    os.makedirs(PROFILE_DIR, exist_ok=True)
-    results: list[dict] = []
-
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=PROFILE_DIR,
-            headless=True,
-            user_agent=UA,
-            ignore_https_errors=True,
-        )
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
-
-        listing_summaries, customer_url = _scrape_listing_playwright(page, customer, max_pages, progress_cb)
-        progress_cb(f"Listing complete — {len(listing_summaries)} tickets found. Fetching details…", 0.15)
-
-        if change_signals is not None:
-            listing_summaries, n_new, n_changed, n_skipped = _filter_changed_tickets(
-                listing_summaries, change_signals, max_tickets
-            )
-            progress_cb(
-                f"Change detection: {n_new} new, {n_changed} changed, {n_skipped} unchanged (skipped)"
-                + (f", capped at {max_tickets}" if max_tickets > 0 else "") + ".",
-                0.15,
-            )
-        elif skip_ids:
-            all_count = len(listing_summaries)
-            listing_summaries = [s for s in listing_summaries if str(s.get("ticket_id", "")) not in skip_ids]
-            if max_tickets > 0:
-                listing_summaries = listing_summaries[:max_tickets]
-            skipped = all_count - len(listing_summaries)
-            progress_cb(
-                f"Incremental mode: {len(listing_summaries)} new tickets to scrape, {skipped} already in Couchbase (skipped).",
-                0.15,
-            )
-        elif max_tickets > 0:
-            listing_summaries = listing_summaries[:max_tickets]
-            progress_cb(f"Capped at {max_tickets} tickets.", 0.15)
-
-        total = len(listing_summaries)
-        for i, summary in enumerate(listing_summaries):
-            tid  = summary.get("ticket_id", "")
-            url  = f"{BASE_URL}/zendesk/ticket/{tid}"
-            pct  = 0.15 + 0.84 * (i / max(total, 1))
-            progress_cb(f"Detail {i + 1}/{total}  ticket #{tid}", pct)
-            try:
-                page.goto(url, wait_until="commit", timeout=60_000)
-                # ticket.js (Vue) renders fields into section.content via XHR
-                try:
-                    page.wait_for_function(
-                        """() => {
-                            const sec = document.querySelector('section.content');
-                            return sec && sec.innerText && sec.innerText.trim().length > 50;
-                        }""",
-                        timeout=30_000,
-                    )
-                except PWTimeoutError:
-                    pass
-                html = page.content()
-                if _is_deleted_ticket_page(200, html):
-                    rec = {**summary, "url": url, "_deleted": True}
-                else:
-                    rec = parse_ticket_detail(html, url)
-                    for field in ("status", "priority", "subject", "created", "solved"):
-                        if not rec.get(field) and summary.get(field):
-                            rec[field] = summary[field]
-            except PWTimeoutError:
-                rec = {**summary, "url": url, "error": "timeout"}
-            except Exception as exc:
-                rec = {**summary, "url": url, "error": str(exc)}
-            rec.setdefault("customer_url", customer_url)
-            results.append(rec)
-            time.sleep(0.15)
-
-        ctx.close()
-
-    progress_cb("Done", 1.0)
-    return results
+    """Auth mode B: uses saved browser session cookie for REST-based scraping."""
+    cookie = _browser_state.get("cookie_string", "") or _get_profile_cookie()
+    if not cookie:
+        raise RuntimeError("No session cookie available — complete browser login first.")
+    return scrape_with_cookie(cookie, customer, max_pages, progress_cb, skip_ids, change_signals, max_tickets)
 
 
 _DELETED_TICKET_PHRASES = (
@@ -2654,31 +1638,12 @@ def scrape_single_ticket_cookie(cookie: str, ticket_id: str) -> dict:
 
 
 def scrape_single_ticket_playwright(ticket_id: str) -> dict:
-    """Fetch and parse a single ticket detail page using the saved Playwright session."""
-    url = f"{BASE_URL}/zendesk/ticket/{ticket_id}"
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=PROFILE_DIR,
-            headless=True,
-            user_agent=UA,
-            ignore_https_errors=True,
-        )
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
-        page.goto(url, wait_until="commit", timeout=60_000)
-        try:
-            page.wait_for_function(
-                """() => {
-                    const sec = document.querySelector('section.content');
-                    return sec && sec.innerText && sec.innerText.trim().length > 50;
-                }""",
-                timeout=60_000,
-            )
-        except PWTimeoutError:
-            pass
-        html = page.content()
-        ctx.close()
-    return parse_ticket_detail(html, url)
+    """Fetch a single ticket via REST API using the saved browser session cookie."""
+    cookie = _browser_state.get("cookie_string", "") or _get_profile_cookie()
+    if not cookie:
+        raise RuntimeError("No session cookie available — complete browser login first.")
+    session = _make_api_session(cookie)
+    return fetch_ticket_api(ticket_id, session)
 
 
 def validate_and_recover_pipeline(
@@ -2701,8 +1666,8 @@ def validate_and_recover_pipeline(
     llm_base_url: str,
     score_batch_size: int,
     cookie: str,
-    use_playwright: bool,
-    progress_cb: Callable[[str, float], None],
+    use_playwright: bool = False,  # kept for backwards compat; ignored (always uses REST)
+    progress_cb: Callable[[str, float], None] = lambda m, p: None,
     cancel: threading.Event | None = None,
     raw_tickets: list[dict] | None = None,
 ) -> tuple[int, int]:
@@ -2789,10 +1754,12 @@ def validate_and_recover_pipeline(
         progress_cb(f"[{i+1}/{total}] Re-scraping ticket #{tid}…", pct)
         doc_key = f"ticket::{tid}"
 
-        # 2. Re-scrape
+        # 2. Re-scrape via REST API
         try:
-            if use_playwright:
-                ticket = scrape_single_ticket_playwright(tid)
+            _ck = cookie or _browser_state.get("cookie_string", "") or _get_profile_cookie()
+            if _ck:
+                sess = _make_api_session(_ck)
+                ticket = fetch_ticket_api(tid, sess)
             else:
                 ticket = scrape_single_ticket_cookie(cookie, tid)
         except Exception as exc:
@@ -2858,209 +1825,55 @@ def validate_and_recover_pipeline(
 
 def open_browser_thread() -> None:
     """
-    Launch a headful Chromium window so the user can complete interactive login.
-
-    This function BLOCKS on _browser_close_event so that ctx.close() and
-    pw.stop() happen in the same OS thread that called sync_playwright().start().
-    Playwright's sync API binds greenlets to the creating thread; closing from a
-    different thread causes "cannot switch to a different thread (has exited)".
+    Launch login_browser.py as a subprocess for interactive SSO login.
+    The subprocess opens a headed browser, detects successful login,
+    saves cookies to ~/.supportal_cookies.json, then exits.
     """
-    os.makedirs(PROFILE_DIR, exist_ok=True)
-    _browser_close_event.clear()
+    import sys as _sys
     _browser_closed_event.clear()
     _browser_ready_event.clear()
+    _browser_state["logged_in"]     = False
+    _browser_state["cookie_string"] = ""
 
-    pw = sync_playwright().start()
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=PROFILE_DIR,
-        headless=False,
-        viewport={"width": 1280, "height": 900},
-        user_agent=UA,
-        ignore_https_errors=True,
-    )
-    page = ctx.new_page()
-    # Use domcontentloaded here — SSO chains may prevent networkidle from firing.
-    # ERR_ABORTED / "frame was detached" can fire mid-SSO-redirect; check whether
-    # the page actually landed somewhere before deciding to raise.
-    try:
-        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=120_000)
-    except Exception as _nav_err:
-        _estr = str(_nav_err)
-        if "ERR_ABORTED" in _estr or "frame was detached" in _estr:
-            try:
-                _landed = page.url
-            except Exception:
-                _landed = ""
-            if not _landed or _landed in ("about:blank", ""):
-                raise  # truly failed to navigate
-            # else: page navigated via SSO redirect — proceed normally
-        else:
-            raise
-    _browser_state["pw"] = pw
-    _browser_state["ctx"] = ctx
+    script = Path(__file__).parent.parent.parent / "tools" / "login_browser.py"
+    venv_python = Path(__file__).parent.parent.parent / "venv" / "bin" / "python"
+    python = str(venv_python) if venv_python.exists() else _sys.executable
 
-    # Signal that the browser is open and ready for the user to log in.
+    # Signal "subprocess starting" so the UI unblocks from _browser_ready_event.wait()
     _browser_ready_event.set()
 
-    # Wait here until confirm_login_thread() signals us to close.
-    # The browser window stays open because this thread is alive.
-    _browser_close_event.wait()
-
-    # Capture only the cookies scoped to the Supportal origin before the
-    # context is destroyed.  Passing urls= filters out SSO/OAuth/CDN cookies
-    # from every other domain visited during the login flow.
     try:
-        raw_cookies = ctx.cookies(urls=[BASE_URL])
-        _browser_state["cookie_string"] = "; ".join(
-            f"{c['name']}={c['value']}" for c in raw_cookies
-        )
-    except Exception:
-        _browser_state["cookie_string"] = ""
+        subprocess.run([python, str(script)], check=False, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("[LOGIN] login_browser.py timed out after 5 min")
+    except Exception as exc:
+        print(f"[LOGIN] subprocess error: {exc}")
 
-    # Clean up in this thread — same greenlet context as pw.start() above.
+    # Read cookies saved by login_browser.py
     try:
-        ctx.close()
-    finally:
-        pw.stop()
-    _browser_state["ctx"] = None
-    _browser_state["pw"]  = None
-    _browser_state["logged_in"] = True
+        if COOKIES_FILE.exists():
+            data = json.loads(COOKIES_FILE.read_text())
+            ck = data.get("cookie", "")
+            if ck:
+                _browser_state["cookie_string"] = ck
+                _browser_state["logged_in"]     = True
+    except Exception as exc:
+        print(f"[LOGIN] cookie read error: {exc}")
+
     _browser_closed_event.set()
 
 
 def confirm_login_thread() -> None:
-    """
-    Signal open_browser_thread() to close the browser, then wait for it to finish.
-    All playwright teardown happens in the thread that created the session.
-    """
-    _browser_close_event.set()
-    # Wait up to 30 s for the browser thread to finish closing.
-    if not _browser_closed_event.wait(timeout=30):
-        raise TimeoutError("Browser did not close within 30 seconds.")
-
-
-# ─────────────────────────── Network API logger ───────────────────────────────
-
-def start_net_log_thread() -> None:
-    """
-    Open a headful Chromium window and capture every XHR/fetch call made to
-    supportal.couchbase.com into _net_log_state['entries'].
-
-    Uses a separate profile dir so it doesn't share cookies with the login
-    browser.  Blocks on _net_log_close_event — call stop_net_log_thread() to
-    shut down cleanly from another thread.
-    """
-    _net_log_close_event.clear()
-    _net_log_closed_event.clear()
-    _net_log_ready_event.clear()
-    _net_log_state["entries"] = []
-    _net_log_state["running"] = True
-
-    profile_dir = os.path.join(os.path.dirname(__file__), ".playwright_netlog")
-    os.makedirs(profile_dir, exist_ok=True)
-
-    pw  = sync_playwright().start()
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=profile_dir,
-        headless=False,
-        viewport={"width": 1280, "height": 900},
-        user_agent=UA,
-        ignore_https_errors=True,
-    )
-    _net_log_state["pw"]  = pw
-    _net_log_state["ctx"] = ctx
-    page = ctx.new_page() if not ctx.pages else ctx.pages[0]
-
-    def _handle_route(route):
-        # page.route() fires synchronously for each request while the page is
-        # alive — unlike requestfinished/response events which fire at browser
-        # shutdown after body buffers are released.  route.fetch() re-issues
-        # the request through Playwright's fetch infrastructure and returns a
-        # fully-buffered APIResponse whose .body() is always available.
-        request = route.request
-        url     = request.url
-
-        if "supportal.couchbase.com" not in url or request.resource_type not in ("xhr", "fetch"):
-            try:
-                route.continue_()
-            except Exception:
-                pass
-            return
-
-        resp_text  = ""
-        resp_error = ""
-        status     = 0
-        try:
-            api_resp  = route.fetch()
-            status    = api_resp.status
-            try:
-                resp_text = api_resp.body().decode("utf-8", errors="replace")
-            except Exception as e:
-                resp_error = str(e)
-            try:
-                route.fulfill(response=api_resp)
-            except Exception:
-                pass
-        except Exception as e:
-            resp_error = str(e)
-            try:
-                route.continue_()
-            except Exception:
-                pass
-
-        try:
-            req_body = request.post_data or ""
-        except Exception:
-            req_body = ""
-
-        entry = {
-            "ts":         int(time.time()),
-            "time":       time.strftime("%H:%M:%S"),
-            "method":     request.method,
-            "url":        url,
-            "status":     status,
-            "req_body":   req_body[:4000],
-            "resp_body":  resp_text[:50000],
-            "resp_size":  len(resp_text),
-            "resp_error": resp_error,
-        }
-        _net_log_state["entries"].append(entry)
-        cb = _net_log_state.get("_ui_cb")
-        lp = _net_log_state.get("_loop")
-        if cb and lp:
-            asyncio.run_coroutine_threadsafe(cb(entry), lp)
-
-    page.route("**/*", _handle_route)
+    """Read saved cookie from COOKIES_FILE (login_browser.py already saved it)."""
     try:
-        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
-    except Exception:
-        pass
-    _net_log_ready_event.set()
-    _net_log_close_event.wait()
-
-    try:
-        ctx.close()
-    finally:
-        pw.stop()
-    _net_log_state["pw"]      = None
-    _net_log_state["ctx"]     = None
-    _net_log_state["running"] = False
-    _net_log_closed_event.set()
-
-
-def stop_net_log_thread() -> None:
-    """Signal start_net_log_thread() to close the browser and wait for cleanup."""
-    _net_log_close_event.set()
-    _net_log_closed_event.wait(timeout=15)
-
-
-def save_net_log() -> str:
-    """Write captured entries to a timestamped JSON file. Returns the path."""
-    ts   = time.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(os.path.dirname(__file__), f"network_log_{ts}.json")
-    with open(path, "w") as f:
-        json.dump(_net_log_state["entries"], f, indent=2)
-    return path
+        if COOKIES_FILE.exists():
+            data = json.loads(COOKIES_FILE.read_text())
+            ck = data.get("cookie", "")
+            if ck:
+                _browser_state["cookie_string"] = ck
+                _browser_state["logged_in"]     = True
+    except Exception as exc:
+        print(f"[LOGIN] confirm_login_thread read error: {exc}")
 
 
 # ─────────────────────────── Export helpers ───────────────────────────────────
@@ -3238,7 +2051,13 @@ class _PctBar:
 
 # ─────────────────────────── UI ───────────────────────────────────────────────
 
-@ui.page("/")
+def _ui_page(path: str):
+    """Conditional page decorator — skips registration in library mode."""
+    if _LIBRARY_MODE:
+        return lambda f: f
+    return ui.page(path)
+
+@_ui_page("/")
 def main_page():
     # Per-page state (NiceGUI re-creates this for each browser tab)
     state = {
@@ -3250,6 +2069,9 @@ def main_page():
         "chat_session_id":  str(uuid.uuid4()),  # unique ID for current conversation session
         "chat_session_turns": [],       # [(question, answer, ts, ticket_ids)] for session storage
         "prior_session_block": "",      # fetched once on first turn; injected into every system prompt
+        # AFTER v1.5.0: chat flow
+        "last_suggestions": [],         # follow-up question chips rendered after last assistant message
+        "_session_log":     {},         # tool call tally carried across turns
     }
 
     # ── Restore from server-level state (survives page refresh) ─────────────
@@ -3259,11 +2081,25 @@ def main_page():
         state["customer_name"] = _SERVER_STATE["customer_name"]
 
     _cancel = threading.Event()   # set() to request cancellation of the active operation
+    _agent_cancel = threading.Event()  # AFTER v1.5.0: cancel for in-flight agent runs
 
     # ── Header ──────────────────────────────────────────────────────────────
-    with ui.header().classes("bg-blue-900 text-white items-center px-6 py-3 shadow-md"):
-        ui.label(f"Couchbase Supportal Scraper").classes("text-xl font-bold")
-        ui.label(f"v{__version__}").classes("text-sm font-mono text-blue-300 ml-2")
+    with ui.header().classes("bg-blue-900 text-white items-center px-6 py-3 shadow-md gap-3"):
+        ui.label("Strabo").classes("text-xl font-bold tracking-tight")
+        ui.label(f"v{__version__}").classes(
+            "text-xs font-mono bg-blue-700 text-blue-200 px-2 py-0.5 rounded"
+        )
+        ui.space()
+        # Active customer chip — updated whenever customer changes
+        _hdr_cust = ui.label("").classes(
+            "text-sm font-medium bg-blue-800 text-blue-100 px-3 py-0.5 rounded-full hidden"
+        )
+        # CB connectivity dot — green when URL is set, grey when not
+        with ui.row().classes("items-center gap-1"):
+            _cb_dot = ui.element("div").classes(
+                "w-2.5 h-2.5 rounded-full bg-gray-400"
+            ).tooltip("Couchbase: not configured")
+            ui.label("CB").classes("text-xs text-blue-300 font-mono")
 
     # ── Reconnect banner — shown when page loads while an op is running ─────
     _reconnect_banner = ui.notify(
@@ -3310,6 +2146,7 @@ def main_page():
             tab_chat     = ui.tab("Chat",               icon="chat")
             tab_scoring  = ui.tab("Scoring & Analysis", icon="analytics")
             tab_custs    = ui.tab("Customers",          icon="people")
+            tab_assets   = ui.tab("Assets",             icon="folder")
         with ui.tab_panels(main_tabs, value=tab_config).classes("w-full pt-4"):
 
             with ui.tab_panel(tab_scrape):
@@ -3378,6 +2215,7 @@ def main_page():
                                 columns=[
                                     {"name": "display_name", "label": "Display Name",  "field": "display_name", "align": "left"},
                                     {"name": "slug",         "label": "Slug / URL key", "field": "slug",         "align": "left"},
+                                    {"name": "source",       "label": "Source",         "field": "source",       "align": "left"},
                                 ],
                                 rows=[],
                                 row_key="slug",
@@ -3399,15 +2237,64 @@ def main_page():
                                 return
                             cust_search_status.set_text("Searching…")
                             cust_search_table.rows = []
-                            cookie = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                            _ck = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
                             try:
-                                hits = await run.io_bound(
-                                    search_customers_on_supportal, q, cookie or None
-                                )
-                                cust_search_table.rows = hits
+                                all_hits: list[dict] = []
+                                seen_slugs: set[str] = set()
+
+                                # 1 — Supportal UI search API
+                                try:
+                                    for h in await run.io_bound(search_customers_on_supportal, q, _ck or None):
+                                        _k = (h.get("slug") or "").lower()
+                                        if _k not in seen_slugs:
+                                            seen_slugs.add(_k)
+                                            h.setdefault("source", "Supportal")
+                                            all_hits.append(h)
+                                except Exception:
+                                    pass
+
+                                # 2 — Analytics LIKE '%q%' (open endpoint, no cookie needed)
+                                if True:
+                                    cust_search_status.set_text("Searching analytics…")
+                                    try:
+                                        for h in await run.io_bound(search_customers_via_analytics, q, _ck):
+                                            _k = (h.get("slug") or "").lower()
+                                            if _k not in seen_slugs:
+                                                seen_slugs.add(_k)
+                                                all_hits.append(h)
+                                    except Exception:
+                                        pass
+
+                                # 3 — Local Couchbase LIKE '%q%' (already-scraped customers)
+                                _cb_url  = cb_url_input.value.strip()
+                                _cb_user = cb_user_input.value.strip()
+                                if _CB_AVAILABLE and _cb_url and _cb_user:
+                                    cust_search_status.set_text("Checking local database…")
+                                    try:
+                                        _local_orgs = await run.io_bound(
+                                            search_orgs_from_cb,
+                                            _cb_url,
+                                            cb_bucket_input.value.strip() or "supportal",
+                                            _cb_user,
+                                            cb_pass_input.value,
+                                            cb_tls_toggle.value,
+                                            cb_scope_input.value.strip() or "_default",
+                                            cb_collection_input.value.strip() or "tickets",
+                                            q,
+                                        )
+                                        for _org in _local_orgs:
+                                            _k = _org.lower()
+                                            if _k not in seen_slugs:
+                                                seen_slugs.add(_k)
+                                                _url = f"{BASE_URL}/customer/{urllib.parse.quote(_org, safe='')}"
+                                                all_hits.append({"slug": _org, "display_name": _org, "url": _url, "source": "Local DB"})
+                                    except Exception:
+                                        pass
+
+                                cust_search_table.rows = all_hits
                                 cust_search_table.update()
                                 cust_search_status.set_text(
-                                    f"{len(hits)} result(s)" if hits else "No customers found."
+                                    f"{len(all_hits)} result(s)" if all_hits else "No customers found."
                                 )
                             except Exception as exc:
                                 cust_search_status.set_text(f"Search error: {exc}")
@@ -3445,17 +2332,69 @@ def main_page():
                                 return
                             max_pages = int(max_pages_input.value or 0)
 
-                            # Resolve auth
-                            active_tab = auth_tabs.value          # NiceGUI tab label text
-                            using_browser = (active_tab == tab_browser.name if hasattr(tab_browser, "name")
-                                             else str(active_tab) == "Browser Login (SSO)")
+                            # Resolve auth — always use cookie (from paste or browser login)
                             cookie = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                            if not cookie:
+                                cookie = _browser_state.get("cookie_string", "") or _get_profile_cookie()
 
-                            if using_browser and not _browser_state.get("logged_in"):
-                                ui.notify("Complete browser login first.", type="warning")
-                                return
-                            if not using_browser and not cookie:
-                                ui.notify("Paste a cookie string or set SUPPORTAL_COOKIE env var.", type="warning")
+                            # Auto-resolve plain name to exact Supportal slug
+                            if not customer_input.value.strip().startswith("http"):
+                                _best_hit: dict | None = None
+
+                                # 1 — Supportal UI search
+                                if cookie:
+                                    progress_label.set_text(f"Searching Supportal for '{customer}'…")
+                                    try:
+                                        _ui_hits = await run.io_bound(search_customers_on_supportal, customer, cookie, 10)
+                                        if _ui_hits:
+                                            _best_hit = _ui_hits[0]
+                                    except Exception:
+                                        pass
+
+                                # 2 — Analytics LIKE fallback
+                                if not _best_hit and cookie:
+                                    progress_label.set_text(f"UI search empty — trying analytics for '{customer}'…")
+                                    try:
+                                        _an_hits = await run.io_bound(search_customers_via_analytics, customer, cookie, 10)
+                                        if _an_hits:
+                                            _best_hit = _an_hits[0]
+                                    except Exception:
+                                        pass
+
+                                # 3 — Local Couchbase LIKE fallback
+                                if not _best_hit and _CB_AVAILABLE and cb_url_input.value.strip() and cb_user_input.value.strip():
+                                    progress_label.set_text(f"Checking local database for '{customer}'…")
+                                    try:
+                                        _local_orgs = await run.io_bound(
+                                            search_orgs_from_cb,
+                                            cb_url_input.value.strip(),
+                                            cb_bucket_input.value.strip() or "supportal",
+                                            cb_user_input.value.strip(),
+                                            cb_pass_input.value,
+                                            cb_tls_toggle.value,
+                                            cb_scope_input.value.strip() or "_default",
+                                            cb_collection_input.value.strip() or "tickets",
+                                            customer,
+                                        )
+                                        if _local_orgs:
+                                            _local_url = f"{BASE_URL}/customer/{urllib.parse.quote(_local_orgs[0], safe='')}"
+                                            _best_hit = {"slug": _local_orgs[0], "display_name": _local_orgs[0], "url": _local_url}
+                                    except Exception:
+                                        pass
+
+                                if _best_hit:
+                                    customer      = _best_hit.get("slug") or customer
+                                    _resolved_url = _best_hit.get("url")  or _resolved_url
+                                    customer_input.set_value(_resolved_url)
+                                    progress_label.set_text(
+                                        f"Resolved '{_best_hit.get('display_name', customer)}' → {_resolved_url}"
+                                    )
+                                    print(f"[SCRAPE] auto-resolved to slug={customer!r} url={_resolved_url}")
+                            if not cookie:
+                                ui.notify(
+                                    "Paste a cookie string in the Cookie tab, or use Browser Login first.",
+                                    type="warning",
+                                )
                                 return
 
                             loop = asyncio.get_event_loop()
@@ -3497,29 +2436,14 @@ def main_page():
                                 ui.notify("Couchbase not available — falling back to full scrape.", type="warning")
 
                             try:
-                                if using_browser:
-                                    _scrape_loop = asyncio.get_event_loop()
-                                    _scrape_fut: asyncio.Future = _scrape_loop.create_future()
-
-                                    def _scrape_thread():
-                                        try:
-                                            _r = scrape_with_playwright(
-                                                customer, max_pages, progress_cb,
-                                                skip_ids, change_signals, max_tickets,
-                                            )
-                                            _scrape_loop.call_soon_threadsafe(_scrape_fut.set_result, _r)
-                                        except Exception as _exc:
-                                            _scrape_loop.call_soon_threadsafe(_scrape_fut.set_exception, _exc)
-
-                                    threading.Thread(target=_scrape_thread, daemon=True).start()
-                                    data = await _scrape_fut
-                                else:
-                                    data = await run.io_bound(
-                                        scrape_with_cookie_playwright, cookie, customer, max_pages, progress_cb,
-                                        skip_ids, change_signals, max_tickets,
-                                    )
+                                data = await run.io_bound(
+                                    scrape_with_cookie, cookie, customer, max_pages, progress_cb,
+                                    skip_ids, change_signals, max_tickets,
+                                )
 
                                 state["results"] = data
+                                _results_empty.set_visibility(False)
+                                _results_card.set_visibility(True)
                                 # Save old customer's history, then load new customer's
                                 _old_cust = state.get("customer_name", "")
                                 if _CB_AVAILABLE and state.get("chat_history") and _old_cust != customer:
@@ -3568,12 +2492,14 @@ def main_page():
                                 if _CB_AVAILABLE and pipeline_save_toggle.value and data:
                                     import time as _time
                                     _pipe_step_start: dict = {}
+                                    _is_full_scrape = scrape_mode_select.value != "Changed only (skip existing)"
                                     _steps_enabled = (
                                         ["save"]
-                                        + (["enrich"]   if pipeline_enrich_toggle.value   else [])
-                                        + (["embed"]    if pipeline_embed_toggle.value    else [])
-                                        + (["score"]    if pipeline_score_toggle.value    else [])
-                                        + (["validate"] if pipeline_validate_toggle.value else [])
+                                        + (["enrich"]    if pipeline_enrich_toggle.value    else [])
+                                        + (["embed"]     if pipeline_embed_toggle.value     else [])
+                                        + (["score"]     if pipeline_score_toggle.value     else [])
+                                        + (["validate"]  if pipeline_validate_toggle.value  else [])
+                                        + (["reconcile"] if pipeline_reconcile_toggle.value and _is_full_scrape else [])
                                     )
 
                                     _cancel.clear()
@@ -3681,7 +2607,7 @@ def main_page():
                                     _save_ok = False
                                     try:
                                         saved, errs = await run.io_bound(
-                                            save_tickets_to_cb,
+                                            load_to_couchbase,
                                             data,
                                             cb_url_input.value.strip(),
                                             cb_bucket_input.value.strip(),
@@ -3737,7 +2663,7 @@ def main_page():
                                                 _enrich_cookie or None,
                                                 _make_step_prog("enrich"),
                                                 _cancel,
-                                                4,
+                                                int(enrich_workers_input.value or 4),
                                                 _snap_upsert_fn,
                                             )
                                             _snap_count = len([t for t in data if t.get("snapshots")])
@@ -3778,6 +2704,14 @@ def main_page():
                                         await _step_activate("embed")
                                         try:
                                             emb_provider, emb_model, emb_api_key, emb_base_url, emb_dims, emb_num_ctx = _get_embed_config()
+                                            # Ensure LMStudio embedding model is loaded before embedding
+                                            if emb_provider == "lmstudio":
+                                                _emb_lms_base = (emb_base_url or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                                                _loaded = await run.io_bound(lmstudio_ensure_model_loaded, _emb_lms_base, emb_model, 45, "embeddings")
+                                                if _loaded:
+                                                    if _loaded != emb_model:
+                                                        progress_label.set_text(f"LMStudio: using embedding model '{_loaded}'")
+                                                    emb_model = _loaded
                                             done_emb, errs_emb = await run.io_bound(
                                                 embed_all_tickets,
                                                 data,
@@ -3796,6 +2730,7 @@ def main_page():
                                                 _make_step_prog("embed"),
                                                 _cancel,
                                                 emb_num_ctx,
+                                                int(embed_parallel_input.value or 1),
                                             )
                                             await _step_finish(
                                                 "embed",
@@ -3875,7 +2810,7 @@ def main_page():
                                                 llm_provider, llm_model, llm_api_key, llm_base_url,
                                                 int(score_batch_input.value or 20),
                                                 (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", ""),
-                                                using_browser,
+                                                False,
                                                 _make_step_prog("validate"),
                                                 _cancel,
                                                 data,
@@ -3889,6 +2824,33 @@ def main_page():
                                         except Exception as exc:
                                             await _step_finish("validate", f"Error: {exc}", ok=False)
                                             ui.notify(f"Pipeline validate error: {exc}", type="negative")
+
+                                    # ── Step 5: Reconcile (delete removed tickets) ──────────
+                                    if pipeline_reconcile_toggle.value and _is_full_scrape and _save_ok and not _cancel.is_set():
+                                        await _step_activate("reconcile")
+                                        try:
+                                            _scraped_ids = {str(t["ticket_id"]) for t in data if t.get("ticket_id")}
+                                            _rec_deleted, _rec_errors = await run.io_bound(
+                                                _reconcile_deleted_tickets,
+                                                _scraped_ids,
+                                                customer,
+                                                cb_url_input.value.strip(),
+                                                cb_bucket_input.value.strip(),
+                                                cb_user_input.value.strip(),
+                                                cb_pass_input.value,
+                                                cb_tls_toggle.value,
+                                                cb_scope_input.value.strip() or "_default",
+                                                cb_collection_input.value.strip() or "tickets",
+                                                _make_step_prog("reconcile"),
+                                            )
+                                            await _step_finish(
+                                                "reconcile",
+                                                f"{_rec_deleted} removed" + (f", {_rec_errors} errors" if _rec_errors else "") if _rec_deleted else "Nothing to remove",
+                                                ok=_rec_errors == 0,
+                                            )
+                                        except Exception as exc:
+                                            await _step_finish("reconcile", f"Error: {exc}", ok=False)
+                                            ui.notify(f"Pipeline reconcile error: {exc}", type="negative")
 
                                     # ── Write customer inventory doc ────────────────────────
                                     if _inv and state.get("customer_name"):
@@ -3939,9 +2901,12 @@ def main_page():
                                 ui.notify("Could not resolve a customer name from the input.", type="warning")
                                 return
 
-                            if not _browser_state.get("logged_in"):
+                            _ck_diag = (cookie_input.value or "").strip() or os.environ.get("SUPPORTAL_COOKIE", "")
+                            if not _ck_diag:
+                                _ck_diag = _browser_state.get("cookie_string", "") or _get_profile_cookie()
+                            if not _ck_diag:
                                 ui.notify(
-                                    "Diagnose uses the browser session — complete Browser Login first.",
+                                    "Paste a cookie string or complete Browser Login first.",
                                     type="warning",
                                 )
                                 return
@@ -3956,48 +2921,32 @@ def main_page():
 
                             btn_diagnose.props("loading disabled")
                             progress_bar.set_value(0)
-                            progress_label.set_text("Running diagnostics (Playwright)…")
+                            progress_label.set_text("Running diagnostics (REST API)…")
 
                             def run_diag():
-                                os.makedirs(PROFILE_DIR, exist_ok=True)
                                 report_lines: list[str] = []
-
                                 def log_cb(msg: str, pct: float):
                                     report_lines.append(msg)
                                     progress_cb(msg, pct)
 
-                                with sync_playwright() as pw:
-                                    ctx = pw.chromium.launch_persistent_context(
-                                        user_data_dir=PROFILE_DIR,
-                                        headless=True,
-                                        user_agent=UA,
-                                        ignore_https_errors=True,
-                                    )
-                                    pg = ctx.new_page()
-                                    pg.set_default_timeout(60_000)
-                                    _scrape_listing_playwright(pg, customer, max_pages=1,
-                                                               progress_cb=log_cb, debug=True)
-                                    ctx.close()
+                                log_cb(f"Testing listing API for: {customer}", 0.1)
+                                try:
+                                    sess = _make_api_session(_ck_diag)
+                                    tickets = _get_customer_ticket_listing_api(customer, sess, log_cb)
+                                    log_cb(f"Listing OK — {len(tickets)} tickets found", 0.5)
+                                    if tickets:
+                                        t0 = tickets[0]
+                                        log_cb(f"First ticket: id={t0.get('id')} status={t0.get('status')} subject={t0.get('subject','')[:60]}", 0.6)
+                                except Exception as exc:
+                                    log_cb(f"Listing error: {exc}", 0.5)
 
-                                report_lines.append(f"\nDebug HTML saved to: {DEBUG_DIR}")
                                 return "\n".join(report_lines)
 
                             try:
-                                _diag_loop = asyncio.get_event_loop()
-                                _diag_fut: asyncio.Future = _diag_loop.create_future()
-
-                                def _diag_thread():
-                                    try:
-                                        _r = run_diag()
-                                        _diag_loop.call_soon_threadsafe(_diag_fut.set_result, _r)
-                                    except Exception as _exc:
-                                        _diag_loop.call_soon_threadsafe(_diag_fut.set_exception, _exc)
-
-                                threading.Thread(target=_diag_thread, daemon=True).start()
-                                report = await _diag_fut
+                                report = await run.io_bound(run_diag)
                                 diag_output.set_text(report)
                                 diag_output.set_visibility(True)
-                                progress_label.set_text("Diagnostics complete — check output and debug_html/ folder")
+                                progress_label.set_text("Diagnostics complete")
                             except Exception as exc:
                                 diag_output.set_text(str(exc))
                                 diag_output.set_visibility(True)
@@ -4021,12 +2970,88 @@ def main_page():
                                 "Enable steps to run automatically after a successful scrape. "
                                 "Uses the Couchbase, Embedding, and LLM configurations from the Analysis tab."
                             ).classes("text-xs text-gray-500 mb-2")
-                            with ui.column().classes("gap-1"):
-                                pipeline_save_toggle     = ui.checkbox("Save tickets to Couchbase")
-                                pipeline_enrich_toggle   = ui.checkbox("Enrich with Snapshot Topology (fetches 1st snapshot per ticket; requires Save)")
-                                pipeline_embed_toggle    = ui.checkbox("Embed tickets (requires Save)")
-                                pipeline_score_toggle    = ui.checkbox("Score tickets and save scores (requires Save)")
-                                pipeline_validate_toggle = ui.checkbox("Validate & Recover (re-scrape, re-embed, re-score any missing tickets)")
+                            _step_label_cls = "text-sm min-w-[13rem]"
+                            _ctrl_col_cls   = "gap-0 items-start"
+                            _ctrl_lbl_cls   = "text-xs text-gray-400 leading-none mb-0.5"
+
+                            # ── Save ──────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_save_toggle = ui.checkbox("").tooltip("Save scraped tickets to Couchbase")
+                                ui.label("Save to Couchbase").classes(_step_label_cls)
+
+                            # ── Enrich ────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_enrich_toggle = ui.checkbox("").tooltip("Fetch first snapshot per ticket; requires Save")
+                                ui.label("Enrich with Snapshots").classes(_step_label_cls)
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Workers").classes(_ctrl_lbl_cls)
+                                    enrich_workers_input = ui.number(value=4, min=1, max=16).classes("w-20").tooltip(
+                                        "Concurrent HTTP requests to Supportal for snapshot data"
+                                    )
+
+                            # ── Embed ─────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_embed_toggle = ui.checkbox("").tooltip("Generate embeddings; requires Save")
+                                ui.label("Embed Tickets").classes(_step_label_cls)
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Parallel").classes(_ctrl_lbl_cls)
+                                    embed_parallel_input = ui.number(value=1, min=1, max=32).classes("w-20").tooltip(
+                                        "Concurrent embedding requests. Match to LMStudio 'Parallel requests' "
+                                        "or OLLAMA_NUM_PARALLEL. Use 1 for MLX (not thread-safe)."
+                                    )
+                                async def _probe_lmstudio_concurrency():
+                                    _, _, _, emb_base_url, _, _ = _get_embed_config()
+                                    url = emb_base_url.strip() or "http://localhost:1234"
+                                    info = await run.io_bound(poll_lmstudio_model_info, url)
+                                    if info.get("n_parallel"):
+                                        embed_parallel_input.set_value(info["n_parallel"])
+                                        ui.notify(
+                                            f"LMStudio reports {info['n_parallel']} parallel slots"
+                                            + (f", context {info['context_length']}" if info.get("context_length") else ""),
+                                            type="positive",
+                                        )
+                                    elif info.get("api_version"):
+                                        ui.notify(
+                                            f"LMStudio API v{info['api_version']} reachable but did not "
+                                            "expose parallel count — set manually.",
+                                            type="info",
+                                        )
+                                    else:
+                                        ui.notify("Could not reach LMStudio API", type="warning")
+                                ui.button("Probe LMStudio", icon="network_ping",
+                                          on_click=_probe_lmstudio_concurrency).props("outline color=teal dense")
+
+                            # ── Score ─────────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_score_toggle = ui.checkbox("").tooltip("Score tickets with LLM and save scores; requires Save")
+                                ui.label("Score & Save").classes(_step_label_cls)
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Batch").classes(_ctrl_lbl_cls)
+                                    score_batch_input = ui.number(value=5, min=1, max=50).classes("w-20")
+                                with ui.column().classes(_ctrl_col_cls):
+                                    ui.label("Parallel").classes(_ctrl_lbl_cls)
+                                    score_parallel_input = ui.number(value=1, min=1, max=8).classes("w-20").tooltip(
+                                        "Batches sent to the LLM concurrently. Match to your model server's "
+                                        "parallel request capacity."
+                                    )
+                                score_no_think_toggle = ui.checkbox("No-think").classes("ml-2").tooltip(
+                                    "Suppresses Qwen3/QwQ reasoning traces (Ollama think=false). "
+                                    "Auto-enabled when a thinking-capable model is detected. "
+                                    "Ignored for Claude, Gemini, and LMStudio."
+                                )
+
+                            # ── Validate ──────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_validate_toggle = ui.checkbox("").tooltip("Re-scrape, re-embed, re-score any tickets missing from Couchbase")
+                                ui.label("Validate & Recover").classes(_step_label_cls)
+
+                            # ── Reconcile ─────────────────────────────────────────────────
+                            with ui.row().classes("items-center gap-4 py-1"):
+                                pipeline_reconcile_toggle = ui.checkbox("").tooltip(
+                                    "Delete tickets from Couchbase that no longer exist in Zendesk. "
+                                    "Only runs on full scrapes — skipped for 'Changed only' mode."
+                                )
+                                ui.label("Reconcile (delete removed)").classes(_step_label_cls)
                         pipeline_status = ui.label("").classes("text-sm text-gray-500 mt-1")
 
                         # ── Pipeline observability card ───────────────────────────────────
@@ -4040,11 +3065,12 @@ def main_page():
                                 btn_stop_pipeline.set_enabled(False)
                             _pipe_step_rows: dict = {}
                             for _sk, _sicon, _sname in [
-                                ("save",     "save",            "Save to Couchbase"),
-                                ("enrich",   "biotech",         "Enrich with Snapshot Topology"),
-                                ("embed",    "model_training",  "Embed Tickets"),
-                                ("score",    "psychology",      "Score & Save"),
-                                ("validate", "verified_user",   "Validate & Recover"),
+                                ("save",      "save",            "Save to Couchbase"),
+                                ("enrich",    "biotech",         "Enrich with Snapshot Topology"),
+                                ("embed",     "model_training",  "Embed Tickets"),
+                                ("score",     "psychology",      "Score & Save"),
+                                ("validate",  "verified_user",   "Validate & Recover"),
+                                ("reconcile", "delete_sweep",    "Reconcile (delete removed)"),
                             ]:
                                 with ui.row().classes("items-start gap-3 w-full py-2 border-b last:border-b-0"):
                                     _ico = ui.icon(_sicon, size="xs").classes("text-gray-300 mt-1")
@@ -4063,6 +3089,56 @@ def main_page():
                             ui.separator().classes("my-2")
                             ui.label("Activity Log").classes("text-xs font-semibold text-gray-500 mb-1")
                             pipe_log = ui.log(max_lines=500).classes("w-full h-40 text-xs font-mono border rounded")
+
+                    # ── Background Jobs ───────────────────────────────────────────────────
+                    _jobs_card = ui.card().classes("w-full mt-2")
+                    with _jobs_card:
+                        with ui.row().classes("items-center justify-between w-full mb-2"):
+                            ui.label("Background Jobs").classes("text-base font-semibold")
+                            ui.label("Auto-refreshes every 3s").classes("text-xs text-gray-400")
+
+                        @ui.refreshable
+                        def _render_jobs():
+                            if not _SCRAPE_JOBS:
+                                ui.label("No jobs started yet.").classes("text-xs text-gray-400 italic")
+                                return
+                            import time as _jt
+                            _now = _jt.time()
+                            for job in reversed(list(_SCRAPE_JOBS.values())):
+                                proc  = job.get("processed") or 0
+                                total = job.get("total")
+                                elap  = int(_now - job["started_at"])
+                                is_run = job["status"] == "running"
+                                color = "blue" if is_run else ("positive" if job["status"] == "done" else "negative")
+                                icon  = "sync" if is_run else ("check_circle" if job["status"] == "done" else "error")
+                                with ui.row().classes("items-start gap-3 w-full py-2 border-b last:border-b-0"):
+                                    ui.icon(icon, size="xs").classes(f"mt-1 text-{color}-500")
+                                    with ui.column().classes("flex-1 gap-0.5"):
+                                        with ui.row().classes("items-center gap-2"):
+                                            ui.label(f"{job['org']}").classes("text-sm font-medium")
+                                            ui.badge(job["mode"], color="teal").classes("text-xs")
+                                            ui.badge(job["phase"], color=color).classes("text-xs")
+                                            ui.label(f"#{job['job_id']}").classes("text-xs text-gray-400 font-mono")
+                                        if total:
+                                            ui.linear_progress(
+                                                value=proc / total,
+                                                color=color,
+                                            ).classes("w-full mt-0.5").props("stripe" if is_run else "")
+                                        ui.label(job.get("last_message") or "").classes("text-xs text-gray-500")
+                                        if is_run:
+                                            ui.label(f"Elapsed: {elap}s").classes("text-xs text-gray-400 font-mono")
+                                        elif job.get("finished_at"):
+                                            dur = int(job["finished_at"] - job["started_at"])
+                                            ui.label(
+                                                f"Done in {dur}s — {proc} scraped, "
+                                                f"{job.get('saved',0)} saved, "
+                                                f"{job.get('embedded',0)} embedded, "
+                                                f"{job.get('scored',0)} scored"
+                                                + (f", {job.get('errors',0)} errors" if job.get("errors") else "")
+                                            ).classes("text-xs text-gray-500 font-mono")
+
+                        _render_jobs()
+                        ui.timer(3.0, _render_jobs.refresh)
 
                     # ── Diagnostics output ────────────────────────────────────────────────
                     with ui.card().classes("w-full"):
@@ -4227,8 +3303,18 @@ def main_page():
                         ui.icon("business").classes("text-indigo-400")
                         results_banner = ui.label("No customer loaded").classes("text-sm font-semibold text-indigo-700 flex-1")
 
+                    # ── Results empty state ───────────────────────────────────────────────
+                    with ui.column().classes("w-full items-center gap-3 py-12 text-center") as _results_empty:
+                        ui.icon("search_off", size="4rem").classes("text-gray-200")
+                        ui.label("No tickets loaded").classes("text-lg font-medium text-gray-400")
+                        ui.label("Scrape a customer or load tickets from Couchbase to get started.").classes("text-xs text-gray-400")
+                        ui.button("Go to Scraping", icon="search", on_click=lambda: main_tabs.set_value(tab_scrape)).props("outline color=primary size=sm")
+                    _has_results = bool(state["results"])
+                    _results_empty.set_visibility(not _has_results)
+
                     # ── Results card ──────────────────────────────────────────────────────
-                    with ui.card().classes("w-full"):
+                    with ui.card().classes("w-full") as _results_card:
+                        _results_card.set_visibility(_has_results)
                         ui.label("Results").classes("text-base font-semibold mb-1")
 
                         columns = [
@@ -4462,7 +3548,7 @@ def main_page():
                     with ui.tabs().classes("w-full bg-white border-b border-gray-200") as config_sub_tabs:
                         cfg_auth      = ui.tab("Authentication",       icon="lock")
                         cfg_cb        = ui.tab("Couchbase",            icon="storage")
-                        cfg_embed     = ui.tab("Embedding Operations", icon="model_training")
+                        cfg_embed     = ui.tab("Data Operations", icon="model_training")
                         cfg_chat_mem  = ui.tab("Chat & Memory",        icon="memory")
                         cfg_analytics = ui.tab("Analytics",            icon="tune")
                         cfg_ai        = ui.tab("AI Models",            icon="smart_toy")
@@ -4498,168 +3584,72 @@ def main_page():
                             # ── Browser login tab ───────────────────────────────────────
                             with ui.tab_panel(tab_browser):
                                 ui.label(
-                                    "Click Open Browser. A Chromium window will appear — log in through SSO "
-                                    "as normal and navigate to at least one ticket to confirm access. "
-                                    "Then click Confirm Login to save the session for headless scraping."
+                                    "Click Open Browser to launch login_browser.py. "
+                                    "A Chromium window will open — complete the Okta SSO login. "
+                                    "The browser auto-closes when login is detected and the cookie is saved automatically."
                                 ).classes("text-sm text-gray-500 mb-3")
 
                                 with ui.row().classes("items-center gap-2 mb-2"):
                                     browser_dot    = ui.icon("circle").classes("text-red-500 text-sm")
                                     browser_status = ui.label("Not logged in").classes("text-sm font-semibold text-gray-600")
 
-                                async def _run_in_plain_thread(fn):
-                                    """Run fn in a plain daemon thread (not asyncio executor).
-                                    Playwright's sync API uses its own internal event loop /
-                                    greenlets and must NOT run inside asyncio's thread-pool
-                                    executor — doing so causes greenlet context conflicts."""
-                                    loop = asyncio.get_event_loop()
-                                    done = asyncio.Event()
-                                    exc_holder: list[Exception] = []
-
-                                    def _run():
-                                        try:
-                                            fn()
-                                        except Exception as e:
-                                            exc_holder.append(e)
-                                        finally:
-                                            loop.call_soon_threadsafe(done.set)
-
-                                    threading.Thread(target=_run, daemon=True).start()
-                                    await done.wait()
-                                    if exc_holder:
-                                        raise exc_holder[0]
-
                                 async def do_open_browser():
                                     btn_open.props("loading disabled")
                                     browser_dot.classes(replace="text-orange-500 text-sm")
-                                    browser_status.set_text("Browser opening…")
+                                    browser_status.set_text("Starting browser (login_browser.py)…")
                                     try:
-                                        # Start the browser thread as fire-and-forget — it blocks
-                                        # internally on _browser_close_event, so we must NOT await it.
                                         threading.Thread(target=open_browser_thread, daemon=True).start()
-                                        # Wait only until the browser has launched and navigated.
+                                        # Wait until subprocess has started
                                         await asyncio.get_event_loop().run_in_executor(
                                             None, _browser_ready_event.wait
                                         )
                                         browser_dot.classes(replace="text-blue-500 text-sm")
-                                        browser_status.set_text("Browser open — log in then click Confirm Login")
-                                        btn_confirm.props(remove="disabled")
+                                        browser_status.set_text("Browser open — log in (will auto-close when complete)")
+                                        # Wait for login to complete in background
+                                        asyncio.ensure_future(_poll_login_complete())
                                     except Exception as exc:
                                         browser_dot.classes(replace="text-red-600 text-sm")
                                         browser_status.set_text(f"Error: {exc}")
                                     finally:
                                         btn_open.props(remove="loading disabled")
 
-                                async def do_confirm_login():
-                                    btn_confirm.props("loading disabled")
-                                    browser_status.set_text("Closing browser and saving session…")
-                                    try:
-                                        await _run_in_plain_thread(confirm_login_thread)
-                                        captured = _browser_state.get("cookie_string", "")
-                                        if captured:
-                                            cookie_input.set_value(captured)
+                                async def _poll_login_complete():
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, _browser_closed_event.wait
+                                    )
+                                    captured = _browser_state.get("cookie_string", "")
+                                    if captured:
+                                        cookie_input.set_value(captured)
                                         browser_dot.classes(replace="text-green-500 text-sm")
                                         browser_status.set_text("Logged in ✓ — cookie captured and ready")
-                                        ui.notify("Session saved — cookie captured into Authentication tab.", type="positive")
-                                    except Exception as exc:
+                                    else:
                                         browser_dot.classes(replace="text-red-600 text-sm")
-                                        browser_status.set_text(f"Error: {exc}")
-                                        ui.notify(f"Error saving session: {exc}", type="negative")
-                                        btn_confirm.props(remove="loading disabled")
+                                        browser_status.set_text(
+                                            "Login subprocess finished but no cookie found — "
+                                            "check that login_browser.py saved ~/.supportal_cookies.json"
+                                        )
+
+                                async def do_load_saved_cookie():
+                                    """Read cookie from ~/.supportal_cookies.json if it exists."""
+                                    try:
+                                        if COOKIES_FILE.exists():
+                                            data = json.loads(COOKIES_FILE.read_text())
+                                            ck = data.get("cookie", "")
+                                            if ck:
+                                                cookie_input.set_value(ck)
+                                                _browser_state["cookie_string"] = ck
+                                                _browser_state["logged_in"]     = True
+                                                browser_dot.classes(replace="text-green-500 text-sm")
+                                                browser_status.set_text("Loaded saved cookie ✓")
+                                                ui.notify("Loaded saved cookie.", type="positive")
+                                                return
+                                        ui.notify("No saved cookie found — run Open Browser first.", type="warning")
+                                    except Exception as exc:
+                                        ui.notify(f"Load error: {exc}", type="negative")
 
                                 with ui.row().classes("gap-3"):
                                     btn_open = ui.button("Open Browser & Login", on_click=do_open_browser, icon="open_in_browser")
-                                    btn_confirm = ui.button("Confirm Login", on_click=do_confirm_login, icon="check_circle")
-                                    btn_confirm.props("disabled color=positive")
-
-                                # ── Network API Inspector ──────────────────────────────
-                                ui.separator().classes("mt-5")
-                                with ui.row().classes("items-center gap-2 mt-2"):
-                                    ui.icon("network_check").classes("text-purple-500")
-                                    ui.label("Network API Inspector").classes("text-sm font-semibold text-gray-700")
-                                ui.label(
-                                    "Opens a browser window — log in, then click through tickets and snapshots. "
-                                    "Every API call Supportal makes is captured here with its URL, "
-                                    "request body, and response. Save to JSON when done."
-                                ).classes("text-xs text-gray-400 mt-1 mb-2")
-
-                                with ui.row().classes("items-center gap-2"):
-                                    netlog_dot    = ui.icon("circle").classes("text-gray-400 text-sm")
-                                    netlog_status = ui.label("Not running").classes("text-sm text-gray-500")
-                                    netlog_count  = ui.badge("0 calls", color="purple").classes("ml-2")
-
-                                netlog_log = ui.log(max_lines=300).classes("w-full mt-2 font-mono text-xs")
-                                netlog_log.set_visibility(False)
-
-                                async def _do_start_netlog():
-                                    if _net_log_state["running"]:
-                                        return
-                                    btn_netlog_start.props("loading disabled")
-                                    netlog_dot.classes(replace="text-orange-400 text-sm")
-                                    netlog_status.set_text("Opening browser…")
-                                    netlog_log.clear()
-                                    netlog_log.set_visibility(True)
-                                    netlog_count.set_text("0 calls")
-
-                                    _net_log_state["_loop"] = asyncio.get_event_loop()
-
-                                    async def _on_entry(entry):
-                                        short_url = entry["url"].split("supportal.couchbase.com")[-1][:80]
-                                        netlog_log.push(
-                                            f"[{entry['time']}] {entry['method']:4} {short_url} → {entry['status']}"
-                                        )
-                                        netlog_count.set_text(f"{len(_net_log_state['entries'])} calls")
-
-                                    _net_log_state["_ui_cb"] = _on_entry
-
-                                    threading.Thread(target=start_net_log_thread, daemon=True).start()
-                                    await asyncio.get_event_loop().run_in_executor(
-                                        None, _net_log_ready_event.wait
-                                    )
-                                    netlog_dot.classes(replace="text-green-500 text-sm")
-                                    netlog_status.set_text("Running — browse Supportal to capture calls")
-                                    btn_netlog_start.props(remove="loading disabled")
-                                    btn_netlog_stop.props(remove="disabled")
-                                    btn_netlog_save.props(remove="disabled")
-
-                                async def _do_stop_netlog():
-                                    btn_netlog_stop.props("loading disabled")
-                                    netlog_status.set_text("Stopping…")
-                                    await run.io_bound(stop_net_log_thread)
-                                    netlog_dot.classes(replace="text-gray-400 text-sm")
-                                    netlog_status.set_text(
-                                        f"Stopped — {len(_net_log_state['entries'])} calls captured"
-                                    )
-                                    btn_netlog_stop.props(remove="loading")
-                                    btn_netlog_stop.props("disabled")
-
-                                async def _do_save_netlog():
-                                    if not _net_log_state["entries"]:
-                                        ui.notify("No calls captured yet.", type="warning")
-                                        return
-                                    try:
-                                        path = await run.io_bound(save_net_log)
-                                        ui.notify(
-                                            f"Saved {len(_net_log_state['entries'])} calls → {os.path.basename(path)}",
-                                            type="positive",
-                                        )
-                                        netlog_status.set_text(f"Saved → {os.path.basename(path)}")
-                                    except Exception as exc:
-                                        ui.notify(f"Save error: {exc}", type="negative")
-
-                                with ui.row().classes("gap-3 mt-2"):
-                                    btn_netlog_start = ui.button(
-                                        "Start", icon="play_circle",
-                                        on_click=_do_start_netlog,
-                                    ).props("color=purple")
-                                    btn_netlog_stop = ui.button(
-                                        "Stop", icon="stop_circle",
-                                        on_click=_do_stop_netlog,
-                                    ).props("outline color=red disabled")
-                                    btn_netlog_save = ui.button(
-                                        "Save Log", icon="save",
-                                        on_click=_do_save_netlog,
-                                    ).props("outline color=green disabled")
+                                    ui.button("Load Saved Cookie", on_click=do_load_saved_cookie, icon="key").props("outline color=teal")
 
                     with ui.tab_panel(cfg_cb):
                         with ui.row().classes("items-center justify-between w-full"):
@@ -4986,6 +3976,8 @@ def main_page():
                                     _prog,
                                 )
                                 state["results"] = tickets
+                                _results_empty.set_visibility(False)
+                                _results_card.set_visibility(True)
                                 cb_cust = (cb_load_filter.value or "").strip() or "All Customers"
                                 _old_cust2 = state.get("customer_name", "")
                                 if _CB_AVAILABLE and state.get("chat_history") and _old_cust2 != cb_cust:
@@ -5047,7 +4039,7 @@ def main_page():
 
                     with ui.tab_panel(cfg_embed):
                         with ui.row().classes("items-center justify-between w-full"):
-                            ui.label("Embedding Operations").classes("text-base font-semibold")
+                            ui.label("Data Operations").classes("text-base font-semibold")
                             ui.label("Configure embedding provider in the AI Models tab").classes("text-xs text-gray-400")
 
                         def _get_embed_config() -> tuple[str, str, str, str, int, int | None]:
@@ -5302,38 +4294,77 @@ def main_page():
                             finally:
                                 btn_backfill.set_enabled(True)
 
-                        # ── Parallel embedding concurrency ────────────────────────────
-                        with ui.row().classes("gap-3 mt-2 items-end flex-wrap"):
-                            with ui.column().classes("gap-1"):
-                                ui.label("Parallel embeddings").classes("text-xs text-gray-500")
-                                embed_parallel_input = ui.number(
-                                    value=1, min=1, max=32,
-                                ).classes("w-24").tooltip(
-                                    "Number of concurrent embedding requests. "
-                                    "Match this to 'Parallel requests' in LMStudio or "
-                                    "OLLAMA_NUM_PARALLEL in Ollama. Use 1 for MLX (not thread-safe)."
+                        async def _do_backfill_cbse():
+                            btn_backfill_cbse.set_enabled(False)
+                            emb_status.set_text("Backfilling missing CBSE/JIRA fields …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_cbse(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog_cbse(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_cbse(msg, pct), loop)
+
+                            try:
+                                updated, errs = await run.io_bound(
+                                    backfill_missing_cbse_fields,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    _prog_cbse,
                                 )
-                            async def _probe_lmstudio_concurrency():
-                                _, _, _, emb_base_url, _, _ = _get_embed_config()
-                                url = emb_base_url.strip() or "http://localhost:1234"
-                                info = await run.io_bound(poll_lmstudio_model_info, url)
-                                if info.get("n_parallel"):
-                                    embed_parallel_input.set_value(info["n_parallel"])
-                                    ui.notify(
-                                        f"LMStudio reports {info['n_parallel']} parallel slots"
-                                        + (f", context {info['context_length']}" if info.get("context_length") else ""),
-                                        type="positive",
-                                    )
-                                elif info.get("api_version"):
-                                    ui.notify(
-                                        f"LMStudio API v{info['api_version']} reachable but did not "
-                                        "expose parallel count — set manually.",
-                                        type="info",
-                                    )
-                                else:
-                                    ui.notify("Could not reach LMStudio API", type="warning")
-                            ui.button("Probe LMStudio", icon="network_ping",
-                                      on_click=_probe_lmstudio_concurrency).props("outline color=teal dense")
+                                msg = f"CBSE backfill complete — {updated} updated, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"CBSE backfill error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_backfill_cbse.set_enabled(True)
+
+                        async def _do_backfill_last_reply():
+                            btn_backfill_last_reply.set_enabled(False)
+                            emb_status.set_text("Backfilling last_comment_at from stored comments …")
+                            emb_progress.set_visibility(True)
+                            emb_progress.set_value(0)
+                            loop = asyncio.get_event_loop()
+
+                            async def _upd_lr(msg: str, pct: float):
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(pct)
+
+                            def _prog_lr(msg: str, pct: float):
+                                asyncio.run_coroutine_threadsafe(_upd_lr(msg, pct), loop)
+
+                            try:
+                                updated, errs = await run.io_bound(
+                                    backfill_last_comment_at,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    cb_collection_input.value.strip() or "tickets",
+                                    _prog_lr,
+                                )
+                                msg = f"Last Reply backfill complete — {updated} tickets updated, {errs} errors."
+                                emb_status.set_text(msg)
+                                emb_progress.set_value(1.0)
+                                ui.notify(msg, type="positive" if errs == 0 else "warning")
+                            except Exception as exc:
+                                emb_status.set_text(f"Last Reply backfill error: {exc}")
+                                ui.notify(str(exc), type="negative")
+                            finally:
+                                btn_backfill_last_reply.set_enabled(True)
 
                         with ui.row().classes("items-center gap-4 mt-2"):
                             summarize_force_cb = ui.checkbox("Force re-summarize (overwrite existing)", value=False)
@@ -5343,8 +4374,10 @@ def main_page():
                             btn_embed_snaps = ui.button("Embed All Snapshots",       on_click=_do_embed_snaps_from_cb,    icon="hub").props("outline color=indigo")
                             btn_summarize   = ui.button("Summarize Tickets",         on_click=_do_summarize,              icon="summarize").props("outline color=teal")
                             btn_create_idx  = ui.button("Create Vector Index",       on_click=_do_create_index,           icon="manage_search").props("outline color=secondary")
-                            btn_backfill    = ui.button("Backfill Analytics Fields", on_click=_do_backfill,               icon="auto_fix_high").props("outline color=brown")
-                            btn_stop_embed  = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
+                            btn_backfill           = ui.button("Backfill Analytics Fields", on_click=_do_backfill,              icon="auto_fix_high").props("outline color=brown")
+                            btn_backfill_cbse      = ui.button("Backfill Missing CBSEs",    on_click=_do_backfill_cbse,         icon="bug_report").props("outline color=deep-orange")
+                            btn_backfill_last_reply = ui.button("Backfill Last Reply Dates", on_click=_do_backfill_last_reply,  icon="chat_bubble_outline").props("outline color=purple")
+                            btn_stop_embed    = ui.button("Stop", icon="stop_circle", on_click=lambda: (_cancel.set(), btn_stop_embed.set_enabled(False))).props("outline color=red")
                             btn_stop_embed.set_enabled(False)
                         btn_embed.set_enabled(_CB_AVAILABLE)
                         btn_embed_snaps.set_enabled(_CB_AVAILABLE)
@@ -5819,6 +4852,56 @@ def main_page():
                         tab_ollama       = ai_tab_ollama
                         tab_lmstudio     = ai_tab_lmstudio
 
+                    def _warn_if_small_model(model: str) -> None:
+                        """Notify if the model name suggests a very small / 8B-or-under variant."""
+                        _low = (model or "").lower()
+                        _small_hints = ("3b", "7b", "8b", "1b", "mini", "nano", "tiny", "phi-2", "phi2")
+                        if any(h in _low for h in _small_hints):
+                            ui.notify(
+                                f"⚠ Small model detected ({model}). Scoring quality may be reduced.",
+                                type="warning",
+                                timeout=6000,
+                            )
+
+                    def _get_llm_config():
+                        """Return (provider, model, api_key, base_url) from current UI inputs."""
+                        provider = (ai_llm_provider.value or "Claude").lower()
+                        if provider == "claude":
+                            return (
+                                provider,
+                                claude_model_input.value or "claude-sonnet-4-6",
+                                claude_key_input.value or "",
+                                "",
+                            )
+                        elif provider == "gemini":
+                            return (
+                                provider,
+                                gemini_model_input.value or "gemini-2.0-flash",
+                                gemini_key_input.value or "",
+                                "",
+                            )
+                        elif provider == "openai":
+                            return (
+                                provider,
+                                openai_llm_model_input.value or "gpt-4o",
+                                emb_openai_key_input.value or "",
+                                "",
+                            )
+                        elif provider in ("lmstudio",):
+                            return (
+                                provider,
+                                lms_model_input.value or "local-model",
+                                "",
+                                emb_lms_url_input.value or "http://localhost:1234",
+                            )
+                        else:  # ollama
+                            return (
+                                "ollama",
+                                ollama_chat_model_input.value or "llama3.2",
+                                "",
+                                emb_ollama_url_input.value or "http://localhost:11434",
+                            )
+
                     # ── Preflight tab ─────────────────────────────────────────────────────
                     with ui.tab_panel(cfg_preflight):
                         ui.label("Preflight Checks").classes("text-base font-semibold mb-1")
@@ -5967,6 +5050,13 @@ def main_page():
                                         model   = lms_model_input.value or "local-model"
                                         api_key = ""
                                         base_url = emb_lms_url_input.value or "http://localhost:1234"
+                                        # Ensure the LLM model is loaded before testing
+                                        _lms_base = base_url.rstrip("/v1").rstrip("/")
+                                        _loaded = lmstudio_ensure_model_loaded(_lms_base, model, timeout_s=120, model_type="llm")
+                                        if _loaded:
+                                            model = _loaded
+                                        else:
+                                            return False, "no LLM/VLM model loaded in LMStudio — load one manually or enable autoload"
                                     else:  # ollama
                                         provider = "ollama"
                                         model   = ollama_chat_model_input.value or "llama3.2"
@@ -5976,11 +5066,13 @@ def main_page():
                                         {"role": "system", "content": "You are a test assistant."},
                                         {"role": "user",   "content": "Reply with just the word: OK"},
                                     ]
-                                    result = call_llm(msgs, provider, model, api_key, base_url, max_tokens=16)
+                                    # Use 128 tokens — 16 is too small for thinking-mode models
+                                    # (Qwen3/QwQ reasoning traces exhaust the budget before output)
+                                    result = call_llm(msgs, provider, model, api_key, base_url, max_tokens=128)
                                     if result and result.strip():
                                         short = result.strip()[:40].replace("\n", " ")
                                         return True, f"{provider}/{model}: \"{short}\""
-                                    return False, "empty response"
+                                    return False, "empty response — model may be in thinking mode; check LMStudio logs"
                                 except Exception as e:
                                     return False, str(e)
                             ok, detail = await run.io_bound(_chk_llm)
@@ -6059,987 +5151,15 @@ def main_page():
                                 "Improves search labelling for any customer, not just AmEx."
                             )
 
+            _render_chat = lambda: None  # chat moved to Corax iframe
             with ui.tab_panel(tab_chat):
-                with ui.column().classes("w-full gap-6"):
-                    # ── Phase 2: Chat / RAG ──────────────────────────────────────────────
-                    with ui.card().classes("w-full"):
-                        ui.label("Chat with Tickets (RAG)").classes("text-base font-semibold")
-
-                        # LLM provider configured in AI Models tab
-                        with ui.row().classes("items-center gap-2 mt-2 mb-1"):
-                            ui.icon("info").classes("text-blue-400 text-sm")
-                            ui.label("LLM provider is configured in the AI Models tab").classes("text-xs text-gray-500")
-                            ui.space()
-                            ui.button(
-                                "Open Chainlit Chat ↗",
-                                on_click=lambda: ui.run_javascript("window.open('http://localhost:8766','_blank')"),
-                            ).props("flat dense size=sm color=indigo").tooltip(
-                                "Open the professional Chainlit chat UI in a new tab.\n"
-                                "Start it first: python run_chainlit.py --port 8766"
-                            )
-
-                        with ui.row().classes("items-center gap-4 mt-2 flex-wrap"):
-                            with ui.column().classes("gap-1"):
-                                ui.label("Retrieval mode").classes("text-xs text-gray-500")
-                                chat_mode_select = ui.select(
-                                    ["Hybrid Search", "Retrieve + Rerank", "All Tickets", "Batch Map-Reduce", "Agent"],
-                                    value="Hybrid Search",
-                                ).classes("w-52")
-                            top_k_input = ui.number("Top-K (vector search)", value=10, min=1, max=1600).classes("w-48")
-                            batch_size_chat_input = ui.number("Batch size", value=50, min=5, max=500).classes("w-36")
-                            batch_parallel_input = ui.number("Parallelism", value=1, min=1, max=4).classes("w-28").tooltip(
-                                "Batches sent to the LLM concurrently. Set to match your model server's "
-                                "parallel request capacity (LMStudio → Context → GPU Offload → Parallel)."
-                            )
-                            with ui.column().classes("gap-1"):
-                                ui.label("Compact context").classes("text-xs text-gray-500")
-                                compact_context_toggle = ui.switch(value=False).tooltip(
-                                    "Condense each ticket to ~3 lines (subject, status, priority, assignee, "
-                                    "200 chars of description). Speeds up LLM processing significantly for "
-                                    "large ticket sets at the cost of some detail."
-                                )
-                            with ui.column().classes("gap-1"):
-                                ui.label("Deep Reasoning").classes("text-xs text-gray-500")
-                                deep_reason_toggle = ui.switch(value=False).tooltip(
-                                    "Multi-stage pipeline: classify → extract → rerank → synthesize → self-critique. "
-                                    "Improves answer quality for small models (Gemma, Phi, Mistral) at the cost of "
-                                    "3× more LLM calls. Recommended for complex aggregation, ranking, or trend questions."
-                                )
-
-                        def _update_chat_mode_visibility():
-                            mode = chat_mode_select.value
-                            top_k_input.set_visibility(mode in ("Hybrid Search", "Retrieve + Rerank"))
-                            batch_size_chat_input.set_visibility(mode == "Batch Map-Reduce")
-                            batch_parallel_input.set_visibility(mode == "Batch Map-Reduce")
-                            compact_context_toggle.set_visibility(mode != "Agent")
-                            deep_reason_toggle.set_visibility(mode != "Agent")
-
-                        chat_mode_select.on("update:model-value", lambda _: _update_chat_mode_visibility())
-                        _update_chat_mode_visibility()
-
-                        # Conversation display
-                        ui.separator().classes("mt-3")
-                        chat_log = ui.column().classes("w-full gap-2 mt-2 min-h-48 max-h-128 overflow-y-auto")
-                        chat_status = ui.label("").classes("text-xs text-gray-400 mt-1 min-h-4")
-
-                        # Live streaming display — visible only while Ollama/LMStudio generates
-                        with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2") as _stream_row:
-                            _stream_label = ui.label("").classes("text-sm whitespace-pre-wrap font-mono")
-                        _stream_row.set_visibility(False)
-
-                        def _render_chat():
-                            chat_log.clear()
-                            with chat_log:
-                                for msg in state["chat_history"]:
-                                    if msg["role"] == "user":
-                                        with ui.chat_message(name="You", sent=True).props("bg-color=blue-6 text-color=white"):
-                                            ui.label(msg["content"]).classes("text-sm whitespace-pre-wrap")
-                                    elif msg["role"] == "assistant":
-                                        _content = msg["content"]
-                                        with ui.chat_message(name="Supportal", sent=False).props("bg-color=grey-2"):
-                                            # Render text + artifact (echart/table) blocks interleaved
-                                            _last_pos = 0
-                                            _has_artifact = bool(_ARTIFACT_RE.search(_content))
-                                            for _am in _ARTIFACT_RE.finditer(_content):
-                                                _pre = _content[_last_pos:_am.start()].strip()
-                                                if _pre:
-                                                    ui.markdown(_pre).classes("prose prose-sm max-w-none")
-                                                _atype, _araw = _am.group(1), _am.group(2)
-                                                _last_pos = _am.end()
-                                                try:
-                                                    _ap = json.loads(_araw)
-                                                except Exception:
-                                                    ui.label(f"[{_atype} parse error]").classes("text-red-500 text-xs")
-                                                    continue
-                                                if _atype == "echart":
-                                                    _cuid = f"agchart-{abs(hash(_araw)):x}"
-                                                    _ctitle = ((_ap.get("title") or {}).get("text") or "chart").replace(" ", "_")
-                                                    with ui.element("div").classes(f"w-full {_cuid} mt-2"):
-                                                        ui.echart(_ap).classes("w-full").style("height:320px")
-                                                    ui.button(
-                                                        "PNG", icon="image",
-                                                        on_click=lambda uid=_cuid, fn=_ctitle: ui.run_javascript(
-                                                            f"(function(){{var el=document.querySelector('.{uid} .nicegui-echart');"
-                                                            f"if(!el)return;var inst=window.echarts&&window.echarts.getInstanceByDom(el);"
-                                                            f"if(!inst)return;var img=inst.getDataURL({{type:'png',pixelRatio:2,backgroundColor:'#fff'}});"
-                                                            f"var a=document.createElement('a');a.href=img;a.download='{fn}.png';a.click();}})();"
-                                                        ),
-                                                    ).props("flat dense size=sm color=blue-grey").classes("mt-1").tooltip("Download PNG")
-                                                elif _atype == "table":
-                                                    import html as _hmod
-                                                    _tcols = _ap.get("columns") or []
-                                                    _trows = _ap.get("rows") or []
-                                                    _tname = _ap.get("title") or "table"
-                                                    if _tname:
-                                                        ui.label(_tname).classes("font-semibold text-sm mt-2 mb-1")
-                                                    if _ap.get("description"):
-                                                        ui.markdown(_ap["description"]).classes("prose prose-sm mb-1")
-                                                    _th = "".join(f'<th class="border border-gray-300 px-2 py-1 bg-gray-200 font-semibold whitespace-nowrap">{_hmod.escape(str(c))}</th>' for c in _tcols)
-                                                    _tb = "".join(
-                                                        "<tr>" + "".join(f'<td class="border border-gray-300 px-2 py-1 whitespace-nowrap">{_hmod.escape(str(cell))}</td>' for cell in row) + "</tr>"
-                                                        for row in _trows
-                                                    )
-                                                    ui.html(f'<div class="overflow-x-auto mt-1"><table class="border-collapse text-xs"><thead><tr>{_th}</tr></thead><tbody>{_tb}</tbody></table></div>')
-                                                    with ui.row().classes("gap-1 mt-1"):
-                                                        def _dl_csv(_c=_tcols, _r=_trows, _n=_tname):
-                                                            import csv as _cm, io as _im
-                                                            buf = _im.StringIO()
-                                                            w = _cm.writer(buf)
-                                                            w.writerow(_c)
-                                                            w.writerows(_r)
-                                                            ui.download(buf.getvalue().encode(), f"{_n}.csv", "text/csv")
-                                                        ui.button("CSV", icon="download", on_click=_dl_csv).props("flat dense size=sm color=green").tooltip("Download CSV")
-                                                        def _dl_xlsx(_c=_tcols, _r=_trows, _n=_tname):
-                                                            try:
-                                                                import openpyxl as _xl, io as _im
-                                                                wb = _xl.Workbook()
-                                                                ws = wb.active
-                                                                ws.title = _n[:31]
-                                                                ws.append(_c)
-                                                                for row in _r:
-                                                                    ws.append([str(c) for c in row])
-                                                                buf = _im.BytesIO()
-                                                                wb.save(buf)
-                                                                ui.download(buf.getvalue(), f"{_n}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                                                            except ImportError:
-                                                                ui.notify("Install openpyxl: pip install openpyxl", type="warning")
-                                                        ui.button("Excel", icon="table_view", on_click=_dl_xlsx).props("flat dense size=sm color=green").tooltip("Download Excel")
-                                            _post = _content[_last_pos:].strip()
-                                            if _post or not _has_artifact:
-                                                ui.markdown(_post or _content).classes("prose prose-sm max-w-none")
-                                            # Copy button — writes raw markdown to clipboard
-                                            ui.button(
-                                                icon="content_copy",
-                                                on_click=lambda e, txt=_content: ui.run_javascript(
-                                                    f"navigator.clipboard.writeText({json.dumps(txt)})"
-                                                ),
-                                            ).props("flat round dense color=gray").classes("mt-2 opacity-40 hover:opacity-100").tooltip("Copy as Markdown")
-                            # Scroll to bottom
-                            ui.run_javascript(
-                                "var el = document.querySelector('.chat-log-scroll');"
-                                "if (el) el.scrollTop = el.scrollHeight;"
-                            )
-
-                        def _get_llm_config() -> tuple[str, str, str, str]:
-                            """Return (provider, model, api_key, base_url) from active AI Models selection."""
-                            provider = ai_llm_provider.value or "Claude"
-                            if provider == "Claude":
-                                return "claude", (claude_model_input.value or "claude-sonnet-4-6").strip(), claude_key_input.value, ""
-                            elif provider == "Gemini":
-                                return "gemini", (gemini_model_input.value or "gemini-2.0-flash").strip(), gemini_key_input.value, ""
-                            elif provider == "Ollama":
-                                return "ollama", (ollama_chat_model_input.value or "llama3.2").strip(), "", emb_ollama_url_input.value.strip() or "http://localhost:11434"
-                            elif provider == "LMStudio":
-                                return "lmstudio", (lms_model_input.value or "local-model").strip(), "", emb_lms_url_input.value.strip() or "http://localhost:1234"
-                            else:  # OpenAI
-                                return "openai", (openai_llm_model_input.value or "gpt-4o").strip(), emb_openai_key_input.value, ""
-
-                        def _warn_if_small_model(model: str) -> None:
-                            """Warn if the model name suggests fewer than 4B parameters."""
-                            m = model.lower()
-                            if re.search(r"[:\-_]([0-3](\.\d+)?b)\b", m) or re.search(r"\b([0-3](\.\d+)?b)\b", m):
-                                ui.notify(
-                                    f"⚠ '{model}' appears to be under 4B parameters. "
-                                    "Small models often produce malformed JSON during scoring — "
-                                    "consider using a 4B+ model for reliable results.",
-                                    type="warning",
-                                    timeout=8000,
-                                )
-
-                        async def _call_llm_streaming(messages, provider, model, api_key, base_url):
-                            """Stream tokens from Ollama/LMStudio, driving the live display."""
-                            q: asyncio.Queue = asyncio.Queue()
-                            loop = asyncio.get_event_loop()
-
-                            def _worker():
-                                try:
-                                    default = "http://localhost:1234" if provider == "lmstudio" else "http://localhost:11434"
-                                    # Long connect timeout for LMStudio on-demand model loading
-                                    # (model load on a 4070 Ti can take 30–90 s before first token)
-                                    _timeout = _openai_mod.Timeout(
-                                        timeout=600.0, connect=180.0
-                                    ) if provider == "lmstudio" else None
-                                    client = _openai_mod.OpenAI(
-                                        api_key=api_key or "ollama",
-                                        base_url=_openai_base_url(base_url, default),
-                                        timeout=_timeout,
-                                    )
-                                    with client.chat.completions.create(
-                                        model=model, messages=messages, max_tokens=4096, stream=True
-                                    ) as stream:
-                                        for chunk in stream:
-                                            delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
-                                            if delta:
-                                                asyncio.run_coroutine_threadsafe(q.put(delta), loop)
-                                    asyncio.run_coroutine_threadsafe(q.put(None), loop)
-                                except Exception as exc:
-                                    asyncio.run_coroutine_threadsafe(q.put(RuntimeError(str(exc))), loop)
-
-                            threading.Thread(target=_worker, daemon=True).start()
-
-                            collected: list[str] = []
-                            token_count = 0
-                            t0 = time.time()
-                            _stream_row.set_visibility(True)
-                            _stream_label.set_text("▌")
-
-                            try:
-                                while True:
-                                    item = await q.get()
-                                    if item is None:
-                                        break
-                                    if isinstance(item, Exception):
-                                        raise item
-                                    collected.append(item)
-                                    token_count += 1
-                                    elapsed = time.time() - t0
-                                    rate = token_count / elapsed if elapsed > 0 else 0
-                                    _stream_label.set_text("".join(collected) + " ▌")
-                                    chat_status.set_text(
-                                        f"Generating… {token_count} tokens  ({rate:.1f} tok/s)"
-                                    )
-                            finally:
-                                _stream_row.set_visibility(False)
-                                _stream_label.set_text("")
-
-                            elapsed = time.time() - t0
-                            rate = token_count / elapsed if elapsed > 0 else 0
-                            return "".join(collected), token_count, elapsed, rate
-
-                        async def _send_chat():
-                            question = chat_input.value.strip()
-                            if not question:
-                                return
-                            if not state["results"]:
-                                ui.notify("No tickets loaded — run a scrape first.", type="warning")
-                                return
-
-                            chat_input.value = ""
-                            chat_input.update()
-                            state["chat_history"].append({"role": "user", "content": question})
-                            _render_chat()
-                            chat_status.set_text("Retrieving relevant tickets …")
-                            btn_send.set_enabled(False)
-
-                            provider, model, api_key, base_url = _get_llm_config()
-                            use_streaming = provider in ("ollama", "lmstudio") and _OPENAI_AVAILABLE
-                            loop = asyncio.get_event_loop()
-
-                            # Ollama pre-flight: show loaded model info before generation starts
-                            if provider == "ollama":
-                                ps = await run.io_bound(poll_ollama_ps, base_url or "http://localhost:11434")
-                                running = ps.get("models", [])
-                                if not running:
-                                    chat_status.set_text(f"Ollama: loading {model} into memory…")
-                                else:
-                                    m0 = running[0]
-                                    ctx   = m0.get("details", {}).get("context_length", "?")
-                                    vram  = m0.get("size_vram", 0)
-                                    vram_s = f"{vram/1e9:.1f} GB" if vram else "—"
-                                    chat_status.set_text(
-                                        f"Ollama ready — model: {m0.get('name','?')} — "
-                                        f"context: {ctx} tokens — VRAM: {vram_s}"
-                                    )
-
-                            # Fetch prior session context once per session (first turn only).
-                            # Subsequent turns reuse the cached block to avoid extra CB round-trips.
-                            if (
-                                _CB_AVAILABLE
-                                and store_memory_toggle.value
-                                and not state["chat_session_turns"]   # first turn of this session
-                                and not state["prior_session_block"]
-                                and state.get("customer_name")
-                            ):
-                                _sc_col_p = (cache_collection_input.value.strip()
-                                             or cb_collection_input.value.strip() or "tickets")
-                                state["prior_session_block"] = await run.io_bound(
-                                    fetch_prior_session_context,
-                                    state["customer_name"],
-                                    cb_url_input.value.strip(), cb_bucket_input.value.strip(),
-                                    cb_user_input.value.strip(), cb_pass_input.value,
-                                    cb_tls_toggle.value,
-                                    cb_scope_input.value.strip() or "_default",
-                                    _sc_col_p,
-                                )
-
-                            try:
-                                mode = chat_mode_select.value
-
-                                if mode == "Batch Map-Reduce":
-                                    if not state["results"]:
-                                        ui.notify("Scrape or load tickets first.", type="warning")
-                                        return
-                                    b_size = int(batch_size_chat_input.value or 50)
-                                    b_workers = int(batch_parallel_input.value or 1)
-                                    chat_status.set_text(f"Batch map-reduce over {len(state['results'])} tickets …")
-
-                                    def _prog_cb(msg: str):
-                                        chat_status.set_text(msg)
-
-                                    answer = await run.io_bound(
-                                        chat_batch_map_reduce,
-                                        question,
-                                        state["results"],
-                                        b_size,
-                                        provider,
-                                        model,
-                                        api_key,
-                                        base_url,
-                                        _prog_cb,
-                                        compact_context_toggle.value,
-                                        b_workers,
-                                    )
-                                    state["chat_history"].append({"role": "assistant", "content": answer})
-                                    _render_chat()
-                                    chat_status.set_text(f"Batch map-reduce complete — {len(state['results'])} tickets analysed.")
-                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now, []))
-
-                                elif mode == "All Tickets":
-                                    if not state["results"]:
-                                        ui.notify("Scrape or load tickets first.", type="warning")
-                                        return
-                                    _today_dt = datetime.datetime.now()
-                                    _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
-                                    # Pre-filter/sort based on query intent, then compute aggregations
-                                    context_tickets, _pf_note = prefilter_for_query(question, state["results"])
-                                    if _pf_note:
-                                        chat_status.set_text(_pf_note + " …")
-                                    else:
-                                        chat_status.set_text(f"Building context from {len(context_tickets)} tickets …")
-                                    _stats_block = build_dataset_stats(state["results"], _today_dt)
-                                    _agg_block   = compute_aggregations(question, context_tickets)
-                                    context_block = (
-                                        (_agg_block + "\n" if _agg_block else "") +
-                                        build_rag_context(context_tickets, state["customer_name"], compact=compact_context_toggle.value)
-                                    )
-                                    system_msg = SYSTEM_PROMPT_TEMPLATE.format(
-                                        today=_today_str,
-                                        stats=_stats_block,
-                                        context=context_block,
-                                    )
-                                    # Prepend relevant session memories (recency-ranked, no vector)
-                                    if _CB_AVAILABLE:
-                                        _mem_col_raw = cache_collection_input.value.strip()
-                                        _mem_col = _mem_col_raw if _mem_col_raw else (cb_collection_input.value.strip() or "tickets")
-                                        _memories = await run.io_bound(
-                                            fetch_relevant_memories,
-                                            [],   # no query_vec in All Tickets mode
-                                            cb_url_input.value.strip(), cb_bucket_input.value.strip(),
-                                            cb_user_input.value.strip(), cb_pass_input.value,
-                                            cb_tls_toggle.value,
-                                            cb_scope_input.value.strip() or "_default",
-                                            _mem_col,
-                                            5,
-                                            state.get("customer_name", ""),
-                                        )
-                                        _mem_block = _build_memory_section(_memories)
-                                        if _mem_block:
-                                            system_msg = system_msg + "\n" + _mem_block
-                                    if state.get("prior_session_block"):
-                                        system_msg = system_msg + "\n" + state["prior_session_block"]
-                                    # Window history to last 20 messages (10 turns)
-                                    _hist_window = state["chat_history"][-(20):-1]
-                                    messages = [{"role": "system", "content": system_msg}]
-                                    for h in _hist_window:
-                                        if h["role"] in ("user", "assistant"):
-                                            messages.append(h)
-                                    messages.append({"role": "user", "content": question})
-                                    if deep_reason_toggle.value:
-                                        chat_status.set_text(
-                                            f"Deep Reasoning — 6-stage pipeline over {len(context_tickets)} tickets …"
-                                        )
-                                        def _dr_prog(msg, _cs=chat_status):
-                                            _cs.set_text(msg)
-                                        answer = await run.io_bound(
-                                            run_deep_reasoning,
-                                            question, context_tickets, _today_str, _stats_block,
-                                            provider, model, api_key, base_url, _dr_prog,
-                                        )
-                                        state["chat_history"].append({"role": "assistant", "content": answer})
-                                        _render_chat()
-                                        chat_status.set_text(
-                                            f"Deep Reasoning complete — {len(context_tickets)} tickets analysed."
-                                        )
-                                    else:
-                                        chat_status.set_text(f"Asking {provider} ({model}) with all {len(context_tickets)} tickets …")
-                                        if use_streaming:
-                                            answer, n_tok, elapsed, rate = await _call_llm_streaming(
-                                                messages, provider, model, api_key, base_url
-                                            )
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
-                                            _render_chat()
-                                            chat_status.set_text(
-                                                f"{len(context_tickets)} tickets as context — "
-                                                f"{n_tok} tokens in {elapsed:.1f}s ({rate:.1f} tok/s)"
-                                            )
-                                        else:
-                                            answer = await run.io_bound(call_llm, messages, provider, model, api_key, base_url, 8192)
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
-                                            _render_chat()
-                                            chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
-                                    # Record turn for session storage
-                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    _turn_tids = [str(t.get("ticket_id","")) for t in context_tickets if t.get("ticket_id")]
-                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
-
-                                elif mode == "Retrieve + Rerank":
-                                    _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
-                                    _cb_rr = (
-                                        cb_url_input.value.strip(),
-                                        cb_bucket_input.value.strip(),
-                                        cb_user_input.value.strip(),
-                                        cb_pass_input.value,
-                                        cb_tls_toggle.value,
-                                        cb_scope_input.value.strip() or "_default",
-                                        cb_collection_input.value.strip() or "tickets",
-                                    )
-                                    _top_k_rr = int(top_k_input.value or 60)
-
-                                    # Rewrite follow-up questions to be self-contained so
-                                    # "out of those, how many had CBSEs?" picks up the date
-                                    # range from the previous answer rather than fetching all time.
-                                    _orig_question = question
-                                    question = await run.io_bound(
-                                        contextualize_question,
-                                        question,
-                                        state["chat_history"][:-1],  # exclude current turn
-                                        provider, model, api_key, base_url,
-                                    )
-                                    if question != _orig_question:
-                                        chat_status.set_text(f"Contextualized: {question[:80]}…")
-
-                                    def _embed_fn_rr(text: str) -> list[float]:
-                                        return embed_text(text, _ep, _em, _eak, _ebu,
-                                                          dims=_edims, num_ctx=_enum_ctx)
-
-                                    chat_status.set_text("Stage 1 — retrieving candidates from Couchbase …")
-                                    rr_tickets, rr_notes = await run.io_bound(
-                                        search_tickets_retrieve_rerank,
-                                        question,   # rewritten — vector embedding
-                                        question,   # rewritten — N1QL date filter via build_structured_query
-                                        *_cb_rr,
-                                        _embed_fn_rr,
-                                        state["results"],
-                                        _top_k_rr,
-                                        500,
-                                        state.get("customer_name", ""),
-                                    )
-                                    if not rr_tickets:
-                                        answer = "No matching tickets found for your query."
-                                    else:
-                                        chat_status.set_text(
-                                            f"Stage 2 — reranking + answering over {len(rr_tickets)} candidates ({rr_notes}) …"
-                                        )
-                                        _today_dt  = datetime.datetime.now()
-                                        _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
-                                        _stats_block = build_dataset_stats(state["results"] or rr_tickets, _today_dt)
-                                        # Force compact when candidates are large
-                                        # to avoid blowing the model's context window.
-                                        _rr_compact = compact_context_toggle.value or len(rr_tickets) > 30
-                                        _context = build_rag_context(
-                                            rr_tickets, state["customer_name"],
-                                            compact=_rr_compact,
-                                        )
-                                        _rr_cust = state.get("customer_name", "")
-                                        _cust_rule = (
-                                            f"\nRULE R0 — You are answering about tickets for customer "
-                                            f"\"{_rr_cust}\". All retrieved tickets belong to "
-                                            f"this customer. Do NOT qualify answers with \"for this customer\" "
-                                            f"on every line — the scope is implicit."
-                                            if _rr_cust and _rr_cust.lower() != "all customers" else ""
-                                        )
-                                        _rerank_sys = (
-                                            SYSTEM_PROMPT_TEMPLATE.format(
-                                                today=_today_str, stats=_stats_block, context=_context,
-                                            ) +
-                                            "\n\n━━ RETRIEVE + RERANK RULES ━━" + _cust_rule + "\n"
-                                            "The tickets above were retrieved by a deterministic structured query "
-                                            "plus semantic vector search — they are your complete candidate set.\n"
-                                            "RULE R1 — Answer using ONLY tickets that directly match the question. "
-                                            "[Application: X] labels in ticket headers are authoritative.\n"
-                                            "RULE R2 — Do NOT include a ticket because it shares infrastructure or "
-                                            "patterns with matching tickets. Explicit label match only.\n"
-                                            "RULE R3 — If the question asks for a list, produce a markdown table of "
-                                            "ALL matching tickets from the context, not just a sample."
-                                            + (("\n" + state["prior_session_block"]) if state.get("prior_session_block") else "")
-                                        )
-                                        _rr_msgs = [
-                                            {"role": "system", "content": _rerank_sys},
-                                            {"role": "user",   "content": question},
-                                        ]
-                                        if use_streaming:
-                                            answer, n_tok, elapsed, rate = await _call_llm_streaming(
-                                                _rr_msgs, provider, model, api_key, base_url
-                                            )
-                                            chat_status.set_text(
-                                                f"Retrieve+Rerank: {len(rr_tickets)} candidates → "
-                                                f"{n_tok} tokens in {elapsed:.1f}s ({rate:.1f} tok/s) | {rr_notes}"
-                                            )
-                                        else:
-                                            answer = await run.io_bound(
-                                                call_llm, _rr_msgs, provider, model, api_key, base_url, 8192
-                                            )
-                                            chat_status.set_text(
-                                                f"Retrieve+Rerank: {len(rr_tickets)} candidates | {rr_notes}"
-                                            )
-                                    state["chat_history"].append({"role": "assistant", "content": answer})
-                                    _render_chat()
-                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    _turn_tids = [str(t.get("ticket_id","")) for t in (rr_tickets or []) if t.get("ticket_id")]
-                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
-
-                                elif mode == "Agent":
-                                    if not _CB_AVAILABLE:
-                                        ui.notify("Couchbase is required for Agent mode.", type="warning")
-                                        return
-                                    _cb_agent = (
-                                        cb_url_input.value.strip(),
-                                        cb_bucket_input.value.strip(),
-                                        cb_user_input.value.strip(),
-                                        cb_pass_input.value,
-                                        cb_tls_toggle.value,
-                                        cb_scope_input.value.strip() or "_default",
-                                        cb_collection_input.value.strip() or "tickets",
-                                    )
-                                    _cust_agent = state.get("customer_name", "")
-                                    _today_str_agent = datetime.datetime.now().strftime("%Y-%m-%d (%A)")
-                                    _cust_scope = (
-                                        f" for customer \"{_cust_agent}\""
-                                        if _cust_agent and _cust_agent.lower() != "all customers"
-                                        else ""
-                                    )
-                                    _agent_sys = (
-                                        f"You are a Couchbase support ticket analyst. Today is {_today_str_agent}. "
-                                        f"You have access to tools that query a live Couchbase database containing "
-                                        f"Zendesk support tickets{_cust_scope}. "
-                                        "Use the available tools to answer questions accurately. "
-                                        "Always call tools to retrieve data — never guess at counts or ticket details.\n\n"
-                                        "TOOL GUIDANCE:\n"
-                                        "DATA SOURCE ROUTING — choose based on what the user is asking about:\n"
-                                        "  LOCAL (your Couchbase): list_organizations, query_tickets, count_tickets, get_ticket\n"
-                                        "    → 'what customers are you aware of?', 'what do you have locally?', 'which orgs have I scraped?'\n"
-                                        "  LIVE/GLOBAL (Supportal Analytics API): list_supportal_customers, query_supportal\n"
-                                        "    → 'how many customers get support today?', 'what's in Supportal globally?', "
-                                        "'how many clusters exist?', 'live snapshot data', 'version distribution across all customers'\n"
-                                        "When ambiguous, prefer LOCAL unless the user says 'today', 'live', 'Supportal', 'globally', or 'all customers'.\n"
-                                        "- count_tickets: for total/count questions\n"
-                                        "- query_tickets: to list or filter tickets (returns Last Scraped age per ticket)\n"
-                                        "- get_ticket: full detail on one ticket including cluster topology from the linked "
-                                        "snapshot (node count, CB version, services, buckets, RAM, auto-failover, bad/warn "
-                                        "health counts). Use this whenever the user asks about cluster configuration, "
-                                        "node count, topology, or infrastructure details for a specific ticket.\n"
-                                        "- check_data_freshness: ALWAYS call this when the user asks about 'current status', "
-                                        "'latest', 'live', 'today', or 'has this changed'. Pass the ticket_ids from a prior "
-                                        "query_tickets call. Report the age and include Supportal URLs for live verification.\n"
-                                        "- rescrape_ticket: refresh a single ticket from Supportal.\n"
-                                        "- rescrape_customer_tickets: bulk-refresh all stale tickets for a customer. "
-                                        "Call this when the user says 'rescrape all', 'refresh all tickets', 'update everything', "
-                                        "'get the latest for all tickets'. By default only rescrapes tickets older than 4 hours. "
-                                        "Use stale_hours=0 to force-refresh all regardless of age.\n"
-                                        "- When filtering by CBSE or Jira, set cbse_only=true or jira_only=true.\n"
-                                        "- generate_chart: MANDATORY when the user asks for any chart, graph, or "
-                                        "visualization. Call this tool — do NOT describe a chart in text or say 'here is "
-                                        "a bar chart:' followed by a text description. The tool renders a real interactive "
-                                        "chart in the UI. Supported types: bar, horizontal_bar, line, pie, donut. "
-                                        "Also call proactively when comparing counts across categories.\n"
-                                        "- generate_table: MANDATORY when the user asks for a table, spreadsheet, or "
-                                        "exportable data. Call this tool — do NOT render a markdown table. Always call "
-                                        "generate_table BEFORE your final summary text so the table appears above your "
-                                        "explanation. Produces real CSV and Excel download buttons."
-                                    )
-                                    if _cust_agent and _cust_agent.lower() != "all customers":
-                                        _agent_sys += (
-                                            f"\n\nSCOPING RULE: Customer is scoped to \"{_cust_agent}\". "
-                                            f"You MUST include customer=\"{_cust_agent}\" in every query_tickets and "
-                                            f"count_tickets call. Never ask the user for the customer name — it is already set.\n"
-                                            f"DISCOVERY EXCEPTIONS (cross-customer queries are allowed ONLY for):\n"
-                                            f"  1. list_organizations — always exempt, always runs across all customers.\n"
-                                            f"  2. Discovering what customers exist ('what orgs are in the system', "
-                                            f"'what other customers are there', 'update the customer list').\n"
-                                            f"  3. Getting a basic ticket count or summary for a specific other customer "
-                                            f"the user names explicitly.\n"
-                                            f"For all analysis, trends, ticket details, and comparisons: stay scoped to \"{_cust_agent}\"."
-                                        )
-                                    if state.get("prior_session_block"):
-                                        _agent_sys += "\n" + state["prior_session_block"]
-                                    _agent_msgs: list[dict] = [{"role": "system", "content": _agent_sys}]
-                                    for _h in state["chat_history"][-(10):-1]:
-                                        if _h["role"] in ("user", "assistant"):
-                                            _agent_msgs.append(_h)
-                                    _agent_msgs.append({"role": "user", "content": question})
-                                    chat_status.set_text("Agent — planning tool calls …")
-                                    answer = await run.io_bound(
-                                        call_llm_with_tools,
-                                        _agent_msgs,
-                                        _AGENT_TOOLS,
-                                        *_cb_agent,
-                                        provider, model, api_key, base_url,
-                                        8192,
-                                        5,
-                                        _cust_agent,
-                                    )
-                                    # ── Chart enforcement ─────────────────────────────────────────
-                                    # Some models describe charts in text instead of calling
-                                    # generate_chart. Detect this and force one more tool-call round.
-                                    _CHART_KWS = ("chart", "graph", "bar chart", "pie chart",
-                                                  "line chart", "plot", "visuali")
-                                    _wants_chart = any(kw in question.lower() for kw in _CHART_KWS)
-                                    if _wants_chart and "```echart" not in (answer or ""):
-                                        chat_status.set_text("Agent — generating chart …")
-                                        _force_msgs = list(_agent_msgs) + [
-                                            {"role": "assistant", "content": answer or ""},
-                                            {"role": "user", "content": (
-                                                "You described the chart in text but did not call "
-                                                "generate_chart. Call generate_chart RIGHT NOW using "
-                                                "the exact numbers from your previous response. "
-                                                "Do not write any text — only make the tool call."
-                                            )},
-                                        ]
-                                        try:
-                                            _chart_ans = await run.io_bound(
-                                                call_llm_with_tools,
-                                                _force_msgs,
-                                                _AGENT_TOOLS,
-                                                *_cb_agent,
-                                                provider, model, api_key, base_url,
-                                                2048, 2, _cust_agent,
-                                            )
-                                            if _chart_ans and "```echart" in _chart_ans:
-                                                # Strip placeholder text from original answer then
-                                                # prepend the real chart artifact.
-                                                _clean = re.sub(
-                                                    r'\[.*?chart.*?(?:appear|here|above|generat).*?\]',
-                                                    '', answer or '', flags=re.IGNORECASE | re.DOTALL
-                                                ).strip()
-                                                answer = _chart_ans + ("\n\n" + _clean if _clean else "")
-                                        except Exception as _cef:
-                                            print(f"[chart enforcement] failed: {_cef}")
-                                    # ─────────────────────────────────────────────────────────────
-                                    state["chat_history"].append({"role": "assistant", "content": answer})
-                                    _render_chat()
-                                    chat_status.set_text("Agent mode complete.")
-                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    state["chat_session_turns"].append((question, answer, _ts_now, []))
-
-                                else:  # Hybrid Search
-                                    _ep, _em, _eak, _ebu, _edims, _enum_ctx = _get_embed_config()
-                                    # Resolve cache collection (override or fall back to global)
-                                    _cache_col_raw = cache_collection_input.value.strip()
-                                    _cache_col = _cache_col_raw if _cache_col_raw else (cb_collection_input.value.strip() or "tickets")
-                                    _cache_cb = (
-                                        cb_url_input.value.strip(),
-                                        cb_bucket_input.value.strip(),
-                                        cb_user_input.value.strip(),
-                                        cb_pass_input.value,
-                                        cb_tls_toggle.value,
-                                        cb_scope_input.value.strip() or "_default",
-                                        _cache_col,
-                                    )
-                                    _ticket_cb = (
-                                        cb_url_input.value.strip(),
-                                        cb_bucket_input.value.strip(),
-                                        cb_user_input.value.strip(),
-                                        cb_pass_input.value,
-                                        cb_tls_toggle.value,
-                                        cb_scope_input.value.strip() or "_default",
-                                        cb_collection_input.value.strip() or "tickets",
-                                    )
-                                    _emb_ttl_days = int(embed_cache_ttl.value or 0)
-                                    _srch_ttl_hrs = int(search_cache_ttl.value or 0)
-                                    _emb_ttl_s    = _emb_ttl_days * 86400   # 0 = permanent
-                                    _srch_ttl_s   = _srch_ttl_hrs * 3600    # 0 = permanent
-
-                                    # Query rewriting: always strip output-format noise and
-                                    # resolve conversational references before embedding.
-                                    # Runs on every turn (first and follow-up) so the vector
-                                    # query is always retrieval-focused, not presentation-focused.
-                                    _hist_for_rewrite = state["chat_history"][:-1]  # exclude current user msg
-                                    chat_status.set_text("Rewriting query for retrieval …")
-                                    _retrieval_q = await run.io_bound(
-                                        rewrite_query_for_retrieval,
-                                        question,
-                                        _hist_for_rewrite,
-                                        provider, model, api_key, base_url,
-                                    )
-
-                                    # 1. Embed — always check cache; always store (TTL=0 = forever)
-                                    _ekey = _chat_cache_key("embed", _retrieval_q, _ep, _em, str(_edims))
-                                    if _CB_AVAILABLE:
-                                        chat_status.set_text("Checking embed cache …")
-                                        _ecached = await run.io_bound(chat_cache_get, _ekey, *_cache_cb)
-                                    else:
-                                        _ecached = None
-                                    if _ecached:
-                                        query_vec = _ecached["vector"]
-                                        chat_status.set_text("Embed cache hit — skipped embedding step.")
-                                    else:
-                                        chat_status.set_text("Embedding question …")
-                                        query_vec = await run.io_bound(
-                                            embed_text, _retrieval_q, _ep, _em, _eak, _ebu, _edims,
-                                        )
-                                        # Truncate + re-normalise if model returns more dims than index expects
-                                        if _edims and len(query_vec) > _edims:
-                                            query_vec = query_vec[:_edims]
-                                            _norm = sum(x * x for x in query_vec) ** 0.5
-                                            if _norm > 0:
-                                                query_vec = [x / _norm for x in query_vec]
-                                        if _CB_AVAILABLE:
-                                            await run.io_bound(
-                                                chat_cache_set, _ekey,
-                                                {"type": "embed_cache", "question": _retrieval_q,
-                                                 "provider": _ep, "model": _em, "dims": _edims,
-                                                 "vector": query_vec,
-                                                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-                                                _emb_ttl_s,
-                                                *_cache_cb,
-                                            )
-
-                                    # 2. Hybrid retrieval: dense vector + structured N1QL → RRF merge
-                                    #    Runs both searches in parallel, merges with Reciprocal Rank
-                                    #    Fusion so ticket IDs, dates, and priority mentioned in the
-                                    #    question are never ignored by pure cosine similarity ranking.
-                                    #    _retrieval_q carries prior-turn ticket IDs so follow-up
-                                    #    questions stay anchored to the same ticket set.
-                                    _top_k = int(top_k_input.value or 10)
-                                    # Build embed_fn closure so hybrid_retrieval can re-embed
-                                    # enriched ticket-content queries for query expansion.
-                                    def _make_embed_fn(_ep=_ep, _em=_em, _eak=_eak,
-                                                       _ebu=_ebu, _edims=_edims):
-                                        def _fn(text: str) -> list[float]:
-                                            vec = embed_text(text, _ep, _em, _eak, _ebu, _edims)
-                                            if _edims and len(vec) > _edims:
-                                                vec = vec[:_edims]
-                                                norm = sum(x * x for x in vec) ** 0.5
-                                                if norm > 0:
-                                                    vec = [x / norm for x in vec]
-                                            return vec
-                                        return _fn
-                                    chat_status.set_text("Hybrid retrieval: vector + structured search …")
-                                    context_tickets, _retrieval_note = await run.io_bound(
-                                        hybrid_retrieval,
-                                        _retrieval_q,       # rewritten: vector embedding + expansion
-                                        query_vec,
-                                        *_ticket_cb,
-                                        _top_k,
-                                        state["results"],   # in-memory fallback
-                                        _make_embed_fn(),   # for query expansion
-                                        _retrieval_q,       # rewritten: N1QL date filter (has prior-context dates)
-                                    )
-                                    chat_status.set_text(f"Hybrid retrieval: {_retrieval_note}")
-                                    doc_keys = [str(t.get("ticket_id", "")) for t in context_tickets if t.get("ticket_id")]
-                                    ui.notify(
-                                        f"Hybrid retrieval: {_retrieval_note}",
-                                        type="info" if context_tickets else "warning",
-                                        timeout=4000,
-                                    )
-
-                                    # 4a. Fetch snapshot topology for retrieved tickets
-                                    _snapshot_map: dict[str, dict] = {}
-                                    if context_tickets and _CB_AVAILABLE:
-                                        _cluster_uuids: list[str] = []
-                                        for _ct in context_tickets:
-                                            for _cu in _ticket_cluster_ids(_ct):
-                                                if _cu not in _cluster_uuids:
-                                                    _cluster_uuids.append(_cu)
-                                        if _cluster_uuids:
-                                            chat_status.set_text("Fetching cluster topology from snapshots …")
-                                            _snapshot_map = await run.io_bound(
-                                                fetch_snapshots_for_clusters,
-                                                _cluster_uuids[:30],
-                                                cb_url_input.value.strip(),
-                                                cb_bucket_input.value.strip(),
-                                                cb_user_input.value.strip(),
-                                                cb_pass_input.value,
-                                                cb_tls_toggle.value,
-                                                cb_scope_input.value.strip() or "_default",
-                                            )
-
-                                    # 4b. Build messages with RAG context in system prompt
-                                    _today_dt  = datetime.datetime.now()
-                                    _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
-                                    _stats_block = build_dataset_stats(state["results"], _today_dt)
-                                    _agg_block   = compute_aggregations(question, context_tickets)
-                                    context_block = (
-                                        (_agg_block + "\n" if _agg_block else "") +
-                                        build_rag_context(context_tickets, state["customer_name"],
-                                                          compact=compact_context_toggle.value,
-                                                          filter_note=_retrieval_note,
-                                                          snapshot_map=_snapshot_map)
-                                    )
-                                    system_msg = SYSTEM_PROMPT_TEMPLATE.format(
-                                        today=_today_str,
-                                        stats=_stats_block,
-                                        context=context_block,
-                                    )
-                                    # Semantic memory retrieval — rank by cosine similarity to query_vec
-                                    if _CB_AVAILABLE:
-                                        chat_status.set_text("Loading relevant memories …")
-                                        _memories = await run.io_bound(
-                                            fetch_relevant_memories,
-                                            query_vec,
-                                            *_cache_cb,
-                                            5,
-                                            state.get("customer_name", ""),
-                                        )
-                                        _mem_block = _build_memory_section(_memories)
-                                        if _mem_block:
-                                            system_msg = system_msg + "\n" + _mem_block
-                                    if state.get("prior_session_block"):
-                                        system_msg = system_msg + "\n" + state["prior_session_block"]
-                                    # Window history to last 20 messages (10 turns)
-                                    _hist_window = state["chat_history"][-(20):-1]
-                                    messages = [{"role": "system", "content": system_msg}]
-                                    for h in _hist_window:
-                                        if h["role"] in ("user", "assistant"):
-                                            messages.append(h)
-                                    messages.append({"role": "user", "content": question})
-
-                                    # 5. Call LLM (or Deep Reasoning pipeline)
-                                    if deep_reason_toggle.value:
-                                        chat_status.set_text(
-                                            f"Deep Reasoning — 6-stage pipeline over {len(context_tickets)} tickets …"
-                                        )
-                                        def _dr_prog_vs(msg, _cs=chat_status):
-                                            _cs.set_text(msg)
-                                        answer = await run.io_bound(
-                                            run_deep_reasoning,
-                                            question, context_tickets, _today_str, _stats_block,
-                                            provider, model, api_key, base_url, _dr_prog_vs,
-                                        )
-                                        state["chat_history"].append({"role": "assistant", "content": answer})
-                                        _render_chat()
-                                        chat_status.set_text(
-                                            f"Deep Reasoning complete — {len(context_tickets)} tickets analysed."
-                                        )
-                                    else:
-                                        chat_status.set_text(f"Asking {provider} ({model}) …")
-                                        if use_streaming:
-                                            answer, n_tok, elapsed, rate = await _call_llm_streaming(
-                                                messages, provider, model, api_key, base_url
-                                            )
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
-                                            _render_chat()
-                                            chat_status.set_text(
-                                                f"{len(context_tickets)} tickets as context — "
-                                                f"{n_tok} tokens in {elapsed:.1f}s ({rate:.1f} tok/s)"
-                                            )
-                                        else:
-                                            answer = await run.io_bound(call_llm, messages, provider, model, api_key, base_url)
-                                            state["chat_history"].append({"role": "assistant", "content": answer})
-                                            _render_chat()
-                                            chat_status.set_text(f"{len(context_tickets)} tickets used as context.")
-                                    # Record turn for session storage
-                                    _ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                                    _turn_tids = [str(t.get("ticket_id","")) for t in context_tickets if t.get("ticket_id")]
-                                    state["chat_session_turns"].append((question, answer, _ts_now, _turn_tids))
-
-                                    # 6. Write permanent memory — always store when toggle is on,
-                                    #    include question_vector for future semantic retrieval
-                                    if _CB_AVAILABLE and store_memory_toggle.value:
-                                        _mkey = _chat_cache_key("memory", question)
-                                        await run.io_bound(
-                                            chat_cache_set, _mkey,
-                                            {"type": "chat_memory",
-                                             "question": question,
-                                             "question_vector": query_vec,
-                                             "answer_summary": answer[:2000],
-                                             "doc_keys": doc_keys,
-                                             "organization": state.get("customer_name", ""),
-                                             "embedding_provider": _ep,
-                                             "embedding_model": _em,
-                                             "llm_provider": provider,
-                                             "llm_model": model,
-                                             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-                                            0,   # permanent — no expiry
-                                            *_cache_cb,
-                                        )
-
-                            except Exception as exc:
-                                chat_status.set_text(f"Error: {exc}")
-                                ui.notify(str(exc), type="negative")
-                                # Remove the user message if we failed completely
-                                if state["chat_history"] and state["chat_history"][-1]["role"] == "user":
-                                    state["chat_history"].pop()
-                                _render_chat()
-                            finally:
-                                btn_send.set_enabled(True)
-                                # Persist history if last exchange completed successfully
-                                if (_CB_AVAILABLE and state.get("chat_history")
-                                        and state["chat_history"][-1]["role"] == "assistant"):
-                                    asyncio.ensure_future(run.io_bound(
-                                        save_customer_chat_history,
-                                        state.get("customer_name", ""), list(state["chat_history"]),
-                                        cb_url_input.value.strip(), cb_bucket_input.value.strip(),
-                                        cb_user_input.value.strip(), cb_pass_input.value, cb_tls_toggle.value,
-                                    ))
-
-                        def _clear_chat():
-                            # Persist the completed session before clearing
-                            if _CB_AVAILABLE and state["chat_session_turns"] and store_memory_toggle.value:
-                                _sc_col = cache_collection_input.value.strip() or (cb_collection_input.value.strip() or "tickets")
-                                save_chat_session(
-                                    state["chat_session_id"],
-                                    state["chat_session_turns"],
-                                    state.get("customer_name", ""),
-                                    cb_url_input.value.strip(), cb_bucket_input.value.strip(),
-                                    cb_user_input.value.strip(), cb_pass_input.value,
-                                    cb_tls_toggle.value,
-                                    cb_scope_input.value.strip() or "_default",
-                                    _sc_col,
-                                )
-                            state["chat_history"].clear()
-                            state["chat_session_turns"].clear()
-                            state["chat_session_id"] = str(uuid.uuid4())
-                            state["prior_session_block"] = ""   # re-fetch on next session's first turn
-                            _render_chat()
-                            chat_status.set_text("")
-
-                        chat_log.classes(add="chat-log-scroll")
-
-                        # ── Chat input bar ────────────────────────────────────────────
-                        with ui.row().classes("w-full gap-2 mt-3 items-end"):
-                            chat_input = (
-                                ui.textarea(placeholder="Ask a question … (Enter to send, Shift+Enter for new line)")
-                                .classes("flex-1")
-                                .props("outlined autogrow rows=1 dense")
-                            )
-                            # Enter sends; Shift+Enter inserts newline.
-                            # Use an async def so NiceGUI awaits it within the client context
-                            # (avoids "slot stack is empty" error from detached tasks).
-                            async def _on_enter(e):
-                                if not (e.args or {}).get("shiftKey"):
-                                    await _send_chat()
-                            chat_input.on("keydown.enter", _on_enter)
-                            with ui.column().classes("gap-1"):
-                                btn_send = (
-                                    ui.button(icon="send", on_click=_send_chat)
-                                    .props("color=primary round dense")
-                                    .tooltip("Send (Enter)")
-                                )
-                                btn_clear = (
-                                    ui.button(icon="delete_sweep", on_click=_clear_chat)
-                                    .props("flat round dense color=grey")
-                                    .tooltip("Clear conversation")
-                                )
-
-                                async def _copy_last_response():
-                                    last = next(
-                                        (m["content"] for m in reversed(state["chat_history"])
-                                         if m["role"] == "assistant"),
-                                        None,
-                                    )
-                                    if last:
-                                        await ui.run_javascript(
-                                            f"navigator.clipboard.writeText({json.dumps(last)})"
-                                        )
-                                        ui.notify("Copied to clipboard", type="positive", timeout=2000)
-                                    else:
-                                        ui.notify("No response to copy yet.", type="warning")
-
-                                ui.button(icon="download", on_click=_copy_last_response).props(
-                                    "flat round dense color=grey"
-                                ).tooltip("Copy last response as Markdown")
+                _corax_port = int(os.environ.get("CORAX_PORT", 8766))
+                ui.html(
+                    f'<iframe src="http://localhost:{_corax_port}"'
+                    ' style="width:100%;height:calc(100vh - 130px);'
+                    'border:none;border-radius:8px;display:block;">'
+                    '</iframe>'
+                ).classes("w-full")
 
             with ui.tab_panel(tab_scoring):
                 with ui.column().classes("w-full gap-0"):
@@ -7049,10 +5169,15 @@ def main_page():
                         scoring_banner = ui.label("No customer loaded").classes("text-sm font-semibold text-indigo-700 flex-1")
 
                     def _set_customer_banner(name: str) -> None:
-                        """Update both tab banners whenever the active customer changes."""
+                        """Update both tab banners and the header chip whenever the active customer changes."""
                         text = f"Viewing: {name}"
                         results_banner.set_text(text)
                         scoring_banner.set_text(text)
+                        if name and name.lower() not in ("", "all customers"):
+                            _hdr_cust.set_text(f"▸ {name}")
+                            _hdr_cust.classes(remove="hidden")
+                        else:
+                            _hdr_cust.classes(add="hidden")
 
                     # Populate banners from any already-loaded state (e.g. page refresh)
                     if state.get("customer_name"):
@@ -7204,17 +5329,6 @@ def main_page():
                         ui.separator().classes("my-2")
 
                         with ui.row().classes("items-center gap-4 mt-2 flex-wrap"):
-                            score_batch_input = ui.number("Tickets per batch", value=5, min=1, max=50).classes("w-40")
-                            score_parallel_input = ui.number("Parallelism", value=1, min=1, max=8).classes("w-28").tooltip(
-                                "Batches sent to the LLM concurrently. Match to your model server's "
-                                "parallel request capacity."
-                            )
-                            score_no_think_toggle = ui.checkbox("Disable thinking (Ollama)").tooltip(
-                                "Uses Ollama's native API with think=false — suppresses Qwen3/QwQ "
-                                "reasoning traces for faster, more reliable JSON output. "
-                                "Auto-enabled when a thinking-capable model is detected. "
-                                "Ignored for Claude, Gemini, and LMStudio."
-                            )
                             score_ctx_input = ui.number(
                                 "Ollama num_ctx (K)", value=131, min=8, max=512,
                             ).classes("w-44").props(
@@ -7245,7 +5359,7 @@ def main_page():
                             score_error_log.set_visibility(False)
                             score_status.set_text("Starting …")
                             loop = asyncio.get_event_loop()
-                            _score_ts = lambda: _time.strftime("%H:%M:%S")
+                            _score_ts = lambda: time.strftime("%H:%M:%S")
 
                             def _prog(msg: str, pct: float):
                                 _OP_STATUS["op"] = "score"
@@ -7266,6 +5380,20 @@ def main_page():
 
                             provider, model, api_key, base_url = _get_llm_config()
                             _warn_if_small_model(model)
+                            if provider == "lmstudio":
+                                _lms_base = (base_url or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                                score_status.set_text("Ensuring LMStudio model is loaded…")
+                                _lms_llm = await run.io_bound(lmstudio_ensure_model_loaded, _lms_base, model, 120, "llm")
+                                if _lms_llm:
+                                    if _lms_llm != model:
+                                        score_status.set_text(f"LMStudio: using '{_lms_llm}' for scoring")
+                                    model = _lms_llm
+                                else:
+                                    ui.notify("No LLM/VLM model loaded in LMStudio — load one in the LMStudio UI, then retry.", type="warning", timeout=8000)
+                                    btn_score.set_enabled(True)
+                                    btn_load_scores.set_enabled(True)
+                                    btn_stop_score.set_enabled(False)
+                                    return
                             try:
                                 scores = await run.io_bound(
                                     score_all_tickets,
@@ -7532,6 +5660,20 @@ def main_page():
                         chart_status = ui.label("").classes("text-sm text-gray-500 mt-1")
                         charts_area  = ui.column().classes("w-full gap-4 mt-3")
 
+                        # ── Chart drill-down dialog ────────────────────────────────────────
+                        # Shared modal — chart clicks open this; rows click to ticket detail
+                        _drill_dlg = ui.dialog().props("maximized=false").classes("q-pa-none")
+                        with _drill_dlg, ui.card().classes("w-full").style("min-width:700px;max-width:1000px;max-height:85vh;overflow-y:auto;padding:16px"):
+                            with ui.row().classes("w-full items-center justify-between mb-2"):
+                                _drill_label = ui.label("").classes("text-sm font-semibold text-blue-800")
+                                ui.button(icon="close", on_click=lambda: _drill_dlg.close()).props("flat round dense color=grey-6 size=sm")
+                            _drill_rows_area = ui.column().classes("w-full")
+
+                        # Ticket detail dialog
+                        _ticket_dlg = ui.dialog().props("maximized=false").classes("q-pa-none")
+                        with _ticket_dlg, ui.card().classes("w-full").style("min-width:600px;max-width:900px;max-height:85vh;overflow-y:auto"):
+                            _ticket_dlg_body = ui.column().classes("w-full gap-3 p-4")
+
                         def _make_chart(container, cfg: dict, height: int = 380):
                             with container:
                                 ui.echart(cfg).classes("w-full").style(f"height:{height}px")
@@ -7668,13 +5810,149 @@ def main_page():
                                     f"Date filter: {_date_label} — {len(display_tickets)} of {_pre_filter} tickets"
                                 )
 
-                            data = build_analytics_data(display_tickets, display_scores)
+                            # ── Drill-down helpers (close over display_tickets) ───────────
+                            def _open_ticket_detail(ticket: dict):
+                                _ticket_dlg_body.clear()
+                                with _ticket_dlg_body:
+                                    tf = _parse_ticket_fields(ticket)
+                                    with ui.row().classes("w-full items-start justify-between gap-2"):
+                                        with ui.column().classes("flex-1 gap-0"):
+                                            ui.label(f"#{ticket.get('ticket_id')} · {ticket.get('organization','')}").classes("text-xs text-gray-400")
+                                            ui.label(ticket.get("subject") or "").classes("text-base font-semibold")
+                                        ui.button(icon="close", on_click=_ticket_dlg.close).props("flat round dense color=grey-6")
+                                    with ui.row().classes("gap-4 flex-wrap text-xs text-gray-500"):
+                                        for _lbl, _val in [
+                                            ("Priority",  (ticket.get("priority") or "—").upper()),
+                                            ("Status",    (ticket.get("status")   or "—").capitalize()),
+                                            ("Created",   (ticket.get("created")  or "")[:10]),
+                                            ("Version",   extract_ticket_version(ticket)),
+                                            ("Component", tf.get("Component") or "—"),
+                                        ]:
+                                            with ui.column().classes("gap-0"):
+                                                ui.label(_lbl).classes("text-xs text-gray-400")
+                                                ui.label(_val).classes("text-xs font-medium")
+                                    sc = state["scores"].get(str(ticket.get("ticket_id", ""))) or {}
+                                    if sc:
+                                        with ui.row().classes("gap-4 flex-wrap text-xs"):
+                                            for _lbl, _key in [("Stars","stars"),("Temp","temperature"),("Complexity","complexity")]:
+                                                if sc.get(_key):
+                                                    ui.badge(f"{_lbl}: {sc[_key]}").props("color=blue-grey-6")
+                                    desc = (ticket.get("description") or "").strip()
+                                    if desc:
+                                        ui.separator()
+                                        ui.label("Description").classes("text-xs font-semibold text-gray-500")
+                                        ui.label(desc[:3000]).classes("text-xs text-gray-700 whitespace-pre-wrap")
+                                    summ = (ticket.get("summary_text") or "").strip()
+                                    if summ:
+                                        ui.separator()
+                                        ui.label("AI Summary").classes("text-xs font-semibold text-gray-500")
+                                        ui.label(summ).classes("text-xs text-gray-700 whitespace-pre-wrap")
+                                    # ── Cluster topology from snapshot ────────────────────
+                                    _dtopo = ticket.get("snapshot_topology") or {}
+                                    if isinstance(_dtopo, str):
+                                        try:
+                                            _dtopo = json.loads(_dtopo)
+                                        except Exception:
+                                            _dtopo = {}
+                                    if isinstance(_dtopo, dict) and _dtopo and (
+                                        _dtopo.get("total_nodes") or _dtopo.get("cb_version") or _dtopo.get("cpus_per_node")
+                                    ):
+                                        ui.separator()
+                                        ui.label("Cluster Topology (snapshot)").classes("text-xs font-semibold text-gray-500")
+                                        _topo_chips = []
+                                        if _dtopo.get("cb_version"):
+                                            _topo_chips.append(("CB Version", _dtopo["cb_version"]))
+                                        if _dtopo.get("total_nodes"):
+                                            _topo_chips.append(("Nodes", str(_dtopo["total_nodes"])))
+                                        if _dtopo.get("cpus_per_node"):
+                                            _topo_chips.append(("CPUs/node", str(_dtopo["cpus_per_node"])))
+                                        if _dtopo.get("ram_used_per_node_mib") and _dtopo.get("ram_per_node_mib"):
+                                            _topo_chips.append(("RAM used/node", f"{_dtopo['ram_used_per_node_mib']}/{_dtopo['ram_per_node_mib']} MiB"))
+                                        elif _dtopo.get("ram_per_node_mib"):
+                                            _topo_chips.append(("RAM/node", f"{_dtopo['ram_per_node_mib']} MiB"))
+                                        if _dtopo.get("os_name"):
+                                            _topo_chips.append(("OS", _dtopo["os_name"]))
+                                        if _dtopo.get("n2n_encryption") is not None:
+                                            _topo_chips.append(("N2N Enc", _dtopo["n2n_encryption"]))
+                                        if _dtopo.get("data_quota_mib"):
+                                            _topo_chips.append(("Data Quota", f"{_dtopo['data_quota_mib']} MiB"))
+                                        if _dtopo.get("auto_failover_seconds") is not None:
+                                            _topo_chips.append(("Auto-failover", f"{_dtopo['auto_failover_seconds']}s"))
+                                        _svc_parts = []
+                                        for _sn, _sk in [("KV", "data_nodes"), ("Index", "index_nodes"),
+                                                         ("Query", "query_nodes"), ("FTS", "fts_nodes"),
+                                                         ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
+                                            if _dtopo.get(_sk):
+                                                _svc_parts.append(f"{_sn}×{_dtopo[_sk]}")
+                                        if _svc_parts:
+                                            _topo_chips.append(("Services", ", ".join(_svc_parts)))
+                                        if _dtopo.get("global_index_count") is not None:
+                                            _topo_chips.append(("GSI Indexes", str(_dtopo["global_index_count"])))
+                                        if _dtopo.get("fts_index_count") is not None:
+                                            _topo_chips.append(("FTS Indexes", str(_dtopo["fts_index_count"])))
+                                        if _dtopo.get("eventing_function_count") is not None:
+                                            _topo_chips.append(("Eventing Fns", str(_dtopo["eventing_function_count"])))
+                                        _dbc = _dtopo.get("bad_count") or len(_dtopo.get("bad_items") or [])
+                                        _dwc = _dtopo.get("warn_count") or len(_dtopo.get("warn_items") or [])
+                                        if _dbc or _dwc:
+                                            _topo_chips.append(("Health", f"{_dbc} bad / {_dwc} warn"))
+                                        with ui.row().classes("gap-2 flex-wrap mt-1"):
+                                            for _lbl, _val in _topo_chips:
+                                                with ui.column().classes("gap-0"):
+                                                    ui.label(_lbl).classes("text-xs text-gray-400")
+                                                    ui.label(_val).classes("text-xs font-medium")
+                                        _dbi = _dtopo.get("bad_items") or []
+                                        if _dbi:
+                                            ui.label(f"Bad checks: {', '.join(_dbi[:12])}").classes("text-xs text-red-600 mt-1")
+                                _ticket_dlg.open()
+
+                            def _show_drill(title: str, tickets: list[dict]):
+                                _drill_label.set_text(title)
+                                _drill_rows_area.clear()
+                                if not tickets:
+                                    with _drill_rows_area:
+                                        ui.label("No matching tickets.").classes("text-sm text-gray-400 p-2")
+                                    _drill_dlg.open()
+                                    return
+                                _sorted = sorted(tickets, key=lambda x: x.get("created") or "", reverse=True)[:200]
+                                _cols = [
+                                    {"name": "date",     "label": "Date",     "field": "date",     "align": "left", "sortable": True},
+                                    {"name": "id",       "label": "#",        "field": "id",       "align": "left"},
+                                    {"name": "priority", "label": "Pri",      "field": "priority", "align": "center", "sortable": True},
+                                    {"name": "status",   "label": "Status",   "field": "status",   "align": "left"},
+                                    {"name": "org",      "label": "Customer", "field": "org",      "align": "left"},
+                                    {"name": "subject",  "label": "Subject",  "field": "subject",  "align": "left"},
+                                ]
+                                _rows = [
+                                    {
+                                        "date":     (t.get("created") or "")[:10],
+                                        "id":       str(t.get("ticket_id", "")),
+                                        "priority": (t.get("priority") or "—").upper(),
+                                        "status":   (t.get("status")   or "—").capitalize(),
+                                        "org":      (t.get("organization") or "")[:35],
+                                        "subject":  (t.get("subject")   or "")[:90],
+                                        "_tid":     str(t.get("ticket_id", "")),
+                                    }
+                                    for t in _sorted
+                                ]
+                                _tid_map = {str(t.get("ticket_id","")): t for t in _sorted}
+                                with _drill_rows_area:
+                                    _dtbl = ui.table(columns=_cols, rows=_rows, row_key="id").classes("w-full text-xs").props("dense flat")
+                                    _dtbl.on("rowClick", lambda e: _open_ticket_detail(
+                                        _tid_map.get((e.args[1] if isinstance(e.args, list) else e.args.get("row", {})).get("_tid", ""), {})
+                                    ))
+                                _drill_dlg.open()
+
+                            # Run in a thread so the NiceGUI event loop isn't blocked
+                            # while processing large ticket sets (e.g. 1 000+ tickets).
+                            chart_status.set_text("Crunching analytics data …")
+                            data = await run.io_bound(build_analytics_data, display_tickets, display_scores)
 
                             with charts_area:
                                 # ── Row 1: Stacked volume by origin over time ─────────────
                                 if data["month_keys"]:
-                                    ui.echart({
-                                        "title":    {"text": "Ticket Volume Over Time by Origin", "subtext": "Drag to zoom"},
+                                    _mchart = ui.echart({
+                                        "title":    {"text": "Ticket Volume Over Time by Origin", "subtext": "Drag to zoom · Click bar to drill down"},
                                         "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                         "legend":   {"bottom": 0},
                                         "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 30}],
@@ -7688,64 +5966,123 @@ def main_page():
                                             {"name": "Proactive/Automated", "type": "bar", "stack": "total", "data": data["month_proactive"]},
                                         ],
                                     }).classes("w-full").style(f"height:{ch}px")
+                                    def _on_month_click(e, _dts=display_tickets):
+                                        mo = e.name or ""
+                                        if not mo:
+                                            return
+                                        _f = [t for t in _dts if _parse_created([t]) and _parse_created([t])[0] == mo]
+                                        _show_drill(f"{len(_f)} tickets — {mo}", _f)
+                                    _mchart.on_point_click(_on_month_click)
                                 else:
                                     ui.label("No parseable dates for frequency chart.").classes("text-sm text-gray-400")
 
                                 # ── Row 1b: Tickets per year ──────────────────────────────
                                 if data["year_keys"]:
                                     with ui.card().classes("w-full"):
-                                        ui.echart({
-                                            "title":   {"text": "Tickets per Year"},
+                                        _ychart = ui.echart({
+                                            "title":   {"text": "Tickets per Year", "subtext": "Click bar to drill down"},
                                             "tooltip": {"trigger": "axis"},
                                             "xAxis":   {"type": "category", "data": data["year_keys"], "name": "Year"},
                                             "yAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
                                             "color":   ["#039BE5"],
                                             "series":  [{"name": "Tickets", "type": "bar", "data": data["year_values"], "label": {"show": True, "position": "top"}}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_year_click(e, _dts=display_tickets):
+                                            yr = e.name or ""
+                                            if not yr:
+                                                return
+                                            _f = [t for t in _dts if (t.get("created") or "")[:4] == yr]
+                                            _show_drill(f"{len(_f)} tickets — {yr}", _f)
+                                        _ychart.on_point_click(_on_year_click)
 
                                 # ── Row 2: Priority + Status side by side ─────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Priority Distribution"},
+                                        _pchart = ui.echart({
+                                            "title":   {"text": "Priority Distribution", "subtext": "Click slice to drill down"},
                                             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                             "color":   ["#43A047","#FB8C00","#E53935","#8E24AA"],
                                             "series":  [{"name": "Tickets", "type": "pie", "radius": "62%", "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["priority_labels"], data["priority_values"])]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_priority_click(e, _dts=display_tickets):
+                                            pri = e.name or ""
+                                            if not pri:
+                                                return
+                                            _f = [t for t in _dts if (t.get("priority") or "unknown").capitalize() == pri]
+                                            _show_drill(f"{len(_f)} tickets — Priority: {pri}", _f)
+                                        _pchart.on_point_click(_on_priority_click)
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Status Breakdown"},
+                                        _schart = ui.echart({
+                                            "title":   {"text": "Status Breakdown", "subtext": "Click slice to drill down"},
                                             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                             "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["status_labels"], data["status_values"])]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_status_click(e, _dts=display_tickets):
+                                            st = e.name or ""
+                                            if not st:
+                                                return
+                                            _f = [t for t in _dts if (t.get("status") or "unknown").capitalize() == st]
+                                            _show_drill(f"{len(_f)} tickets — Status: {st}", _f)
+                                        _schart.on_point_click(_on_status_click)
 
                                 # ── Row 3: Comment distribution + Escalation rate ─────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Comment Count Distribution"},
+                                        _comm_labels = data["comment_labels"]
+                                        _cchart = ui.echart({
+                                            "title":   {"text": "Comment Count Distribution", "subtext": "Click bar to drill down"},
                                             "tooltip": {"trigger": "axis"},
-                                            "xAxis":   {"type": "category", "data": data["comment_labels"]},
+                                            "xAxis":   {"type": "category", "data": _comm_labels},
                                             "yAxis":   {"type": "value", "name": "Tickets"},
                                             "color":   ["#00ACC1"],
                                             "series":  [{"name": "Tickets", "type": "bar", "data": data["comment_values"]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        _comm_bucket_map = {
+                                            "1": lambda c: c <= 1,
+                                            "2-5": lambda c: 2 <= c <= 5,
+                                            "6-10": lambda c: 6 <= c <= 10,
+                                            "11-20": lambda c: 11 <= c <= 20,
+                                            "21+": lambda c: c >= 21,
+                                        }
+                                        def _on_comm_click(e, _dts=display_tickets, _bm=_comm_bucket_map):
+                                            lbl = e.name or ""
+                                            fn = _bm.get(lbl)
+                                            if not fn:
+                                                return
+                                            _f = [t for t in _dts if fn(int(t.get("comment_count") or 0))]
+                                            _show_drill(f"{len(_f)} tickets — Comments: {lbl}", _f)
+                                        _cchart.on_point_click(_on_comm_click)
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Escalation Rate"},
+                                        _eschart = ui.echart({
+                                            "title":   {"text": "Escalation Rate", "subtext": "Click slice to drill down"},
                                             "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                             "color":   ["#E53935","#43A047"],
                                             "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["esc_labels"], data["esc_values"])]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_esc_click(e, _dts=display_tickets):
+                                            lbl = e.name or ""
+                                            if not lbl:
+                                                return
+                                            want_esc = lbl.lower().startswith("escalat")
+                                            _f = [t for t in _dts if bool(t.get("escalations")) == want_esc]
+                                            _show_drill(f"{len(_f)} tickets — {lbl}", _f)
+                                        _eschart.on_point_click(_on_esc_click)
 
                                 # ── Row 4: Ticket origin ──────────────────────────────────
                                 with ui.card().classes("w-full"):
-                                    ui.echart({
-                                        "title":   {"text": "Ticket Origin", "subtext": "How the ticket was opened"},
+                                    _origchart = ui.echart({
+                                        "title":   {"text": "Ticket Origin", "subtext": "How the ticket was opened · Click slice to drill down"},
                                         "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                         "color":   ["#1E88E5", "#FB8C00", "#6D4C41"],
                                         "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"formatter": "{b}: {c} ({d}%)", "fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["origin_labels"], data["origin_values"])]}],
                                     }).classes("w-full").style(f"height:{ch_sm}px")
+                                    def _on_origin_click(e, _dts=display_tickets):
+                                        orig = e.name or ""
+                                        if not orig:
+                                            return
+                                        _f = [t for t in _dts if classify_ticket_origin(t) == orig]
+                                        _show_drill(f"{len(_f)} tickets — Origin: {orig}", _f)
+                                    _origchart.on_point_click(_on_origin_click)
 
                                 # Proactive diagnostic breakdown
                                 if data["origin_values"][2] > 0:  # Proactive/Automated count
@@ -7773,23 +6110,88 @@ def main_page():
                                 # ── Row 5: Version + Feature area ─────────────────────────
                                 with ui.row().classes("w-full gap-4"):
                                     with ui.card().classes("flex-1"):
-                                        if data["version_labels"]:
-                                            ui.echart({
-                                                "title":    {"text": "Tickets by Couchbase Version", "subtext": "Drag to zoom"},
-                                                "tooltip":  {"trigger": "axis"},
-                                                "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
-                                                "grid":     {"bottom": 60},
-                                                "xAxis":    {"type": "category", "data": data["version_labels"], "name": "Version", "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
-                                                "yAxis":    {"type": "value", "name": "Tickets"},
-                                                "color":    ["#0277BD"],
-                                                "series":   [{"name": "Tickets", "type": "bar", "data": data["version_values"]}],
-                                            }).classes("w-full").style(f"height:{ch}px")
+                                        if data["version_breakdown"]:
+                                            _VER_COLORS = {
+                                                "version": "#0277BD",
+                                                "eol":     "#FF8F00",
+                                                "admin":   "#9E9E9E",
+                                                "blank":   "#78909C",
+                                            }
+                                            _vf_state = {"eol": True, "admin": True, "blank": True}
+
+                                            def _ver_chart_opts(_vf=_vf_state, _bd=data["version_breakdown"]):
+                                                shown = [
+                                                    (lbl, cnt, cat) for lbl, cnt, cat in _bd
+                                                    if cat == "version" or _vf.get(cat, True)
+                                                ]
+                                                return {
+                                                    "title":    {"text": "Tickets by Couchbase Version", "subtext": "Drag to zoom"},
+                                                    "tooltip":  {"trigger": "axis", "formatter": "{b}: {c} tickets"},
+                                                    "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                                                    "grid":     {"bottom": 60},
+                                                    "xAxis":    {"type": "category", "data": [l for l,_,_ in shown], "axisLabel": {"rotate": 45, "fontSize": _fs_sm}},
+                                                    "yAxis":    {"type": "value", "name": "Tickets"},
+                                                    "series":   [{"name": "Tickets", "type": "bar", "data": [
+                                                        {"value": cnt, "itemStyle": {"color": _VER_COLORS.get(cat, "#0277BD")}}
+                                                        for _, cnt, cat in shown
+                                                    ]}],
+                                                }
+
+                                            _vchart = ui.echart(_ver_chart_opts()).classes("w-full").style(f"height:{ch}px")
+
+                                            def _refresh_vchart():
+                                                _vchart.options.clear()
+                                                _vchart.options.update(_ver_chart_opts())
+                                                _vchart.update()
+
+                                            def _on_ver_click(e, _dts=display_tickets, _bd=data["version_breakdown"]):
+                                                lbl = e.name or ""
+                                                if not lbl:
+                                                    return
+                                                _cat = next((cat for l2, _, cat in _bd if l2 == lbl), "version")
+                                                if _cat == "version":
+                                                    _f = [t for t in _dts if extract_ticket_version(t) == lbl]
+                                                elif _cat == "eol":
+                                                    _f = [t for t in _dts if "end of life" in (_parse_ticket_fields(t).get("Couchbase_Server") or "").lower()]
+                                                elif _cat == "admin":
+                                                    _f = [t for t in _dts if "Couchbase_Server" not in _parse_ticket_fields(t)]
+                                                else:  # blank
+                                                    _f = [t for t in _dts if "Couchbase_Server" in _parse_ticket_fields(t) and not (_parse_ticket_fields(t).get("Couchbase_Server") or "").strip()]
+                                                _show_drill(f"{len(_f)} tickets — {lbl}", _f)
+                                            _vchart.on_point_click(_on_ver_click)
+
+                                            # Colour legend + filter checkboxes
+                                            with ui.row().classes("gap-4 items-center mt-1 flex-wrap"):
+                                                for _cat_lbl, _cat_key, _cat_clr, _cat_cnt in [
+                                                    ("Known version",       "version", "#0277BD", None),
+                                                    ("EOL",                 "eol",     "#FF8F00", data["version_eol_count"]),
+                                                    ("Admin/No-product",    "admin",   "#9E9E9E", data["version_admin_count"]),
+                                                    ("Version unspecified", "blank",   "#78909C", data["version_blank_count"]),
+                                                ]:
+                                                    if _cat_cnt is None or _cat_cnt > 0:
+                                                        with ui.row().classes("gap-1 items-center"):
+                                                            ui.element("div").style(
+                                                                f"width:10px;height:10px;border-radius:2px;background:{_cat_clr}"
+                                                            )
+                                                            if _cat_key == "version":
+                                                                ui.label(_cat_lbl).classes("text-xs text-gray-600")
+                                                            else:
+                                                                def _make_toggle(_k=_cat_key):
+                                                                    def _toggle(e):
+                                                                        v = e.args
+                                                                        _vf_state[_k] = v[0] if isinstance(v, (list, tuple)) else v
+                                                                        _refresh_vchart()
+                                                                    return _toggle
+                                                                ui.checkbox(
+                                                                    f"{_cat_lbl} ({_cat_cnt})",
+                                                                    value=True,
+                                                                ).classes("text-xs").on("update:model-value", _make_toggle(_cat_key))
                                         else:
                                             ui.label("No version data found in ticket fields.").classes("text-sm text-gray-400 p-4")
                                     with ui.card().classes("flex-1"):
                                         if data["feature_labels"]:
-                                            ui.echart({
-                                                "title":    {"text": "Tickets by Feature Area", "subtext": "Drag to zoom"},
+                                            _fchart = ui.echart({
+                                                "title":    {"text": "Tickets by Feature Area", "subtext": "Drag to zoom · Click bar to drill down"},
                                                 "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                                 "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                                 "grid":     {"left": 170, "right": 60},
@@ -7798,6 +6200,13 @@ def main_page():
                                                 "color":    ["#00838F"],
                                                 "series":   [{"name": "Tickets", "type": "bar", "data": data["feature_values"]}],
                                             }).classes("w-full").style(f"height:{ch}px")
+                                            def _on_feature_click(e, _dts=display_tickets):
+                                                feat = e.name or ""
+                                                if not feat:
+                                                    return
+                                                _f = [t for t in _dts if classify_ticket_feature(t) == feat]
+                                                _show_drill(f"{len(_f)} tickets — Feature: {feat}", _f)
+                                            _fchart.on_point_click(_on_feature_click)
                                         else:
                                             ui.label("No component/feature data found.").classes("text-sm text-gray-400 p-4")
 
@@ -7808,33 +6217,55 @@ def main_page():
                                     # Row 4: Stars + Temperature
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "Experience Stars Distribution"},
+                                            _stchart = ui.echart({
+                                                "title":   {"text": "Experience Stars Distribution", "subtext": "Click bar to drill down"},
                                                 "tooltip": {"trigger": "axis"},
                                                 "xAxis":   {"type": "category", "data": ["★1","★2","★3","★4","★5"]},
                                                 "yAxis":   {"type": "value", "name": "Tickets"},
                                                 "color":   ["#FDD835"],
                                                 "series":  [{"name": "Tickets", "type": "bar", "data": data["stars_values"]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_stars_click(e, _dts=display_tickets, _sc=display_scores):
+                                                lbl = e.name or ""
+                                                n = lbl.replace("★","").strip()
+                                                if not n.isdigit():
+                                                    return
+                                                _f = [t for t in _dts if str(_sc.get(str(t.get("ticket_id","")), {}).get("stars") or "") == n]
+                                                _show_drill(f"{len(_f)} tickets — {lbl} stars", _f)
+                                            _stchart.on_point_click(_on_stars_click)
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "Temperature Distribution"},
+                                            _tempchart = ui.echart({
+                                                "title":   {"text": "Temperature Distribution", "subtext": "Click slice to drill down"},
                                                 "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
                                                 "color":   ["#42A5F5","#FFA726","#EF5350"],
                                                 "series":  [{"name": "Tickets", "type": "pie", "radius": ["45%", "68%"], "label": {"fontSize": _fs_sm}, "data": [{"name": l, "value": v} for l, v in zip(data["temp_labels"], data["temp_values"])]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_temp_click(e, _dts=display_tickets, _sc=display_scores):
+                                                lbl = (e.name or "").lower()
+                                                if not lbl:
+                                                    return
+                                                _f = [t for t in _dts if ((_sc.get(str(t.get("ticket_id","")), {}) or {}).get("temperature") or "").lower() == lbl]
+                                                _show_drill(f"{len(_f)} tickets — Temperature: {e.name}", _f)
+                                            _tempchart.on_point_click(_on_temp_click)
 
                                     # Row 5: Complexity + Dimension averages
                                     with ui.row().classes("w-full gap-4"):
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "Complexity Score Distribution"},
+                                            _compchart = ui.echart({
+                                                "title":   {"text": "Complexity Score Distribution", "subtext": "Click bar to drill down"},
                                                 "tooltip": {"trigger": "axis"},
                                                 "xAxis":   {"type": "category", "data": ["1","2","3","4","5"]},
                                                 "yAxis":   {"type": "value", "name": "Tickets"},
                                                 "color":   ["#8E24AA"],
                                                 "series":  [{"name": "Tickets", "type": "bar", "data": data["complexity_values"]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_complexity_click(e, _dts=display_tickets, _sc=display_scores):
+                                                lbl = e.name or ""
+                                                if not lbl.isdigit():
+                                                    return
+                                                _f = [t for t in _dts if str((_sc.get(str(t.get("ticket_id","")), {}) or {}).get("complexity") or "") == lbl]
+                                                _show_drill(f"{len(_f)} tickets — Complexity: {lbl}", _f)
+                                            _compchart.on_point_click(_on_complexity_click)
                                         with ui.card().classes("flex-1"):
                                             ui.echart({
                                                 "title":   {"text": "Avg Dimension Scores (1-5)"},
@@ -7861,8 +6292,8 @@ def main_page():
                                         ]
                                         if bubble_pts:
                                             with ui.card().classes("w-full"):
-                                                ui.echart({
-                                                    "title":     {"text": "Customer Portfolio: Volume vs Satisfaction", "subtext": "Bubble size = avg complexity · Hover for customer name"},
+                                                _bbchart = ui.echart({
+                                                    "title":     {"text": "Customer Portfolio: Volume vs Satisfaction", "subtext": "Bubble size = avg complexity · Click bubble to drill down"},
                                                     "tooltip":   {"trigger": "item", "formatter": "{b}<br/>Tickets: {c[0]}<br/>Avg Stars: {c[1]}<br/>Avg Complexity: {c[2]}"},
                                                     "xAxis":     {"type": "value", "name": "Ticket Count"},
                                                     "yAxis":     {"type": "value", "name": "Avg Stars (1-5)", "min": 0, "max": 5},
@@ -7870,27 +6301,53 @@ def main_page():
                                                     "color":     ["rgba(30,136,229,0.65)"],
                                                     "series":    [{"name": "Customers", "type": "scatter", "data": [{"name": pt["name"], "value": [pt["x"], pt["y"], pt["z"]]} for pt in bubble_pts]}],
                                                 }).classes("w-full").style(f"height:{ch_bbl}px")
+                                                def _on_bubble_click(e, _dts=display_tickets, _om=_org_map):
+                                                    org = e.name or ""
+                                                    if not org:
+                                                        return
+                                                    _f = [t for t in _dts if _apply_org_map(t.get("organization",""), _om) == org]
+                                                    _show_drill(f"{len(_f)} tickets — {org}", _f)
+                                                _bbchart.on_point_click(_on_bubble_click)
 
                                 # ── Cluster & Snapshot metrics ──────────────────────────
                                 ui.label("— Cluster & Snapshot Metrics —").classes("text-sm font-semibold text-gray-500 text-center w-full mt-2")
 
+                                _snap_bucket_fn = {
+                                    "0":    lambda t: int(t.get("snapshot_count") or 0) == 0,
+                                    "1":    lambda t: int(t.get("snapshot_count") or 0) == 1,
+                                    "2-5":  lambda t: 2 <= int(t.get("snapshot_count") or 0) <= 5,
+                                    "6-10": lambda t: 6 <= int(t.get("snapshot_count") or 0) <= 10,
+                                    "11+":  lambda t: int(t.get("snapshot_count") or 0) >= 11,
+                                }
+
                                 with ui.row().classes("w-full gap-4"):
                                     # Snapshot count distribution
                                     with ui.card().classes("flex-1"):
-                                        ui.echart({
-                                            "title":   {"text": "Snapshots per Ticket", "subtext": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot"},
+                                        _snchart = ui.echart({
+                                            "title":   {"text": "Snapshots per Ticket", "subtext": f"{data['tickets_with_snapshots']} tickets have ≥1 snapshot · Click bar to drill down"},
                                             "tooltip": {"trigger": "axis"},
                                             "xAxis":   {"type": "category", "data": data["snap_bucket_labels"], "name": "Snapshot Count"},
                                             "yAxis":   {"type": "value", "name": "Tickets"},
                                             "color":   ["#00ACC1"],
                                             "series":  [{"name": "Tickets", "type": "bar", "data": data["snap_bucket_values"]}],
                                         }).classes("w-full").style(f"height:{ch_sm}px")
+                                        def _on_snap_click(e, _dts=display_tickets, _bm=_snap_bucket_fn):
+                                            lbl = e.name or ""
+                                            fn = _bm.get(lbl)
+                                            if not fn:
+                                                return
+                                            try:
+                                                _f = [t for t in _dts if fn(t)]
+                                            except Exception:
+                                                _f = []
+                                            _show_drill(f"{len(_f)} tickets — Snapshots: {lbl}", _f)
+                                        _snchart.on_point_click(_on_snap_click)
 
                                     # Cluster names (if any detected)
                                     if data["cluster_name_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":    {"text": "Top Cluster Names by Ticket Count", "subtext": "Drag to zoom"},
+                                            _cnchart = ui.echart({
+                                                "title":    {"text": "Top Cluster Names by Ticket Count", "subtext": "Drag to zoom · Click bar to drill down"},
                                                 "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                                 "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                                 "grid":     {"left": 190, "right": 60},
@@ -7899,10 +6356,17 @@ def main_page():
                                                 "color":    ["#5E35B1"],
                                                 "series":   [{"name": "Tickets", "type": "bar", "data": data["cluster_name_values"]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_cname_click(e, _dts=display_tickets):
+                                                cn = (e.name or "").lower()
+                                                if not cn:
+                                                    return
+                                                _f = [t for t in _dts if _topo_str((t.get("snapshot_topology") or {}).get("cluster_name")).lower() == cn]
+                                                _show_drill(f"{len(_f)} tickets — Cluster: {e.name}", _f)
+                                            _cnchart.on_point_click(_on_cname_click)
                                     elif data["cluster_id_labels"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                            _cidchart = ui.echart({
+                                                "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom · Click bar to drill down"},
                                                 "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                                 "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                                 "grid":     {"left": 110, "right": 60},
@@ -7911,6 +6375,14 @@ def main_page():
                                                 "color":    ["#5E35B1"],
                                                 "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
                                             }).classes("w-full").style(f"height:{ch_sm}px")
+                                            def _on_cid_click(e, _dts=display_tickets):
+                                                # e.name is the full UUID embedded in the data item
+                                                cid = (e.name or "").lower()
+                                                if not cid:
+                                                    return
+                                                _f = [t for t in _dts if cid in _topo_str((t.get("snapshot_topology") or {}).get("cluster_uuid")).lower() or cid in _topo_str((t.get("snapshot_topology") or {}).get("capella_cluster_id")).lower()]
+                                                _show_drill(f"{len(_f)} tickets — Cluster ID: {e.name[:12]}…", _f)
+                                            _cidchart.on_point_click(_on_cid_click)
                                     else:
                                         with ui.card().classes("flex-1"):
                                             ui.label("No cluster names or IDs detected in ticket data.").classes("text-sm text-gray-400 p-4")
@@ -7918,8 +6390,8 @@ def main_page():
                                 # Cluster IDs (separate row, only if both names and IDs exist)
                                 if data["cluster_name_labels"] and data["cluster_id_labels"]:
                                     with ui.card().classes("w-full"):
-                                        ui.echart({
-                                            "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom"},
+                                        _cid2chart = ui.echart({
+                                            "title":    {"text": "Top Cluster IDs by Ticket Count", "subtext": "Drag to zoom · Click bar to drill down"},
                                             "tooltip":  {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                             "dataZoom": [{"type": "inside", "yAxisIndex": 0}, {"type": "slider", "yAxisIndex": 0, "right": 10}],
                                             "grid":     {"left": 110, "right": 60},
@@ -7928,6 +6400,13 @@ def main_page():
                                             "color":    ["#3949AB"],
                                             "series":   [{"name": "Tickets", "type": "bar", "data": [{"value": v, "name": data["cluster_id_full"][i]} for i, v in enumerate(data["cluster_id_values"])]}],
                                         }).classes("w-full").style(f"height:{ch}px")
+                                        def _on_cid2_click(e, _dts=display_tickets):
+                                            cid = (e.name or "").lower()
+                                            if not cid:
+                                                return
+                                            _f = [t for t in _dts if cid in _topo_str((t.get("snapshot_topology") or {}).get("cluster_uuid")).lower() or cid in _topo_str((t.get("snapshot_topology") or {}).get("capella_cluster_id")).lower()]
+                                            _show_drill(f"{len(_f)} tickets — Cluster ID: {e.name[:12]}…", _f)
+                                        _cid2chart.on_point_click(_on_cid2_click)
 
                                 # Unique clusters vs tickets per version
                                 if data["clusters_by_version_labels"]:
@@ -7937,8 +6416,8 @@ def main_page():
                                             ui.label(str(data["unique_cluster_total"])).classes("text-3xl font-bold text-teal-600")
                                             ui.label("Unique Clusters Seen (all tickets)").classes("text-xs text-gray-500")
                                     with ui.card().classes("w-full"):
-                                        ui.echart({
-                                            "title":   {"text": "Unique Clusters vs Tickets — by Version", "subtext": f"{data['unique_cluster_total']} unique cluster UUIDs · drag to zoom"},
+                                        _cvchart = ui.echart({
+                                            "title":   {"text": "Unique Clusters vs Tickets — by Version", "subtext": f"{data['unique_cluster_total']} unique cluster UUIDs · drag to zoom · click to drill down"},
                                             "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
                                             "legend":  {"bottom": 0},
                                             "grid":    {"left": 100, "bottom": 50},
@@ -7950,6 +6429,13 @@ def main_page():
                                                 {"name": "Tickets",         "type": "bar", "data": data["tickets_by_version_for_clusters"]},
                                             ],
                                         }).classes("w-full").style(f"height:{_cv_h}px")
+                                        def _on_cv_click(e, _dts=display_tickets):
+                                            ver = e.name or ""
+                                            if not ver:
+                                                return
+                                            _f = [t for t in _dts if extract_ticket_version(t) == ver]
+                                            _show_drill(f"{len(_f)} tickets — Version: {ver}", _f)
+                                        _cvchart.on_point_click(_on_cv_click)
 
                                 # ── CBSE Document Analytics ──────────────────────────────────────
                                 if data["cbse_total"] > 0:
@@ -7966,22 +6452,30 @@ def main_page():
                                             ui.label("CBSEs per Ticket (avg)").classes("text-xs text-gray-500")
 
                                     # Charts: per-year bar + per-month line
+                                    _cbse_re2 = re.compile(r"cbse[-_]?\d+", re.IGNORECASE)
                                     with ui.row().classes("w-full gap-4"):
                                         if data["cbse_year_labels"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.echart({
-                                                    "title":   {"text": "CBSEs Generated per Year"},
+                                                _cbseyrchart = ui.echart({
+                                                    "title":   {"text": "CBSEs Generated per Year", "subtext": "Click bar to drill down"},
                                                     "tooltip": {"trigger": "axis"},
                                                     "xAxis":   {"type": "category", "data": data["cbse_year_labels"], "name": "Year"},
                                                     "yAxis":   {"type": "value", "name": "CBSE Count", "minInterval": 1},
                                                     "color":   ["#7B1FA2"],
                                                     "series":  [{"name": "CBSEs", "type": "bar", "data": data["cbse_year_values"], "label": {"show": True, "position": "top"}}],
                                                 }).classes("w-full").style(f"height:{ch_sm}px")
+                                                def _on_cbse_yr_click(e, _dts=display_tickets, _rx=_cbse_re2):
+                                                    yr = e.name or ""
+                                                    if not yr:
+                                                        return
+                                                    _f = [t for t in _dts if (t.get("created") or "")[:4] == yr and _rx.search(_topo_str(_parse_ticket_fields(t).get("CBSE")))]
+                                                    _show_drill(f"{len(_f)} tickets with CBSEs — {yr}", _f)
+                                                _cbseyrchart.on_point_click(_on_cbse_yr_click)
 
                                         if data["cbse_month_keys"]:
                                             with ui.card().classes("flex-1"):
-                                                ui.echart({
-                                                    "title":    {"text": "CBSEs Generated per Month", "subtext": "Drag to zoom"},
+                                                _cbsemochart = ui.echart({
+                                                    "title":    {"text": "CBSEs Generated per Month", "subtext": "Drag to zoom · Click to drill down"},
                                                     "tooltip":  {"trigger": "axis"},
                                                     "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
                                                     "grid":     {"bottom": 60},
@@ -7990,6 +6484,13 @@ def main_page():
                                                     "color":    ["#5C6BC0"],
                                                     "series":   [{"name": "CBSEs", "type": "line", "smooth": True, "data": data["cbse_month_values"]}],
                                                 }).classes("w-full").style(f"height:{ch_sm}px")
+                                                def _on_cbse_mo_click(e, _dts=display_tickets, _rx=_cbse_re2):
+                                                    mo = e.name or ""
+                                                    if not mo:
+                                                        return
+                                                    _f = [t for t in _dts if _parse_created([t]) and _parse_created([t])[0] == mo and _rx.search(_topo_str(_parse_ticket_fields(t).get("CBSE")))]
+                                                    _show_drill(f"{len(_f)} tickets with CBSEs — {mo}", _f)
+                                                _cbsemochart.on_point_click(_on_cbse_mo_click)
 
                                 # ── Enriched topology charts (only when ≥1 ticket enriched) ──────
                                 if data["enriched_ticket_count"] > 0:
@@ -9074,17 +7575,66 @@ def main_page():
                                                 "series":  [{"name": "Tickets", "type": "pie", "radius": ["38%", "65%"], "label": {"formatter": "{b}: {d}%", "fontSize": 10}, "data": [{"name": l, "value": v} for l, v in zip(prof["feature_labels"], prof["feature_values"])]}],
                                             }).classes("w-full").style("height:280px")
 
-                                    if prof["version_labels"]:
+                                    if prof["version_breakdown"]:
                                         with ui.card().classes("flex-1"):
-                                            ui.echart({
-                                                "title":   {"text": "CB Version Distribution", "subtext": "From ticket fields + snapshots"},
-                                                "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-                                                "grid":    {"left": 100},
-                                                "xAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
-                                                "yAxis":   {"type": "category", "data": prof["version_labels"], "axisLabel": {"fontSize": 10}},
-                                                "color":   ["#0277BD"],
-                                                "series":  [{"name": "Tickets", "type": "bar", "data": prof["version_values"]}],
-                                            }).classes("w-full").style("height:280px")
+                                            _PROF_VER_COLORS = {
+                                                "version": "#0277BD",
+                                                "eol":     "#FF8F00",
+                                                "admin":   "#9E9E9E",
+                                                "blank":   "#78909C",
+                                            }
+                                            _pvf_state = {"eol": True, "admin": True, "blank": True}
+
+                                            def _prof_ver_opts(_vf=_pvf_state, _bd=prof["version_breakdown"]):
+                                                shown = [
+                                                    (lbl, cnt, cat) for lbl, cnt, cat in _bd
+                                                    if cat == "version" or _vf.get(cat, True)
+                                                ]
+                                                _h = max(280, len(shown) * 28 + 60)
+                                                return {
+                                                    "title":   {"text": "CB Version Distribution", "subtext": "From ticket fields + snapshots"},
+                                                    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}, "formatter": "{b}: {c} tickets"},
+                                                    "grid":    {"left": 160},
+                                                    "xAxis":   {"type": "value", "name": "Tickets", "minInterval": 1},
+                                                    "yAxis":   {"type": "category", "data": [l for l,_,_ in shown], "axisLabel": {"fontSize": 10}},
+                                                    "series":  [{"name": "Tickets", "type": "bar", "data": [
+                                                        {"value": cnt, "itemStyle": {"color": _PROF_VER_COLORS.get(cat, "#0277BD")}}
+                                                        for _, cnt, cat in shown
+                                                    ]}],
+                                                }
+
+                                            _pvchart = ui.echart(_prof_ver_opts()).classes("w-full").style("height:280px")
+
+                                            def _refresh_pvchart():
+                                                _pvchart.options.clear()
+                                                _pvchart.options.update(_prof_ver_opts())
+                                                _pvchart.update()
+
+                                            with ui.row().classes("gap-4 items-center mt-1 flex-wrap"):
+                                                for _pcat_lbl, _pcat_key, _pcat_clr, _pcat_cnt in [
+                                                    ("Known version",       "version", "#0277BD", None),
+                                                    ("EOL",                 "eol",     "#FF8F00", prof["version_eol_count"]),
+                                                    ("Admin/No-product",    "admin",   "#9E9E9E", prof["version_admin_count"]),
+                                                    ("Version unspecified", "blank",   "#78909C", prof["version_blank_count"]),
+                                                ]:
+                                                    if _pcat_cnt is None or _pcat_cnt > 0:
+                                                        with ui.row().classes("gap-1 items-center"):
+                                                            ui.element("div").style(
+                                                                f"width:10px;height:10px;border-radius:2px;background:{_pcat_clr}"
+                                                            )
+                                                            if _pcat_key == "version":
+                                                                ui.label(_pcat_lbl).classes("text-xs text-gray-600")
+                                                            else:
+                                                                def _make_ptoggle(_k=_pcat_key):
+                                                                    def _ptoggle(e):
+                                                                        v = e.args
+                                                                        _pvf_state[_k] = v[0] if isinstance(v, (list, tuple)) else v
+                                                                        _refresh_pvchart()
+                                                                    return _ptoggle
+                                                                ui.checkbox(
+                                                                    f"{_pcat_lbl} ({_pcat_cnt})",
+                                                                    value=True,
+                                                                ).classes("text-xs").on("update:model-value", _make_ptoggle(_pcat_key))
 
                                 # ── Row 4: Satisfaction trend ─────────────────────────────
                                 if prof["stars_trend_keys"]:
@@ -9175,8 +7725,8 @@ def main_page():
                                     topo = t.get("snapshot_topology") or {}
                                     if not isinstance(topo, dict):
                                         topo = {}
-                                    name       = (topo.get("cluster_name") or "").strip()
-                                    capella_id = (topo.get("capella_cluster_id") or "").strip()
+                                    name       = _topo_str(topo.get("cluster_name"))
+                                    capella_id = _topo_str(topo.get("capella_cluster_id"))
                                     # Also pull Cluster_ID from ticket fields — it's the
                                     # Capella UUID users see in Zendesk (matches capella_cluster_id)
                                     tf    = _parse_ticket_fields(t)
@@ -9288,15 +7838,83 @@ def main_page():
                                                     ui.label(label).classes("text-xs text-gray-500")
                                                     ui.label(str(val)).classes("text-sm font-semibold")
 
+                                # ── Ticket detail opener (reuses shared scoring-tab dialog) ──
+                                _cr_tid_map = {str(t.get("ticket_id","")): t for t in tickets_src}
+
+                                def _open_cr_ticket(ticket: dict):
+                                    _ticket_dlg_body.clear()
+                                    with _ticket_dlg_body:
+                                        tf2 = _parse_ticket_fields(ticket)
+                                        with ui.row().classes("w-full items-start justify-between gap-2"):
+                                            with ui.column().classes("flex-1 gap-0"):
+                                                ui.label(f"#{ticket.get('ticket_id')} · {ticket.get('organization','')}").classes("text-xs text-gray-400")
+                                                ui.label(ticket.get("subject") or "").classes("text-base font-semibold")
+                                            ui.button(icon="close", on_click=_ticket_dlg.close).props("flat round dense color=grey-6")
+                                        with ui.row().classes("gap-4 flex-wrap text-xs text-gray-500"):
+                                            for _l2, _v2 in [
+                                                ("Priority",  (ticket.get("priority") or "—").upper()),
+                                                ("Status",    (ticket.get("status")   or "—").capitalize()),
+                                                ("Created",   (ticket.get("created")  or "")[:10]),
+                                                ("Version",   extract_ticket_version(ticket)),
+                                                ("Component", tf2.get("Component") or "—"),
+                                            ]:
+                                                with ui.column().classes("gap-0"):
+                                                    ui.label(_l2).classes("text-xs text-gray-400")
+                                                    ui.label(_v2).classes("text-xs font-medium")
+                                        _dtopo2 = ticket.get("snapshot_topology") or {}
+                                        if isinstance(_dtopo2, dict) and _dtopo2 and (
+                                            _dtopo2.get("total_nodes") or _dtopo2.get("cb_version")
+                                        ):
+                                            ui.separator()
+                                            ui.label("Cluster Topology (snapshot)").classes("text-xs font-semibold text-gray-500")
+                                            _chips2 = []
+                                            for _l2, _k2 in [("CB Version","cb_version"),("Nodes","total_nodes"),("Buckets","bucket_count"),("GSI","global_index_count"),("FTS Idx","fts_index_count"),("Eventing Fns","eventing_function_count"),("N2N Enc","n2n_encryption"),("Auto-failover","auto_failover_seconds")]:
+                                                if _dtopo2.get(_k2) is not None:
+                                                    _chips2.append((_l2, str(_dtopo2[_k2]) + ("s" if _k2 == "auto_failover_seconds" else "")))
+                                            if _dtopo2.get("bad_count") or _dtopo2.get("warn_count"):
+                                                _chips2.append(("Health", f"{_dtopo2.get('bad_count',0)} bad / {_dtopo2.get('warn_count',0)} warn"))
+                                            with ui.row().classes("gap-2 flex-wrap mt-1"):
+                                                for _l2, _v2 in _chips2:
+                                                    with ui.column().classes("gap-0"):
+                                                        ui.label(_l2).classes("text-xs text-gray-400")
+                                                        ui.label(_v2).classes("text-xs font-medium")
+                                        desc2 = (ticket.get("description") or "").strip()
+                                        if desc2:
+                                            ui.separator()
+                                            ui.label(desc2[:2000]).classes("text-xs text-gray-700 whitespace-pre-wrap")
+                                    _ticket_dlg.open()
+
                                 # ── Time-series charts ────────────────────────────────────
                                 for spec in chart_specs:
                                     _ch = spec.pop("_height", 280)
+                                    _is_scatter = any(
+                                        s.get("type") == "scatter"
+                                        for s in (spec.get("series") or [])
+                                    )
                                     with ui.card().classes("w-full"):
-                                        ui.echart(spec).classes("w-full").style(f"height:{_ch}px")
+                                        _ec = ui.echart(spec).classes("w-full").style(f"height:{_ch}px")
+                                    if _is_scatter:
+                                        # Scatter: ticket_id is embedded at data[3]
+                                        def _on_scatter_click(e, _tm=_cr_tid_map):
+                                            d = e.data
+                                            if isinstance(d, list) and len(d) > 3:
+                                                t2 = _tm.get(str(d[3]))
+                                                if t2:
+                                                    _open_cr_ticket(t2)
+                                        _ec.on_point_click(_on_scatter_click)
+                                    else:
+                                        # Line/bar: data_index corresponds to points[idx]
+                                        def _on_tl_click(e, _pts=points, _tm=_cr_tid_map):
+                                            idx = e.data_index
+                                            if idx is not None and 0 <= idx < len(_pts):
+                                                t2 = _tm.get(str(_pts[idx]["ticket_id"]))
+                                                if t2:
+                                                    _open_cr_ticket(t2)
+                                        _ec.on_point_click(_on_tl_click)
 
-                                # ── CB Version & Orchestrator change log ──────────────────
+                                # ── CB Version / SDK / Orchestrator change log ────────────
                                 version_changes = [
-                                    (p["date_label"], p["ticket_id"], p["cb_version"])
+                                    (p["date_label"], p["ticket_id"], p["cb_version"], p.get("sdk_version") or "")
                                     for p in points if p["cb_version"]
                                 ]
                                 orch_changes = [
@@ -9308,17 +7926,18 @@ def main_page():
                                     with ui.row().classes("w-full gap-4"):
                                         if version_changes:
                                             with ui.card().classes("flex-1"):
-                                                ui.label("CB Version History").classes("text-sm font-semibold mb-2")
+                                                ui.label("CB Version & SDK Change Log").classes("text-sm font-semibold mb-2")
                                                 cols = [
-                                                    {"name": "date",    "label": "Date",      "field": "date",    "align": "left"},
-                                                    {"name": "tid",     "label": "Ticket",    "field": "tid",     "align": "left"},
-                                                    {"name": "version", "label": "Version",   "field": "version", "align": "left"},
+                                                    {"name": "date",    "label": "Date",        "field": "date",    "align": "left"},
+                                                    {"name": "tid",     "label": "Ticket",      "field": "tid",     "align": "left"},
+                                                    {"name": "version", "label": "CB Version",  "field": "version", "align": "left"},
+                                                    {"name": "sdk",     "label": "SDK Version", "field": "sdk",     "align": "left"},
                                                 ]
                                                 rows = [
-                                                    {"date": d, "tid": str(tid), "version": v}
-                                                    for d, tid, v in version_changes
+                                                    {"date": d, "tid": str(tid), "version": v, "sdk": sdk}
+                                                    for d, tid, v, sdk in version_changes
                                                 ]
-                                                ui.table(columns=cols, rows=rows, row_key="date").classes("w-full text-xs")
+                                                ui.table(columns=cols, rows=rows, row_key="tid").classes("w-full text-xs")
 
                                         if orch_changes:
                                             with ui.card().classes("flex-1"):
@@ -9332,20 +7951,21 @@ def main_page():
                                                     {"date": d, "tid": str(tid), "orch": o}
                                                     for d, tid, o in orch_changes
                                                 ]
-                                                ui.table(columns=cols, rows=rows, row_key="date").classes("w-full text-xs")
+                                                ui.table(columns=cols, rows=rows, row_key="tid").classes("w-full text-xs")
 
                                 # ── Ticket list ───────────────────────────────────────────
                                 with ui.card().classes("w-full"):
                                     ui.label("Matching Tickets (chronological)").classes("text-sm font-semibold mb-2")
                                     cols = [
-                                        {"name": "date",    "label": "Date",    "field": "date",    "align": "left"},
-                                        {"name": "tid",     "label": "Ticket",  "field": "tid",     "align": "left"},
-                                        {"name": "subject", "label": "Subject", "field": "subject", "align": "left"},
-                                        {"name": "nodes",   "label": "Nodes",   "field": "nodes",   "align": "right"},
-                                        {"name": "bkts",    "label": "Buckets", "field": "bkts",    "align": "right"},
-                                        {"name": "ver",     "label": "Version", "field": "ver",     "align": "left"},
-                                        {"name": "bad",     "label": "BAD",     "field": "bad",     "align": "right"},
-                                        {"name": "warn",    "label": "WARN",    "field": "warn",    "align": "right"},
+                                        {"name": "date",    "label": "Date",        "field": "date",    "align": "left"},
+                                        {"name": "tid",     "label": "Ticket",      "field": "tid",     "align": "left"},
+                                        {"name": "subject", "label": "Subject",     "field": "subject", "align": "left"},
+                                        {"name": "nodes",   "label": "Nodes",       "field": "nodes",   "align": "right"},
+                                        {"name": "bkts",    "label": "Buckets",     "field": "bkts",    "align": "right"},
+                                        {"name": "ver",     "label": "CB Version",  "field": "ver",     "align": "left"},
+                                        {"name": "sdk",     "label": "SDK Version", "field": "sdk",     "align": "left"},
+                                        {"name": "bad",     "label": "BAD",         "field": "bad",     "align": "right"},
+                                        {"name": "warn",    "label": "WARN",        "field": "warn",    "align": "right"},
                                     ]
                                     rows = [
                                         {
@@ -9355,6 +7975,7 @@ def main_page():
                                             "nodes":   p["node_count"] if p["node_count"] is not None else "",
                                             "bkts":    p["bucket_count"] if p["bucket_count"] is not None else "",
                                             "ver":     p["cb_version"] or "",
+                                            "sdk":     p.get("sdk_version") or "",
                                             "bad":     p["bad_count"],
                                             "warn":    p["warn_count"],
                                         }
@@ -9776,12 +8397,11 @@ def main_page():
                             new_snaps: list = []
                             try:
                                 limit = int(ch_analytics_limit.value or 200)
+                                cookie = (cookie_input.value or "").strip() or _get_profile_cookie()
+
                                 new_snaps = await run.io_bound(
                                     fetch_snapshots_via_analytics,
-                                    cust_name,
-                                    cookie_input.value or None,
-                                    limit,
-                                    _prog,
+                                    cust_name, cookie, limit, _prog,
                                 )
                                 # Merge with existing — skip snap_ids already present
                                 existing_ids = {s.get("snap_id", "") for s in ch_snap_state["snapshots"]}
@@ -10457,12 +9077,14 @@ def main_page():
 
                     dir_table = ui.table(
                         columns=[
-                            {"name": "organization",    "label": "Customer",          "field": "organization",    "align": "left",   "sortable": True},
+                            {"name": "health_score",    "label": "Health",             "field": "health_score",    "align": "center", "sortable": True},
+                            {"name": "organization",    "label": "Customer",           "field": "organization",    "align": "left",   "sortable": True},
                             {"name": "active_clusters", "label": "Active (≤90d)",      "field": "active_clusters", "align": "center", "sortable": True},
                             {"name": "stale_clusters",  "label": "Stale (>90d)",       "field": "stale_clusters",  "align": "center", "sortable": True},
                             {"name": "total_clusters",  "label": "Total Clusters",     "field": "total_clusters",  "align": "center", "sortable": True},
                             {"name": "total_snapshots", "label": "Snapshots",          "field": "total_snapshots", "align": "center", "sortable": True},
                             {"name": "total_tickets",   "label": "Tickets",            "field": "total_tickets",   "align": "center", "sortable": True},
+                            {"name": "open_p1",         "label": "Open P1",            "field": "open_p1",         "align": "center", "sortable": True},
                             {"name": "last_scraped_at", "label": "Last Scraped",       "field": "last_scraped_at", "align": "left",   "sortable": True},
                             {"name": "customer_url",    "label": "Supportal URL",      "field": "customer_url",    "align": "left"},
                         ],
@@ -10473,6 +9095,14 @@ def main_page():
                     dir_table.add_slot("body-row", """
                         <q-tr :props="props" class="cursor-pointer hover:bg-blue-50"
                               @click="$emit('rowclick', props.row)">
+                          <q-td key="health_score" :props="props" class="text-center">
+                            <q-badge v-if="props.row.health_score != null"
+                              :color="props.row.health_score >= 70 ? 'green' : props.row.health_score >= 40 ? 'orange' : 'red'"
+                              class="text-white font-bold px-2">
+                              {{ props.row.health_score }}
+                            </q-badge>
+                            <span v-else class="text-gray-300 text-xs">—</span>
+                          </q-td>
                           <q-td key="organization" :props="props">
                             <span class="font-medium">{{ props.row.organization }}</span>
                           </q-td>
@@ -10490,6 +9120,12 @@ def main_page():
                           <q-td key="total_clusters"  :props="props" class="text-center">{{ props.row.total_clusters }}</q-td>
                           <q-td key="total_snapshots" :props="props" class="text-center">{{ props.row.total_snapshots }}</q-td>
                           <q-td key="total_tickets"   :props="props" class="text-center">{{ props.row.total_tickets }}</q-td>
+                          <q-td key="open_p1" :props="props" class="text-center">
+                            <q-badge v-if="props.row.open_p1 > 0" color="red" class="font-bold">
+                              {{ props.row.open_p1 }}
+                            </q-badge>
+                            <span v-else class="text-gray-400">0</span>
+                          </q-td>
                           <q-td key="last_scraped_at" :props="props">
                             {{ props.row.last_scraped_at ? (typeof props.row.last_scraped_at === 'number' ? new Date(props.row.last_scraped_at * 1000) : new Date(props.row.last_scraped_at)).toISOString().substring(0,16).replace('T',' ') : '—' }}
                           </q-td>
@@ -10522,6 +9158,9 @@ def main_page():
                             dir_table.rows = rows
                             dir_table.update()
                             dir_status.set_text(f"{len(rows)} customer(s) found.")
+                            # Update Customers tab badge
+                            tab_custs._props["label"] = f"Customers ({len(rows)})"
+                            tab_custs.update()
                         except Exception as exc:
                             dir_status.set_text(f"Error: {exc}")
                             ui.notify(str(exc), type="negative")
@@ -10539,6 +9178,256 @@ def main_page():
 
                     btn_dir_refresh.on_click(lambda: asyncio.ensure_future(_dir_load()))
                     dir_table.on("rowclick", _dir_pick)
+
+            # ══════════════════════════════════════════════════════════════════
+            # Assets tab — persistent artifacts (charts, reports, CSV, JSON…)
+            # ══════════════════════════════════════════════════════════════════
+            with ui.tab_panel(tab_assets):
+                with ui.column().classes("w-full gap-4 p-4"):
+                    with ui.card().classes("w-full"):
+                        # ── Header ────────────────────────────────────────────────────
+                        with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                            ui.icon("folder", color="amber").classes("text-2xl")
+                            ui.label("Assets").classes("text-base font-semibold flex-1")
+                            _assets_status = ui.label("").classes("text-xs text-gray-400")
+                            _btn_assets_refresh = ui.button(
+                                "Refresh", icon="refresh"
+                            ).props("outline size=sm color=primary")
+
+                        ui.label(
+                            "Charts and reports generated during chat are auto-saved here. "
+                            "Ask the agent to 'save this as an asset' for any text content."
+                        ).classes("text-xs text-gray-400 mt-1 mb-2")
+
+                        # ── Filter row ────────────────────────────────────────────────
+                        with ui.row().classes("w-full gap-3 mt-1 flex-wrap items-end"):
+                            _af_org = ui.input(
+                                "Filter by org", placeholder="all"
+                            ).props("dense outlined clearable").classes("w-48")
+                            _af_type = ui.select(
+                                ["all", "chart", "report", "table", "csv", "json", "js", "html"],
+                                value="all", label="Type",
+                            ).props("dense outlined").classes("w-36")
+                            _af_search = ui.input(
+                                "Search title", placeholder="keyword"
+                            ).props("dense outlined clearable").classes("w-48")
+
+                        # ── Asset list ────────────────────────────────────────────────
+                        _assets_area = ui.column().classes("w-full gap-2 mt-3")
+
+                        def _render_asset_card(row: dict) -> None:
+                            _aid       = row.get("id", "")
+                            _atype     = row.get("asset_type", "report")
+                            _atitle    = row.get("title") or row.get("filename") or "Untitled"
+                            _aorg      = row.get("org") or ""
+                            _ats       = row.get("created_at") or 0
+                            _afname    = row.get("filename") or f"{_atitle}.{_atype}"
+                            _amime     = row.get("mime_type") or _ASSET_MIME.get(_atype, "text/plain")
+                            _aicon     = _ASSET_ICONS.get(_atype, "description")
+                            _athumb    = row.get("thumbnail") or ""
+                            import datetime as _dtt
+                            _ts_str = (
+                                _dtt.datetime.fromtimestamp(_ats).strftime("%Y-%m-%d %H:%M")
+                                if _ats else "—"
+                            )
+
+                            def _cb_args_assets():
+                                return (
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                )
+
+                            with ui.card().classes("w-full overflow-hidden"):
+                                # ── Thumbnail strip ────────────────────────────────────
+                                if _athumb:
+                                    if _atype in ("chart", "echart"):
+                                        try:
+                                            _topt = json.loads(_athumb)
+                                            ui.echart(_topt).classes("w-full pointer-events-none").style(
+                                                "height:110px;border-bottom:1px solid #e5e7eb"
+                                            )
+                                        except Exception:
+                                            pass
+                                    else:
+                                        # Text snippet preview
+                                        _snip = _athumb[:220].replace("\n", " ").strip()
+                                        with ui.element("div").classes(
+                                            "w-full px-3 py-2 bg-gray-50 border-b border-gray-200"
+                                        ).style("height:56px;overflow:hidden"):
+                                            ui.label(_snip).classes(
+                                                "font-mono text-xs text-gray-500 break-all"
+                                            ).style(
+                                                "line-height:1.4;"
+                                                "display:-webkit-box;"
+                                                "-webkit-line-clamp:3;"
+                                                "-webkit-box-orient:vertical;"
+                                                "overflow:hidden"
+                                            ).tooltip(_snip)
+
+                                # ── Metadata + actions row ─────────────────────────────
+                                with ui.row().classes("w-full items-center gap-2 px-3 py-2"):
+                                    ui.icon(_aicon, color="blue-grey").classes("text-xl shrink-0")
+                                    with ui.column().classes("flex-1 gap-0 min-w-0"):
+                                        ui.label(_atitle).classes(
+                                            "text-sm font-semibold leading-tight truncate"
+                                        )
+                                        with ui.row().classes("gap-2 items-center flex-wrap"):
+                                            if _aorg:
+                                                ui.badge(_aorg[:28]).props(
+                                                    "color=teal outline"
+                                                ).classes("text-xs")
+                                            ui.badge(_atype).props(
+                                                "color=blue-grey"
+                                            ).classes("text-xs")
+                                            ui.label(_ts_str).classes("text-xs text-gray-400")
+
+                                    # ── Per-asset actions ──────────────────────────
+                                    with ui.row().classes("gap-1 shrink-0"):
+                                        async def _preview(aid=_aid, atype=_atype, atitle=_atitle):
+                                            doc = await run.io_bound(
+                                                _get_asset_content_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            content = doc.get("content", "")
+                                            with ui.dialog() as _dlg, ui.card().classes(
+                                                "w-full max-w-4xl max-h-screen overflow-auto"
+                                            ):
+                                                with ui.row().classes("w-full items-center sticky top-0 bg-white z-10 pb-2"):
+                                                    ui.label(atitle).classes("text-base font-semibold flex-1")
+                                                    ui.button(icon="close", on_click=_dlg.close).props("flat round dense")
+                                                if atype in ("chart", "echart"):
+                                                    try:
+                                                        _opt = json.loads(content)
+                                                        _opt_c = {k: v for k, v in _opt.items() if not k.startswith("_")}
+                                                        ui.echart(_opt_c).classes("w-full").style("height:380px")
+                                                    except Exception:
+                                                        ui.code(content, language="json").classes("w-full")
+                                                elif atype == "report":
+                                                    ui.markdown(content).classes("prose prose-sm max-w-none")
+                                                elif atype in ("csv", "table"):
+                                                    import csv as _cv2, io as _io2
+                                                    import html as _hm2
+                                                    _rdr = list(_cv2.reader(_io2.StringIO(content)))
+                                                    if _rdr:
+                                                        _th2 = "".join(
+                                                            f'<th class="border border-gray-300 px-2 py-1 bg-gray-100 text-xs font-semibold">{_hm2.escape(str(c))}</th>'
+                                                            for c in _rdr[0]
+                                                        )
+                                                        _tb2 = "".join(
+                                                            "<tr>" + "".join(
+                                                                f'<td class="border border-gray-300 px-2 py-1 text-xs">{_hm2.escape(str(c))}</td>'
+                                                                for c in r
+                                                            ) + "</tr>"
+                                                            for r in _rdr[1:]
+                                                        )
+                                                        ui.html(
+                                                            f'<div class="overflow-x-auto"><table class="border-collapse">'
+                                                            f'<thead><tr>{_th2}</tr></thead><tbody>{_tb2}</tbody></table></div>'
+                                                        )
+                                                else:
+                                                    _lang = {"json": "json", "js": "javascript", "javascript": "javascript", "html": "html"}.get(atype, "text")
+                                                    ui.code(content, language=_lang).classes("w-full")
+                                            _dlg.open()
+
+                                        ui.button(icon="visibility", on_click=_preview).props(
+                                            "flat round dense color=primary"
+                                        ).tooltip("Preview")
+
+                                        async def _download(aid=_aid, afname=_afname, amime=_amime):
+                                            doc = await run.io_bound(
+                                                _get_asset_content_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            ui.download(
+                                                doc.get("content", "").encode(), afname, amime
+                                            )
+
+                                        ui.button(icon="download", on_click=_download).props(
+                                            "flat round dense color=green"
+                                        ).tooltip("Download")
+
+                                        async def _print_asset(aid=_aid, atitle=_atitle, atype=_atype):
+                                            doc = await run.io_bound(
+                                                _get_asset_content_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            content = doc.get("content", "")
+                                            _esc_content = json.dumps(content)
+                                            _esc_title   = json.dumps(atitle)
+                                            await ui.run_javascript(f"""
+(function() {{
+  var w = window.open('', '_blank');
+  var c = {_esc_content};
+  var t = {_esc_title};
+  w.document.write('<html><head><title>' + t + '</title>');
+  w.document.write('<style>body{{font-family:system-ui,sans-serif;padding:2rem;max-width:960px;margin:auto;line-height:1.6}}');
+  w.document.write('pre{{background:#f5f5f5;padding:1rem;border-radius:4px;overflow-x:auto;font-size:12px}}');
+  w.document.write('table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 8px;font-size:12px}}');
+  w.document.write('h1,h2,h3{{margin-top:1.5rem}}</style></head><body>');
+  w.document.write('<h2>' + t + '</h2><pre>' + c.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>');
+  w.document.write('</body></html>');
+  w.document.close();
+  setTimeout(function(){{w.print();}}, 400);
+}})();
+""")
+
+                                        ui.button(icon="print", on_click=_print_asset).props(
+                                            "flat round dense color=blue-grey"
+                                        ).tooltip("Print / Save as PDF")
+
+                                        async def _delete(aid=_aid):
+                                            ok = await run.io_bound(
+                                                _delete_asset_from_cb, *_cb_args_assets(), aid
+                                            )
+                                            if ok:
+                                                ui.notify("Asset deleted.", type="positive")
+                                                await _load_assets()
+                                            else:
+                                                ui.notify("Delete failed.", type="warning")
+
+                                        ui.button(icon="delete_outline", on_click=_delete).props(
+                                            "flat round dense color=red"
+                                        ).tooltip("Delete")
+
+                        async def _load_assets():
+                            _org_f  = (_af_org.value or "").strip()
+                            _type_f = _af_type.value if _af_type.value != "all" else ""
+                            _srch   = (_af_search.value or "").strip().lower()
+                            _assets_status.set_text("Loading…")
+                            _assets_area.clear()
+                            if not (_CB_AVAILABLE and cb_url_input.value.strip()):
+                                _assets_status.set_text("Couchbase not configured.")
+                                return
+                            try:
+                                rows = await run.io_bound(
+                                    _list_assets_from_cb,
+                                    cb_url_input.value.strip(),
+                                    cb_bucket_input.value.strip(),
+                                    cb_user_input.value.strip(),
+                                    cb_pass_input.value,
+                                    cb_tls_toggle.value,
+                                    cb_scope_input.value.strip() or "_default",
+                                    _org_f, _type_f,
+                                )
+                                if _srch:
+                                    rows = [r for r in rows if _srch in (r.get("title") or "").lower()]
+                                _assets_status.set_text(f"{len(rows)} asset(s)")
+                                with _assets_area:
+                                    if not rows:
+                                        ui.label(
+                                            "No assets yet. Charts and reports from chat are saved here automatically."
+                                        ).classes("text-sm text-gray-400 mt-4 text-center w-full")
+                                    else:
+                                        for _row in rows:
+                                            _render_asset_card(_row)
+                            except Exception as _exc:
+                                _assets_status.set_text(f"Error: {_classify_agent_error(_exc)}")
+
+                        _btn_assets_refresh.on_click(lambda: asyncio.ensure_future(_load_assets()))
+                        _af_org.on("change", lambda: asyncio.ensure_future(_load_assets()))
+                        _af_type.on("update:model-value", lambda: asyncio.ensure_future(_load_assets()))
+                        _af_search.on("change", lambda: asyncio.ensure_future(_load_assets()))
 
     # ── Settings profile logic ───────────────────────────────────────────────
     def _tab_name(tab_val) -> str:
@@ -10582,6 +9471,7 @@ def main_page():
             "emb_openai_model":   emb_openai_model_input.value or "",
             "emb_openai_dims":    emb_openai_dims_input.value,
             "embed_parallel":     embed_parallel_input.value,
+            "enrich_workers":     enrich_workers_input.value,
             # LLM (chat/scoring)
             "llm_provider":       ai_llm_provider.value,
             "claude_key":         claude_key_input.value,
@@ -10602,20 +9492,15 @@ def main_page():
             "pipeline_embed":     pipeline_embed_toggle.value,
             "pipeline_score":     pipeline_score_toggle.value,
             "pipeline_enrich":    pipeline_enrich_toggle.value,
-            "pipeline_validate":  pipeline_validate_toggle.value,
-            "snap_auto_save_cb":  ch_auto_save_cb.value,
+            "pipeline_validate":   pipeline_validate_toggle.value,
+            "pipeline_reconcile":  pipeline_reconcile_toggle.value,
+            "snap_auto_save_cb":   ch_auto_save_cb.value,
             # CH scrape settings
             "ch_max_pages":       ch_max_pages.value,
             "ch_workers":         ch_workers.value,
             "ch_max_snapshots":   ch_max_snapshots.value,
             "ch_analytics_limit": ch_analytics_limit.value,
-            # Chat settings
-            "chat_mode":              chat_mode_select.value,
-            "top_k":                  top_k_input.value,
-            "batch_size_chat":        batch_size_chat_input.value,
-            "batch_parallel":         batch_parallel_input.value,
-            "compact_context":        compact_context_toggle.value,
-            "deep_reason":            deep_reason_toggle.value,
+            # Chat settings (retired — Corax handles chat; keys kept for profile compat)
             # Chat cache / memory
             "cache_collection":   cache_collection_input.value,
             "embed_cache_ttl":    embed_cache_ttl.value,
@@ -10663,6 +9548,7 @@ def main_page():
             emb_openai_model_input.set_value(p["emb_openai_model"])
         _set(emb_openai_dims_input,  "emb_openai_dims")
         _set(embed_parallel_input,   "embed_parallel")
+        _set(enrich_workers_input,   "enrich_workers")
         if p.get("emb_provider"):
             ai_emb_provider.set_value(p["emb_provider"])
 
@@ -10700,19 +9586,14 @@ def main_page():
         _set(pipeline_embed_toggle,   "pipeline_embed")
         _set(pipeline_score_toggle,   "pipeline_score")
         _set(pipeline_enrich_toggle,  "pipeline_enrich")
-        _set(pipeline_validate_toggle,"pipeline_validate")
-        _set(ch_auto_save_cb,         "snap_auto_save_cb")
+        _set(pipeline_validate_toggle, "pipeline_validate")
+        _set(pipeline_reconcile_toggle,"pipeline_reconcile")
+        _set(ch_auto_save_cb,          "snap_auto_save_cb")
         _set(ch_max_pages,            "ch_max_pages")
         _set(ch_workers,              "ch_workers")
         _set(ch_max_snapshots,        "ch_max_snapshots")
         _set(ch_analytics_limit,      "ch_analytics_limit")
-        if p.get("chat_mode"):
-            chat_mode_select.set_value(p["chat_mode"])
-        _set(top_k_input,             "top_k")
-        _set(batch_size_chat_input,   "batch_size_chat")
-        _set(batch_parallel_input,    "batch_parallel")
-        _set(compact_context_toggle,  "compact_context")
-        _set(deep_reason_toggle,      "deep_reason")
+        # chat_mode / top_k / batch_size / compact_context / deep_reason retired
         _set(cache_collection_input,  "cache_collection")
         _set(embed_cache_ttl,        "embed_cache_ttl")
         _set(search_cache_ttl,       "search_cache_ttl")
@@ -10837,4873 +9718,953 @@ def main_page():
             asyncio.ensure_future(_refresh_cluster_map())
 
 
-# ─────────────────────────── Couchbase connection helper ─────────────────────
-
-def _cb_conn_str(cb_url: str, use_tls: bool) -> str:
-    """
-    Build a couchbase[s]:// connection string from whatever the user typed.
-    Strips any existing scheme so we never produce couchbase://couchbase://...
-    """
-    # Remove any existing scheme the user may have included
-    host = re.sub(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", "", cb_url).strip().rstrip("/")
-    scheme = "couchbases" if use_tls else "couchbase"
-    return f"{scheme}://{host}"
 
 
-def _cb_save_settings(
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-    profiles: dict,
-) -> None:
-    """Upsert the full profiles dict as __supportal_settings__ in Couchbase."""
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=10))
+
+
+
+
+
+
+
+
+# If any of these appear at the start or as a dominant pattern the rewriter fires.
+
+
+
+
+def _job_fail(job: dict, stage: str, err, ticket_id: str | None = None) -> None:
+    """Record a pipeline failure on the job: bump the error counter AND capture
+    detail into job["error_log"] (capped) so failures become durable knowledge
+    instead of an opaque count. Never raises."""
     try:
-        cluster.bucket(bucket).scope(scope).collection(collection).upsert(
-            "__supportal_settings__", profiles
-        )
-    finally:
-        cluster.close()
-
-
-def _cb_load_settings(
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-) -> dict:
-    """Fetch __supportal_settings__ from Couchbase. Returns {} if doc not found."""
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=10))
-    try:
-        return cluster.bucket(bucket).scope(scope).collection(collection).get(
-            "__supportal_settings__"
-        ).content_as[dict]
-    except CouchbaseException:
-        return {}
-    finally:
-        cluster.close()
-
-    # ── Reconnect timer — placed at end of main_page so all UI elements ──────
-    # (progress_bar, progress_label, score_progress, score_status) are in scope.
-    # Polls _OP_STATUS every 2 s and updates BOTH the banner AND the relevant
-    # tab's progress elements so a page refresh reconnects fully to any running op.
-    def _poll_op_status():
-        running = not _OP_STATUS["done"] and bool(_OP_STATUS["op"])
-        _op_banner_label.set_visibility(running)
-        if not running:
-            return
-        op  = _OP_STATUS["op"]
-        msg = _OP_STATUS["status"]
-        pct = _OP_STATUS["progress"]
-        pct_int = int(pct * 100)
-        _op_banner_label.set_text(
-            f"⏳ {op.capitalize()} in progress ({pct_int}%): {msg}"
-        )
-        # Update the scrape tab progress elements
-        if op == "scrape":
-            try:
-                progress_bar.set_value(pct)
-                progress_label.set_text(msg)
-            except Exception:
-                pass
-        # Update the score tab progress elements
-        elif op == "score":
-            try:
-                score_status.set_text(msg)
-                score_progress.set_value(pct)
-                score_progress.set_visibility(True)
-            except Exception:
-                pass
-
-    ui.timer(2.0, _poll_op_status)
-
-
-# ─────────────────────────── Customer inventory document ─────────────────────
-
-def _org_slug(org: str) -> str:
-    """Lowercase, spaces → underscores, strip non-alphanumeric/underscore chars."""
-    slug = org.lower().strip()
-    slug = re.sub(r"\s+", "_", slug)
-    slug = re.sub(r"[^\w]", "", slug)
-    return slug or "unknown"
-
-
-def upsert_inventory_doc(
-    org: str,
-    pipeline_results: dict,
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-) -> None:
-    """Write (or update) an inventory::{org_slug} doc in Couchbase.
-
-    pipeline_results is a dict keyed by step name, each value a dict with:
-        at (ISO timestamp), done (int), total (int), errors (int)
-    """
-    if not _CB_AVAILABLE:
-        return
-    slug = _org_slug(org)
-    doc = {
-        "type": "customer_inventory",
-        "organization": org,
-        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
-        "pipeline": pipeline_results,
-    }
-    try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=10))
-        col = cluster.bucket(bucket).scope(scope).collection(collection)
-        col.upsert(f"inventory::{slug}", doc)
-        cluster.close()
+        from supportal.cb_helpers import classify_error
+        job["errors"] = job.get("errors", 0) + 1
+        log = job.setdefault("error_log", [])
+        if len(log) < 200:
+            entry = {"stage": stage, "at": time.time(), **classify_error(err)}
+            if ticket_id:
+                entry["ticket_id"] = str(ticket_id)
+            log.append(entry)
     except Exception:
-        pass  # inventory write is best-effort; don't fail the pipeline
+        pass
 
 
-# ─────────────────────────── Load tickets from Couchbase ─────────────────────
-
-def list_orgs_from_cb(
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-) -> list[str]:
-    """Return a sorted list of distinct organization names from the tickets collection."""
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed")
-
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-    rows = list(cluster.query(
-        f"SELECT DISTINCT RAW t.organization FROM {keyspace} AS t "
-        f"WHERE META(t).id LIKE 'ticket::%' AND t.organization IS NOT MISSING",
-        QueryOptions(timeout=timedelta(seconds=60)),
-    ))
-    cluster.close()
-    return sorted({str(r).strip() for r in rows if r and str(r).strip()})
-
-
-def search_orgs_from_cb(
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    query_str: str,
-    limit: int = 50,
-) -> list[str]:
-    """Return org names containing query_str (case-insensitive), capped at limit."""
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed")
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-    rows = list(cluster.query(
-        f"SELECT DISTINCT RAW t.organization FROM {keyspace} AS t "
-        f"WHERE META(t).id LIKE 'ticket::%' "
-        f"AND t.organization IS NOT MISSING "
-        f"AND LOWER(t.organization) LIKE $1 "
-        f"LIMIT {limit}",
-        QueryOptions(
-            positional_parameters=[f"%{query_str.lower()}%"],
-            timeout=timedelta(seconds=30),
-        ),
-    ))
-    cluster.close()
-    return sorted({str(r).strip() for r in rows if r and str(r).strip()})
-
-
-def load_tickets_for_orgs_from_cb(
-    orgs: list[str],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    progress_cb: Callable[[str, float], None],
-) -> list[dict]:
-    """Load tickets for a specific set of org names — more efficient than loading all tickets."""
-    if not _CB_AVAILABLE or not orgs:
-        return []
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    keyspace     = f"`{bucket}`.`{scope}`.`{collection}`"
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(orgs)))
-    progress_cb(f"Querying {len(orgs)} customer(s) …", 0.1)
-    rows = list(cluster.query(
-        f"SELECT t.* FROM {keyspace} AS t WHERE t.organization IN [{placeholders}]",
-        QueryOptions(
-            positional_parameters=orgs,
-            timeout=timedelta(seconds=60),
-        ),
-    ))
-    cluster.close()
-    progress_cb(f"Loaded {len(rows)} tickets.", 1.0)
-    return rows
-
-
-def load_tickets_from_cb(
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    customer_filter: str,
-    progress_cb: Callable[[str, float], None],
-    summary_collection: str = "summary",
-) -> list[dict]:
-    """
-    Query tickets from Couchbase via SQL++ and return them as a list of dicts,
-    ready to populate state["results"].  Optionally filter by organization field.
-    Enriches each ticket with summary_text from the summary collection when available.
-    """
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed")
-
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    progress_cb(f"Connecting to {conn_str} …", 0.0)
-    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-
-    _order = (
-        "CASE WHEN LOWER(t.status) IN [\"closed\",\"solved\"] THEN 1 ELSE 0 END ASC, "
-        "CASE LOWER(t.priority) "
-        "WHEN 'urgent' THEN 0 WHEN 'p1' THEN 0 "
-        "WHEN 'high'   THEN 1 WHEN 'p2' THEN 1 "
-        "WHEN 'normal' THEN 2 WHEN 'p3' THEN 2 WHEN 'medium' THEN 2 "
-        "WHEN 'low'    THEN 3 WHEN 'p4' THEN 3 "
-        "ELSE 4 END ASC, "
-        "t.created DESC"
-    )
-    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-    _terms = [t.strip() for t in customer_filter.split(",") if t.strip()]
-    if _terms:
-        _clauses = " OR ".join(
-            f"LOWER(t.organization) LIKE ${i+1}" for i in range(len(_terms))
-        )
-        query = (f"SELECT t.* FROM {keyspace} AS t "
-                 f"WHERE t.ticket_id IS NOT MISSING "
-                 f"AND ({_clauses}) "
-                 f"ORDER BY {_order}")
-        opts  = QueryOptions(positional_parameters=[f"%{t.lower()}%" for t in _terms])
-    else:
-        query  = (f"SELECT t.* FROM {keyspace} AS t "
-                  f"WHERE t.ticket_id IS NOT MISSING "
-                  f"ORDER BY {_order}")
-        opts   = QueryOptions()
-
-    progress_cb("Running query …", 0.1)
-    result  = cluster.query(query, opts)
-    tickets = [row for row in result.rows()]
-
-    # Enrich tickets with pre-computed summary_text from the summary collection.
-    if summary_collection and tickets:
-        progress_cb("Loading ticket summaries …", 0.95)
-        try:
-            sum_ks = f"`{bucket}`.`{scope}`.`{summary_collection}`"
-            sum_rows = list(cluster.query(
-                f"SELECT ticket_id, summary_text, health, resolution, cluster_name, cb_version "
-                f"FROM {sum_ks} WHERE type = 'ticket_summary' "
-                f"AND summary_text IS NOT NULL AND summary_text != ''",
-                QueryOptions(timeout=timedelta(seconds=60)),
-            ))
-            sum_map = {str(r["ticket_id"]): r for r in sum_rows if r.get("ticket_id")}
-            for t in tickets:
-                s = sum_map.get(str(t.get("ticket_id", "")))
-                if s:
-                    t["summary_text"]    = s.get("summary_text", "")
-                    t["summary_health"]  = s.get("health")
-                    t["summary_resolution"] = s.get("resolution")
-        except Exception as _sum_exc:
-            print(f"[load_tickets_from_cb] summary enrich skipped: {_sum_exc}")
-
-    cluster.close()
-    progress_cb(f"Loaded {len(tickets)} tickets.", 1.0)
-    return tickets
-
-
-def fetch_tickets_by_keys(
-    doc_keys: list[str],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-) -> list[dict]:
-    """
-    Fetch ticket documents from Couchbase by their document keys using SQL++.
-    Used as a fallback in vector search when state["results"] is empty.
-    """
-    if not _CB_AVAILABLE or not doc_keys:
-        return []
+def _persist_failure_log(
+    job: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str,
+) -> None:
+    """If the job had any errors, write a PERMANENT failure-knowledge doc to the
+    `markers` collection (unlike scrape_job:: docs, which expire after 48h).
+    Key: failurelog::<job_id>. Never raises."""
+    if not job.get("errors") and not job.get("error_log"):
+        return
+    if not _CB_AVAILABLE or not cb_url:
+        return
     try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=15))
-        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-        # USE KEYS is bucket-level only; use META().id IN for scoped collections
-        placeholders = ", ".join(f"${i+1}" for i in range(len(doc_keys)))
-        query  = f"SELECT t.* FROM {keyspace} AS t WHERE META(t).id IN [{placeholders}]"
-        result = cluster.query(query, QueryOptions(positional_parameters=doc_keys))
-        tickets = [row for row in result.rows()]
-        cluster.close()
-        _missing_req = [t.get("ticket_id") for t in tickets if not t.get("requester")]
-        if _missing_req:
-            print(f"[fetch_tickets_by_keys] {len(tickets)} returned, "
-                  f"missing requester on: {_missing_req}")
-        return tickets
-    except Exception as exc:
-        print(f"[fetch_tickets_by_keys] CB fetch failed ({len(doc_keys)} keys): {exc}")
-        return []
-
-
-def _make_snap_col(
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    snap_collection: str,
-):
-    """
-    Open and return a Couchbase Collection object for the snapshots collection,
-    or None if the SDK is unavailable or connection fails.  Intentionally kept
-    alive by the caller for the duration of a scrape pass.
-    """
-    if not _CB_AVAILABLE:
-        return None
-    try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=10))
-        return cluster.bucket(bucket).scope(scope).collection(snap_collection)
-    except Exception as exc:
-        print(f"[_make_snap_col] Could not open snapshots collection: {exc}")
-        return None
-
-
-# ─────────────────────────── Phase 1: Couchbase loader ───────────────────────
-
-def load_to_couchbase(
-    tickets: list[dict],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    progress_cb: Callable[[str, float], None],
-) -> tuple[int, int]:
-    """
-    Upsert each ticket into Couchbase using the Python SDK.
-
-    Returns (upserted_count, error_count).
-    """
-    if not _CB_AVAILABLE:
-        raise RuntimeError(
-            "couchbase SDK not installed — run: venv/bin/pip install couchbase"
-        )
-
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    progress_cb(f"Connecting to {conn_str} …", 0.0)
-    auth = PasswordAuthenticator(username, password)
-    opts = ClusterOptions(auth)
-    cluster = Cluster(conn_str, opts)
-    cluster.wait_until_ready(timedelta(seconds=15))
-
-    progress_cb(f"Connected — opening {bucket}.{scope}.{collection} …", 0.02)
-    bkt = cluster.bucket(bucket)
-    col = bkt.scope(scope).collection(collection)
-
-    total = len(tickets)
-    upserted = 0
-    errors = 0
-
-    _now = int(time.time())
-    for i, ticket in enumerate(tickets, start=1):
-        tid = ticket.get("ticket_id") or f"unknown_{i}"
-        doc_key = f"ticket::{tid}"
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        _c = _Cl(_cb_conn_str(cb_url, use_tls), _CO(_PA(username, password)))
+        _c.wait_until_ready(timedelta(seconds=5))
         try:
-            doc = ticket.copy()
-            doc["last_scraped_at"] = _now
-            doc["type"] = "ticket"
-            col.upsert(doc_key, doc)
-            upserted += 1
-        except CouchbaseException as exc:
-            errors += 1
-            progress_cb(f"Error on {doc_key}: {exc}", i / total)
-            continue
-
-        if i % 25 == 0 or i == total:
-            pct = i / total
-            progress_cb(f"Upserted {i}/{total} …", pct)
-
-    cluster.close()
-    return upserted, errors
-
-
-# ─────────────────────────── Phase 2: Embedding & RAG ────────────────────────
-
-def build_embed_text(ticket: dict) -> str:
-    """
-    Concatenate all meaningful ticket fields into a single text blob for
-    embedding.  Capped at ~8 000 chars so embedding models with shorter
-    prompt limits don't choke.
-
-    Version priority:
-      1. ticket.cb_version — from the customer's own ticket fields (primary)
-      2. snapshot_topology.cb_version — cluster version at time of snapshot (historical)
-    Both are included when available so semantic search on version works for
-    all tickets, not just the 40% that have snapshot enrichment.
-    """
-    parts: list[str] = []
-
-    if ticket.get("ticket_id"):
-        parts.append(f"Ticket ID: {ticket['ticket_id']}")
-    if ticket.get("organization"):
-        parts.append(f"Customer: {ticket['organization']}")
-    # Subject repeated at the top — application/product names here are the primary
-    # retrieval signal; a second occurrence improves recall for keyword queries.
-    if ticket.get("subject"):
-        parts.append(f"Subject: {ticket['subject']}")
-        parts.append(f"Topic: {ticket['subject']}")
-
-    # Application alias injection: if the subject/description references a known cluster
-    # hostname but doesn't mention the application name, inject it so vector search on
-    # the app name ("MLE") finds this ticket.
-    _topo_for_alias = ticket.get("snapshot_topology") or {}
-    if isinstance(_topo_for_alias, str):
-        try:
-            _topo_for_alias = json.loads(_topo_for_alias)
+            cm = _c.bucket(bucket).collections()
+            existing = {s.name: {cc.name for cc in s.collections} for s in cm.get_all_scopes()}
+            if "markers" not in existing.get(scope, set()):
+                from couchbase.management.collections import CollectionSpec
+                cm.create_collection(CollectionSpec("markers", scope_name=scope))
         except Exception:
-            _topo_for_alias = {}
-    _bn_for_alias = _topo_for_alias.get("bucket_names") or []
-    _bn_str = " ".join(_bn_for_alias) if isinstance(_bn_for_alias, list) else str(_bn_for_alias)
-    _text_for_alias = " ".join([
-        ticket.get("subject") or "", ticket.get("description") or "", _bn_str,
-    ]).lower()
-    _injected_apps: set[str] = set()
-    for _host, _app in _get_cluster_to_app().items():
-        if _host in _text_for_alias and _app not in _injected_apps:
-            if _app.lower() not in _text_for_alias:  # only inject if not already present
-                parts.append(f"Application: {_app.upper()}")
-                _injected_apps.add(_app)
-    # Phase 2a summary — full-thread LLM narrative; richest semantic signal.
-    # Placed first so it is weighted highest by the embedding model.
-    _summary_text = (ticket.get("summary_text") or "").strip()
-    if _summary_text:
-        parts.append(f"Summary: {_summary_text}")
+            pass
+        doc = {
+            "type":         "failure_log",
+            "job_id":       job.get("job_id"),
+            "organization": job.get("org"),
+            "mode":         job.get("mode"),
+            "finished_at":  job.get("finished_at"),
+            "total":        job.get("total"),
+            "errors":       job.get("errors", 0),
+            "error_log":    (job.get("error_log") or [])[:200],
+            "last_message": job.get("last_message", ""),
+        }
+        _c.bucket(bucket).scope(scope).collection("markers").upsert(
+            f"failurelog::{job.get('job_id')}", doc
+        )
+        _c.close()
+    except Exception:
+        pass
 
-    # Interaction summary — scoring LLM by-product; used when no Phase 2a summary.
-    _t_score   = ticket.get("score") or {}
-    _t_summary = (ticket.get("interaction_summary") or _t_score.get("interaction_summary") or "").strip()
-    if _t_summary and not _summary_text:
-        parts.append(f"Summary: {_t_summary}")
-    if ticket.get("status"):
-        parts.append(f"Status: {ticket['status']}")
-    if ticket.get("priority"):
-        parts.append(f"Priority: {ticket['priority']}")
-    if ticket.get("created"):
-        parts.append(f"Date Created: {ticket['created']}")
-    if ticket.get("solved"):
-        parts.append(f"Date Solved: {ticket['solved']}")
-    if ticket.get("requester"):
-        parts.append(f"Requester: {ticket['requester']}")
-    if ticket.get("assignee"):
-        parts.append(f"Assignee: {ticket['assignee']}")
 
-    # ── Version — ticket-reported is primary; snapshot is supplemental ────────
-    ticket_ver = (ticket.get("cb_version") or "").strip()
-    if ticket_ver and ticket_ver != "Unknown":
-        parts.append(f"Couchbase Version (reported): {ticket_ver}")
+_JOBRUN_DEFAULT_TTL_S = 45 * 60   # reap deadline when total is unknown
+_JOBRUN_PER_TICKET_S  = 6         # scrape+embed+score allowance per ticket
+_JOBRUN_MARGIN_S      = 15 * 60
 
-    # ── Feature area / ticket origin ──────────────────────────────────────────
-    if ticket.get("feature_area"):
-        parts.append(f"Feature Area: {ticket['feature_area']}")
-    if ticket.get("ticket_origin"):
-        parts.append(f"Ticket Origin: {ticket['ticket_origin']}")
 
-    # ── Tags ──────────────────────────────────────────────────────────────────
-    tags = (ticket.get("tags") or "").strip()
-    if tags:
-        parts.append(f"Tags: {tags}")
+def _jobrun_deadline(started_at: float, total: int | None) -> float:
+    """Computed conclude-by time: past this, a still-'started' jobrun is
+    presumed lost (process died / silently dropped) and gets reaped."""
+    if total:
+        return started_at + max(_JOBRUN_DEFAULT_TTL_S,
+                                total * _JOBRUN_PER_TICKET_S + _JOBRUN_MARGIN_S)
+    return started_at + _JOBRUN_DEFAULT_TTL_S
 
-    # ── CBSEs and Jira issues — formal escalation references ─────────────────
-    _cbses_e = ticket.get("cbses") or []
-    if _cbses_e:
-        _cbses_str_e = ", ".join(_cbses_e) if isinstance(_cbses_e, list) else str(_cbses_e)
-        parts.append(f"CBSEs: {_cbses_str_e}")
-    _jiras_e = ticket.get("jira_issues") or []
-    if _jiras_e:
-        _jiras_str_e = ", ".join(_jiras_e) if isinstance(_jiras_e, list) else str(_jiras_e)
-        parts.append(f"Jira Issues: {_jiras_str_e}")
 
-    # ── All ticket fields (Zendesk custom fields — include every key) ───────────
-    tf = _parse_ticket_fields(ticket)
-    tf_lines = []
-    for key, val in tf.items():
-        val_str = (str(val) or "").strip()
-        if val_str:
-            label = key.replace("_", " ").title()
-            tf_lines.append(f"  {label}: {val_str}")
-    if tf_lines:
-        parts.append("Ticket Fields:\n" + "\n".join(tf_lines))
+def _persist_job_run(
+    job: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str = "",
+    conclude: bool = False,
+) -> None:
+    """PERMANENT jobrun::<job_id> lifecycle record in `markers`.
 
-    # ── Escalations ──────────────────────────────────────────────────────────
-    _esc = ticket.get("escalations")
-    if _esc:
-        _esc_str = str(_esc)[:500]
-        parts.append(f"Escalations: {_esc_str}")
-
-    # ── Score cluster names and app labels ───────────────────────────────────
-    _score_e = ticket.get("score") or {}
-    _cluster_names_e = _score_e.get("cluster_names") or []
-    if _cluster_names_e:
-        _cn_str = ", ".join(_cluster_names_e) if isinstance(_cluster_names_e, list) else str(_cluster_names_e)
-        parts.append(f"Cluster Names: {_cn_str}")
-    _app_labels_e = _score_e.get("analytics_app_labels") or []
-    if _app_labels_e:
-        _al_str = ", ".join(_app_labels_e) if isinstance(_app_labels_e, list) else str(_app_labels_e)
-        parts.append(f"Application Labels: {_al_str}")
-
-    # ── Snapshot topology (cluster state at time of snapshot) ─────────────────
-    topo = ticket.get("snapshot_topology")
-    if topo:
-        if isinstance(topo, str):
-            try:
-                topo = json.loads(topo)
-            except Exception:
-                topo = {}
-    if isinstance(topo, dict) and topo:
-        topo_lines = []
-        if topo.get("cluster_name"):
-            topo_lines.append(f"  Cluster Name: {topo['cluster_name']}")
-        snap_ver = (topo.get("cb_version") or "").strip()
-        if snap_ver:
-            topo_lines.append(f"  Cluster CB Version (at snapshot): {snap_ver}")
-        if topo.get("total_nodes"):
-            topo_lines.append(f"  Nodes: {topo['total_nodes']}")
-        if topo.get("bucket_count"):
-            topo_lines.append(f"  Buckets: {topo['bucket_count']}")
-        _bn = topo.get("bucket_names") or []
-        if isinstance(_bn, list) and _bn:
-            topo_lines.append(f"  Bucket Names: {', '.join(_bn[:20])}")
-        elif isinstance(_bn, str) and _bn:
-            topo_lines.append(f"  Bucket Names: {_bn}")
-        if topo.get("ram_per_node_mib"):
-            topo_lines.append(f"  RAM per Node: {topo['ram_per_node_mib']} MiB")
-        if topo.get("auto_failover_seconds") is not None:
-            topo_lines.append(f"  Auto-failover: {topo['auto_failover_seconds']}s")
-        svc_parts = []
-        for svc, key in [("KV/Data", "data_nodes"), ("Index", "index_nodes"),
-                         ("Query", "query_nodes"), ("Search", "fts_nodes"),
-                         ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
-            n = topo.get(key)
-            if n:
-                svc_parts.append(f"{svc}×{n}")
-        if svc_parts:
-            topo_lines.append(f"  Services: {', '.join(svc_parts)}")
-        if topo.get("os_name"):
-            topo_lines.append(f"  OS: {topo['os_name']}")
-        if topo_lines:
-            parts.append("Cluster Topology (snapshot):\n" + "\n".join(topo_lines))
-
-    # ── Description and comments — budget-aware ───────────────────────────────
-    # Total char budget: ~24 000 chars ≈ 6 000 tokens, well inside BGE-M3's
-    # 8 192-token context.  Allocation:
-    #   • Metadata header (parts so far)  — up to ~2 000 chars
-    #   • Description                     — up to 4 000 chars
-    #   • Comments: first 2 + last 4      — up to 4 000 chars each group
-    # Keeping the most-recent comments ensures resolution/diagnosis text is
-    # always present even for long tickets with many exchanges.
-    BUDGET = 24_000
-    header_text = "\n\n".join(parts)
-
-    desc_text = ""
-    if ticket.get("description"):
-        desc_text = f"Description:\n{ticket['description'][:4_000]}"
-
-    comment_parts: list[str] = []
-    comments_raw = ticket.get("comments")
-    if comments_raw:
+    Written once at job start (status 'started' + computed conclude-by
+    deadline) and again at conclusion. A jobrun still 'started' past its
+    deadline is evidence of a silently dropped job — the start record is the
+    only witness, since scrape_job:: docs expire and in-memory state dies
+    with the process. On conclusion of an org-scoped job, also re-verifies
+    freshness so drift → rescrape → VERIFIED fresh, not assumed. Never raises.
+    """
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        _c = _Cl(_cb_conn_str(cb_url, use_tls), _CO(_PA(username, password)))
+        _c.wait_until_ready(timedelta(seconds=5))
         try:
-            comments = json.loads(comments_raw) if isinstance(comments_raw, str) else comments_raw
-            # Sort oldest-first so first 2 = initial report/response, last 4 = most recent activity
-            comments = sorted(comments, key=lambda c: c.get("timestamp") or "")
-            def _fmt(c: dict) -> str:
-                body = (c.get("body") or "").strip()[:800]
-                return f"[{c.get('timestamp','')}] {c.get('author','')}: {body}" if body else ""
+            from supportal.cb_helpers import _ensure_collection
+            _ensure_collection(_c, bucket, scope, "markers")
+        except Exception:
+            pass
+        col = _c.bucket(bucket).scope(scope).collection("markers")
+        key = f"jobrun::{job.get('job_id')}"
+        doc = {
+            "type":         "job_run",
+            "job_id":       job.get("job_id"),
+            "organization": job.get("org"),
+            "mode":         job.get("mode"),
+            "status":       job.get("status") if conclude else "started",
+            "started_at":   job.get("started_at"),
+            "expected_deadline": _jobrun_deadline(
+                job.get("started_at") or time.time(), job.get("total")),
+        }
+        if conclude:
+            doc.update({
+                "finished_at":  job.get("finished_at"),
+                "total":        job.get("total"),
+                "processed":    job.get("processed", 0),
+                "saved":        job.get("saved", 0),
+                "embedded":     job.get("embedded", 0),
+                "scored":       job.get("scored", 0),
+                "errors":       job.get("errors", 0),
+                "last_message": job.get("last_message", ""),
+            })
+        col.upsert(key, doc)
 
-            # First 2 comments (initial report + first support response)
-            early = [_fmt(c) for c in comments[:2] if _fmt(c)]
-            # Last 4 comments (most recent activity — resolution, diagnosis, pending asks)
-            late  = [_fmt(c) for c in comments[-4:] if _fmt(c)]
-            # Avoid duplicating if ticket has ≤6 comments
-            seen: set[str] = set()
-            for s in early + late:
-                if s and s not in seen:
-                    comment_parts.append(s)
-                    seen.add(s)
+        # Post-job freshness verification — only on a real conclusion of an
+        # org-scoped job that saved something (skip fatal-at-startup noise).
+        if conclude and job.get("org") and job.get("status") == "done" and collection:
+            try:
+                from supportal.cb_helpers import compute_and_mark_freshness
+                fresh = compute_and_mark_freshness(
+                    job["org"], cb_url, bucket, username, password,
+                    use_tls, scope, collection,
+                    verified_by=f"jobrun::{job.get('job_id')}",
+                )
+                doc["freshness_after"] = {
+                    "status": fresh.get("status"),
+                    "missing_count": fresh.get("missing_count"),
+                    "checked_at": fresh.get("checked_at"),
+                }
+                col.upsert(key, doc)
+            except Exception as exc:
+                doc["freshness_after"] = {"status": "unverified", "error": str(exc)[:160]}
+                col.upsert(key, doc)
+            # Contacts enrichment — refresh the org-scoped contacts:: marker
+            # from live zdorg so AE/TSE/renewal flags stay current alongside
+            # the tickets. Org-scoped only; never denormalized per-ticket.
+            try:
+                from supportal.cb_helpers import refresh_org_contacts
+                refresh_org_contacts(
+                    job["org"], cb_url, bucket, username, password,
+                    use_tls, scope,
+                    refreshed_by=f"jobrun::{job.get('job_id')}",
+                )
+            except Exception:
+                pass  # best-effort — never fail a completed job on enrichment
+        _c.close()
+    except Exception:
+        pass
+
+
+def _upsert_job_doc(job: dict, col) -> None:
+    """Write job state using an already-open CB collection handle. Never raises."""
+    if col is None:
+        return
+    try:
+        from couchbase.options import UpsertOptions as _UO
+        col.upsert(
+            f"scrape_job::{job['job_id']}",
+            {**job, "type": "scrape_job"},
+            _UO(expiry=timedelta(hours=48)),
+        )
+    except Exception:
+        pass
+
+
+def _persist_job_state(
+    job: dict,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, scope: str, collection: str,
+) -> None:
+    """Write job state to CB by opening a short-lived connection. Use at phase transitions."""
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        from couchbase.options import UpsertOptions as _UO
+        _conn = _cb_conn_str(cb_url, use_tls)
+        _c    = _Cl(_conn, _CO(_PA(username, password)))
+        _c.wait_until_ready(timedelta(seconds=5))
+        _c.bucket(bucket).scope(scope).collection(collection).upsert(
+            f"scrape_job::{job['job_id']}",
+            {**job, "type": "scrape_job"},
+            _UO(expiry=timedelta(hours=48)),
+        )
+        _c.close()
+    except Exception:
+        pass
+
+
+def _make_scrape_job(org: str, mode: str) -> dict:
+    """Create a new scrape job record, register it, and return it."""
+    import secrets
+    job_id = secrets.token_hex(3)  # 6-char hex, e.g. "a3f9c1"
+    job: dict = {
+        "job_id":       job_id,
+        "org":          org,
+        "mode":         mode,          # "scrape" | "rescrape"
+        "phase":        "queued",      # queued → scraping → saving → embedding → scoring → done
+        "status":       "running",     # running | done | error | cancelled | interrupted
+        "total":        None,          # total tickets to process (set once known)
+        "processed":    0,             # tickets processed so far
+        "saved":        0,
+        "embedded":     0,
+        "scored":       0,
+        "errors":       0,
+        "last_message": "Queued…",
+        "started_at":   time.time(),
+        "finished_at":  None,
+        "heartbeat_at": time.time(),   # updated every ticket; stale = process died
+    }
+    _SCRAPE_JOBS[job_id] = job
+    _JOB_CANCEL_EVENTS[job_id] = threading.Event()
+    # Trim to MAX
+    if len(_SCRAPE_JOBS) > _MAX_SCRAPE_JOBS:
+        oldest = next(iter(_SCRAPE_JOBS))
+        del _SCRAPE_JOBS[oldest]
+        _JOB_CANCEL_EVENTS.pop(oldest, None)
+    return job
+
+
+def _run_scrape_job_bg(
+    job: dict,
+    org: str,
+    cookie: str,
+    max_tickets: int,
+    cb_params: dict,
+    emb_params: dict,
+    score_params: dict,
+) -> None:
+    """Background worker for scrape_customer_tickets. Runs full scrape→save→embed→score pipeline."""
+    cb_url    = cb_params["url"]
+    bucket    = cb_params["bucket"]
+    username  = cb_params["username"]
+    password  = cb_params["password"]
+    use_tls   = cb_params["use_tls"]
+    scope     = cb_params["scope"]
+    collection = cb_params["collection"]
+
+    def _set_op(msg: str, pct: float, done: bool = False):
+        job["last_message"] = msg
+        _OP_STATUS["op"]       = "scrape"
+        _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+        _OP_STATUS["progress"] = pct
+        _OP_STATUS["done"]     = done
+
+    try:
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope)
+        # ── Phase 1: scrape ─────────────────────────────────────────────────
+        job["phase"] = "scraping"
+        _set_op(f"Scraping tickets for '{org}'…", 0.0)
+
+        def _scrape_prog(msg: str, pct: float):
+            job["last_message"] = msg
+            _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+            _OP_STATUS["progress"] = pct * 0.4   # scrape = 0–40%
+            m = re.search(r"(\d+)\s*/\s*(\d+)", msg)
+            if m:
+                job["processed"] = int(m.group(1))
+                job["total"]     = int(m.group(2))
+
+        scraped = scrape_with_cookie(org, cookie, progress_cb=_scrape_prog, max_tickets=max_tickets)
+        job["total"]     = len(scraped)
+        job["processed"] = len(scraped)
+        _set_op(f"Scraped {len(scraped)} tickets — saving to Couchbase…", 0.40)
+
+        # ── Phase 2: save ───────────────────────────────────────────────────
+        job["phase"] = "saving"
+        _saved = 0
+        now_epoch = int(time.time())
+        try:
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _col = _cluster.bucket(bucket).scope(scope).collection(collection)
+            _upsert_job_doc(job, _col)   # persist "saving" phase start
+            for t in scraped:
+                tid = t.get("ticket_id")
+                if not tid:
+                    continue
+                try:
+                    _col.upsert(f"ticket::{tid}", {**t, "type": "ticket", "last_scraped_at": now_epoch})
+                    _saved += 1
+                except Exception as _texc:
+                    _job_fail(job, "save", _texc, ticket_id=tid)
+            _upsert_job_doc(job, _col)   # persist end-of-save state
+            _cluster.close()
+        except Exception as exc:
+            _job_fail(job, "save", f"CB save failed: {exc}")
+            job["last_message"] = f"CB save failed: {exc}"
+        job["saved"] = _saved
+        _set_op(f"Saved {_saved} tickets — embedding…", 0.55)
+
+        # ── Phase 3: embed ──────────────────────────────────────────────────
+        emb_p = emb_params.get("provider", "").lower().strip()
+        emb_m = emb_params.get("model", "")
+        emb_k = emb_params.get("api_key", "")
+        emb_u = emb_params.get("base_url", "")
+        emb_d = int(emb_params.get("dims") or 0)
+        emb_workers = int(emb_params.get("max_workers") or emb_params.get("embed_parallel") or 1)
+        if emb_p and emb_m and emb_d and _saved > 0:
+            job["phase"] = "embedding"
+            if emb_p == "lmstudio":
+                _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                _lms_emb_id = lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45, model_type="embeddings")
+                if _lms_emb_id:
+                    emb_m = _lms_emb_id
+            try:
+                _saved_data = [{**t, "type": "ticket", "last_scraped_at": now_epoch} for t in scraped]
+
+                def _emb_prog(msg: str, pct: float):
+                    job["last_message"] = msg
+                    _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+                    _OP_STATUS["progress"] = 0.55 + pct * 0.30  # embed = 55–85%
+
+                _emb_errs: list = job.setdefault("error_log", [])
+                _done_emb, _errs_emb = embed_all_tickets(
+                    _saved_data, cb_url, bucket, username, password,
+                    use_tls, scope, collection,
+                    emb_p, emb_m, emb_k, emb_u, emb_d,
+                    _emb_prog,
+                    max_workers=emb_workers,
+                    error_sink=_emb_errs,
+                )
+                job["embedded"] = _done_emb
+                job["errors"]  += _errs_emb
+            except Exception as exc:
+                job["last_message"] = f"Embedding failed: {exc}"
+                _job_fail(job, "embed", exc)
+        _set_op(f"Embedded {job['embedded']} tickets — scoring…", 0.85)
+
+        # ── Phase 4: score ──────────────────────────────────────────────────
+        s_prov = score_params.get("provider", "")
+        s_mod  = score_params.get("model", "")
+        s_key  = score_params.get("api_key", "")
+        s_url  = score_params.get("base_url", "")
+        if s_prov and s_mod and _saved > 0:
+            job["phase"] = "scoring"
+            try:
+                _score_data = [{**t, "type": "ticket"} for t in scraped[:_saved]]
+                _scores = score_tickets_batch(
+                    _score_data[:10],
+                    s_prov, s_mod, s_key, s_url,
+                    cb_url, bucket, username, password, use_tls, scope, collection,
+                    save_to_cb=True,
+                )
+                job["scored"] = len(_scores)
+            except Exception as exc:
+                job["last_message"] = f"Scoring failed: {exc}"
+                _job_fail(job, "score", exc)
+
+        # ── Done ────────────────────────────────────────────────────────────
+        job["status"]       = "done"
+        job["phase"]        = None
+        job["finished_at"]  = time.time()
+        summary = (
+            f"Done — {job['saved']} scraped, {job['embedded']} embedded, "
+            f"{job['scored']} scored"
+            + (f", {job['errors']} errors" if job["errors"] else "")
+        )
+        job["last_message"] = summary
+        _set_op(summary, 1.0, done=True)
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
+
+    except Exception as exc:
+        job["status"]      = "error"
+        job["phase"]       = None
+        job["finished_at"] = time.time()
+        job["last_message"] = f"Fatal error: {exc}"
+        _job_fail(job, "fatal", exc)
+        _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
+
+
+def _run_rescrape_job_bg(
+    job: dict,
+    org: str,
+    to_scrape: list[dict],
+    cookie: str,
+    cb_params: dict,
+    emb_params: dict | None = None,
+) -> None:
+    """Background worker for rescrape_customer_tickets. Refreshes individual ticket docs."""
+    from couchbase.options import GetOptions, UpsertOptions  # type: ignore
+
+    cb_url     = cb_params["url"]
+    bucket     = cb_params["bucket"]
+    username   = cb_params["username"]
+    password   = cb_params["password"]
+    use_tls    = cb_params["use_tls"]
+    scope      = cb_params["scope"]
+    collection = cb_params["collection"]
+    _cb_op_timeout = timedelta(seconds=5)
+
+    total = len(to_scrape)
+    job["total"] = total
+
+    def _set_op(msg: str, pct: float, done: bool = False):
+        job["last_message"] = msg
+        _OP_STATUS["op"]       = "scrape"
+        _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+        _OP_STATUS["progress"] = pct
+        _OP_STATUS["done"]     = done
+
+    try:
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope)
+        job["phase"] = "scraping"
+        _set_op(f"Rescraping 0/{total} tickets for '{org}'…", 0.0)
+
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn_str  = _cb_conn_str(cb_url, use_tls)
+        _bcluster = _Cl(conn_str, _CO(_PA(username, password)))
+        _bcluster.wait_until_ready(timedelta(seconds=10))
+        _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
+        _upsert_job_doc(job, _bcol)   # persist initial "scraping" state
+
+        # Create session once — reused across all ticket fetches
+        _sess = _make_api_session(cookie)
+
+        ok = skipped = errors = 0
+        job["enriched"] = 0
+        refreshed_tickets: list[dict] = []
+        _cancel_ev = _JOB_CANCEL_EVENTS.get(job["job_id"])
+        for i, t in enumerate(to_scrape, 1):
+            # Check for cancellation request before each ticket
+            if _cancel_ev and _cancel_ev.is_set():
+                job["status"]       = "cancelled"
+                job["phase"]        = None
+                job["finished_at"]  = time.time()
+                job["last_message"] = (
+                    f"Cancelled at ticket {i}/{total}. "
+                    f"{ok} saved so far. To resume, rescrape with stale_hours=1 — "
+                    f"the {ok} already-refreshed tickets will be skipped automatically."
+                )
+                _upsert_job_doc(job, _bcol)
+                _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
+                return
+
+            tid = str(t.get("ticket_id") or "").strip()
+            job["heartbeat_at"] = time.time()   # alive signal for zombie detection
+            if not tid:
+                skipped += 1
+                job["processed"] = i
+                continue
+            try:
+                fresh = fetch_ticket_api(tid, _sess)
+                if not fresh or not fresh.get("ticket_id"):
+                    skipped += 1
+                    job["processed"] = i
+                    continue
+                fresh["last_scraped_at"] = int(time.time())
+                fresh["type"]            = "ticket"
+                fresh["cb_version"]      = extract_ticket_version(fresh)
+                fresh["feature_area"]    = classify_ticket_feature(fresh)
+                fresh["ticket_origin"]   = classify_ticket_origin(fresh)
+                doc_key = f"ticket::{tid}"
+                try:
+                    existing = _bcol.get(
+                        doc_key, GetOptions(timeout=_cb_op_timeout)
+                    ).content_as[dict]
+                    merged = {**existing}
+                    for k, v in fresh.items():
+                        if v not in (None, "", [], {}):
+                            merged[k] = v
+                        elif k not in merged:
+                            merged[k] = v
+                    _bcol.upsert(doc_key, merged, UpsertOptions(timeout=_cb_op_timeout))
+                    refreshed_tickets.append(merged)
+                except Exception:
+                    _bcol.upsert(doc_key, fresh, UpsertOptions(timeout=_cb_op_timeout))
+                    refreshed_tickets.append(fresh)
+                ok += 1
+                job["saved"] = ok
+            except Exception as exc:
+                errors += 1
+                job["errors"] = errors
+                _log = job.setdefault("error_log", [])
+                if len(_log) < 200:
+                    from supportal.cb_helpers import classify_error as _clf
+                    _log.append({"stage": "scrape", "ticket_id": str(tid),
+                                 "at": time.time(), **_clf(exc)})
+            job["processed"] = i
+            pct = i / total * 0.80   # scrape phase = 0–80%
+            if i % 10 == 0 or i == total:
+                _set_op(f"Rescraping {i}/{total} for '{org}'…", pct)
+            if i % 20 == 0 or i == total:
+                _upsert_job_doc(job, _bcol)   # persist progress every 20 tickets
+            time.sleep(0.35)
+
+        try:
+            _bcluster.close()
         except Exception:
             pass
 
-    comment_text = "\n\n".join(comment_parts)
+        # ── Enrich with snapshot topology ─────────────────────────────────
+        # Fetch snapshot topology for any refreshed ticket that has snap IDs,
+        # then patch the topology fields back into the already-saved CB docs.
+        if refreshed_tickets:
+            job["phase"] = "enriching"
+            _set_op(f"Enriching {len(refreshed_tickets)} tickets with snapshot topology…", 0.81)
+            try:
+                _enrich_cancel = threading.Event()  # never set — runs to completion
 
-    # Assemble within budget — header is always kept in full
-    remaining = BUDGET - len(header_text)
-    assembled = header_text
-    if desc_text and remaining > 200:
-        assembled += "\n\n" + desc_text[:remaining - 200]
-        remaining -= len(desc_text[:remaining - 200]) + 2
-    if comment_text and remaining > 100:
-        assembled += "\n\n" + comment_text[:remaining - 100]
-
-    return assembled
-
-
-def build_snapshot_embed_text(snap: dict) -> str:
-    """
-    Build embedding text for a snapshot document so vector search can find
-    snapshots by cluster characteristics, health state, or application.
-
-    Enables queries like: "AmEx clusters running 7.6 with bad items",
-    "MLE clusters with more than 10 nodes", "clusters with high warn count".
-    """
-    parts: list[str] = []
-    if snap.get("organization"):
-        parts.append(f"Customer: {snap['organization']}")
-    if snap.get("cluster_name"):
-        parts.append(f"Cluster Name: {snap['cluster_name']}")
-        parts.append(f"Cluster: {snap['cluster_name']}")
-    if snap.get("cluster_uuid"):
-        parts.append(f"Cluster UUID: {snap['cluster_uuid']}")
-    if snap.get("cb_version"):
-        parts.append(f"Couchbase Version: {snap['cb_version']}")
-    if snap.get("date"):
-        parts.append(f"Snapshot Date: {snap['date']}")
-    _nodes = snap.get("total_nodes") or snap.get("node_count")
-    if _nodes:
-        parts.append(f"Total Nodes: {_nodes}")
-    if snap.get("ram_per_node_mib"):
-        parts.append(f"RAM per Node: {snap['ram_per_node_mib']} MiB")
-    svc_parts = []
-    for svc, key in [("KV/Data", "data_nodes"), ("Index", "index_nodes"),
-                     ("Query", "query_nodes"), ("Search", "fts_nodes"),
-                     ("Eventing", "eventing_nodes"), ("Analytics", "analytics_nodes")]:
-        n = snap.get(key)
-        if n:
-            svc_parts.append(f"{svc}×{n}")
-    if svc_parts:
-        parts.append(f"Services: {', '.join(svc_parts)}")
-    _bn = snap.get("bucket_names") or []
-    if isinstance(_bn, list) and _bn:
-        parts.append(f"Bucket Names: {', '.join(_bn[:30])}")
-    elif isinstance(_bn, str) and _bn:
-        parts.append(f"Bucket Names: {_bn}")
-    _bad = snap.get("bad_items") or []
-    if isinstance(_bad, list) and _bad:
-        parts.append(f"Bad Items: {', '.join(str(b) for b in _bad[:20])}")
-    elif isinstance(_bad, str) and _bad:
-        parts.append(f"Bad Items: {_bad}")
-    _warn = snap.get("warn_items") or []
-    if isinstance(_warn, list) and _warn:
-        parts.append(f"Warning Items: {', '.join(str(w) for w in _warn[:20])}")
-    elif isinstance(_warn, str) and _warn:
-        parts.append(f"Warning Items: {_warn}")
-    if snap.get("bad_count"):
-        parts.append(f"Bad Count: {snap['bad_count']}")
-    if snap.get("warn_count"):
-        parts.append(f"Warning Count: {snap['warn_count']}")
-    _tids = snap.get("ticket_ids") or []
-    if _tids:
-        parts.append(f"Associated Tickets: {', '.join(str(t) for t in _tids[:10])}")
-    # App alias injection — same pattern as tickets
-    _alias_text = " ".join([
-        snap.get("cluster_name") or "",
-        " ".join(_bn[:30]) if isinstance(_bn, list) else (_bn or ""),
-    ]).lower()
-    for _host, _app in _get_cluster_to_app().items():
-        if _host in _alias_text and _app.lower() not in _alias_text:
-            parts.append(f"Application: {_app.upper()}")
-    return "\n".join(parts)
-
-
-def embed_all_snapshots(
-    snapshots: list[dict],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    snap_collection: str,
-    embed_provider: str,
-    embed_model: str,
-    embed_api_key: str,
-    embed_base_url: str,
-    vector_dims: int,
-    progress_cb: Callable[[str, float], None],
-    cancel_event: threading.Event | None = None,
-    max_workers: int = 1,
-) -> tuple[int, int]:
-    """
-    For each snapshot: build embed text → call embedding provider → upsert back
-    to Couchbase with an added `embedding` field.  Returns (done, errors).
-    """
-    import concurrent.futures
-    from couchbase.subdocument import upsert as _SD_upsert
-
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed")
-
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    progress_cb("Connecting to Couchbase for snapshot embedding …", 0.0)
-    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    col = cluster.bucket(bucket).scope(scope).collection(snap_collection)
-
-    total = len(snapshots)
-    done_count = error_count = 0
-    lock = threading.Lock()
-
-    def _embed_one(snap: dict) -> tuple[str, list[float] | None, str | None]:
-        sid = snap.get("snap_id") or "unknown"
-        doc_key = f"snapshot::{sid}"
-        try:
-            text = build_snapshot_embed_text(snap)
-            vec  = embed_text(text, embed_provider, embed_model, embed_api_key,
-                              embed_base_url, vector_dims)
-            if vector_dims and len(vec) > vector_dims:
-                vec = vec[:vector_dims]
-                norm = sum(x * x for x in vec) ** 0.5
-                if norm > 0:
-                    vec = [x / norm for x in vec]
-            return doc_key, vec, None
-        except Exception as exc:
-            return doc_key, None, str(exc)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
-        futs = {pool.submit(_embed_one, s): s for s in snapshots}
-        for i, fut in enumerate(concurrent.futures.as_completed(futs)):
-            if cancel_event and cancel_event.is_set():
-                break
-            doc_key, vec, err = fut.result()
-            snap = futs[fut]
-            if vec:
+                # Reconnect to CB for topology write-back
+                from couchbase.cluster import Cluster as _ECl
+                from couchbase.options import ClusterOptions as _ECO
+                from couchbase.auth import PasswordAuthenticator as _EPA
+                from couchbase.options import UpsertOptions as _EUO
+                _econn  = _cb_conn_str(cb_url, use_tls)
+                _eclust = _ECl(_econn, _ECO(_EPA(username, password)))
+                _eclust.wait_until_ready(timedelta(seconds=10))
+                _ecol   = _eclust.bucket(bucket).scope(scope).collection(collection)
+                _snapcol = None
                 try:
-                    col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
-                    with lock:
-                        done_count += 1
-                        if done_count % 10 == 0 or done_count == total:
-                            progress_cb(f"Embedded {done_count}/{total} snapshots …",
-                                        done_count / total)
-                except Exception as exc:
-                    with lock:
-                        error_count += 1
-                    print(f"[embed_snapshots] upsert error {doc_key}: {exc}")
-            else:
-                with lock:
-                    error_count += 1
-                print(f"[embed_snapshots] embed error {doc_key}: {err}")
-
-    cluster.close()
-    return done_count, error_count
-
-
-def embed_text_ollama(text: str, model: str, base_url: str,
-                      num_ctx: int | None = None) -> list[float]:
-    """
-    POST to Ollama and return the embedding vector.
-
-    Tries the new /api/embed endpoint (Ollama >= 0.1.26) first, then falls
-    back to the legacy /api/embeddings endpoint for older installs.
-    num_ctx sets the input context window — text beyond this is silently truncated.
-    """
-    base = base_url.rstrip("/")
-    options = {"num_ctx": num_ctx} if num_ctx else {}
-
-    # New API (>= 0.1.26): POST /api/embed, field "input", response "embeddings": [[...]]
-    payload: dict = {"model": model, "input": text}
-    if options:
-        payload["options"] = options
-    resp = requests.post(f"{base}/api/embed", json=payload, timeout=120)
-    if resp.status_code == 200:
-        data = resp.json()
-        vecs = data.get("embeddings")
-        if vecs and isinstance(vecs, list) and len(vecs) > 0:
-            return vecs[0]
-
-    # Legacy API (< 0.1.26): POST /api/embeddings, field "prompt", response "embedding": [...]
-    payload2: dict = {"model": model, "prompt": text}
-    if options:
-        payload2["options"] = options
-    resp = requests.post(f"{base}/api/embeddings", json=payload2, timeout=120)
-    resp.raise_for_status()
-    return resp.json()["embedding"]
-
-
-def _openai_base_url(raw: str, default: str) -> str:
-    """Normalise a user-supplied URL so it ends with exactly one /v1."""
-    url = (raw or default).rstrip("/")
-    if url.endswith("/v1"):
-        return url          # already correct
-    return url + "/v1"
-
-
-# Thread-local OpenAI client cache.  Creating a new OpenAI() per call from many
-# threads simultaneously can stall on httpx connection-pool initialisation.
-# Reusing one client per thread eliminates that bottleneck so parallel scoring
-# batches each get their own persistent connection without contention.
-_tls_openai = threading.local()
-
-def _get_openai_client(api_key: str, base_url: str) -> "openai.OpenAI":
-    """Return a thread-local OpenAI client, creating one if needed."""
-    if not _OPENAI_AVAILABLE:
-        raise RuntimeError("openai package not installed: venv/bin/pip install openai")
-    key = (api_key, base_url)
-    if getattr(_tls_openai, "client_key", None) != key:
-        _tls_openai.client_key = key
-        _tls_openai.client = _openai_mod.OpenAI(
-            api_key=api_key or "lmstudio",
-            base_url=base_url or None,
-        )
-    return _tls_openai.client
-
-
-def embed_text(
-    text: str,
-    provider: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-    dims: int = 0,
-    num_ctx: int | None = None,
-) -> list[float]:
-    """Dispatch to the correct embedding provider and return a float vector."""
-    if provider == "ollama":
-        return embed_text_ollama(text, model, base_url or "http://localhost:11434", num_ctx=num_ctx)
-
-    elif provider == "lmstudio":
-        client = _get_openai_client("lmstudio", _openai_base_url(base_url, "http://localhost:1234"))
-        resp = client.embeddings.create(model=model, input=text, encoding_format="float")
-        return resp.data[0].embedding
-
-    elif provider == "gemini":
-        if not _GEMINI_AVAILABLE:
-            raise RuntimeError("google-genai not installed: venv/bin/pip install google-genai")
-        # Preview/experimental models live on v1beta; stable models on v1
-        _gem_ver = "v1beta" if any(k in model for k in ("preview", "exp", "latest")) else "v1"
-        client = _genai_mod.Client(api_key=api_key, http_options={"api_version": _gem_ver})
-        extra = {}
-        if dims and dims > 0:
-            extra["config"] = {"output_dimensionality": dims}
-        result = client.models.embed_content(model=model, contents=text, **extra)
-        return list(result.embeddings[0].values)
-
-    elif provider == "openai":
-        if not _OPENAI_AVAILABLE:
-            raise RuntimeError("openai package not installed: venv/bin/pip install openai")
-        kwargs: dict = {"model": model, "input": text, "encoding_format": "float"}
-        if dims and dims > 0:
-            kwargs["dimensions"] = dims
-        client = _get_openai_client(api_key, "")
-        resp = client.embeddings.create(**kwargs)
-        return resp.data[0].embedding
-
-    elif provider == "mlx":
-        if not _MLX_EMB_AVAILABLE:
-            raise RuntimeError(
-                f"mlx-embeddings import failed: {_MLX_EMB_IMPORT_ERROR}\n"
-                "Run: venv/bin/pip install mlx-embeddings"
-            )
-        # Load (or reuse cached) model
-        if _mlx_emb_cache["model_id"] != model:
-            m, tok = _mlx_emb_load(model)
-            _mlx_emb_cache["model"]     = m
-            _mlx_emb_cache["tokenizer"] = tok
-            _mlx_emb_cache["model_id"]  = model
-        m   = _mlx_emb_cache["model"]
-        tok = _mlx_emb_cache["tokenizer"]
-        # TokenizerWrapper.encode() — handle varying return shapes across versions
-        encoded = tok.encode([text])
-        if isinstance(encoded, (list, tuple)) and len(encoded) == 2:
-            input_ids, attention_mask = encoded
-        elif isinstance(encoded, dict):
-            input_ids      = encoded["input_ids"]
-            attention_mask = encoded.get("attention_mask")
-        else:
-            input_ids      = encoded
-            attention_mask = None
-
-        # Ensure MLX arrays (encode may return plain Python lists)
-        if not hasattr(input_ids, "shape"):
-            input_ids = _mx.array(input_ids)
-        if attention_mask is not None and not hasattr(attention_mask, "shape"):
-            attention_mask = _mx.array(attention_mask)
-
-        if attention_mask is not None:
-            out = m(input_ids, attention_mask)
-        else:
-            out = m(input_ids)
-
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out
-        if _mlx_pool is not None and attention_mask is not None:
-            vec = _mlx_pool(hidden, attention_mask)
-        elif attention_mask is not None:
-            mask_exp = attention_mask[:, :, None].astype(_mx.float32)
-            vec = (hidden * mask_exp).sum(axis=1) / mask_exp.sum(axis=1).clip(1e-9)
-        else:
-            vec = _mx.mean(hidden, axis=1)
-        vec = vec / _mx.linalg.norm(vec, axis=-1, keepdims=True)
-        _mx.eval(vec)
-        return vec[0].tolist()
-
-    else:
-        raise ValueError(f"Unknown embedding provider: {provider!r}")
-
-
-def migrate_ticket_fields_in_cb(
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-    progress_cb=None,
-) -> tuple[int, int]:
-    """
-    One-time migration: normalize existing Couchbase documents.
-
-    Fixes two fields that were previously stored as escaped JSON strings:
-      - ticket_fields: JSON string → native dict with normalized keys
-      - comments: JSON string → native list of {timestamp, author, body} dicts
-
-    Already-normalized docs are skipped. Safe to run multiple times.
-    Returns (migrated_count, skipped_count).
-    """
-    if not _CB_AVAILABLE:
-        raise RuntimeError("Couchbase SDK not available")
-
-    cluster = Cluster(
-        _cb_conn_str(cb_url, use_tls),
-        ClusterOptions(PasswordAuthenticator(username, password)),
-    )
-    col = cluster.bucket(bucket).scope(scope).collection(collection)
-
-    # Fetch all document keys
-    q = f"SELECT META().id AS doc_key FROM `{bucket}`.`{scope}`.`{collection}`"
-    rows = list(cluster.query(q))
-    total = len(rows)
-    migrated = skipped = 0
-
-    for i, row in enumerate(rows, 1):
-        key = row["doc_key"]
-        try:
-            result = col.get(key)
-            doc = result.content_as[dict]
-            mutations = []
-
-            # ── ticket_fields ───────────────────────────────────────────────
-            raw_tf = doc.get("ticket_fields")
-            if raw_tf is not None:
-                if isinstance(raw_tf, str):
-                    try:
-                        tf_dict = json.loads(raw_tf)
-                    except Exception:
-                        tf_dict = None
-                elif isinstance(raw_tf, dict):
-                    tf_dict = raw_tf
-                else:
-                    tf_dict = None
-
-                if isinstance(tf_dict, dict):
-                    if any(" " in k or "(" in k for k in tf_dict):
-                        normalized_tf = {_normalize_field_key(k): v for k, v in tf_dict.items()}
-                        mutations.append(_SD.upsert("ticket_fields", normalized_tf))
-                    elif isinstance(raw_tf, str):
-                        # Was a valid dict as string but keys already clean — still store as native
-                        mutations.append(_SD.upsert("ticket_fields", tf_dict))
-
-            # ── comments ────────────────────────────────────────────────────
-            raw_cm = doc.get("comments")
-            if isinstance(raw_cm, str):
-                try:
-                    cm_list = json.loads(raw_cm)
-                    if isinstance(cm_list, list):
-                        mutations.append(_SD.upsert("comments", cm_list))
+                    _snapcol = _eclust.bucket(bucket).scope(scope).collection("snapshots")
                 except Exception:
                     pass
 
-            if mutations:
-                col.mutate_in(key, mutations)
-                migrated += 1
-            else:
-                skipped += 1
+                def _snap_upsert(snap_doc: dict):
+                    if _snapcol is None:
+                        return
+                    _sid = snap_doc.get("snap_id") or ""
+                    if _sid:
+                        try:
+                            _snapcol.upsert(f"snapshot::{_sid}", snap_doc)
+                        except Exception:
+                            pass
 
-        except Exception:
-            skipped += 1
+                def _enrich_prog(msg: str, pct: float):
+                    job["last_message"] = msg
+                    _OP_STATUS["status"] = f"[{job['job_id']}] {msg}"
 
-        if progress_cb and i % 10 == 0:
-            progress_cb(f"Migrating documents {i}/{total}…", i / total)
-
-    cluster.close()
-    return migrated, skipped
-
-
-def save_tickets_to_cb(
-    tickets: list[dict],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    progress_cb: Callable[[str, float], None],
-    cancel_event: threading.Event | None = None,
-) -> tuple[int, int]:
-    """
-    Upsert raw ticket docs to Couchbase (no embedding).  Adds analytics
-    classification fields (cb_version, feature_area, ticket_origin) at save time.
-    Returns (saved, errors).
-    """
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed — run: venv/bin/pip install couchbase")
-
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    progress_cb(f"Connecting to {conn_str} …", 0.0)
-    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    col = cluster.bucket(bucket).scope(scope).collection(collection)
-
-    total = len(tickets)
-    saved = errors = 0
-
-    _now = int(time.time())
-    for i, ticket in enumerate(tickets, 1):
-        if cancel_event and cancel_event.is_set():
-            progress_cb(f"Cancelled — {saved}/{total} saved.", i / total)
-            break
-        tid     = ticket.get("ticket_id") or f"unknown_{i}"
-        doc_key = f"ticket::{tid}"
-        try:
-            if ticket.get("_deleted"):
-                # Store a minimal deletion marker; merge with existing if present
-                try:
-                    existing = col.get(doc_key).content_as[dict]
-                    existing["_deleted"] = True
-                    existing["last_scraped_at"] = _now
-                    col.upsert(doc_key, existing)
-                except Exception:
-                    col.upsert(doc_key, {
-                        "ticket_id": tid, "_deleted": True,
-                        "type": "ticket", "last_scraped_at": _now,
-                    })
-                saved += 1
-                progress_cb(f"  ✗ Ticket #{tid} is deleted on Supportal — marked, will skip future scrapes.", i / total)
-                continue
-            doc = ticket.copy()
-            doc["cb_version"]      = extract_ticket_version(ticket)
-            doc["feature_area"]    = classify_ticket_feature(ticket)
-            doc["ticket_origin"]   = classify_ticket_origin(ticket)
-            doc["last_scraped_at"] = _now
-            doc["type"]            = "ticket"
-            col.upsert(doc_key, doc)
-            saved += 1
-        except Exception as exc:
-            errors += 1
-            progress_cb(f"Error saving {tid}: {exc}", i / total)
-        if i % 50 == 0 or i == total:
-            progress_cb(f"Saved {i}/{total} tickets …", i / total)
-
-    cluster.close()
-    return saved, errors
-
-
-def run_ticket_pipeline(
-    customer: str,
-    auth: dict,
-    cb_config: CbConfig,
-    options: dict | None = None,
-    progress_cb: Callable[[str, float], None] | None = None,
-    cancel_event: threading.Event | None = None,
-) -> dict:
-    """
-    Scrape tickets for *customer* and save them to Couchbase in one call.
-
-    auth dict keys:
-      mode    – "cookie" | "browser"
-      cookie  – session cookie string (required when mode=="cookie")
-
-    options dict keys (all optional):
-      max_pages   – int, 0 = all listing pages
-      max_tickets – int, 0 = no limit
-      scrape_mode – "all" | "changed"  (default "all")
-
-    Returns:
-      {
-        "tickets": list[dict],   # scraped ticket docs
-        "saved":   int,          # docs upserted to CB
-        "errors":  int,          # upsert errors
-        "skipped": int,          # tickets skipped by change detection
-      }
-
-    Callable from CLI, tests, or MCP tools without a NiceGUI context.
-    """
-    opts = options or {}
-    _prog = progress_cb or (lambda msg, pct: None)
-
-    max_pages   = int(opts.get("max_pages",   0))
-    max_tickets = int(opts.get("max_tickets", 0))
-    scrape_mode = opts.get("scrape_mode", "all")
-
-    # Change detection
-    skip_ids: set | None       = None
-    change_signals: dict | None = None
-    n_skipped = 0
-
-    if scrape_mode == "changed" and _CB_AVAILABLE:
-        _prog("Change detection: fetching stored ticket signals from Couchbase…", 0.0)
-        change_signals = fetch_ticket_signals_from_cb(
-            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
-            cb_config.use_tls, cb_config.scope, cb_config.ticket_collection,
-        )
-
-    # Scrape
-    _prog("Scraping tickets…", 0.05)
-    mode     = auth.get("mode", "cookie")
-    cookie   = auth.get("cookie", "")
-
-    if mode == "browser":
-        tickets = scrape_with_playwright(
-            customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
-        )
-    else:
-        tickets = scrape_with_cookie_playwright(
-            cookie, customer, max_pages, _prog, skip_ids, change_signals, max_tickets,
-        )
-
-    _prog(f"Scraped {len(tickets)} tickets. Saving to Couchbase…", 0.7)
-
-    # Persist
-    saved = errors = 0
-    if _CB_AVAILABLE and cb_config.url:
-        saved, errors = save_tickets_to_cb(
-            tickets,
-            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
-            cb_config.use_tls, cb_config.scope, cb_config.ticket_collection,
-            _prog, cancel_event,
-        )
-
-    _prog(f"Done — {len(tickets)} scraped, {saved} saved, {errors} errors.", 1.0)
-    return {"tickets": tickets, "saved": saved, "errors": errors, "skipped": n_skipped}
-
-
-def run_snapshot_pipeline(
-    customer: str,
-    auth: dict,
-    cb_config: CbConfig,
-    options: dict | None = None,
-    progress_cb: Callable[[str, float], None] | None = None,
-    cancel_event: threading.Event | None = None,
-    embed_config: dict | None = None,
-) -> dict:
-    """
-    Scrape snapshots for *customer* and save them to Couchbase in one call.
-
-    auth dict keys:
-      cookie – session cookie string
-
-    options dict keys (all optional):
-      max_pages     – int, 0 = all listing pages
-      max_snapshots – int, 0 = no limit
-      workers       – int (default 4), concurrent topology fetches
-
-    embed_config dict keys (all optional — omit to skip embedding):
-      provider, model, api_key, base_url, dims, max_workers
-
-    Returns:
-      {"snapshots": list[dict], "saved": int, "errors": int, "skipped": int,
-       "embedded": int, "embed_errors": int}
-    """
-    opts     = options or {}
-    _prog    = progress_cb or (lambda msg, pct: None)
-    cookie   = auth.get("cookie", "")
-    max_pages = int(opts.get("max_pages",     0))
-    max_snaps = int(opts.get("max_snapshots", 0))
-    workers   = int(opts.get("workers",       4))
-
-    # Skip IDs already complete in CB
-    skip_ids: set = set()
-    n_skipped = 0
-    if _CB_AVAILABLE and cb_config.url:
-        _prog("Checking Couchbase for already-complete snapshots…", 0.0)
-        signals = fetch_snapshot_signals_from_cb(
-            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
-            cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
-        )
-        skip_ids = {sid for sid, sig in signals.items() if sig.get("complete")}
-        n_skipped = len(skip_ids)
-
-    _prog("Scraping snapshots…", 0.05)
-    snapshots = scrape_snapshots_for_customer(
-        customer, cookie or None, max_pages, workers, _prog, skip_ids, max_snaps,
-    )
-
-    _prog(f"Scraped {len(snapshots)} snapshots. Saving to Couchbase…", 0.8)
-
-    saved = errors = 0
-    if _CB_AVAILABLE and cb_config.url:
-        saved, errors = load_snapshots_to_couchbase(
-            snapshots,
-            cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
-            cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
-            _prog,
-        )
-
-    embedded = embed_errors = 0
-    if embed_config and snapshots and _CB_AVAILABLE and cb_config.url:
-        ecfg = embed_config
-        _prog(f"Embedding {len(snapshots)} snapshots …", 0.85)
-        try:
-            embedded, embed_errors = embed_all_snapshots(
-                snapshots,
-                cb_config.url, cb_config.bucket, cb_config.username, cb_config.password,
-                cb_config.use_tls, cb_config.scope, cb_config.snap_collection,
-                embed_provider   = ecfg.get("provider", ""),
-                embed_model      = ecfg.get("model", ""),
-                embed_api_key    = ecfg.get("api_key", ""),
-                embed_base_url   = ecfg.get("base_url", ""),
-                vector_dims      = int(ecfg.get("dims", 1024)),
-                progress_cb      = _prog,
-                cancel_event     = cancel_event,
-                max_workers      = int(ecfg.get("max_workers", 1)),
-            )
-        except Exception as exc:
-            _prog(f"Snapshot embedding error: {exc}", 0.95)
-
-    _prog(
-        f"Done — {len(snapshots)} scraped, {saved} saved, {errors} errors"
-        + (f", {embedded} embedded" if embed_config else "") + ".",
-        1.0,
-    )
-    return {
-        "snapshots": snapshots, "saved": saved, "errors": errors, "skipped": n_skipped,
-        "embedded": embedded, "embed_errors": embed_errors,
-    }
-
-
-def embed_all_tickets(
-    tickets: list[dict],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    embed_provider: str,
-    embed_model: str,
-    embed_api_key: str,
-    embed_base_url: str,
-    vector_dims: int,
-    progress_cb: Callable[[str, float], None],
-    cancel_event: threading.Event | None = None,
-    embed_num_ctx: int | None = None,
-    max_workers: int = 1,
-) -> tuple[int, int]:
-    """
-    For each ticket: build embed text → call embedding provider → upsert the doc
-    back to Couchbase with an added `embedding` field.  Returns (done, errors).
-
-    max_workers > 1 enables parallel embedding requests — set to match the
-    'Parallel requests' setting in LMStudio / OLLAMA_NUM_PARALLEL in Ollama.
-    MLX always uses max_workers=1 (model is not thread-safe).
-    """
-    import concurrent.futures
-    import traceback as _tb
-    from couchbase.subdocument import upsert as _SD_upsert
-
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed — run: venv/bin/pip install couchbase")
-
-    conn_str = _cb_conn_str(cb_url, use_tls)
-    progress_cb(f"Connecting to {conn_str} …", 0.0)
-    cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    col = cluster.bucket(bucket).scope(scope).collection(collection)
-
-    # MLX model is not thread-safe — force sequential
-    if embed_provider == "mlx":
-        max_workers = 1
-        if not _MLX_EMB_AVAILABLE:
-            raise RuntimeError(
-                f"mlx-embeddings import failed: {_MLX_EMB_IMPORT_ERROR}\n"
-                "Run: venv/bin/pip install mlx-embeddings"
-            )
-        if _mlx_emb_cache["model_id"] != embed_model:
-            progress_cb(f"Loading MLX model {embed_model} …", 0.0)
-            m, tok = _mlx_emb_load(embed_model)
-            _mlx_emb_cache["model"]     = m
-            _mlx_emb_cache["tokenizer"] = tok
-            _mlx_emb_cache["model_id"]  = embed_model
-            progress_cb(f"MLX model loaded — starting embeddings …", 0.0)
-
-    effective_workers = max(1, max_workers)
-    total = len(tickets)
-    progress_cb(
-        f"Embedding {total} tickets"
-        + (f" (parallel={effective_workers})" if effective_workers > 1 else "") + " …",
-        0.0,
-    )
-
-    done_count  = 0
-    error_count = 0
-    lock        = threading.Lock()
-    first_error: list[str] = []   # mutable container so worker can write it
-
-    def _embed_one(ticket: dict) -> tuple[str, list[float] | None, str | None]:
-        """Embed a single ticket; returns (doc_key, vec_or_None, error_or_None)."""
-        tid     = ticket.get("ticket_id") or "unknown"
-        doc_key = f"ticket::{tid}"
-        try:
-            text = build_embed_text(ticket)
-            vec  = embed_text(text, embed_provider, embed_model, embed_api_key,
-                              embed_base_url, dims=vector_dims, num_ctx=embed_num_ctx)
-            if len(vec) > vector_dims:
-                vec = vec[:vector_dims]
-                norm = sum(x * x for x in vec) ** 0.5
-                if norm > 0:
-                    vec = [x / norm for x in vec]
-            elif len(vec) < vector_dims:
-                raise ValueError(
-                    f"Model returned {len(vec)} dims but expected {vector_dims}. "
-                    "Lower the Vector Dims field to match or below the model's native output."
+                _enriched_n, _enrich_errs = enrich_tickets_with_snapshots(
+                    refreshed_tickets, cookie, _enrich_prog, _enrich_cancel,
+                    max_workers=4, snap_upsert_fn=_snap_upsert,
                 )
-            return doc_key, vec, None
-        except Exception as exc:
-            return doc_key, None, f"{type(exc).__name__}: {exc}\n{_tb.format_exc()}"
+                job["enriched"] = _enriched_n
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as pool:
-        futures = {pool.submit(_embed_one, t): t for t in tickets}
-        for fut in concurrent.futures.as_completed(futures):
-            if cancel_event and cancel_event.is_set():
-                pool.shutdown(wait=False, cancel_futures=True)
-                progress_cb(f"Cancelled — {done_count}/{total} embedded.", done_count / total)
-                break
-
-            ticket     = futures[fut]
-            doc_key, vec, err = fut.result()
-            tid = ticket.get("ticket_id") or "unknown"
-
-            if err:
-                with lock:
-                    error_count += 1
-                    if not first_error:
-                        first_error.append(err)
-                    progress_cb(f"Skipped ticket {tid}: {err.splitlines()[0]}", done_count / total)
-                continue
-
-            col.mutate_in(doc_key, [_SD_upsert("embedding", vec)])
-
-            with lock:
-                done_count += 1
-                if done_count % 10 == 0 or done_count == total:
-                    progress_cb(f"Embedded {done_count}/{total} …", done_count / total)
-
-    cluster.close()
-    return done_count, error_count
-
-
-def create_vector_index(
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    vector_dims: int,
-) -> None:
-    """
-    PUT a vector FTS index definition via the Couchbase FTS REST API (port 8094).
-
-    Uses the scope-aware endpoint:
-      PUT /api/bucket/{bucket}/scope/{scope}/index/{indexName}
-
-    The index definition follows the structure from the official CB curl example:
-    - sourceType = couchbase, sourceParams with bucket/scope/collections
-    - doc_config.mode = scope.collection.type_field
-    - mapping type key = collection name only (scoping is done by the URL path)
-    """
-    index_name = f"{collection}_vector_idx"
-    port       = 18094 if use_tls else 8094
-    api_scheme = "https" if use_tls else "http"
-    host       = re.sub(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", "", cb_url).strip().rstrip("/")
-    api_url    = f"{api_scheme}://{host}:{port}/api/bucket/{bucket}/scope/{scope}/index/{index_name}"
-
-    def _text_field(name: str) -> dict:
-        return {
-            "dynamic": False,
-            "enabled": True,
-            "fields": [{"analyzer": "standard", "index": True, "name": name, "store": True, "type": "text"}],
-        }
-
-    # In scope.collection.type_field mode, CB FTS keys docs by
-    # "{scope}.{collection}" when they have no `type` field — matching the
-    # existing production index.  No document stamping required.
-    snap_collection = "snapshots"
-    ticket_type_key  = f"{scope}.{collection}"
-    snap_type_key    = f"{scope}.{snap_collection}"
-
-    def _vec_field() -> dict:
-        return {
-            "dynamic": False,
-            "enabled": True,
-            "fields": [{"dims": vector_dims, "index": True, "name": "embedding",
-                        "similarity": "dot_product", "type": "vector"}],
-        }
-
-    def _nested(children: dict) -> dict:
-        """Nested object mapping (for arrays-of-objects or sub-documents)."""
-        return {"dynamic": False, "enabled": True, "properties": children}
-
-    index_def = {
-        "type":       "fulltext-index",
-        "name":       f"{bucket}.{scope}.{index_name}",
-        "sourceType": "gocbcore",
-        "sourceName": bucket,
-        "sourceParams": {},
-        "planParams": {"maxPartitionsPerPIndex": 1024, "indexPartitions": 1},
-        "params": {
-            "doc_config": {
-                "docid_prefix_delim": "",
-                "docid_regexp":       "",
-                "mode":               "scope.collection.type_field",
-                "type_field":         "type",
-            },
-            "mapping": {
-                "analysis": {},
-                "default_analyzer":        "standard",
-                "default_datetime_parser": "dateTimeOptional",
-                "default_field":           "_all",
-                "default_mapping":         {"dynamic": False, "enabled": False},
-                "default_type":            "_default",
-                "docvalues_dynamic":       False,
-                "index_dynamic":           False,
-                "store_dynamic":           False,
-                "type_field":              "_type",
-                "types": {
-                    # ── Tickets ──────────────────────────────────────────────
-                    ticket_type_key: {
-                        "dynamic": False,
-                        "enabled": True,
-                        "properties": {
-                            "embedding":   _vec_field(),
-                            "subject":     _text_field("subject"),
-                            "description": _text_field("description"),
-                            # comments is an array of objects — must map the
-                            # nested .body field so BM25 indexes comment text.
-                            "comments":    _nested({"body": _text_field("body")}),
-                            "tags":        _text_field("tags"),
-                            "status":      _text_field("status"),
-                            "priority":    _text_field("priority"),
-                            "requester":   _text_field("requester"),
-                            "assignee":    _text_field("assignee"),
-                            "created":     _text_field("created"),
-                            # Embedded snapshot topology — cluster hostname and
-                            # bucket names let BM25 find tickets by cluster.
-                            "snapshot_topology": _nested({
-                                "cluster_name": _text_field("cluster_name"),
-                                "bucket_names": _text_field("bucket_names"),
-                            }),
-                            # Scoring system pre-computes cluster names that
-                            # span multiple snapshots — richer than topo alone.
-                            "score": _nested({
-                                "cluster_names": _text_field("cluster_names"),
-                            }),
-                            # CBSE and Jira issue numbers for BM25 lookups.
-                            "cbses":       _text_field("cbses"),
-                            "jira_issues": _text_field("jira_issues"),
-                        },
-                    },
-                    # ── Snapshots ─────────────────────────────────────────────
-                    # Vector enables semantic topology queries ("clusters with
-                    # memory pressure", "clusters running 7.6 with XDCR issues").
-                    # Numeric topology filters (node count, RAM) stay in SQL++
-                    # via snapshot_topology_search — FTS doesn't do numeric range.
-                    snap_type_key: {
-                        "dynamic": False,
-                        "enabled": True,
-                        "properties": {
-                            "embedding":    _vec_field(),
-                            "cluster_name": _text_field("cluster_name"),
-                            "organization": _text_field("organization"),
-                            "cb_version":   _text_field("cb_version"),
-                            "bad_items":    _text_field("bad_items"),
-                            "warn_items":   _text_field("warn_items"),
-                        },
-                    },
-                },
-            },
-            "store": {"indexType": "scorch", "segmentVersion": 16},
-        },
-    }
-
-    # Delete any stale index at every possible registration level — CB rejects
-    # PUT if the existing index was registered under a different bucket/scope.
-    _auth    = (username, password)
-    _base    = f"{api_scheme}://{host}:{port}"
-    for _del_url in [
-        f"{_base}/api/index/{index_name}",                                        # global
-        f"{_base}/api/bucket/{bucket}/index/{index_name}",                        # bucket
-        f"{_base}/api/bucket/{bucket}/scope/{scope}/index/{index_name}",          # scope
-    ]:
-        requests.delete(_del_url, auth=_auth, verify=False, timeout=10)
-
-    resp = requests.put(
-        api_url,
-        json=index_def,
-        auth=(username, password),
-        verify=False,
-        timeout=30,
-    )
-    if not resp.ok:
-        raise RuntimeError(
-            f"FTS index PUT failed {resp.status_code}: {resp.text}"
-        )
-
-    # No document stamping needed: type key is "{scope}.{collection}" which CB
-    # FTS assigns automatically to all docs that lack a `type` field.
-
-
-def vector_search_cb(
-    query_vec: list[float],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    top_k: int = 10,
-) -> list[str]:
-    """
-    Run a CB vector search; returns document keys sorted by relevance.
-
-    Retries up to 5 times with a 3-second pause on 429 / InternalServerFailure,
-    which CB FTS returns while a newly created index is still building.
-    """
-    if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed")
-
-    index_name = f"{collection}_vector_idx"
-    conn_str   = _cb_conn_str(cb_url, use_tls)
-    cluster    = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-    cluster.wait_until_ready(timedelta(seconds=15))
-    scope_obj  = cluster.bucket(bucket).scope(scope)
-
-    # num_candidates drives FTS scan depth; cap at 200 to avoid overwhelming
-    # a local CB instance when top_k is large (e.g. 150 → 450 is too heavy).
-    _num_candidates = min(top_k * 3, 200)
-    search_req = SearchRequest.create(
-        VectorSearch.from_vector_query(
-            VectorQuery("embedding", query_vec, num_candidates=_num_candidates)
-        )
-    )
-
-    last_exc: Exception = RuntimeError("vector search did not run")
-    for attempt in range(1, 6):
-        try:
-            result = scope_obj.search(index_name, search_req, SearchOptions(limit=top_k))
-            ids = [row.id for row in result.rows()]
-            cluster.close()
-            return ids
-        except Exception as exc:
-            last_exc = exc
-            err_str = str(exc)
-            # CB FTS returns 429 while the index is still building
-            if "429" in err_str or "query request rejected" in err_str or "internal_server_failure" in err_str.lower():
-                if attempt < 5:
-                    time.sleep(3)
-                    continue
-            # Any other error — fail immediately
-            cluster.close()
-            raise
-
-    cluster.close()
-    raise RuntimeError(
-        f"Vector index not ready after 5 attempts (last error: {last_exc}). "
-        "The index may still be building — check its status in the Couchbase UI "
-        "under Search → your index, then try again."
-    ) from last_exc
-
-
-def _snap_keys_to_ticket_keys(
-    snap_keys: list[str],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    snap_collection: str = "snapshots",
-) -> list[str]:
-    """Resolve snapshot doc keys → ticket doc keys via snapshot.ticket_ids.
-
-    Used when vector search returns snapshot:: keys (from the hybrid FTS index)
-    so they can be cross-referenced into the ticket retrieval pipeline.
-    Returns deduplicated ticket keys in 'ticket::<id>' format.
-    """
-    if not _CB_AVAILABLE or not snap_keys:
-        return []
-    try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=10))
-        ks           = f"`{bucket}`.`{scope}`.`{snap_collection}`"
-        placeholders = ", ".join(f"${i+1}" for i in range(len(snap_keys)))
-        q    = f"SELECT s.ticket_ids FROM {ks} s WHERE META(s).id IN [{placeholders}]"
-        rows = list(cluster.query(q, QueryOptions(positional_parameters=snap_keys)))
-        cluster.close()
-        seen: set[str] = set()
-        result: list[str] = []
-        for row in rows:
-            for tid in (row.get("ticket_ids") or []):
-                key = f"ticket::{tid}"
-                if key not in seen:
-                    seen.add(key)
-                    result.append(key)
-        return result
-    except Exception as exc:
-        print(f"[_snap_keys_to_ticket_keys] {exc}")
-        return []
-
-
-def fts_keyword_search_cb(
-    keywords: list[str],
-    cb_url: str,
-    bucket: str,
-    username: str,
-    password: str,
-    use_tls: bool,
-    scope: str,
-    collection: str,
-    top_k: int = 50,
-) -> list[str]:
-    """FTS text search (BM25) against the hybrid FTS index.
-
-    Uses OR semantics: any ticket matching ANY keyword is a candidate.
-    The FTS index handles tokenisation, stemming, and BM25 scoring.
-    This is the correct place for keyword matching — not N1QL LIKE scans.
-
-    Returns doc keys in 'ticket::<id>' format, ranked by FTS score.
-    """
-    if not _CB_AVAILABLE or not keywords:
-        return []
-    try:
-        conn_str   = _cb_conn_str(cb_url, use_tls)
-        cluster    = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=10))
-        scope_obj  = cluster.bucket(bucket).scope(scope)
-        index_name = f"{collection}_vector_idx"
-
-        kw_list = keywords[:8]
-        if len(kw_list) == 1:
-            fts_q = MatchQuery(kw_list[0])
-        else:
-            fts_q = DisjunctionQuery(*[MatchQuery(kw) for kw in kw_list])
-
-        result = scope_obj.search(
-            index_name,
-            SearchRequest.create(fts_q),
-            SearchOptions(limit=top_k),
-        )
-        ids = [row.id for row in result.rows()]
-        cluster.close()
-        return ids
-    except Exception as exc:
-        print(f"[fts_keyword_search_cb] {exc}")
-        return []
-
-
-def _extract_ticket_ids(text: str) -> set[str]:
-    """Extract ticket IDs from free text.
-
-    Matches all of:
-      #76403          — hash prefix
-      ticket 76403    — "ticket" keyword
-      ticket #76403   — both
-      76403           — standalone 5+ digit number not adjacent to other digits
-                        (5 digits avoids matching years like 2026)
-    """
-    ids: set[str] = set()
-    # Prefixed forms
-    for m in re.finditer(r"(?:ticket\s+#?|#)(\d{4,})", text, re.IGNORECASE):
-        ids.add(m.group(1))
-    # Standalone 5+ digit numbers (ticket IDs, not years)
-    for m in re.finditer(r"(?<!\d)(\d{5,})(?!\d)", text):
-        ids.add(m.group(1))
-    return ids
-
-
-def rewrite_query_for_retrieval(
-    question: str,
-    chat_history: list[dict],
-    provider: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-) -> str:
-    """Rewrite any question into a focused, self-contained retrieval query.
-
-    Always runs — even on the first turn — so that verbose natural-language
-    questions ("give me a summary in a table with timeline, cluster name,
-    impact...") are distilled to retrieval-focused text ("MLE tickets 2026
-    authentication failure") before embedding.  This prevents output-format
-    noise from diluting the vector signal.
-
-    On follow-up turns the chat history is included so pronouns and references
-    ("expand on that", "what about safekey?") are resolved to concrete terms.
-
-    Returns the original question unchanged if the LLM call fails.
-    """
-    # Build a compact history block: last 3 turns (6 messages max), text only
-    _turns: list[str] = []
-    for msg in (chat_history or [])[-6:]:
-        role = msg.get("role", "")
-        if role == "user":
-            _turns.append(f"User: {msg['content']}")
-        elif role == "assistant":
-            _turns.append(f"Assistant: {msg['content'][:400]}")
-    history_block = ("\nConversation so far:\n" + "\n".join(_turns)) if _turns else ""
-
-    _today = datetime.date.today()
-    _today_str = _today.isoformat()
-    _yr = _today.year
-    _lookback = (_today - datetime.timedelta(days=90)).isoformat()
-    _prompt = (
-        f"You are a query rewriter for a support-ticket retrieval system.\n"
-        f"Today's date is {_today_str}.\n"
-        f"Your job: extract ONLY the search intent from the user's message — "
-        f"what topics, applications, error types, priorities, ticket IDs, or "
-        f"time ranges to find — and output a concise retrieval query.\n"
-        f"STRIP all output-format instructions (tables, timelines, summaries, "
-        f"columns, 'please', 'give me', 'in a table', etc.) — those are for the "
-        f"answer formatter, not the retriever.\n"
-        f"DATE RESOLUTION (critical): Convert every relative or ambiguous date "
-        f"reference to explicit ISO-8601 dates (YYYY-MM-DD). Examples:\n"
-        f"  'this year' -> 'from {_yr}-01-01'\n"
-        f"  'since January' -> 'from {_yr}-01-01'\n"
-        f"  'last quarter' -> compute the previous calendar quarter start/end\n"
-        f"  'recent' / 'lately' -> from {_lookback}\n"
-        f"  'last month' -> from first day of the previous calendar month\n"
-        f"  'in 2025' -> 'from 2025-01-01 to 2025-12-31'\n"
-        f"Always include the resolved date range in the output query as "
-        f"'from YYYY-MM-DD' or 'from YYYY-MM-DD to YYYY-MM-DD'.\n"
-        f"Output ONLY the rewritten query — no explanation, no prefix, no quotes.\n"
-        f"{history_block}\n\n"
-        f"User message: {question}\n\n"
-        f"Retrieval query:"
-    )
-    try:
-        result = call_llm(
-            [{"role": "user", "content": _prompt}],
-            provider, model, api_key, base_url,
-            max_tokens=120,
-        )
-        rewritten = result.strip().strip('"').strip("'")
-        if rewritten and len(rewritten) > 5:
-            return rewritten
-    except Exception:
-        pass
-    return question
-
-
-# ── Dynamic cluster↔application alias maps ────────────────────────────────────
-# These maps are populated at runtime by querying CB snapshots/tickets.
-# _cluster_app_dynamic  : cluster_name (hostname) → app/org label (lowercase)
-# _app_cluster_dynamic  : app/org label → [cluster_name, ...] list
-# Both dicts start empty and are filled by _load_cluster_app_map().
-# _get_cluster_to_app() / _get_app_cluster_aliases() merge dynamic data with
-# the static seed dict so existing AmEx entries remain until CB is queried.
-_cluster_app_dynamic: dict[str, str] = {}
-_app_cluster_dynamic: dict[str, list[str]] = {}
-
-# Static seed — known AmEx mappings kept as a fallback / bootstrap until CB
-# data is loaded. Multi-word aliases that share hosts are intentionally kept
-# separate so both "mle" and "merchant list" expand to the same hosts.
-_APP_CLUSTER_ALIASES_SEED: dict[str, list[str]] = {
-    "mle":              ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129", "peuse1cbecpsd000069"],
-    "merchant list":    ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129", "peuse1cbecpsd000069"],
-    "merchant":         ["peuse1cbecpsd2000083", "peusw1cbecpsd2000129"],
-    "safekey":          ["peusw1cbecpsd000102", "peuse1cbecpsd000103"],
-    "griffin":          ["peusw1cbecpsd2000303"],
-    "digital payments": ["peusw1cbecpsd2000086", "peuse1cbecpsd2000081"],
-}
-
-
-def _get_cluster_to_app() -> dict[str, str]:
-    """Merge static seed + dynamic CB data → cluster_name → app label."""
-    merged: dict[str, str] = {
-        host: app
-        for app, hosts in _APP_CLUSTER_ALIASES_SEED.items()
-        for host in hosts
-        if app not in ("merchant list", "merchant")
-    }
-    merged.update(_cluster_app_dynamic)
-    return merged
-
-
-def _get_app_cluster_aliases() -> dict[str, list[str]]:
-    """Merge static seed + dynamic CB data → app label → [cluster_names]."""
-    merged: dict[str, list[str]] = dict(_APP_CLUSTER_ALIASES_SEED)
-    for app, hosts in _app_cluster_dynamic.items():
-        if app in merged:
-            existing = merged[app]
-            for h in hosts:
-                if h not in existing:
-                    existing.append(h)
-        else:
-            merged[app] = list(hosts)
-    return merged
-
-
-def _load_cluster_app_map(
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, snap_collection: str,
-    ticket_collection: str = "tickets",
-) -> tuple[int, int]:
-    """
-    Query CB to build dynamic cluster→app maps from snapshot organization labels
-    and ticket score.cluster_names + organization fields.  Updates the module-level
-    _cluster_app_dynamic / _app_cluster_dynamic dicts in place.
-    Returns (n_from_snaps, n_from_tickets).
-    """
-    if not _CB_AVAILABLE:
-        return (0, 0)
-    try:
-        from couchbase.cluster import Cluster
-        from couchbase.options import ClusterOptions, QueryOptions
-        from couchbase.auth import PasswordAuthenticator
-        from couchbase.exceptions import CouchbaseException
-        scheme = "couchbases" if use_tls else "couchbase"
-        cluster = Cluster(
-            f"{scheme}://{cb_url}",
-            ClusterOptions(PasswordAuthenticator(username, password)),
-        )
-        cluster.wait_until_ready(datetime.timedelta(seconds=10))
-        ks_snaps   = f"`{bucket}`.`{scope}`.`{snap_collection}`"
-        ks_tickets = f"`{bucket}`.`{scope}`.`{ticket_collection}`"
-
-        snap_n = 0
-        try:
-            q = (
-                f"SELECT DISTINCT cluster_name, organization "
-                f"FROM {ks_snaps} "
-                f"WHERE cluster_name IS NOT MISSING AND organization IS NOT MISSING "
-                f"LIMIT 2000"
-            )
-            rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
-            for row in rows:
-                cname = (row.get("cluster_name") or "").strip().lower()
-                org   = (row.get("organization") or "").strip().lower()
-                if not cname or not org:
-                    continue
-                _cluster_app_dynamic[cname] = org
-                if org not in _app_cluster_dynamic:
-                    _app_cluster_dynamic[org] = []
-                if cname not in _app_cluster_dynamic[org]:
-                    _app_cluster_dynamic[org].append(cname)
-                snap_n += 1
-        except Exception:
-            pass
-
-        ticket_n = 0
-        try:
-            q = (
-                f"SELECT organization, score.cluster_names AS cnames "
-                f"FROM {ks_tickets} "
-                f"WHERE organization IS NOT MISSING "
-                f"  AND score.cluster_names IS NOT MISSING "
-                f"LIMIT 5000"
-            )
-            rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
-            for row in rows:
-                org    = (row.get("organization") or "").strip().lower()
-                cnames = row.get("cnames") or []
-                if not org or not isinstance(cnames, list):
-                    continue
-                for cname in cnames:
-                    cname = (cname or "").strip().lower()
-                    if not cname:
+                # Write topology fields back to the ticket docs in CB
+                _topo_op_to = timedelta(seconds=5)
+                for _et in refreshed_tickets:
+                    if not _et.get("snapshot_topology"):
                         continue
-                    if cname not in _cluster_app_dynamic:
-                        _cluster_app_dynamic[cname] = org
-                        ticket_n += 1
-                    if org not in _app_cluster_dynamic:
-                        _app_cluster_dynamic[org] = []
-                    if cname not in _app_cluster_dynamic[org]:
-                        _app_cluster_dynamic[org].append(cname)
-        except Exception:
-            pass
+                    _etid = str(_et.get("ticket_id") or "").strip()
+                    if not _etid:
+                        continue
+                    try:
+                        _ex2 = _ecol.get(f"ticket::{_etid}", GetOptions(timeout=_topo_op_to)).content_as[dict]
+                        _ex2["snapshot_topology"] = _et["snapshot_topology"]
+                        _ex2["snapshot_summary"]  = _et.get("snapshot_summary") or {}
+                        _ex2["snap_ids"]          = _et.get("snap_ids") or []
+                        _ecol.upsert(f"ticket::{_etid}", _ex2, UpsertOptions(timeout=_topo_op_to))
+                    except Exception:
+                        pass
 
-        cluster.close()
-        return (snap_n, ticket_n)
-    except Exception:
-        return (0, 0)
+                try:
+                    _eclust.close()
+                except Exception:
+                    pass
+            except Exception as exc:
+                job["last_message"] = f"Enrichment failed: {exc}"
+                _job_fail(job, "enrich", exc)
 
+        # ── Embed refreshed tickets ────────────────────────────────────────
+        emb_p = (emb_params or {}).get("provider", "").lower().strip()
+        emb_m = (emb_params or {}).get("model", "")
+        emb_k = (emb_params or {}).get("api_key", "")
+        emb_u = (emb_params or {}).get("base_url", "")
+        emb_d = int((emb_params or {}).get("dims") or 0)
+        emb_workers = int((emb_params or {}).get("max_workers") or (emb_params or {}).get("embed_parallel") or 1)
+        if emb_p and emb_m and emb_d and refreshed_tickets:
+            job["phase"] = "embedding"
+            _set_op(f"Embedding {len(refreshed_tickets)} refreshed tickets…", 0.82)
+            if emb_p == "lmstudio":
+                _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                _lms_emb_id = lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45, model_type="embeddings")
+                if _lms_emb_id:
+                    emb_m = _lms_emb_id
+            try:
+                def _emb_prog(msg: str, pct: float):
+                    job["last_message"] = msg
+                    _OP_STATUS["status"]   = f"[{job['job_id']}] {msg}"
+                    _OP_STATUS["progress"] = 0.82 + pct * 0.15
 
-_KEYWORD_STOPWORDS = frozenset({
-    # question / filler words
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
-    "should", "may", "might", "must", "can", "could", "i", "me", "my",
-    "we", "our", "you", "your", "he", "she", "it", "they", "them",
-    "this", "that", "these", "those", "what", "which", "who", "how",
-    "when", "where", "why", "all", "any", "both", "each", "few", "more",
-    "most", "other", "some", "such", "no", "nor", "not", "only", "own",
-    "same", "so", "than", "too", "very", "just", "but", "and", "or",
-    "if", "in", "on", "at", "to", "for", "of", "with", "about", "as",
-    "into", "through", "during", "before", "after", "above", "below",
-    "from", "up", "down", "out", "off", "over", "under", "again", "then",
-    "once", "here", "there",
-    # task / request words
-    "tell", "get", "show", "give", "find", "list", "please", "hi", "hello",
-    "can", "could", "would", "also", "now", "like", "want", "need",
-    "help", "look", "using", "used", "use",
-    # output / format words — these describe what the user wants returned,
-    # NOT what to search for; they pollute keyword search with zero matches
-    "summary", "summarize", "summarise", "table", "timeline", "review",
-    "happened", "able", "create", "sort", "impact", "details", "detail",
-    "info", "information", "explain", "description", "describe", "reason",
-    "note", "notes", "result", "results", "output", "format", "report",
-    "chart", "graph", "compare", "comparison", "analysis", "analyze",
-    # schema / metadata words — not product names
-    "cluster", "clusters", "name", "status", "id", "date", "time",
-    "customer", "org", "organization", "account",
-    # ticket domain noise
-    "ticket", "tickets", "issue", "issues", "problem", "problems", "case",
-    "cases", "related", "recent", "latest", "last", "first", "top", "next",
-    "new", "old", "many", "number", "count", "see", "per", "each",
-    # time words (handled structurally)
-    "month", "months", "week", "weeks", "day", "days", "year", "years",
-    "past", "quarter", "today", "yesterday", "ago",
-    # priority / status (handled structurally)
-    "open", "closed", "solved", "pending", "hold", "high", "low",
-    "priority", "p1", "p2", "p3", "p4",
-    # common English verbs / adjectives that pollute LIKE keyword search
-    # (not product names — these match every ticket's description text)
-    "involved", "involving", "involve", "involves",
-    "affected", "affecting", "affects", "affect",
-    "occurred", "occurring", "occur", "occurs",
-    "failed", "failing", "fails", "fail",
-    "caused", "causing", "causes", "cause",
-    "seen", "see", "far", "across", "along",
-    "means", "mean", "take", "taken", "took",
-    "since", "until", "while", "whereby",
-})
-
-
-def build_structured_query(question: str) -> dict:
-    """Parse a free-text question into structured CB filter constraints.
-
-    Returns a dict with keys:
-      ticket_ids : list[str]   — explicit IDs mentioned  (#76205 / "ticket 76205")
-      priorities : list[str]   — P1 / P2 / P3 / P4
-      date_from  : str | None  — ISO-8601 lower bound  (computed from relative phrases)
-      date_to    : str | None  — ISO-8601 upper bound
-      cluster_ids: list[str]   — explicit cluster identifiers mentioned
-      statuses   : list[str]   — open / closed / pending / solved
-      keywords      : list[str]   — all extracted terms (full set, for vector/context)
-      struct_keywords: list[str]  — alias/tech terms only; passed to FTS text search
-                                    and Stage-6 post-filter (never used in N1QL LIKE)
-      limit         : int         — explicit N from "last N" / "top N" (0 = use default)
-
-    Keyword matching uses the FTS hybrid index (BM25) via fts_keyword_search_cb,
-    not N1QL LIKE scans. Structured search handles only: ticket IDs, priorities,
-    date ranges, and statuses.
-    """
-    q = question.lower()
-    today = datetime.datetime.now()
-    result: dict = {
-        "ticket_ids":            [],
-        "priorities":            [],
-        "date_from":             None,
-        "date_to":               None,
-        "cluster_ids":           [],
-        "statuses":              [],
-        "keywords":              [],
-        "limit":                 0,
-        # Topology filters — trigger snapshot_topology_search leg
-        "topology_min_nodes":    None,   # total node count lower bound
-        "topology_max_nodes":    None,   # total node count upper bound
-        "topology_min_data":     None,   # data-node lower bound
-        "topology_services":     [],     # ["fts","eventing","analytics","index","query"]
-    }
-
-    # ── Ticket IDs ────────────────────────────────────────────────────────
-    result["ticket_ids"] = list(_extract_ticket_ids(question))
-
-    # ── Priority ──────────────────────────────────────────────────────────
-    prio_map = {"p1": "P1", "p2": "P2", "p3": "P3", "p4": "P4",
-                "priority 1": "P1", "priority 2": "P2",
-                "priority 3": "P3", "priority 4": "P4"}
-    result["priorities"] = list({v for k, v in prio_map.items() if k in q})
-
-    # ── Date range — relative phrases → absolute cutoff ──────────────────
-    # Note: we compute these for *retrieval* (querying the right docs from CB).
-    # The LLM independently uses the monthly index for its answer.
-
-    # Written-number → digit normalisation so "last two months" works like "last 2 months"
-    _WORD_TO_NUM = {
-        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-        "eleven": 11, "twelve": 12,
-    }
-    def _n_unit(unit: str) -> int | None:
-        """Return number of days for the first 'last/past N <unit>' phrase found, written or digit."""
-        # Digit form: "last 3 months"
-        dm = re.search(rf"\b(?:last|past)\s+(\d+)\s+{unit}s?\b", q)
-        if dm:
-            return int(dm.group(1))
-        # Written form: "last two months"
-        wm = re.search(rf"\b(?:last|past)\s+({'|'.join(_WORD_TO_NUM)})\s+{unit}s?\b", q)
-        if wm:
-            return _WORD_TO_NUM[wm.group(1)]
-        return None
-
-    _n_d = _n_unit("day")
-    _n_w = _n_unit("week")
-    _n_m = _n_unit("month")
-    _n_y = _n_unit("year")
-
-    # Generic "last N days/weeks/months/years" — checked before hardcoded aliases
-    if _n_d is not None:
-        result["date_from"] = (today - datetime.timedelta(days=_n_d)).strftime("%Y-%m-%d")
-    elif _n_w is not None:
-        result["date_from"] = (today - datetime.timedelta(weeks=_n_w)).strftime("%Y-%m-%d")
-    elif _n_m is not None:
-        result["date_from"] = (today - datetime.timedelta(days=_n_m * 30)).strftime("%Y-%m-%d")
-    elif _n_y is not None:
-        result["date_from"] = (today - datetime.timedelta(days=_n_y * 365)).strftime("%Y-%m-%d")
-    elif any(k in q for k in ("last week", "past week", "7 day", "past 7")):
-        result["date_from"] = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-    elif any(k in q for k in ("last month", "past month", "30 day", "this month", "past 30")):
-        result["date_from"] = (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-    elif any(k in q for k in ("last quarter", "last three month", "last 3 month",
-                               "3 month", "past 3 month", "90 day", "past quarter")):
-        result["date_from"] = (today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    elif any(k in q for k in ("last year", "past year", "12 month", "365 day")):
-        result["date_from"] = (today - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-    elif any(k in q for k in ("this year", "year to date", "ytd", "so far this year", "current year")):
-        result["date_from"] = f"{today.year}-01-01"
-    elif re.search(r"\brecent\b", q):
-        # "recent" without an explicit time qualifier → last 90 days
-        result["date_from"] = (today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    else:
-        # Explicit ISO date injected by query rewriter — e.g. "since 2026-01-01"
-        iso_dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", q)
-        if iso_dates:
-            iso_dates_sorted = sorted(iso_dates)
-            result["date_from"] = iso_dates_sorted[0]
-            if len(iso_dates_sorted) > 1:
-                result["date_to"] = iso_dates_sorted[-1]
-        else:
-            # Explicit year — e.g. "in 2025" / "during 2024"
-            ym = re.search(r"\b(20\d{2})\b", q)
-            if ym:
-                yr = int(ym.group(1))
-                result["date_from"] = f"{yr}-01-01"
-                result["date_to"]   = f"{yr}-12-31"
-            # Explicit month+year — e.g. "March 2026" / "2026-03"
-            month_names = {"january": 1, "february": 2, "march": 3, "april": 4,
-                           "may": 5, "june": 6, "july": 7, "august": 8,
-                           "september": 9, "october": 10, "november": 11, "december": 12}
-            for name, num in month_names.items():
-                if name in q:
-                    yr_m = re.search(r"\b(20\d{2})\b", q)
-                    if yr_m:
-                        yr = int(yr_m.group(1))
-                        last_day = (datetime.datetime(yr, num, 1)
-                                    + datetime.timedelta(days=32)).replace(day=1)
-                        result["date_from"] = f"{yr}-{num:02d}-01"
-                        result["date_to"]   = (last_day - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                    break
-
-    # ── Status ────────────────────────────────────────────────────────────
-    status_map = {"open": "open", "closed": "closed", "solved": "solved",
-                  "pending": "pending", "new": "new", "hold": "hold"}
-    result["statuses"] = [v for k, v in status_map.items() if re.search(rf"\b{k}\b", q)]
-
-    # ── Explicit limit ("last 5", "top 10") ──────────────────────────────
-    m_lim = re.search(r"\b(?:last|top|first|show|recent)\s+(\d+)\b", q)
-    if m_lim:
-        result["limit"] = int(m_lim.group(1))
-
-    # ── Keywords — application/product names for LIKE text search ─────────
-    # Strip punctuation, tokenise, remove stop words and already-structured
-    # terms (IDs, priorities, dates, statuses). What remains are likely
-    # application/product names (safekey, xdcr, mle, orchestration, etc.)
-    # Min length is 4 for generic terms; exact alias-key or known tech acronym
-    # matches bypass the length check so short names like "mle", "fts", "kv" work.
-    _aca = _get_app_cluster_aliases()  # dynamic + seed merged
-    _alias_key_set = set(_aca.keys())
-    _TECH_ACRONYMS = frozenset({
-        "mle", "fts", "kv", "xdcr", "cbas", "n1ql", "sdk", "ssl",
-        "tls", "ldap", "rbac", "cbse", "cbm", "dcp", "gsi", "eventing",
-    })
-    _tokens = re.sub(r"[^\w\s]", " ", q).split()
-    _used = set(result["ticket_ids"]) | {p.lower() for p in result["priorities"]} | \
-            {s.lower() for s in result["statuses"]}
-    _keywords = [
-        t for t in _tokens
-        if t not in _KEYWORD_STOPWORDS
-        and t not in _used
-        and not t.isdigit()
-        and (
-            t in _alias_key_set    # exact app alias: "mle", "safekey", etc.
-            or t in _TECH_ACRONYMS  # known short technical acronym
-            or len(t) >= 4          # everything else needs 4+ chars
-        )
-    ]
-    # Deduplicate while preserving order: check membership BEFORE adding
-    _seen: set[str] = set()
-    _deduped = [k for k in _keywords if not (k in _seen or _seen.add(k))]  # type: ignore[func-returns-value]
-
-    # Application alias expansion: "mle" → also include known cluster hostnames
-    # so tickets titled "peuse1cbecpsd2000083 warmup" are found even without "mle" in subject.
-    _alias_hosts: list[str] = []
-    for kw in _deduped:
-        for alias, hosts in _aca.items():
-            if kw == alias or alias.startswith(kw) or kw in alias:
-                for h in hosts:
-                    if h not in _alias_hosts and h not in _deduped:
-                        _alias_hosts.append(h)
-    result["keywords"] = _deduped + _alias_hosts
-    # struct_keywords = alias app names + tech acronyms + expanded hostnames +
-    # any token that is a known cluster hostname (from cluster→app map) or that
-    # looks like a hostname pattern (long alphanumeric, e.g. peusw1cbecpsd2000129).
-    # General English words are excluded to avoid noisy LIKE conditions.
-    _known_hostnames = set(_get_cluster_to_app().keys())
-    # Hostname heuristic: 12+ char alphanumeric-with-digits token — catches cluster
-    # names typed verbatim that aren't in the alias map yet (dynamic map lag).
-    _HOSTNAME_RE = re.compile(r"^[a-z][a-z0-9]{11,}$")
-    # Normalize tech-acronym plurals: "cbses" → "cbse", "sdks" → "sdk".
-    # This ensures the LIKE condition and grounding check use the base form.
-    def _base_tech(tok: str) -> str:
-        if tok in _TECH_ACRONYMS:
-            return tok
-        stripped = tok.rstrip("s")
-        if stripped in _TECH_ACRONYMS:
-            return stripped
-        return tok
-
-    _struct_raw = [
-        _base_tech(k) for k in _deduped
-        if k in _alias_key_set
-        or k in _TECH_ACRONYMS
-        or k.rstrip("s") in _TECH_ACRONYMS
-        or k in _known_hostnames
-        or _HOSTNAME_RE.match(k)
-    ]
-    # Deduplicate after normalization (e.g. "cbse" + "cbses" → ["cbse"])
-    _sk_seen: set[str] = set()
-    result["struct_keywords"] = [
-        k for k in _struct_raw + _alias_hosts
-        if not (k in _sk_seen or _sk_seen.add(k))  # type: ignore[func-returns-value]
-    ]
-
-    # ── Topology filters — node counts and service presence ───────────────
-    # Patterns: "more than 9 nodes", "> 9 nodes", "9+ nodes", "at least 9 nodes"
-    _topo_gt = re.search(
-        r"\b(?:more than|greater than|over|>\s*)(\d+)\s+(?:total\s+)?nodes?\b", q)
-    _topo_ge = re.search(
-        r"\b(?:at least|minimum of?|min\s+)(\d+)\s+(?:total\s+)?nodes?\b", q)
-    _topo_plus = re.search(r"\b(\d+)\+\s*nodes?\b", q)
-    _topo_lt = re.search(
-        r"\b(?:fewer than|less than|under|<\s*)(\d+)\s+(?:total\s+)?nodes?\b", q)
-    _topo_le = re.search(
-        r"\b(?:at most|maximum of?|max\s+)(\d+)\s+(?:total\s+)?nodes?\b", q)
-    if _topo_gt:
-        result["topology_min_nodes"] = int(_topo_gt.group(1)) + 1
-    elif _topo_ge:
-        result["topology_min_nodes"] = int(_topo_ge.group(1))
-    elif _topo_plus:
-        result["topology_min_nodes"] = int(_topo_plus.group(1))
-    if _topo_lt:
-        result["topology_max_nodes"] = int(_topo_lt.group(1)) - 1
-    elif _topo_le:
-        result["topology_max_nodes"] = int(_topo_le.group(1))
-    # Data-node specific: "more than 5 data nodes"
-    _data_gt = re.search(
-        r"\b(?:more than|greater than|over|>\s*)(\d+)\s+data\s+nodes?\b", q)
-    if _data_gt:
-        result["topology_min_data"] = int(_data_gt.group(1)) + 1
-    # Services mentioned
-    _SVC_MAP = {
-        "fts": "fts", "full text search": "fts", "full-text": "fts",
-        "eventing": "eventing", "analytics": "analytics",
-        "index": "index", "query": "query",
-    }
-    result["topology_services"] = list({
-        v for k, v in _SVC_MAP.items() if k in q
-    })
-
-    return result
-
-
-def structured_search_cb(
-    filters: dict,
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-    default_limit: int = 50,
-) -> list[str]:
-    """Run a N1QL query built from structured filters; return doc key list.
-
-    Keys are in 'ticket::<id>' format matching how vector_search_cb returns them
-    so reciprocal_rank_fusion can merge the two lists directly.
-    Returns an empty list (not an error) if CB is unavailable or no filters apply.
-    """
-    if not _CB_AVAILABLE:
-        return []
-
-    ticket_ids = filters.get("ticket_ids") or []
-    priorities = filters.get("priorities") or []
-    date_from  = filters.get("date_from")
-    date_to    = filters.get("date_to")
-    statuses   = filters.get("statuses") or []
-    limit      = filters.get("limit") or default_limit
-
-    # Nothing useful to query — skip
-    if not any([ticket_ids, priorities, date_from, statuses]):
-        return []
-
-    try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=10))
-        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-
-        where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]  # enables partial index use
-        params: list = []
-
-        if ticket_ids:
-            placeholders = ", ".join(f"${ i+1}" for i, _ in enumerate(ticket_ids))
-            where_parts.append(f"t.ticket_id IN [{placeholders}]")
-            params.extend(ticket_ids)
-
-        if priorities:
-            p_idx = len(params) + 1
-            placeholders = ", ".join(f"${p_idx + i}" for i, _ in enumerate(priorities))
-            where_parts.append(
-                f"UPPER(TOSTRING(t.priority)) IN [{placeholders}]"
-            )
-            params.extend(priorities)
-
-        if date_from:
-            params.append(date_from)
-            where_parts.append(f"t.created >= ${len(params)}")
-        if date_to:
-            params.append(date_to)
-            where_parts.append(f"t.created <= ${len(params)}")
-
-        if statuses:
-            s_idx = len(params) + 1
-            placeholders = ", ".join(f"${s_idx + i}" for i, _ in enumerate(statuses))
-            where_parts.append(f"LOWER(TOSTRING(t.status)) IN [{placeholders}]")
-            params.extend(statuses)
-
-        where_clause = " AND ".join(where_parts)
-        n1ql = (
-            f"SELECT META(t).id AS doc_key FROM {keyspace} AS t "
-            f"WHERE {where_clause} "
-            f"ORDER BY t.created DESC "
-            f"LIMIT {min(limit * 3, 200)}"   # fetch extra for RRF to re-rank
-        )
-
-        rows = list(cluster.query(
-            n1ql,
-            QueryOptions(positional_parameters=params, timeout=timedelta(seconds=20)),
-        ))
-        cluster.close()
-        return [r["doc_key"] for r in rows if r.get("doc_key")]
-    except Exception as exc:
-        print(f"[structured_search_cb] {exc}")
-        return []
-
-
-def tool_query_tickets(
-    filters: dict,
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-    limit: int = 500,
-) -> list[dict]:
-    """
-    Stage-1 structured retrieval for retrieve-then-rerank pipeline.
-    Returns full ticket docs — no top_k cap, up to `limit` results.
-    Expands app alias keywords to cluster hostnames dynamically via
-    _get_app_cluster_aliases(). Unlike structured_search_cb, returns docs
-    not keys and includes keyword/hostname LIKE conditions.
-    """
-    if not _CB_AVAILABLE:
-        return []
-    try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cluster.wait_until_ready(timedelta(seconds=10))
-        keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
-
-        where_parts: list[str] = ["t.ticket_id IS NOT MISSING"]
-        params: list = []
-
-        organization = (filters.get("organization") or "").strip()
-        if organization:
-            params.append(f"%{organization.lower()}%")
-            where_parts.append(f"LOWER(TOSTRING(t.organization)) LIKE ${len(params)}")
-
-        ticket_ids = filters.get("ticket_ids") or []
-        if ticket_ids:
-            phs = ", ".join(f"${i + 1}" for i, _ in enumerate(ticket_ids))
-            where_parts.append(f"t.ticket_id IN [{phs}]")
-            params.extend(ticket_ids)
-
-        date_from = filters.get("date_from")
-        date_to   = filters.get("date_to")
-        if date_from:
-            params.append(date_from)
-            _df_idx = len(params)
-            # Fallback: tickets with null created compare scraped-at epoch as ISO string
-            where_parts.append(
-                f"(t.created >= ${_df_idx}"
-                f" OR (t.created IS NULL"
-                f" AND MILLIS_TO_STR(t.last_scraped_at * 1000) >= ${_df_idx}))"
-            )
-        if date_to:
-            params.append(date_to + "T23:59:59Z")
-            _dt_idx = len(params)
-            where_parts.append(
-                f"(t.created <= ${_dt_idx}"
-                f" OR (t.created IS NULL"
-                f" AND MILLIS_TO_STR(t.last_scraped_at * 1000) <= ${_dt_idx}))"
-            )
-
-        priorities = filters.get("priorities") or []
-        if priorities:
-            p_idx = len(params) + 1
-            phs   = ", ".join(f"${p_idx + i}" for i, _ in enumerate(priorities))
-            where_parts.append(f"UPPER(TOSTRING(t.priority)) IN [{phs}]")
-            params.extend(priorities)
-
-        statuses = filters.get("statuses") or []
-        if statuses:
-            s_idx = len(params) + 1
-            phs   = ", ".join(f"${s_idx + i}" for i, _ in enumerate(statuses))
-            where_parts.append(f"LOWER(TOSTRING(t.status)) IN [{phs}]")
-            params.extend(statuses)
-
-        # When "cbse" or "jira" appear in struct_keywords, filter directly on
-        # the array fields — never rely on LIKE text matching for these since
-        # many tickets mention CBSE/Jira in prose without having formal links.
-        struct_kws = filters.get("struct_keywords") or []
-        _array_kws: set[str] = set()
-        if "cbse" in struct_kws:
-            where_parts.append("ARRAY_LENGTH(t.`cbses`) > 0")
-            _array_kws.add("cbse")
-        if "jira" in struct_kws:
-            where_parts.append("ARRAY_LENGTH(t.`jira_issues`) > 0")
-            _array_kws.add("jira")
-        # Remaining keywords (excluding array-handled ones) go through LIKE conditions.
-        _text_kws = [kw for kw in struct_kws if kw not in _array_kws]
-
-        # Keyword + hostname LIKE conditions built from struct_keywords.
-        # struct_keywords contains app names ("mle") AND expanded hostnames
-        # ("peuse1cbecpsd2000083") — each generates OR conditions across
-        # subject, description, and score.cluster_names.
-        if _text_kws:
-            kw_ors: list[str] = []
-            for kw in _text_kws:
-                params.append(f"%{kw.lower()}%")
-                idx = len(params)
-                kw_ors.append(
-                    f"(LOWER(t.subject) LIKE ${idx}"
-                    f" OR LOWER(t.description) LIKE ${idx}"
-                    f" OR ANY c IN t.`score`.`cluster_names`"
-                    f"   SATISFIES LOWER(c) LIKE ${idx} END"
-                    f" OR ANY cb IN t.`cbses`"
-                    f"   SATISFIES LOWER(cb) LIKE ${idx} END"
-                    f" OR ANY ji IN t.`jira_issues`"
-                    f"   SATISFIES LOWER(ji) LIKE ${idx} END)"
+                _done_emb, _errs_emb = embed_all_tickets(
+                    refreshed_tickets, cb_url, bucket, username, password,
+                    use_tls, scope, collection,
+                    emb_p, emb_m, emb_k, emb_u, emb_d,
+                    _emb_prog,
+                    max_workers=emb_workers,
+                    error_sink=job.setdefault("error_log", []),
                 )
-            where_parts.append(f"({' OR '.join(kw_ors)})")
+                job["embedded"] = _done_emb
+                job["errors"]  += _errs_emb
+            except Exception as exc:
+                job["last_message"] = f"Embedding failed: {exc}"
+                _job_fail(job, "embed", exc)
 
-        where_clause = " AND ".join(where_parts)
-        n1ql = (
-            f"SELECT t.* FROM {keyspace} AS t "
-            f"WHERE {where_clause} "
-            f"ORDER BY IFNULL(t.created, MILLIS_TO_STR(t.last_scraped_at * 1000)) DESC "
-            f"LIMIT {int(limit)}"
-        )
-        rows = list(cluster.query(
-            n1ql,
-            QueryOptions(positional_parameters=params, timeout=timedelta(seconds=30)),
-        ))
-        cluster.close()
-        return [dict(r) for r in rows if r.get("ticket_id")]
-    except Exception as exc:
-        print(f"[tool_query_tickets] {exc}")
-        return []
-
-
-def search_tickets_retrieve_rerank(
-    question: str,
-    original_question: str,
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-    embed_fn,
-    in_memory_tickets: list[dict],
-    top_k_vec: int = 60,
-    query_limit: int = 500,
-    customer_name: str = "",
-) -> tuple[list[dict], str]:
-    """
-    Two-stage retrieval pipeline:
-    Stage 1a — tool_query_tickets: complete structured set, no top_k cap
-    Stage 1b — vector_search_cb: semantic supplement for tickets not in Stage 1a
-    Stage 1c — K/V fetch full docs for vector-only hits
-    Returns (all_candidate_tickets, notes_string).
-    The caller is responsible for the Stage 2 LLM rerank + answer pass.
-    """
-    notes: list[str] = []
-    filters = build_structured_query(original_question or question)
-
-    # Scope retrieval to the loaded customer so cross-customer tickets never
-    # appear in the candidate set. Skip the "All Customers" sentinel — that
-    # value means no filter was set and all customers should be searched.
-    _cust_for_filter = customer_name.strip()
-    if _cust_for_filter and _cust_for_filter.lower() != "all customers":
-        filters["organization"] = _cust_for_filter
-
-    # Stage 1a: deterministic structured retrieval
-    struct_tickets: list[dict] = []
-    if _CB_AVAILABLE and cb_url:
-        struct_tickets = tool_query_tickets(
-            filters, cb_url, bucket, username, password,
-            use_tls, scope, collection, limit=query_limit,
-        )
-        notes.append(f"struct:{len(struct_tickets)}")
-    struct_ids = {str(t.get("ticket_id", "")) for t in struct_tickets}
-
-    # Stage 1b: semantic vector supplement
-    vec_tickets: list[dict] = []
-    if embed_fn and _CB_AVAILABLE and cb_url:
-        try:
-            query_vec = embed_fn(question)
-            if query_vec:
-                all_vec_keys = vector_search_cb(
-                    query_vec, cb_url, bucket, username, password,
-                    use_tls, scope, collection, top_k_vec,
+        # ── Score refreshed tickets ───────────────────────────────────────
+        s_prov    = (emb_params or {}).get("score_provider", "").lower().strip()
+        s_mod     = (emb_params or {}).get("score_model", "")
+        s_key     = (emb_params or {}).get("score_api_key", "")
+        s_url     = (emb_params or {}).get("score_base_url", "")
+        s_num_ctx = int((emb_params or {}).get("score_ctx") or 0) or None
+        s_no_think = bool((emb_params or {}).get("score_no_think", False))
+        if s_prov and s_mod and refreshed_tickets:
+            job["phase"] = "scoring"
+            _score_batch_sz = 20
+            _total_scored = 0
+            _scored_at = int(time.time())
+            # Scoring runs after the scrape-phase cluster (_bcluster) has already
+            # been closed above — open a fresh connection rather than reusing it,
+            # the same way the enrich phase opens its own _eclust connection.
+            _scol = None
+            try:
+                from couchbase.cluster import Cluster as _SCl
+                from couchbase.options import ClusterOptions as _SCO
+                from couchbase.auth import PasswordAuthenticator as _SPA
+                _sconn   = _cb_conn_str(cb_url, use_tls)
+                _sclust  = _SCl(_sconn, _SCO(_SPA(username, password)))
+                _sclust.wait_until_ready(timedelta(seconds=10))
+                _scol = _sclust.bucket(bucket).scope(scope).collection(collection)
+            except Exception as exc:
+                job["last_message"] = f"Scoring save-back connection failed: {exc}"
+                _job_fail(job, "score", exc)
+            for _si in range(0, len(refreshed_tickets), _score_batch_sz):
+                _chunk = refreshed_tickets[_si:_si + _score_batch_sz]
+                _set_op(
+                    f"Scoring tickets {_si + 1}–{min(_si + _score_batch_sz, len(refreshed_tickets))}"
+                    f" of {len(refreshed_tickets)}…",
+                    0.97 + (_si / max(len(refreshed_tickets), 1)) * 0.02,
                 )
-                new_vec_keys = [k for k in all_vec_keys
-                                if k.split("::")[-1] not in struct_ids]
-                if new_vec_keys:
-                    vec_tickets = fetch_tickets_by_keys(
-                        new_vec_keys, cb_url, bucket, username,
-                        password, use_tls, scope, collection,
+                try:
+                    _score_results = score_tickets_batch(
+                        _chunk,
+                        s_prov, s_mod, s_key, s_url,
+                        num_ctx=s_num_ctx,
+                        no_think=s_no_think,
                     )
-                    # Drop vector hits that belong to a different customer.
-                    # Use bidirectional substring: handles cases where the typed
-                    # customer name is shorter OR longer than the stored org value.
-                    if _cust_for_filter and _cust_for_filter.lower() != "all customers":
-                        _org_lc = _cust_for_filter.lower()
-                        vec_tickets = [
-                            t for t in vec_tickets
-                            if _org_lc in (t.get("organization") or "").lower()
-                            or (t.get("organization") or "").lower() in _org_lc
-                        ]
-                notes.append(f"vec_new:{len(vec_tickets)}")
-        except Exception as exc:
-            notes.append(f"vec_err:{exc}")
-
-    # Union: struct first (date-ordered), then vector supplement
-    all_tickets = struct_tickets + [
-        t for t in vec_tickets
-        if str(t.get("ticket_id", "")) not in struct_ids
-    ]
-
-    # Fallback to in-memory prefilter when CB is unavailable
-    if not all_tickets and in_memory_tickets:
-        all_tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
-        notes.append(f"mem:{pf_note}")
-
-    # Date post-filter: apply date_from / date_to to the full combined set so
-    # the vector leg respects the same temporal constraint as the N1QL leg.
-    # Tickets with no parseable date are kept (don't penalise missing data).
-    _date_from = filters.get("date_from")
-    _date_to   = filters.get("date_to")
-    if _date_from or _date_to:
-        _pre_date = len(all_tickets)
-        def _in_date_range(t: dict) -> bool:
-            d = _ticket_date(t)[:10]
-            if not d:
-                return True
-            if _date_from and d < _date_from:
-                return False
-            if _date_to and d > _date_to:
-                return False
-            return True
-        all_tickets = [t for t in all_tickets if _in_date_range(t)]
-        if len(all_tickets) < _pre_date:
-            notes.append(f"date_filter:{_pre_date}→{len(all_tickets)}")
-
-    # Tech-keyword grounding: when struct_keywords are pure technical terms (not
-    # app aliases) and Stage 1a returned 0 N1QL hits, validate that each vector
-    # candidate actually contains at least one keyword in its text fields.
-    # Without this, vector-only noise is passed to Stage 2 and the LLM gives
-    # inconsistent answers about whether unrelated tickets "match" the keyword.
-    _skws = filters.get("struct_keywords") or []
-    _known_apps = set(_get_app_cluster_aliases().keys())
-    _pure_tech_kws = [k for k in _skws if k not in _known_apps]
-    if _pure_tech_kws and not struct_tickets:
-        def _ticket_mentions_kw(t: dict) -> bool:
-            _comments_raw = t.get("comments") or []
-            _comments_str = " ".join(
-                str(c.get("body") or c.get("content") or c)
-                for c in (_comments_raw if isinstance(_comments_raw, list) else [])
-            )[:800]
-            # interaction_summary may be at top level (in-memory) or nested
-            # inside score (CB-loaded) — check both
-            _score = t.get("score") or {}
-            _summary = (
-                str(t.get("interaction_summary") or "")
-                or str(_score.get("interaction_summary") or "")
-            )
-            haystack = " ".join([
-                str(t.get("subject") or ""),
-                str(t.get("description") or ""),
-                str(t.get("tags") or ""),
-                _comments_str,
-                _summary,
-            ]).lower()
-            return any(kw.lower() in haystack for kw in _pure_tech_kws)
-        grounded = [t for t in all_tickets if _ticket_mentions_kw(t)]
-        if grounded:
-            all_tickets = grounded
-            notes.append(f"grounded:{len(all_tickets)}")
-        elif all_tickets:
-            # Candidates exist but none mention the keyword in their text.
-            # Rather than returning empty (which produces "No matching tickets
-            # found"), pass the candidates through so the LLM can explicitly
-            # answer "none of these N tickets mention <keyword>" — much more
-            # informative than a retrieval-failure message.
-            notes.append(f"grounded:0,candidates:{len(all_tickets)}")
-        else:
-            notes.append("grounded:0→empty")
-            return [], " | ".join(notes)
-
-    # Safety cap: never send more than 150 candidates to Stage 2 LLM.
-    # Struct results are already date-DESC ordered; keep the most recent N.
-    _MAX_CANDIDATES = 150
-    if len(all_tickets) > _MAX_CANDIDATES:
-        notes.append(f"capped:{len(all_tickets)}→{_MAX_CANDIDATES}")
-        all_tickets = all_tickets[:_MAX_CANDIDATES]
-
-    notes.append(f"total:{len(all_tickets)}")
-    return all_tickets, " | ".join(notes)
-
-
-def snapshot_topology_search(
-    topology_filters: dict,
-    date_from: str | None,
-    date_to: str | None,
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, ticket_collection: str,
-    snap_collection: str = "snapshots",
-    default_limit: int = 200,
-) -> list[str]:
-    """Two-step topology-aware ticket retrieval.
-
-    Step 1: query the snapshots collection for clusters matching topology
-            criteria (node count, data nodes, services).
-    Step 2: collect ticket IDs from those snapshots, optionally filtered
-            by date from the tickets collection.
-
-    Returns ticket doc keys in 'ticket::<id>' format for RRF merging.
-    No cross-collection JOIN index required.
-    """
-    if not _CB_AVAILABLE:
-        return []
-    min_nodes = topology_filters.get("topology_min_nodes")
-    max_nodes = topology_filters.get("topology_max_nodes")
-    min_data  = topology_filters.get("topology_min_data")
-    services  = topology_filters.get("topology_services") or []
-    if not any([min_nodes, max_nodes, min_data, services]):
-        return []
-    try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cl       = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cl.wait_until_ready(timedelta(seconds=10))
-        ks_snap = f"`{bucket}`.`{scope}`.`{snap_collection}`"
-        ks_tick = f"`{bucket}`.`{scope}`.`{ticket_collection}`"
-
-        snap_where = ["ticket_ids IS NOT MISSING AND ARRAY_LENGTH(ticket_ids) > 0"]
-        if min_nodes is not None:
-            snap_where.append(f"node_count >= {min_nodes}")
-        if max_nodes is not None:
-            snap_where.append(f"node_count <= {max_nodes}")
-        if min_data is not None:
-            snap_where.append(f"topology.data_nodes >= {min_data}")
-        for svc in services:
-            snap_where.append(f"topology.{svc}_nodes > 0")
-
-        snap_q = (
-            f"SELECT cluster_uuid, cluster_name, node_count, ticket_ids "
-            f"FROM {ks_snap} WHERE {' AND '.join(snap_where)} LIMIT 500"
-        )
-        snap_rows = list(cl.query(snap_q, QueryOptions(timeout=timedelta(seconds=20))))
-        if not snap_rows:
-            cl.close()
-            return []
-
-        # Collect ticket IDs (deduplicated)
-        all_tids: list[str] = []
-        seen_tids: set[str] = set()
-        for row in snap_rows:
-            for tid in (row.get("ticket_ids") or []):
-                s = str(tid)
-                if s not in seen_tids:
-                    all_tids.append(s)
-                    seen_tids.add(s)
-        if not all_tids:
-            cl.close()
-            return []
-
-        # If a date range is required, filter tickets by date from the ticket collection
-        if date_from or date_to:
-            placeholders = ", ".join(f'"{t}"' for t in all_tids[:500])
-            tick_where   = [f"t.ticket_id IN [{placeholders}]"]
-            if date_from:
-                tick_where.append(f"t.created >= '{date_from}'")
-            if date_to:
-                tick_where.append(f"t.created <= '{date_to}'")
-            tick_q = (
-                f"SELECT META(t).id AS doc_key FROM {ks_tick} AS t "
-                f"WHERE {' AND '.join(tick_where)} "
-                f"ORDER BY t.created DESC LIMIT {default_limit}"
-            )
-            tick_rows = list(cl.query(tick_q, QueryOptions(timeout=timedelta(seconds=20))))
-            cl.close()
-            return [r["doc_key"] for r in tick_rows if r.get("doc_key")]
-
-        cl.close()
-        return [f"ticket::{tid}" for tid in all_tids[:default_limit]]
-    except Exception as exc:
-        print(f"[snapshot_topology_search] {exc}")
-        return []
-
-
-def fetch_snapshots_for_clusters(
-    cluster_uuids: list[str],
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str,
-    snap_collection: str = "snapshots",
-) -> dict[str, dict]:
-    """Fetch the latest snapshot document for each cluster UUID.
-
-    Returns {cluster_uuid: snapshot_dict} with these topology fields:
-    cluster_name, node_count, cb_version, date, data_nodes, index_nodes,
-    query_nodes, fts_nodes, eventing_nodes, analytics_nodes,
-    warn_items, bad_items, cluster_hostname.
-    """
-    if not cluster_uuids or not _CB_AVAILABLE:
-        return {}
-    try:
-        conn_str = _cb_conn_str(cb_url, use_tls)
-        cl       = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-        cl.wait_until_ready(timedelta(seconds=10))
-        ks   = f"`{bucket}`.`{scope}`.`{snap_collection}`"
-        uids = ", ".join(f'"{u}"' for u in cluster_uuids[:50])
-        q    = (
-            f"SELECT s.cluster_uuid, s.cluster_name, s.node_count, s.cb_version, s.date, "
-            f"s.topology.data_nodes, s.topology.index_nodes, s.topology.query_nodes, "
-            f"s.topology.fts_nodes, s.topology.eventing_nodes, s.topology.analytics_nodes, "
-            f"s.topology.warn_items, s.topology.bad_items, s.topology.cluster_hostname "
-            f"FROM {ks} s WHERE s.cluster_uuid IN [{uids}] ORDER BY s.date DESC"
-        )
-        rows = list(cl.query(q, QueryOptions(timeout=timedelta(seconds=15))))
-        cl.close()
-        result: dict[str, dict] = {}
-        for row in rows:
-            uid = row.get("cluster_uuid")
-            if uid and uid not in result:   # keep latest (first due to ORDER BY date DESC)
-                result[uid] = row
-        return result
-    except Exception as exc:
-        print(f"[fetch_snapshots_for_clusters] {exc}")
-        return {}
-
-
-def reciprocal_rank_fusion(
-    *ranked_lists: list[str],
-    k: int = 60,
-) -> list[str]:
-    """Merge any number of ranked doc-key lists using Reciprocal Rank Fusion.
-
-    RRF score for doc d across lists L:
-        score(d) = Σ_L  1 / (k + rank_in_L(d))
-
-    Documents appearing in multiple lists are naturally boosted.
-    k=60 is the standard value from the original RRF paper.
-    Returns keys sorted by descending score.
-    """
-    scores: dict[str, float] = {}
-    for ranked in ranked_lists:
-        for rank, doc_id in enumerate(ranked):
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-    return sorted(scores, key=lambda d: scores[d], reverse=True)
-
-
-def hybrid_retrieval(
-    question: str,
-    query_vec: list[float] | None,
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-    top_k: int = 10,
-    in_memory_tickets: list[dict] | None = None,
-    embed_fn: "Callable[[str], list[float]] | None" = None,
-    original_question: str | None = None,
-) -> tuple[list[dict], str]:
-    """Run dense vector search + structured N1QL in parallel, merge with RRF,
-    and optionally expand the query using resolved ticket content.
-
-    Returns (ticket_dicts, status_note).
-
-    Retrieval stages:
-    1. Structured  — N1QL for exact ticket IDs, priority, date range, status
-    2. Dense       — vector_search_cb with the question embedding
-    3. Expansion   — if specific ticket IDs were requested AND embed_fn is provided:
-                     resolve those tickets first, build an enriched query string
-                     from their subject + cluster IDs + priority, re-embed it,
-                     and run a third vector pass to surface related tickets.
-    4. RRF merge   — all result lists fused; tickets in multiple lists boosted.
-    5. Resolve     — keys → full ticket dicts (in-memory first, CB fallback).
-
-    embed_fn is a zero-argument-resolved callable: embed_fn(text) -> vector.
-    Pass it from _send_chat as a lambda closing over provider/model/key/url/dims.
-    When absent or when no specific ticket IDs are in the question, step 3 is skipped.
-
-    Falls back to prefilter_for_query on in_memory_tickets when CB is unavailable.
-    """
-    import concurrent.futures
-
-    # Structured filters always built from the original question so product names
-    # (e.g. "safekey", "mle") are never stripped by the query rewriter.
-    # The rewritten question is used only for the vector embedding (query_vec).
-    filters = build_structured_query(original_question or question)
-    cb_args = (cb_url, bucket, username, password, use_tls, scope, collection)
-    vector_ids:    list[str] = []
-    struct_ids:    list[str] = []
-    expansion_ids: list[str] = []
-    notes:         list[str] = []
-
-    if not _CB_AVAILABLE:
-        if in_memory_tickets:
-            tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
-            # Apply keyword filters in-memory when CB is unavailable
-            kws = filters.get("struct_keywords") or filters.get("keywords") or []
-            if kws:
-                def _kw_match(t: dict) -> bool:
-                    haystack = " ".join([
-                        str(t.get("subject") or ""),
-                        str(t.get("description") or ""),
-                        str(t.get("tags") or ""),
-                    ]).lower()
-                    return any(kw.lower() in haystack for kw in kws)
-                tickets = [t for t in tickets if _kw_match(t)] or tickets  # fall back to unfiltered if nothing matches
-            return tickets[:top_k], f"in-memory fallback ({pf_note})"
-        return [], "CB unavailable, no in-memory tickets"
-
-    # ── Stages 1 + 2: structured and dense in parallel ───────────────────
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        f_struct = pool.submit(structured_search_cb, filters, *cb_args, top_k)
-        f_vec    = pool.submit(vector_search_cb, query_vec, *cb_args, top_k * 3) \
-                   if query_vec else None
-
-        try:
-            struct_ids = f_struct.result(timeout=20)
-            if struct_ids:
-                notes.append(f"{len(struct_ids)} structured")
-        except Exception as e:
-            notes.append(f"structured err: {e}")
-
-        if f_vec:
+                    # Persist scores back into ticket docs in CB
+                    if _scol and _score_results:
+                        for _sc in _score_results:
+                            _stid = str(_sc.get("ticket_id") or "").strip()
+                            if not _stid:
+                                continue
+                            try:
+                                _sdoc_key = f"ticket::{_stid}"
+                                _sdoc = _scol.get(_sdoc_key).content_as[dict]
+                                _sdoc["score"] = {**(_sdoc.get("score") or {}), **_sc, "scored_at": _scored_at}
+                                _scol.upsert(_sdoc_key, _sdoc)
+                                _total_scored += 1
+                            except Exception as _wexc:
+                                _job_fail(job, "score_save", _wexc, ticket_id=_stid)
+                                job["last_message"] = f"Failed to save score for ticket {_stid}: {_wexc}"
+                    elif _score_results:
+                        # No working CB connection — do not fake success.
+                        job["errors"] += len(_score_results)
+                        _log = job.setdefault("error_log", [])
+                        if len(_log) < 200:
+                            _log.append({"stage": "score_save", "error_type": "str",
+                                         "error_code": "CONN_REFUSED",
+                                         "abridged": f"{len(_score_results)} scores lost — no CB connection",
+                                         "at": time.time()})
+                        job["last_message"] = (
+                            f"Scored {len(_score_results)} tickets but had no CB connection "
+                            f"to save them — see earlier error."
+                        )
+                    job["scored"] = _total_scored
+                except Exception as exc:
+                    job["last_message"] = f"Scoring batch {_si // _score_batch_sz + 1} failed: {exc}"
+                    _job_fail(job, "score", exc)
             try:
-                _raw_vec = f_vec.result(timeout=30)
-                # Separate ticket and snapshot keys — the hybrid FTS index covers
-                # both collections.  Snapshot hits are cross-referenced to their
-                # associated ticket IDs and fed into the expansion leg.
-                _snap_from_vec   = [k for k in _raw_vec if k.startswith("snapshot::")]
-                vector_ids       = [k for k in _raw_vec if not k.startswith("snapshot::")]
-                notes.append(f"{len(vector_ids)} vector")
-                if _snap_from_vec:
-                    _xref = _snap_keys_to_ticket_keys(_snap_from_vec, *cb_args)
-                    expansion_ids.extend(k for k in _xref if k not in expansion_ids)
-                    notes.append(f"{len(_xref)} snap-vec→ticket")
-            except Exception as e:
-                notes.append(f"vector err: {e}")
-
-    # ── Stage 2b: FTS keyword text search (BM25) ─────────────────────────
-    # supportal_vector_idx is a true hybrid index: embedding (vector, 1024
-    # dims, dot_product) + text fields (subject, description, comments,
-    # assignee, priority, requester, status) — all with standard analyzer.
-    # MatchQuery/DisjunctionQuery hit the text fields directly; BM25 ranking
-    # surfaces tickets by exact term match (e.g. "mle", hostname tokens).
-    # Only struct_keywords (alias/tech) are sent so question-structure words
-    # ("reported", "relate") never enter the FTS query.
-    keyword_ids: list[str] = []
-    _skw = filters.get("struct_keywords") or []
-    if _skw and _CB_AVAILABLE:
-        try:
-            _raw_kw = fts_keyword_search_cb(_skw, *cb_args, top_k * 3)
-            _snap_from_kw = [k for k in _raw_kw if k.startswith("snapshot::")]
-            keyword_ids   = [k for k in _raw_kw if not k.startswith("snapshot::")]
-            notes.append(f"{len(keyword_ids)} fts-keyword")
-            if _snap_from_kw:
-                _xref = _snap_keys_to_ticket_keys(_snap_from_kw, *cb_args)
-                expansion_ids.extend(k for k in _xref if k not in expansion_ids)
-                notes.append(f"{len(_xref)} snap-kw→ticket")
-        except Exception as e:
-            notes.append(f"fts-keyword err: {e}")
-
-    # ── Stage 2c: snapshot topology search ───────────────────────────────
-    # When the question contains topology constraints ("more than 9 nodes",
-    # "with eventing service"), query the snapshots collection for matching
-    # clusters, then cross-reference their ticket_ids — filtered by date.
-    # This leg is the only way to answer "how many clusters > 9 nodes had
-    # issues in 2026" correctly; vector + keyword search cannot do it.
-    topology_ids: list[str] = []
-    _snap_col = "snapshots"   # collection name in same scope
-    if any([filters.get("topology_min_nodes"), filters.get("topology_max_nodes"),
-            filters.get("topology_min_data"), filters.get("topology_services")]):
-        try:
-            topology_ids = snapshot_topology_search(
-                filters,
-                filters.get("date_from"), filters.get("date_to"),
-                cb_url, bucket, username, password, use_tls, scope, collection,
-                snap_collection=_snap_col,
-            )
-            if topology_ids:
-                notes.append(f"{len(topology_ids)} topology-snapshot")
-        except Exception as e:
-            notes.append(f"topology err: {e}")
-
-    # ── Stage 3: query expansion via ticket content ───────────────────────
-    # When the user asks about a specific ticket (e.g. "summary of 76403"),
-    # the question embedding is generic and won't find related tickets.
-    # Instead, resolve the target ticket(s) first, build an enriched query
-    # from their actual content, and run a third vector pass so contextually
-    # related tickets (same cluster, same issue type) also come back.
-    if filters.get("ticket_ids") and embed_fn and _CB_AVAILABLE:
-        # Resolve the specifically-requested tickets (in-memory first)
-        _mem_map = {str(t.get("ticket_id", "")): t for t in (in_memory_tickets or [])}
-        _target_tickets = [_mem_map[tid] for tid in filters["ticket_ids"] if tid in _mem_map]
-        if not _target_tickets:
-            # Not in memory — fetch from CB
-            _target_keys = [f"ticket::{tid}" for tid in filters["ticket_ids"]]
-            _target_tickets = fetch_tickets_by_keys(_target_keys, *cb_args)
-
-        if _target_tickets:
-            # Build enriched query text from the ticket's own fields
-            _enriched_parts: list[str] = []
-            for t in _target_tickets[:3]:   # cap at 3 to keep query focused
-                parts = []
-                if t.get("subject"):
-                    parts.append(t["subject"])
-                for cid in _ticket_cluster_ids(t)[:2]:
-                    parts.append(f"cluster {cid}")
-                if t.get("priority"):
-                    parts.append(f"priority {t['priority']}")
-                if t.get("description"):
-                    parts.append((t["description"] or "")[:200])
-                _enriched_parts.append(" ".join(parts))
-
-            _enriched_query = question + "\n" + "\n".join(_enriched_parts)
-            try:
-                _exp_vec = embed_fn(_enriched_query)
-                expansion_ids = vector_search_cb(_exp_vec, *cb_args, top_k * 2)
-                notes.append(f"{len(expansion_ids)} expansion")
-            except Exception as e:
-                notes.append(f"expansion err: {e}")
-
-    # ── Stage 4: RRF merge ────────────────────────────────────────────────
-    all_lists = [lst for lst in (struct_ids, vector_ids, keyword_ids, topology_ids, expansion_ids) if lst]
-    if not all_lists:
-        if in_memory_tickets:
-            tickets, pf_note = prefilter_for_query(question, in_memory_tickets)
-            return tickets[:top_k], f"in-memory fallback ({pf_note})"
-        return [], "no results"
-
-    _rrf_ordered = reciprocal_rank_fusion(*all_lists)
-    _rrf_cap     = top_k * 2
-    _rrf_set     = set(_rrf_ordered[:_rrf_cap])
-    # Structured results matched explicit user filters — guarantee they survive the
-    # final [:top_k] slice even if the RRF vector signal didn't rank them high enough.
-    # Cap struct_forced at top_k so a broad query can't flood the LLM context.
-    _struct_forced = [k for k in struct_ids if k not in _rrf_set][:top_k]
-    _sf_set = set(_struct_forced)
-    # BM25 keyword hits get the same guarantee: if a ticket passed FTS relevance
-    # testing for the query terms but didn't rank in the RRF top-N (because a
-    # broad date filter produces ~150 struct_ids that dilute RRF scores), force
-    # it in.  This is the main path for tickets like "Moving of partitioned
-    # index : peuse1cbecpsd2000083" — FTS matches the hostname; struct rank is
-    # too low for the RRF top-20 cut.
-    _kw_forced = [k for k in keyword_ids if k not in _rrf_set and k not in _sf_set][:top_k]
-    _kf_set = set(_kw_forced)
-    # struct_forced first → keyword_forced second → RRF-ranked fills remaining
-    merged_ids = (
-        _struct_forced
-        + _kw_forced
-        + [k for k in _rrf_ordered[:_rrf_cap] if k not in _sf_set and k not in _kf_set]
-    )
-    notes.append(f"{len(merged_ids)} after RRF (sf={len(_struct_forced)} kf={len(_kw_forced)})")
-
-    # ── Stage 5: resolve keys → full ticket dicts ────────────────────────
-    # Always prefer CB when available — in-memory tickets may have stale or
-    # incomplete fields (e.g. requester=None from an older scrape).
-    # Memory is used only as a fast fallback when CB is unavailable.
-    resolved: list[dict] = []
-    if _CB_AVAILABLE:
-        resolved = fetch_tickets_by_keys(merged_ids, *cb_args)
-        if resolved:
-            notes.append(f"cb:{len(resolved)}")
-        else:
-            notes.append("cb:0(failed?)")
-        # Fill in any not found in CB from memory
-        if in_memory_tickets:
-            _cb_ids = {str(t.get("ticket_id", "")) for t in resolved}
-            mem_map = {str(t.get("ticket_id", "")): t for t in in_memory_tickets}
-            _mem_filled = 0
-            for k in merged_ids:
-                tid = k.split("::")[-1]
-                if tid not in _cb_ids and tid in mem_map:
-                    resolved.append(mem_map[tid])
-                    _mem_filled += 1
-            if _mem_filled:
-                notes.append(f"mem-fill:{_mem_filled}")
-    elif in_memory_tickets:
-        mem_map = {str(t.get("ticket_id", "")): t for t in in_memory_tickets}
-        resolved = [mem_map[k.split("::")[-1]] for k in merged_ids
-                    if k.split("::")[-1] in mem_map]
-        notes.append(f"mem-only:{len(resolved)}")
-
-    # Preserve RRF order
-    order = {k.split("::")[-1]: i for i, k in enumerate(merged_ids)}
-    resolved.sort(key=lambda t: order.get(str(t.get("ticket_id", "")), 999))
-
-    # ── Stage 6: post-RRF keyword filter ─────────────────────────────────
-    # When the query has keyword filters (e.g. "safekey"), remove tickets
-    # whose text doesn't contain ANY of the keywords.
-    # Uses ANY (not ALL) so multi-keyword questions still return results.
-    # Only applied when keywords are non-trivial (≥3 chars) to avoid
-    # over-filtering on short stop-word-like terms.
-    kws = [k for k in (filters.get("struct_keywords") or filters.get("keywords") or []) if len(k) >= 3]
-    # Tickets that came from the FTS BM25 leg already passed relevance testing
-    # for these exact keywords — trust them and skip the text scan.
-    _kw_trusted = set(keyword_ids)
-    if kws and not filters.get("ticket_ids"):  # skip if pinned by explicit ID
-        _c2a_s6 = _get_cluster_to_app()   # resolve once outside the per-ticket closure
-        _known_apps_s6 = set(_get_app_cluster_aliases().keys())  # all known app names
-        # Which app aliases appear in the query keywords?
-        _queried_apps_s6 = {kw.lower() for kw in kws if kw.lower() in _known_apps_s6}
-        def _kw_match(t: dict) -> bool:
-            # ── Cluster-authoritative exclusion (runs before FTS trust bypass) ──
-            # When the query names a known app (e.g. "safekey"), a ticket whose
-            # cluster(s) ALL resolve to a DIFFERENT known app is a cross-app false
-            # positive — exclude it even if FTS found a keyword hit in its text.
-            if _queried_apps_s6:
-                _t_cids = _ticket_cluster_ids(t)
-                _t_apps = {_c2a_s6.get(cid, "") for cid in _t_cids} - {""}
-                # Only exclude when: ticket has clusters that map to known apps
-                # AND none of those apps match the queried app(s).
-                if _t_apps and not (_t_apps & _queried_apps_s6):
-                    return False
-
-            # FTS BM25 already validated this ticket for the query keywords
-            _key = f"ticket::{t.get('ticket_id', '')}"
-            if _key in _kw_trusted:
-                return True
-            # Build haystack from all text-bearing fields including comments
-            _comments_raw = t.get("comments") or []
-            if isinstance(_comments_raw, list):
-                _comments_str = " ".join(
-                    str(c.get("body") or c.get("content") or c)
-                    for c in _comments_raw
-                )[:1000]
-            else:
-                _comments_str = str(_comments_raw)[:1000]
-            haystack = " ".join([
-                str(t.get("subject") or ""),
-                str(t.get("description") or ""),
-                str(t.get("tags") or ""),
-                _comments_str,
-            ]).lower()
-            # 1. Direct text match
-            if any(kw.lower() in haystack for kw in kws):
-                return True
-            # 2. Structured cluster→app match (cluster_name / UUID from snapshot_topology)
-            _ticket_apps = {
-                _c2a_s6.get(cid, "")
-                for cid in _ticket_cluster_ids(t)
-            } - {""}
-            if any(kw.lower() in _ticket_apps for kw in kws):
-                return True
-            # 3. Hostname text-scan: any known host appears in subject/desc/comments
-            #    and that host's app matches a queried keyword
-            for host, app in _c2a_s6.items():
-                if host in haystack and any(kw.lower() == app for kw in kws):
-                    return True
-            return False
-        filtered = [t for t in resolved if _kw_match(t)]
-        if filtered:   # only apply if something survives — never return empty
-            resolved = filtered
-            notes.append(f"keyword-filtered to {len(resolved)}")
-
-    # ── Stage 7: date post-filter ─────────────────────────────────────────
-    # Apply date range to ALL retrieved tickets including vector hits so that
-    # "in 2026" / "last month" constrains the final answer even when the
-    # structured search returned nothing (keyword-driven fallback path).
-    _date_from = filters.get("date_from")
-    _date_to   = filters.get("date_to")
-    if _date_from or _date_to:
-        def _in_date_range(t: dict) -> bool:
-            _cd = str(t.get("created") or "")[:10]
-            if not _cd:
-                return True   # don't drop tickets with no date field
-            if _date_from and _cd < _date_from:
-                return False
-            if _date_to and _cd > _date_to:
-                return False
-            return True
-        date_filtered = [t for t in resolved if _in_date_range(t)]
-        if date_filtered:   # never return empty just because of strict date
-            resolved = date_filtered
-            notes.append(f"date-filtered to {len(resolved)}")
-
-    return resolved[:top_k], " | ".join(notes)
-
-
-def chat_batch_map_reduce(
-    question: str,
-    tickets: list[dict],
-    batch_size: int,
-    provider: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-    progress_cb,
-    compact: bool = False,
-    max_workers: int = 1,
-) -> str:
-    """
-    Map-reduce RAG: query each batch of tickets with the question, then synthesise.
-    Returns the final synthesised answer string.
-
-    max_workers > 1 sends multiple batches to the LLM concurrently — set to match
-    the parallel request capacity of your local model server.
-    """
-    import concurrent.futures
-
-    batches = [tickets[i: i + batch_size] for i in range(0, len(tickets), batch_size)]
-    partial_answers: list[tuple[int, str]] = []   # (batch_idx, answer)
-    _today_dt  = datetime.datetime.now()
-    _today_str = _today_dt.strftime("%Y-%m-%d (%A)")
-    _stats_block = build_dataset_stats(tickets, _today_dt)
-    lock = threading.Lock()
-    completed = [0]
-
-    _BATCH_NO_MATCH = "NO_MATCH"
-    _batch_instruction = (
-        "\n\n━━ BATCH MODE RULES ━━\n"
-        "You are processing ONE slice of a larger dataset. Most slices will not contain "
-        "tickets matching the question — that is normal and expected.\n"
-        "RULE B1 — If NO tickets in this slice match the question, respond with exactly the "
-        "two words: NO_MATCH — nothing else.\n"
-        "RULE B2 — Only include a ticket if it DIRECTLY matches. Do NOT include tickets "
-        "because they share infrastructure, patterns, or implied relationships with matching "
-        "tickets. [Application: X] labels are authoritative — do not override them.\n"
-        "RULE B3 — Never infer that a ticket belongs to an application unless its header "
-        "explicitly shows [Application: THAT_APP] or its subject/description names it directly."
-    )
-
-    def _run_batch(idx: int, batch: list[dict]) -> tuple[int, str]:
-        context = build_rag_context(batch, "", compact=compact)
-        system  = SYSTEM_PROMPT_TEMPLATE.format(today=_today_str, stats=_stats_block, context=context)
-        system += _batch_instruction
-        msgs    = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": question},
-        ]
-        try:
-            ans = call_llm(msgs, provider, model, api_key, base_url, max_tokens=4096)
-            return idx, ans.strip()
-        except Exception as exc:
-            return idx, f"ERROR: {exc}"
-
-    effective = max(1, min(max_workers, len(batches)))
-    progress_cb(
-        f"Processing {len(batches)} batch(es) × {batch_size} tickets"
-        + (f" (parallel={effective})" if effective > 1 else "") + " …"
-    )
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=effective) as pool:
-        futures = {pool.submit(_run_batch, i, b): i for i, b in enumerate(batches)}
-        for fut in concurrent.futures.as_completed(futures):
-            idx, ans = fut.result()
-            with lock:
-                partial_answers.append((idx, ans))
-                completed[0] += 1
-                progress_cb(
-                    f"Batch {completed[0]}/{len(batches)} complete …"
-                )
-
-    # Restore original order before synthesis
-    partial_answers.sort(key=lambda x: x[0])
-
-    # Filter out batches that found nothing — they are not contradictions,
-    # just slices that didn't contain matching tickets.
-    # Local models rarely respond with the exact sentinel, so detect emptiness
-    # by: (a) exact/near sentinel match, or (b) no ticket ID (#NNNNN) in a
-    # short response, or (c) contains common "nothing found" phrases.
-    _NO_RESULT_PHRASES = (
-        "no_match", "no match", "no tickets", "no matching tickets",
-        "no relevant", "no results", "none found", "not found",
-        "no ticket", "no support ticket",
-    )
-
-    def _is_empty_batch(ans: str) -> bool:
-        if ans.startswith("ERROR:"):
-            return True
-        _lower = ans.strip().lower()
-        # Exact sentinel (or with trailing punctuation)
-        if _lower.rstrip(".,! ") == "no_match":
-            return True
-        # Short response with no ticket ID reference → almost certainly empty
-        if len(_lower) < 120 and "#" not in ans:
-            return True
-        # Contains a clear "nothing found" phrase and no ticket ID
-        if "#" not in ans and any(p in _lower for p in _NO_RESULT_PHRASES):
-            return True
-        return False
-
-    matching = [(idx, ans) for idx, ans in partial_answers if not _is_empty_batch(ans)]
-    n_empty = len(partial_answers) - len(matching)
-    ordered = [f"[Batch {idx + 1}]\n{ans}" for idx, ans in matching]
-
-    if not ordered:
-        return "No matching tickets found across all batches."
-
-    # Final synthesis pass
-    progress_cb(f"Synthesising {len(ordered)} batch answer(s) ({n_empty} empty batches excluded) …")
-    combined = "\n\n".join(ordered)
-    synthesis_system = (
-        "You are a senior Couchbase support analyst performing the final synthesis step of a "
-        "map-reduce analysis. You have been given partial answers from batches that found "
-        "MATCHING tickets — batches that found no matches were already excluded.\n\n"
-        "CRITICAL RULES:\n"
-        "1. Batches that found no results are NOT contradictions — they simply did not contain "
-        "matching tickets. Treat all provided partial answers as additive evidence.\n"
-        "2. Synthesise into a single coherent answer. Remove exact duplicates but preserve "
-        "all unique ticket IDs.\n"
-        "3. Never include a ticket from one application in results for a different application. "
-        "[Application: X] labels are authoritative.\n"
-        "4. Do NOT infer relationships between tickets based on infrastructure patterns. "
-        "Only report tickets explicitly identified as matching in the partial answers.\n"
-        "5. Cite ticket IDs wherever relevant. Use markdown tables for ticket lists."
-    )
-    synthesis_msgs = [
-        {"role": "system",  "content": synthesis_system},
-        {"role": "user",    "content": f"Original question: {question}\n\nPartial answers:\n{combined}"},
-    ]
-    return call_llm(synthesis_msgs, provider, model, api_key, base_url, max_tokens=8192)
-
-
-def _ticket_date(t: dict) -> str:
-    """Return the best available ISO date string for a ticket (empty string if none)."""
-    return (t.get("created") or t.get("created_at") or t.get("date") or "").strip()
-
-
-def _parse_ticket_date(t: dict):
-    """Parse the ticket date into a datetime, or None."""
-    raw = _ticket_date(t)
-    if not raw:
-        return None
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
-        try:
-            return datetime.datetime.strptime(raw[:19], fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def _ticket_cluster_ids(t: dict) -> list[str]:
-    """Extract cluster hostnames/IDs from a ticket.
-
-    Returns cluster_name (hostname) first so callers can look up _get_cluster_to_app().
-    Falls back to UUID and snap_id prefix for completeness.
-    """
-    ids: list[str] = []
-    topo = t.get("snapshot_topology") or {}
-    if isinstance(topo, str):
-        try:
-            topo = json.loads(topo)
-        except Exception:
-            topo = {}
-    # cluster_name is the short hostname (e.g. "peuse1cbecpsd2000083") — used by _CLUSTER_TO_APP
-    _cname = (topo.get("cluster_name") or "").strip()
-    if _cname and _cname not in ids:
-        ids.append(_cname)
-    # UUID from topology
-    _cuuid = (topo.get("cluster_uuid") or "").strip()
-    if _cuuid and _cuuid not in ids:
-        ids.append(_cuuid)
-    # snap_ids prefix (UUID format — lower priority, kept for compatibility)
-    for sid in t.get("snap_ids") or []:
-        cid = sid.split("::")[0]
-        if cid and cid not in ids:
-            ids.append(cid)
-    # score.cluster_names: pre-computed cluster hostnames from the scoring step;
-    # more reliable than snapshot_topology when a ticket spans multiple clusters.
-    _score = t.get("score") or {}
-    for cname in (_score.get("cluster_names") or []):
-        cname = (cname or "").strip()
-        if cname and cname not in ids:
-            ids.append(cname)
-    # Text-scan supplement: always check subject/description/comments for known hostnames.
-    # Not a fallback — runs even when topology fields already populated, so a ticket
-    # titled "Cluster peuse1cbecpsd2000083 indexes in warmup" gets labelled MLE even
-    # if snapshot_topology references a different cluster.
-    _comments_raw = t.get("comments") or []
-    if isinstance(_comments_raw, list):
-        _comments_text = " ".join(
-            str(c.get("body") or c.get("content") or c) for c in _comments_raw
-        )[:2000]
-    else:
-        _comments_text = str(_comments_raw)[:2000]
-    _text = " ".join([
-        (t.get("subject") or ""),
-        (t.get("description") or "")[:500],
-        _comments_text,
-    ]).lower()
-    for host in _get_cluster_to_app():
-        if host in _text and host not in ids:
-            ids.append(host)
-    return ids
-
-
-def build_dataset_stats(tickets: list[dict], today_dt: datetime.datetime) -> str:
-    """
-    Return a pre-computed stats block that grounds the LLM on today's date,
-    dataset structure, and a full monthly ticket index.
-
-    The monthly index lets the LLM answer *any* relative-date question
-    ("last 3 months", "Q1 2025", "since March") by doing the calendar
-    arithmetic itself — no Python keyword guessing needed.
-    Context tickets are always sorted newest-first so the LLM sees
-    the most relevant temporal slice first regardless of query phrasing.
-    """
-    if not tickets:
-        return ""
-
-    # Sort newest-first once; reuse for recent list
-    sorted_by_date = sorted(tickets, key=lambda t: _ticket_date(t), reverse=True)
-
-    # ── Monthly breakdown (all months in dataset) ─────────────────────────
-    monthly: dict[str, int] = {}
-    for t in tickets:
-        dt = _parse_ticket_date(t)
-        if dt:
-            ym = dt.strftime("%Y-%m")
-            monthly[ym] = monthly.get(ym, 0) + 1
-
-    # Build sorted month lines (newest first), cap at 36 months to stay concise
-    month_lines: list[str] = []
-    for ym in sorted(monthly, reverse=True)[:36]:
-        yr, mo = int(ym[:4]), int(ym[5:])
-        month_name = datetime.date(yr, mo, 1).strftime("%b %Y")
-        month_lines.append(f"  {ym} ({month_name}): {monthly[ym]} tickets")
-
-    # ── Priority distribution ─────────────────────────────────────────────
-    prio_counts: dict[str, int] = {}
-    for t in tickets:
-        p = (t.get("priority") or "unknown").strip().upper()
-        prio_counts[p] = prio_counts.get(p, 0) + 1
-
-    # ── Status breakdown ──────────────────────────────────────────────────
-    status_counts: dict[str, int] = {}
-    for t in tickets:
-        s = (t.get("status") or "unknown").strip().lower()
-        status_counts[s] = status_counts.get(s, 0) + 1
-
-    # ── Date range and cluster count ──────────────────────────────────────
-    dates = sorted(filter(None, (_ticket_date(t) for t in tickets)))
-    date_range = f"{dates[0][:10]} → {dates[-1][:10]}" if dates else "unknown"
-
-    all_cluster_ids: set[str] = set()
-    for t in tickets:
-        for cid in _ticket_cluster_ids(t):
-            all_cluster_ids.add(cid)
-
-    # ── Rolling window counts (exact, based on TODAY) ─────────────────────
-    def _days_ago(t: dict) -> int | None:
-        dt = _parse_ticket_date(t)
-        return (today_dt - dt).days if dt else None
-
-    window_7  = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 7))
-    window_30 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 30))
-    window_60 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 60))
-    window_90 = sum(1 for t in tickets if (_days_ago(t) is not None and _days_ago(t) <= 90))
-
-    # ── 10 most recent tickets ────────────────────────────────────────────
-    recent_lines = [
-        f"  #{t.get('ticket_id','?')} [{(t.get('priority') or '?').upper()}|{t.get('status','?')}] "
-        f"{_ticket_date(t)[:10]} — {(t.get('subject') or '')[:80]}"
-        for t in sorted_by_date[:10]
-    ]
-
-    # ── Most recent ticket per priority level ─────────────────────────────
-    most_recent_by_prio: dict[str, dict] = {}
-    for t in sorted_by_date:
-        p = (t.get("priority") or "unknown").strip().upper()
-        if p not in most_recent_by_prio:
-            most_recent_by_prio[p] = t
-        if len(most_recent_by_prio) >= 6:
-            break
-    prio_recent_lines = [
-        f"  {p}: #{t.get('ticket_id','?')} on {_ticket_date(t)[:10]} — {(t.get('subject') or '')[:70]}"
-        for p, t in sorted(most_recent_by_prio.items())
-    ]
-
-    prio_str   = " | ".join(f"{k}: {v}" for k, v in sorted(prio_counts.items()))
-    status_str = " | ".join(f"{k}: {v}" for k, v in sorted(status_counts.items()))
-
-    lines = [
-        "### Dataset Summary",
-        "# Use this section for ALL time-based and count-based questions.",
-        "# TODAY is the reference point for 'last N months/weeks/days' calculations.",
-        f"TODAY:            {today_dt.strftime('%Y-%m-%d (%A)')}",
-        f"TOTAL TICKETS:    {len(tickets)}",
-        f"DATE RANGE:       {date_range}",
-        f"PRIORITY:         {prio_str}",
-        f"STATUS:           {status_str}",
-        f"UNIQUE CLUSTERS:  {len(all_cluster_ids)}",
-        "",
-        "### Rolling Window Counts (computed from TODAY — use these for 'last N days/weeks/months' questions)",
-        "# 'Last week' = 7 days. 'Last month' = 30 days. 'Last 2 months' = 60 days. 'Last quarter' = 90 days.",
-        f"  Last  7 days:  {window_7} tickets",
-        f"  Last 30 days:  {window_30} tickets",
-        f"  Last 60 days:  {window_60} tickets",
-        f"  Last 90 days:  {window_90} tickets",
-        "",
-        "### Most Recent Ticket Per Priority",
-        "# Use this to answer 'most recent P1/P2/P3/P4' questions accurately.",
-        *prio_recent_lines,
-        "",
-        "### Monthly Ticket Counts (calendar months, newest first)",
-        "# NOTE: These are CALENDAR month buckets, not rolling windows.",
-        "# 'Last month' in a rolling sense = Last 30 days above (not just this calendar month).",
-        "# Use Monthly Counts only when the question explicitly names a calendar month or quarter.",
-        *month_lines,
-        "",
-        "### 10 Most Recent Tickets — BACKGROUND REFERENCE ONLY",
-        "# These are dataset-wide background context. Do NOT use these IDs to answer",
-        "# 'what are the ticket IDs' questions — use only the Retrieved Ticket Context below.",
-        *recent_lines,
-    ]
-    return "\n".join(lines)
-
-
-def prefilter_for_query(question: str, tickets: list[dict]) -> tuple[list[dict], str]:
-    """
-    Prepare the ticket list for the LLM context window.
-
-    Philosophy: Python handles *structural* facts (sorting, explicit field
-    filters, hard N-limits, specific ticket ID lookups).  The LLM handles
-    *semantic* date interpretation — it already knows TODAY from the system
-    prompt and the monthly breakdown in build_dataset_stats.
-
-    What Python does here:
-    - Pins any explicitly mentioned ticket IDs (#NNNNN) to the front of
-      context so "summarize ticket #76205" always works regardless of mode.
-    - Always sorts newest-first so the LLM sees the most recent tickets first.
-    - Filters by priority when the question explicitly names one (P1/P2/etc.).
-    - Applies a hard N-limit only when a literal number is given ("last 5").
-
-    What Python does NOT do:
-    - Guess what "last 3 months" means in calendar days — the LLM uses
-      the monthly index and TODAY to compute that itself.
-
-    Returns (filtered_tickets, note_for_ui).
-    """
-    q = question.lower()
-    note_parts: list[str] = []
-
-    # ── Pin explicitly mentioned ticket IDs to front of context ──────────
-    mentioned_ids = _extract_ticket_ids(question)
-
-    # Always sort newest-first
-    sorted_all = sorted(tickets, key=lambda t: _ticket_date(t), reverse=True)
-
-    if mentioned_ids:
-        pinned  = [t for t in sorted_all if str(t.get("ticket_id", "")) in mentioned_ids]
-        rest    = [t for t in sorted_all if str(t.get("ticket_id", "")) not in mentioned_ids]
-        result  = pinned + rest
-        note_parts.append(f"pinned #{', #'.join(sorted(mentioned_ids))}")
-    else:
-        result = sorted_all
-
-    # ── Priority filter — explicit, unambiguous field ─────────────────────
-    prio_map = {"p1": "P1", "p2": "P2", "p3": "P3", "p4": "P4",
-                "priority 1": "P1", "priority 2": "P2", "priority 3": "P3",
-                "priority 4": "P4"}
-    matched_prios = [v for k, v in prio_map.items() if k in q]
-    if matched_prios and not mentioned_ids:
-        # Don't further filter when user asked about a specific ticket
-        result = [t for t in result
-                  if (t.get("priority") or "").strip().upper() in matched_prios]
-        note_parts.append(f"{'/'.join(matched_prios)}: {len(result)} tickets")
-
-    # ── Hard N-limit — only when a literal number is given ───────────────
-    m_lim = re.search(r"\b(?:last|top|first|recent|show)\s+(\d+)\b", q)
-    if m_lim and not mentioned_ids:
-        n = int(m_lim.group(1))
-        result = result[:n]
-        note_parts.append(f"limited to {n}")
-
-    note = "Context: " + ", ".join(note_parts) + " (sorted newest-first)" if note_parts else "sorted newest-first"
-    return result, note
-
-
-def compute_aggregations(question: str, tickets: list[dict]) -> str:
-    """
-    For questions that require counting, grouping, or time arithmetic,
-    compute the answer in Python and return it as a pre-computed block
-    the LLM can cite directly rather than reasoning from prose.
-    """
-    q = question.lower()
-    today = datetime.datetime.now()
-    lines: list[str] = []
-
-    # Cluster impact count
-    if any(k in q for k in ("cluster", "clusters", "how many cluster")):
-        all_cids: set[str] = set()
-        for t in tickets:
-            for cid in _ticket_cluster_ids(t):
-                all_cids.add(cid)
-        lines.append(f"UNIQUE CLUSTERS REFERENCED: {len(all_cids)}")
-        if all_cids and len(all_cids) <= 20:
-            lines.append("CLUSTER IDs: " + ", ".join(sorted(all_cids)))
-
-    # Time-to-resolution / longest open
-    if any(k in q for k in ("longest", "longest open", "time", "rca", "resolution", "how long")):
-        timed: list[tuple[datetime.timedelta, dict]] = []
-        for t in tickets:
-            created = _parse_ticket_date(t)
-            if not created:
-                continue
-            # Use solved/closed date if present, else today (still open)
-            closed_raw = (t.get("solved") or t.get("solved_at") or t.get("closed_at") or t.get("updated") or "").strip()
-            closed = None
-            if closed_raw:
-                closed = _parse_ticket_date({"created": closed_raw})
-            delta = (closed or today) - created
-            timed.append((delta, t))
-        if timed:
-            timed.sort(key=lambda x: x[0], reverse=True)
-            lines.append("\nTICKETS BY OPEN DURATION (longest first):")
-            for delta, t in timed[:10]:
-                days = delta.days
-                still = "" if (t.get("status") or "").lower() in ("solved", "closed") else " (still open)"
-                lines.append(
-                    f"  #{t.get('ticket_id','?')} [{(t.get('priority') or '?').upper()}] "
-                    f"{days}d{still} — {(t.get('subject') or '')[:60]}"
-                )
-
-    # Priority distribution over the filtered set
-    if any(k in q for k in ("priority", "p1", "p2", "p3", "how many")):
-        prio: dict[str, int] = {}
-        for t in tickets:
-            p = (t.get("priority") or "unknown").strip().upper()
-            prio[p] = prio.get(p, 0) + 1
-        if prio:
-            lines.append("\nPRIORITY DISTRIBUTION (this ticket set):")
-            for k, v in sorted(prio.items()):
-                lines.append(f"  {k}: {v}")
-
-    if not lines:
-        return ""
-    return "### Pre-computed Analysis\n" + "\n".join(lines) + "\n"
-
-
-def build_rag_context(
-    tickets: list[dict],
-    customer_name: str = "",
-    compact: bool = False,
-    filter_note: str = "",
-    snapshot_map: "dict[str, dict] | None" = None,
-) -> str:
-    """
-    Format a list of ticket dicts as a context block for the LLM system prompt.
-
-    Rendering depth is automatic:
-    - compact=True  → single line per ticket (fast, for large batch sweeps)
-    - ≤5 tickets    → deep-dive: full description, all comments, ticket_fields, tags
-    - >5 tickets    → standard: description capped at 1 500 chars, 8 comments × 600 chars
-    filter_note is shown in the header so the LLM knows what retrieval produced this set.
-    snapshot_map: {cluster_uuid: snapshot_doc} — when provided, topology is appended
-    after each ticket's cluster line so the LLM can answer topology questions.
-    """
-    header = "### Retrieved Ticket Context"
-    if customer_name:
-        header += f" — Customer: {customer_name}"
-    if filter_note:
-        header += f"\n# This set: {filter_note}. Answer questions using THESE tickets, not the stats summary above."
-    elif tickets:
-        header += f"\n# {len(tickets)} ticket(s) below — sorted newest-first."
-    lines = [header + "\n"]
-
-    deep = (not compact) and len(tickets) <= 5
-    _c2a = _get_cluster_to_app()   # resolve once per call, not per ticket
-
-    for t in tickets:
-        tid = t.get("ticket_id", "?")
-        cluster_ids = _ticket_cluster_ids(t)
-        # Append app name when known, e.g. "peuse1cbecpsd2000083 (MLE)"
-        _cluster_parts = []
-        for _cid in cluster_ids[:5]:
-            _app = _c2a.get(_cid, "")
-            _cluster_parts.append(f"{_cid} ({_app.upper()})" if _app else _cid)
-        cluster_str = ", ".join(_cluster_parts) if _cluster_parts else "—"
-
-        # ── Compute resolution date and time-taken (shared by compact + standard) ──
-        _created_str  = _ticket_date(t)[:10]                           # may be empty
-        _solved_raw   = (t.get("solved") or t.get("solved_at")
-                         or t.get("closed_at") or "").strip()
-        _resolved_str = _solved_raw[:10] if _solved_raw else ""
-        # Fall back to updated when ticket is closed but no explicit solved date
-        if not _resolved_str and t.get("status", "").lower() in ("closed", "solved"):
-            _resolved_str = (t.get("updated") or "").strip()[:10]
-        # Time-taken in days (only when both dates available)
-        _days_str = ""
-        if _created_str and _resolved_str:
-            try:
-                _c = datetime.datetime.strptime(_created_str, "%Y-%m-%d")
-                _r = datetime.datetime.strptime(_resolved_str, "%Y-%m-%d")
-                _days_str = f"{max(0, (_r - _c).days)}d"
+                if _scol is not None:
+                    _sclust.close()
             except Exception:
                 pass
 
-        # ── Application label (shared by compact + standard) ─────────────────
-        # Derive from cluster→app map so hostname-only subjects get labelled too
-        _app_labels = list({
-            _c2a[_cid].upper()
-            for _cid in cluster_ids
-            if _c2a.get(_cid)
-        })
-        # Fallback: analytics-enriched labels stored on the ticket document
-        if not _app_labels:
-            _score_t = t.get("score") or {}
-            _analytics_labels = _score_t.get("analytics_app_labels") or []
-            if _analytics_labels:
-                _app_labels = [str(lbl).upper() for lbl in _analytics_labels]
-        _app_str = ", ".join(sorted(_app_labels)) if _app_labels else ""
-
-        if compact:
-            desc = (t.get("description") or "")[:200].replace("\n", " ")
-            _app_tag = f"[Application: {_app_str}]" if _app_str else "[Application: ?]"
-            _score_c   = t.get("score") or {}
-            _summary_c = (
-                t.get("summary_text")
-                or t.get("interaction_summary")
-                or _score_c.get("interaction_summary")
-                or ""
-            ).strip()
-            _compact_line = (
-                f"#{tid} [{(t.get('priority') or '?').upper()}|{t.get('status','?')}] "
-                f"{_app_tag} requester:{t.get('requester','?')} "
-                f"created:{_created_str or '?'} resolved:{_resolved_str or '?'} "
-                f"time:{_days_str or '?'} assignee:{t.get('assignee','?')} "
-                f"clusters:{cluster_str} — {t.get('subject','N/A')}"
-            )
-            # Append compact topology note when snapshot_topology is available
-            _topo_c = t.get("snapshot_topology") or {}
-            if isinstance(_topo_c, str):
-                try:
-                    _topo_c = json.loads(_topo_c)
-                except Exception:
-                    _topo_c = {}
-            if _topo_c and (_topo_c.get("total_nodes") or _topo_c.get("data_nodes") or _topo_c.get("cb_version")):
-                _tv   = _topo_c.get("cb_version") or ""
-                _tn   = _topo_c.get("total_nodes") or _topo_c.get("node_count") or "?"
-                _tbc  = _topo_c.get("bad_count") or len(_topo_c.get("bad_items") or [])
-                _twc  = _topo_c.get("warn_count") or len(_topo_c.get("warn_items") or [])
-                _tram = _topo_c.get("ram_per_node_mib")
-                _tcpu = _topo_c.get("cpus_per_node")
-                _snap_note = f" [Snap: {_tn}nodes CB={(_tv or '?')[:12]} bad={_tbc} warn={_twc}"
-                if _tram:
-                    _snap_note += f" RAM/node={round(int(_tram)/1024)}GB"
-                if _tcpu:
-                    _snap_note += f" CPU/node={_tcpu}"
-                _snap_note += "]"
-                _compact_line += _snap_note
-            _cbses_c = t.get("cbses") or []
-            _jiras_c = t.get("jira_issues") or []
-            if _cbses_c:
-                _compact_line += f" | CBSEs: {', '.join(_cbses_c) if isinstance(_cbses_c, list) else _cbses_c}"
-            if _jiras_c:
-                _compact_line += f" | Jira: {', '.join(_jiras_c) if isinstance(_jiras_c, list) else _jiras_c}"
-            if _summary_c:
-                _compact_line += f" | Summary: {_summary_c[:300].replace(chr(10), ' ')}"
-            elif desc:
-                _compact_line += f" — {desc}"
-            lines.append(_compact_line)
-            continue
-
-        # ── Header fields (standard / deep modes) ────────────────────────────
-        _subj_line = f"**Ticket #{tid}** — {t.get('subject', 'N/A')}"
-        if _app_str:
-            _subj_line += f"  [Application: {_app_str}]"
-        lines.append(_subj_line)
-        lines.append(
-            f"Priority: {(t.get('priority') or '?').upper()} | Status: {t.get('status','?')} "
-            f"| Created: {_created_str or '?'} | Resolved: {_resolved_str or '?'} "
-            f"| Time-taken: {_days_str or '?'} | Assignee: {t.get('assignee','?')}"
+        job["status"]      = "done"
+        job["phase"]       = None
+        job["finished_at"] = time.time()
+        _new_n = job.get("new_count", 0)
+        _new_label = f"{_new_n} new + " if _new_n else ""
+        summary = (
+            f"Done — {_new_label}{ok}/{total} tickets updated, "
+            f"{job.get('enriched', 0)} enriched with topology, "
+            f"{job['embedded']} embedded, {job['scored']} scored"
+            + (f", {skipped} skipped" if skipped else "")
+            + (f", {job['errors']} errors" if job["errors"] else "")
         )
-        lines.append(f"Requester: {t.get('requester','?')} | Clusters: {cluster_str}")
+        job["last_message"] = summary
+        _set_op(summary, 1.0, done=True)
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
 
-        # ── Snapshot topology (when available) ────────────────────────────────
-        # Primary: external snapshot_map (fetched from snapshots collection).
-        # Fallback: snapshot_topology stored directly on the ticket doc — populated
-        # by the Enrich pipeline step and authoritative for the linked snapshot.
-        def _render_topo_snap(snap: dict, label: str = "Snapshot") -> None:
-            _topo = snap.get("topology") or {}
-            def _f(key: str):
-                return snap.get(key) or _topo.get(key)
-            _svc_parts = []
-            for _svc in ("data", "index", "query", "fts", "eventing", "analytics"):
-                _n = _f(f"{_svc}_nodes") or 0
-                if _n:
-                    _svc_parts.append(f"{_n} {_svc}")
-            _nodes   = _f("total_nodes") or _f("node_count") or "?"
-            _vers    = _f("cb_version") or ""
-            _buckets = _f("bucket_names") or []
-            _ram_mib = _f("ram_per_node_mib")
-            _cpus    = _f("cpus_per_node")
-            _groups  = _f("server_groups") or []
-            _afo     = _f("auto_failover_seconds")
-            _topo_line = (
-                f"  {label} [{(snap.get('date') or '?')[:10]}]: "
-                f"Cluster={snap.get('cluster_name') or '?'} | "
-                f"Nodes={_nodes} ({', '.join(_svc_parts) if _svc_parts else '?'}) | "
-                f"CB={_vers or '?'}"
-            )
-            if _ram_mib:
-                _topo_line += f" | RAM/node={round(int(_ram_mib)/1024)}GB"
-            if _cpus:
-                _topo_line += f" | CPU/node={_cpus}"
-            if _groups:
-                _topo_line += f" | ServerGroups={len(_groups)}({','.join(str(g) for g in _groups[:4])})"
-            if _afo:
-                _topo_line += f" | AutoFailover={_afo}s"
-            _warns = _f("warn_items") or []
-            _bads  = _f("bad_items")  or []
-            if _bads:
-                _topo_line += f" | Issues({len(_bads)}): {', '.join(str(b) for b in _bads[:5])}"
-            if _warns:
-                _topo_line += f" | Warnings({len(_warns)}): {', '.join(str(w) for w in _warns[:5])}"
-            if _buckets:
-                _topo_line += f" | Buckets: {', '.join(str(b) for b in _buckets[:6])}"
-            lines.append(_topo_line)
-
-        _topo_rendered = False
-        if snapshot_map and cluster_ids:
-            for _cid in cluster_ids[:3]:
-                _snap = snapshot_map.get(_cid)
-                if _snap and (_snap.get("node_count") or _snap.get("cb_version")):
-                    _render_topo_snap(_snap)
-                    _topo_rendered = True
-
-        # Fallback: use snapshot_topology stored on the ticket itself
-        if not _topo_rendered:
-            _topo_inline = t.get("snapshot_topology") or {}
-            if isinstance(_topo_inline, str):
-                try:
-                    _topo_inline = json.loads(_topo_inline)
-                except Exception:
-                    _topo_inline = {}
-            if _topo_inline and (
-                _topo_inline.get("total_nodes") or _topo_inline.get("node_count")
-                or _topo_inline.get("data_nodes") or _topo_inline.get("cb_version")
-            ):
-                _render_topo_snap(_topo_inline, label="Cluster Snapshot")
-
-        # ── Tags ──────────────────────────────────────────────────────────────
-        if t.get("tags"):
-            lines.append(f"Tags: {t['tags']}")
-
-        # ── Custom ticket fields (CB version, cluster info, etc.) ─────────────
-        tf = _parse_ticket_fields(t)
-        if tf:
-            tf_pairs = [f"{k}: {v}" for k, v in tf.items() if v and str(v).strip()]
-            if tf_pairs:
-                lines.append("Fields: " + " | ".join(tf_pairs[:20 if deep else 8]))
-
-        # ── Escalations / CBSEs / Jira / snapshots ────────────────────────────
-        if t.get("escalations"):
-            lines.append(f"Escalations: {str(t['escalations'])[:500]}")
-        _cbses_r = t.get("cbses")
-        if _cbses_r:
-            _cbses_str = ", ".join(_cbses_r) if isinstance(_cbses_r, list) else str(_cbses_r)
-            lines.append(f"CBSEs: {_cbses_str}")
-        _jira_r = t.get("jira_issues")
-        if _jira_r:
-            _jira_str_r = ", ".join(_jira_r) if isinstance(_jira_r, list) else str(_jira_r)
-            lines.append(f"Jira Issues: {_jira_str_r}")
-        if deep and t.get("snapshots"):
-            lines.append(f"Snapshots: {str(t['snapshots'])[:500]}")
-
-        # ── AI summary (preferred) or raw description ────────────────────────
-        # Prefer Phase 2a summary_text (full-thread LLM narrative) over the
-        # older interaction_summary (scoring by-product, closure-message only).
-        _score_s  = t.get("score") or {}
-        _summary  = (
-            t.get("summary_text")
-            or t.get("interaction_summary")
-            or _score_s.get("interaction_summary")
-            or ""
-        ).strip()
-        if _summary:
-            lines.append(f"Summary: {_summary}")
-        if t.get("description"):
-            desc_limit = None if deep else 1_500
-            desc = t["description"] if deep else t["description"][:1_500]
-            # In standard mode show description only when no summary exists,
-            # or always in deep-dive mode for full fidelity.
-            if deep or not _summary:
-                lines.append(f"Description:\n{desc}")
-
-        # ── Comments ─────────────────────────────────────────────────────────
-        comments_raw = t.get("comments")
-        if comments_raw:
-            try:
-                comments = json.loads(comments_raw) if isinstance(comments_raw, str) else comments_raw
-                comments = sorted(comments, key=lambda c: c.get("timestamp") or "")
-                max_comments = len(comments) if deep else 8
-                body_limit   = None          if deep else 600
-                for c in comments[:max_comments]:
-                    body = (c.get("body") or "").strip()
-                    if not body:
-                        continue
-                    body = body if deep else body[:600]
-                    lines.append(f"  [{c.get('timestamp','')}] {c.get('author','')}: {body}")
-            except Exception:
-                pass
-
-        lines.append("")
-
-    lines.append("--- END CONTEXT ---")
-    return "\n".join(lines)
+    except Exception as exc:
+        job["status"]      = "error"
+        job["phase"]       = None
+        job["finished_at"] = time.time()
+        job["last_message"] = f"Fatal error: {exc}"
+        _job_fail(job, "fatal", exc)
+        _OP_STATUS.update({"op": None, "status": str(exc), "progress": 0.0, "done": True})
+        _persist_job_state(job, cb_url, bucket, username, password, use_tls, scope, collection)
+        _persist_failure_log(job, cb_url, bucket, username, password, use_tls, scope)
+        _persist_job_run(job, cb_url, bucket, username, password, use_tls, scope, collection, conclude=True)
 
 
-SYSTEM_PROMPT_TEMPLATE = """\
-You are a senior Couchbase support analyst. Today is {today}.
-
-━━ RESPONSE FORMAT RULES (always follow these) ━━
-
-RULE 1 — DIRECT ANSWER FIRST.
-Open every response with a single sentence that directly answers the question.
-Example: "There were 4 high-priority tickets in the last month."
-Never start with a preamble, caveat, or "Based on the data…".
-
-RULE 2 — USE MARKDOWN TABLES for ANY response listing 2 or more tickets.
-Always render a properly formatted markdown table — never use bullet lists when a table fits.
-Standard columns: Ticket # | Subject | Priority | Status | Created | Resolved | Days | Notes
-Add columns as relevant (e.g., Cluster, Org, Assignee, Reporter). Omit columns where ALL values would be "?".
-The "Created", "Resolved", and "Days" columns come directly from the ticket context header lines:
-  Created = the "Created:" field   Resolved = the "Resolved:" field   Days = the "Time-taken:" field
-The "Reporter" (also called Requester or Submitter) comes from the "Requester:" line in the ticket context.
-  "Requester:", "Reporter:", and "Submitted by:" all refer to the same person — the one who opened the ticket.
-  When the user asks for reporter, submitter, or who raised the ticket, use the "Requester:" field value.
-Use "?" only when a field is genuinely absent — never say "Date Unavailable" or "N/A".
-Example:
-| Ticket # | Subject | Priority | Status | Created | Resolved | Days | Notes |
-|---|---|---|---|---|---|---|---|
-| #12345 | SDK crash on connect | P1 | Open | 2026-04-10 | ? | ? | Memory leak suspected |
-| #12346 | Rebalance hung | P2 | Closed | 2026-03-01 | 2026-03-15 | 14 | Fixed via rebalance retry |
-
-RULE 3 — APPLICATION MEMBERSHIP.
-Each ticket header may include [Application: NAME] derived from its cluster IDs.
-A ticket IS an MLE ticket, SafeKey ticket, etc. if its header shows [Application: MLE] or [Application: SAFEKEY],
-even when the application name does not appear in the subject line.
-Always count and include ALL tickets for an application regardless of whether the name appears in the subject.
-
-RULE 4 — SCALE DETAIL TO QUESTION TYPE.
-
-▸ COUNT / SIMPLE FACTUAL ("how many", "when was", "who is")
-  Direct answer sentence, then a markdown table if any items exist.
-  Nothing more unless the user asks to expand.
-
-▸ LIST / SURVEY ("show me", "what are the recent", "list all P1s")
-  Direct answer sentence stating the count, then a markdown table with ALL retrieved tickets.
-  NEVER use bullet points for ticket lists — always use the markdown table format from RULE 2.
-
-▸ SPECIFIC TICKET DEEP-DIVE ("tell me about #NNNNN", "summarise ticket X",
-  "expand on MLE", "what happened with SafeKey")
-  Direct answer sentence, then structured analysis:
-  1. **Issue** — what problem is reported, in plain language
-  2. **Root Cause** — what the comments and description reveal
-  3. **Current State** — what has been tried; what is resolved vs still open
-  4. **Recommended Next Actions** — concrete steps (diagnostics, settings, escalation triggers,
-     known Couchbase fixes) based on ticket content and your expertise
-  5. **Related Patterns** — if other tickets in context share the same root cause, note them
-
-▸ AGGREGATION / TREND / COMPARISON ("frequency of", "top issues", "compare clusters")
-  Direct answer sentence, then:
-  - Summary paragraph (2–4 sentences on the dominant pattern)
-  - Markdown table of top findings (issue | ticket count | example ticket IDs)
-  - One sentence on recommended focus area
-
-━━ DATA RULES ━━
-- Use ONLY the ticket data provided below.
-- For rolling time questions ("last 30 days", "last month", "past week"):
-  use the Rolling Window Counts in the Dataset Summary — NOT the calendar month buckets.
-  "Last month" = last 30 days. "Last week" = last 7 days.
-- For calendar month questions ("in April", "during Q1", "in March 2026"):
-  use the Monthly Ticket Counts table.
-- For counts and cluster IDs: use Dataset Summary values; do not invent numbers.
-- TICKET IDs: when the user asks "what are the ticket IDs" or "list the tickets",
-  use ONLY the ticket IDs from the Retrieved Ticket Context section below —
-  NEVER use the "10 Most Recent Tickets" background list in the Dataset Summary
-  unless the question is explicitly about the most recent tickets in the whole dataset.
-- KEYWORD COUNTS: when counting tickets "related to X", "about X", or "from X" for any
-  application, product, component, or topic name the user mentions, count ONLY tickets
-  whose subject or description explicitly contains that term — do not count all tickets
-  in context as matching simply because they appear in the same retrieval result.
-- Cite ticket IDs (#NNNNN) when referencing specific tickets.
-- If the answer genuinely requires data absent from the context, say so in one sentence.
-
-{stats}
-
-{context}
-"""
-
-# ── Deep Reasoning pipeline prompts ──────────────────────────────────────────
-
-CLASSIFY_PROMPT = """\
-Classify this support analysis question into exactly ONE of these categories:
-FACTUAL      – asks about a specific ticket, event, or detail
-AGGREGATION  – asks for counts, totals, or summaries across many tickets
-RANKING      – asks to rank, sort, find the most/least/longest/highest
-TREND        – asks about patterns over time or across dates
-COMPARISON   – asks to compare two clusters, periods, or groups
-OPEN         – general or open-ended question not fitting above
-
-Question: {question}
-
-Reply with ONLY the category name, nothing else."""
-
-EXTRACT_PROMPT = """\
-You are a structured data extractor. Given the question and ticket data, extract the \
-most relevant ticket fields as a JSON array. Each element should be an object with these \
-keys (omit keys that have no value): ticket_id, subject, status, priority, cluster_id, \
-created_at, resolution_time_days, description_snippet (≤80 chars).
-
-Question: {question}
-
-Tickets (JSON):
-{tickets_json}
-
-Reply ONLY with a valid JSON array, no explanation."""
-
-RERANK_PROMPT = """\
-Score each ticket 0–10 for how relevant it is to answering this question. \
-Higher = more relevant. Consider subject, status, priority, cluster, and dates.
-
-Question: {question}
-
-{ticket_summaries}
-
-Reply ONLY with lines in this exact format (one per ticket):
-<ticket_id>: <integer 0-10>"""
-
-CRITIQUE_PROMPT = """\
-Review this draft answer against the question and data.
-
-RULES:
-- Summing monthly counts from the Monthly Ticket Counts table is VALID — not invented.
-- Using TODAY's date to compute "last N months/weeks" is VALID — not invented.
-- Citing a ticket ID that appears in the data is VALID.
-- Only flag as wrong if a number or ticket ID has NO basis anywhere in the data.
-
-If the answer is acceptable, output the single word: APPROVED
-If it has a clear factual error, output ONLY the corrected answer — no explanation, \
-no preamble, no reasoning. One or two sentences maximum.
-
-Question: {question}
-
-Data (excerpt):
-{context}
-
-Draft:
-{answer}"""
+_PROFILE_SCOPE      = "chat"
+_PROFILE_COLLECTION = "profiles"
 
 
-def classify_query(
-    question: str,
-    provider: str, model: str, api_key: str, base_url: str,
-) -> str:
-    """Return one of: FACTUAL AGGREGATION RANKING TREND COMPARISON OPEN."""
+def _ensure_profiles_collection(cluster, bucket_name: str) -> None:
     try:
-        resp = call_llm(
-            [{"role": "user", "content": CLASSIFY_PROMPT.format(question=question)}],
-            provider, model, api_key, base_url,
-            max_tokens=16, no_think=True,
-        )
-        word = resp.strip().upper().split()[0] if resp.strip() else "OPEN"
-        valid = {"FACTUAL", "AGGREGATION", "RANKING", "TREND", "COMPARISON", "OPEN"}
-        return word if word in valid else "OPEN"
-    except Exception:
-        return "OPEN"
-
-
-def extract_ticket_fields(
-    question: str,
-    tickets: list[dict],
-    provider: str, model: str, api_key: str, base_url: str,
-) -> list[dict]:
-    """First LLM pass: extract structured fields from raw ticket dicts.
-
-    Returns the parsed list or falls back to the original tickets on failure.
-    """
-    if not tickets:
-        return tickets
-    # Send at most 40 tickets to keep prompt short
-    sample = tickets[:40]
-    tickets_json = json.dumps([
-        {k: t.get(k) for k in ("ticket_id", "subject", "status", "priority",
-                                "cluster_id", "created_at", "description")}
-        for t in sample
-    ], ensure_ascii=False)
-    try:
-        raw = call_llm(
-            [{"role": "user", "content": EXTRACT_PROMPT.format(
-                question=question, tickets_json=tickets_json)}],
-            provider, model, api_key, base_url,
-            max_tokens=4096, no_think=True,
-        )
-        # Strip markdown fences if present
-        clean = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
-        clean = re.sub(r"\n?```$", "", clean.strip())
-        extracted = json.loads(clean)
-        if isinstance(extracted, list) and extracted:
-            return extracted
+        from couchbase.management.collections import CollectionSpec  # type: ignore
+        cm = cluster.bucket(bucket_name).collections()
+        existing = {s.name: {c.name for c in s.collections} for s in cm.get_all_scopes()}
+        if _PROFILE_SCOPE not in existing:
+            cm.create_scope(_PROFILE_SCOPE)
+            existing[_PROFILE_SCOPE] = set()
+        if _PROFILE_COLLECTION not in existing[_PROFILE_SCOPE]:
+            cm.create_collection(CollectionSpec(_PROFILE_COLLECTION, scope_name=_PROFILE_SCOPE))
+        cluster.query(
+            f"CREATE PRIMARY INDEX IF NOT EXISTS "
+            f"ON `{bucket_name}`.`{_PROFILE_SCOPE}`.`{_PROFILE_COLLECTION}`"
+        ).execute()
     except Exception:
         pass
-    return sample
 
 
-def rerank_tickets(
-    question: str,
-    tickets: list[dict],
-    provider: str, model: str, api_key: str, base_url: str,
-    top_k: int = 10,
-) -> list[dict]:
-    """Second LLM pass: score each ticket for relevance; return top_k reranked.
-
-    Sends one-line summaries only (no full descriptions) to keep the prompt minimal.
-    """
-    if not tickets:
-        return tickets
-    summaries = []
-    for t in tickets:
-        tid  = t.get("ticket_id") or t.get("ticket_id", "?")
-        subj = (t.get("subject") or "")[:80]
-        pri  = t.get("priority") or "?"
-        sta  = t.get("status")   or "?"
-        cid  = t.get("cluster_id") or t.get("cluster_name") or "?"
-        dt   = (t.get("created_at") or "")[:10]
-        summaries.append(f"{tid}: [{pri}] [{sta}] {subj} | cluster={cid} date={dt}")
-
-    prompt = RERANK_PROMPT.format(
-        question=question,
-        ticket_summaries="\n".join(summaries),
-    )
+def _record_customer_access(
+    org: str,
+    cb_url: str, bucket: str, username: str, password: str,
+    use_tls: bool, profile_user: str,
+) -> None:
+    """Increment access_count and update last_accessed_at for org in the user profile."""
+    if not _CB_AVAILABLE or not cb_url or not org:
+        return
     try:
-        raw = call_llm(
-            [{"role": "user", "content": prompt}],
-            provider, model, api_key, base_url,
-            max_tokens=len(tickets) * 8 + 64, no_think=True,
-        )
-        scores: dict[str, float] = {}
-        for line in raw.strip().splitlines():
-            m = re.match(r"(\S+?):\s*(\d+)", line.strip())
-            if m:
-                scores[m.group(1)] = float(m.group(2))
-
-        def _score(t):
-            tid = str(t.get("ticket_id", ""))
-            return scores.get(tid, 0.0)
-
-        ranked = sorted(tickets, key=_score, reverse=True)
-        return ranked[:top_k]
-    except Exception:
-        return tickets[:top_k]
-
-
-def self_critique_answer(
-    question: str,
-    answer: str,
-    context: str,
-    provider: str, model: str, api_key: str, base_url: str,
-) -> str:
-    """Third LLM pass: verify correctness; return revised answer or original.
-
-    If the model replies 'APPROVED', the original answer is returned unchanged.
-    """
-    if not answer.strip():
-        return answer
-    try:
-        resp = call_llm(
-            [{"role": "user", "content": CRITIQUE_PROMPT.format(
-                question=question, context=context[:3000], answer=answer)}],
-            provider, model, api_key, base_url,
-            max_tokens=2048, no_think=True,
-        )
-        if resp.strip().startswith("APPROVED"):
-            return answer
-        return resp.strip() or answer
-    except Exception:
-        return answer
-
-
-def run_deep_reasoning(
-    question: str,
-    tickets: list[dict],
-    today_str: str,
-    stats_block: str,
-    provider: str, model: str, api_key: str, base_url: str,
-    progress_cb: Callable[[str], None] | None = None,
-) -> str:
-    """Multi-stage pipeline for small/low-density models.
-
-    Stage routing by query type:
-
-      AGGREGATION / TREND
-        1. Classify  2. Pre-filter+aggregate (Python)  3. Synthesize
-        → skip extract, rerank, and self-critique: Python numbers are already
-          correct; critique on numeric answers causes over-analysis loops.
-
-      RANKING
-        1. Classify  2. Pre-filter+aggregate (Python)  3. Rerank  4. Synthesize
-        → skip extract and self-critique: rerank gives us the right order.
-
-      FACTUAL / COMPARISON / OPEN
-        1. Classify  2. Pre-filter  3. Extract  4. Rerank  5. Synthesize
-        6. Self-critique (binary only — approves calendar math as valid)
-    """
-    def _log(msg: str):
-        if progress_cb:
-            progress_cb(msg)
-
-    # ── Stage 1: Classify ────────────────────────────────────────────────
-    _log("Deep Reasoning — Stage 1: classifying query …")
-    q_type = classify_query(question, provider, model, api_key, base_url)
-    _log(f"Deep Reasoning — query type: {q_type}")
-
-    # ── Stage 2: Python pre-filter + aggregation (always free) ──────────
-    context_tickets, _pf_note = prefilter_for_query(question, tickets)
-    _log(f"Deep Reasoning — Stage 2: {len(context_tickets)} tickets ({_pf_note})")
-    agg_block = compute_aggregations(question, context_tickets)
-
-    type_hints = {
-        "FACTUAL":     "Focus on exact details: ticket ID, date, cluster, resolution.",
-        "AGGREGATION": "Narrate the pre-computed counts from the Dataset Summary and "
-                       "Pre-computed Analysis. Do NOT recount manually.",
-        "RANKING":     "List items in the order shown in Pre-computed Analysis.",
-        "TREND":       "Describe the pattern using the Monthly Ticket Counts table. "
-                       "Sum months as needed — that is valid, not invented.",
-        "COMPARISON":  "Compare the two groups side-by-side using the data provided.",
-        "OPEN":        "Give a concise answer grounded in the ticket data.",
-    }
-
-    # ── AGGREGATION / TREND: Python has the answer — just synthesize ─────
-    if q_type in ("AGGREGATION", "TREND"):
-        _log("Deep Reasoning — Stage 3: synthesizing (aggregation fast-path) …")
-        context_block = (agg_block + "\n" if agg_block else "") + \
-                        build_rag_context(context_tickets[:20], "", compact=True)
-        system_msg = SYSTEM_PROMPT_TEMPLATE.format(
-            today=today_str, stats=stats_block, context=context_block,
-        ) + f"\n\nQuery type: {q_type}. {type_hints[q_type]}"
-        answer = call_llm(
-            [{"role": "system", "content": system_msg},
-             {"role": "user",   "content": question}],
-            provider, model, api_key, base_url, max_tokens=1024,
-        )
-        _log(f"Deep Reasoning — complete (3 stages, {q_type} fast-path)")
-        return answer
-
-    # ── RANKING: pre-compute + rerank, then synthesize ───────────────────
-    if q_type == "RANKING":
-        _log("Deep Reasoning — Stage 3: reranking …")
-        top_tickets = rerank_tickets(
-            question, context_tickets, provider, model, api_key, base_url, top_k=12
-        )
-        _log("Deep Reasoning — Stage 4: synthesizing …")
-        context_block = (agg_block + "\n" if agg_block else "") + \
-                        build_rag_context(top_tickets, "", compact=True)
-        system_msg = SYSTEM_PROMPT_TEMPLATE.format(
-            today=today_str, stats=stats_block, context=context_block,
-        ) + f"\n\nQuery type: RANKING. {type_hints['RANKING']}"
-        answer = call_llm(
-            [{"role": "system", "content": system_msg},
-             {"role": "user",   "content": question}],
-            provider, model, api_key, base_url, max_tokens=2048,
-        )
-        _log("Deep Reasoning — complete (4 stages, RANKING path)")
-        return answer
-
-    # ── FACTUAL / COMPARISON / OPEN: full pipeline ───────────────────────
-    _log("Deep Reasoning — Stage 3: extracting structured fields …")
-    extract_ticket_fields(question, context_tickets, provider, model, api_key, base_url)
-
-    _log("Deep Reasoning — Stage 4: reranking by relevance …")
-    top_tickets = rerank_tickets(
-        question, context_tickets, provider, model, api_key, base_url, top_k=12
-    )
-
-    _log("Deep Reasoning — Stage 5: synthesizing answer …")
-    context_block = (agg_block + "\n" if agg_block else "") + \
-                    build_rag_context(top_tickets, "", compact=True)
-    system_msg = SYSTEM_PROMPT_TEMPLATE.format(
-        today=today_str, stats=stats_block, context=context_block,
-    ) + f"\n\nQuery type: {q_type}. {type_hints.get(q_type, '')}"
-    answer = call_llm(
-        [{"role": "system", "content": system_msg},
-         {"role": "user",   "content": question}],
-        provider, model, api_key, base_url, max_tokens=4096,
-    )
-
-    _log("Deep Reasoning — Stage 6: self-critique …")
-    answer = self_critique_answer(
-        question, answer, context_block, provider, model, api_key, base_url
-    )
-
-    _log(f"Deep Reasoning — complete (6 stages, {q_type} path)")
-    return answer
-
-
-def _build_memory_section(memories: list[dict]) -> str:
-    """Format a list of chat memory dicts into a ### Previous Session Memory block."""
-    if not memories:
-        return ""
-    lines = ["### Previous Session Memory\n"
-             "The following summaries are from prior chat sessions with this ticket corpus. "
-             "Use them for continuity but treat the ticket context above as authoritative.\n"]
-    for m in memories:
-        q   = (m.get("question") or "").strip()
-        ans = (m.get("answer_summary") or "").strip()
-        ts  = (m.get("created_at") or "").strip()
-        if q and ans:
-            ts_part = f" [{ts}]" if ts else ""
-            lines.append(f"**Q{ts_part}:** {q}\n**A (summary):** {ans}\n")
-    return "\n".join(lines)
-
-
-# Follow-up pronouns and phrases that indicate the question depends on prior context.
-# If any of these appear at the start or as a dominant pattern the rewriter fires.
-_FOLLOWUP_TRIGGERS = re.compile(
-    r"\b(of (those|them|the(se|m)?|those issues|those tickets|the issues?|the tickets?)"
-    r"|out of|from those|from them|among those|among them"
-    r"|how many (of|were|had|have|did|do)"
-    r"|which (of|ones|tickets?|issues?)"
-    r"|what (about|were|was|is|are) (those|them|the)"
-    r"|same (tickets?|issues?|period|year|month)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def contextualize_question(
-    question: str,
-    chat_history: list[dict],
-    provider: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-) -> str:
-    """Rewrite a follow-up question to be self-contained using recent conversation history.
-
-    For example:
-      History: "how many tickets in 2026?" → "31 tickets in 2026..."
-      Question: "out of those, how many had CBSEs?"
-      → "Out of the 31 tickets opened in 2026, how many had CBSEs or Jira issue references?"
-
-    Only fires when the question contains pronouns or phrases that reference prior context.
-    Returns the original question unchanged if the model is not configured or no history exists.
-    """
-    if not provider or not model or not chat_history:
-        return question
-    if not _FOLLOWUP_TRIGGERS.search(question):
-        return question
-
-    # Use last 4 messages (2 turns) — enough context without token bloat
-    recent = [m for m in chat_history[-4:] if m.get("role") in ("user", "assistant")]
-    if not recent:
-        return question
-
-    history_text = "\n".join(
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: "
-        f"{(m.get('content') or '')[:600]}"
-        for m in recent
-    )
-    prompt = (
-        "Given the conversation excerpt below, rewrite the LAST USER QUESTION so it is "
-        "fully self-contained: replace pronouns and vague references ('those', 'them', "
-        "'the issues opened', 'out of those', etc.) with the explicit date ranges, "
-        "application names, ticket IDs, or other context they refer to. "
-        "If the question is already unambiguous, return it unchanged. "
-        "Return ONLY the rewritten question — no explanation, no quotes, no preamble.\n\n"
-        f"Conversation:\n{history_text}\n\n"
-        f"Last user question: {question}"
-    )
-    try:
-        rewritten = call_llm(
-            [{"role": "user", "content": prompt}],
-            provider, model, api_key, base_url,
-            max_tokens=150,
-        ).strip().strip('"\'')
-        if rewritten and rewritten.lower() != question.lower():
-            print(f"[contextualize] '{question}' → '{rewritten}'")
-            return rewritten
-    except Exception as exc:
-        print(f"[contextualize] failed: {exc}")
-    return question
-
-
-def call_llm(
-    messages: list[dict],
-    provider: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-    max_tokens: int = 4096,
-    num_ctx: int | None = None,
-    no_think: bool = False,
-) -> str:
-    """Send a messages list to the selected provider and return the response text.
-
-    no_think — when True and provider is "ollama", uses the native /api/chat endpoint
-    with think=false instead of the OpenAI-compat path.  This is the only reliable way
-    to disable Qwen3/QwQ reasoning traces without prompt hacks.  Ignored for all other
-    providers.
-    """
-    if provider == "claude":
-        if not _ANTHROPIC_AVAILABLE:
-            raise RuntimeError("anthropic package not installed: venv/bin/pip install anthropic")
-        client = _anthropic_mod.Anthropic(api_key=api_key or None)
-        system   = next((m["content"] for m in messages if m["role"] == "system"), None)
-        user_msgs = [m for m in messages if m["role"] != "system"]
-        kwargs: dict = {"model": model, "max_tokens": max_tokens, "messages": user_msgs}
-        if system:
-            kwargs["system"] = system
-        resp = client.messages.create(**kwargs)
-        return resp.content[0].text
-
-    elif provider == "gemini":
-        if not _GEMINI_AVAILABLE:
-            raise RuntimeError(
-                "google-genai not installed: venv/bin/pip install google-genai"
-            )
-        client  = _genai_mod.Client(api_key=api_key)
-        system  = next((m["content"] for m in messages if m["role"] == "system"), None)
-        non_sys = [m for m in messages if m["role"] != "system"]
-        # google-genai expects role "model" not "assistant"
-        contents = [
-            {"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
-            for m in non_sys
-        ]
-        config = {"max_output_tokens": max_tokens}
-        if system:
-            config["system_instruction"] = system
-        resp = client.models.generate_content(model=model, contents=contents, config=config)
-        return resp.text
-
-    elif provider in ("ollama", "lmstudio"):
-        if not _OPENAI_AVAILABLE:
-            raise RuntimeError("openai package not installed: venv/bin/pip install openai")
-        default = "http://localhost:1234" if provider == "lmstudio" else "http://localhost:11434"
-
-        if no_think and provider == "ollama":
-            # Native Ollama /api/chat with think=false — the only reliable way to suppress
-            # Qwen3/QwQ reasoning traces (the OpenAI-compat path ignores this parameter).
-            # num_ctx is intentionally NOT passed here: forcing a context change via the
-            # native API causes Ollama to unload and reload the model, adding 2-3 minutes
-            # of dead time before the first token.  The model keeps whatever context it
-            # was loaded with; use the OpenAI-compat path if you need to change num_ctx.
-            base = (base_url or default).rstrip("/")
-            payload: dict = {
-                "model":    model,
-                "messages": messages,
-                "think":    False,
-                "stream":   False,
-                "options":  {"num_predict": max_tokens},
-            }
-            resp = requests.post(f"{base}/api/chat", json=payload, timeout=600, verify=False)
-            resp.raise_for_status()
-            return resp.json()["message"]["content"]
-
-        _timeout = _openai_mod.Timeout(
-            timeout=600.0, connect=180.0
-        ) if provider == "lmstudio" else None
-        client = _openai_mod.OpenAI(
-            api_key=api_key or "lmstudio",
-            base_url=_openai_base_url(base_url, default),
-            timeout=_timeout,
-        )
-        kwargs: dict = {"model": model, "messages": messages, "max_tokens": max_tokens}
-        # num_ctx is an Ollama-specific option; LM Studio context length is fixed at
-        # model load time and cannot be changed via API — sending it causes errors.
-        if num_ctx and provider == "ollama":
-            kwargs["extra_body"] = {"num_ctx": num_ctx}
-        resp = client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content
-
-    elif provider == "bedrock":
-        if not _BOTO3_AVAILABLE:
-            raise RuntimeError("boto3 not installed: venv/bin/pip install boto3")
-        # model  = e.g. "anthropic.claude-3-5-sonnet-20241022-v2:0"
-        # base_url is repurposed as the AWS region (e.g. "us-east-1")
-        region = base_url.strip() if base_url and base_url.strip() else "us-east-1"
-        client = _boto3_mod.client("bedrock-runtime", region_name=region)
-        system_text = next((m["content"] for m in messages if m["role"] == "system"), None)
-        converse_msgs = [
-            {"role": m["role"], "content": [{"text": m["content"]}]}
-            for m in messages if m["role"] in ("user", "assistant")
-        ]
-        kwargs: dict = {
-            "modelId": model,
-            "messages": converse_msgs,
-            "inferenceConfig": {"maxTokens": max_tokens},
-        }
-        if system_text:
-            kwargs["system"] = [{"text": system_text}]
-        resp = client.converse(**kwargs)
-        return resp["output"]["message"]["content"][0]["text"]
-
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider!r}")
-
-
-# ──────────────────────────── Phase 2b: Agent Tool Calling ───────────────────
-
-_AGENT_TOOLS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query_tickets",
-            "description": (
-                "Query support tickets from Couchbase using structured filters. "
-                "Returns a markdown table of matching tickets with key fields. "
-                "Use this to find, list, or analyze tickets matching specific criteria."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "organization": {
-                        "type": "string",
-                        "description": "Customer/organization name (partial match, case-insensitive).",
-                    },
-                    "cbse_only": {
-                        "type": "boolean",
-                        "description": "If true, only return tickets that have formal CBSE bug links.",
-                    },
-                    "jira_only": {
-                        "type": "boolean",
-                        "description": "If true, only return tickets that have formal Jira issue links.",
-                    },
-                    "cbse_id": {
-                        "type": "string",
-                        "description": "Specific CBSE ID to search for (e.g. 'MB-12345'). Partial match.",
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["P1", "P2", "P3", "P4", "URGENT", "HIGH", "NORMAL", "LOW"],
-                        "description": "Filter by ticket priority.",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["open", "pending", "solved", "closed", "hold"],
-                        "description": "Filter by ticket status.",
-                    },
-                    "date_from": {
-                        "type": "string",
-                        "description": "ISO date lower bound for ticket creation (e.g. '2024-01-01').",
-                    },
-                    "date_to": {
-                        "type": "string",
-                        "description": "ISO date upper bound for ticket creation (e.g. '2024-12-31').",
-                    },
-                    "keyword": {
-                        "type": "string",
-                        "description": "Text keyword to search in subject, description, and cluster names.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of tickets to return (default 50, max 200).",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "count_tickets",
-            "description": (
-                "Count support tickets matching the given filters. "
-                "Returns just the count. Prefer this over query_tickets when you "
-                "only need a total, not individual ticket details."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "organization": {"type": "string", "description": "Customer name (partial match)."},
-                    "cbse_only": {"type": "boolean", "description": "Only tickets with formal CBSE links."},
-                    "jira_only": {"type": "boolean", "description": "Only tickets with formal Jira links."},
-                    "priority": {
-                        "type": "string",
-                        "enum": ["P1", "P2", "P3", "P4", "URGENT", "HIGH", "NORMAL", "LOW"],
-                        "description": "Filter by priority.",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["open", "pending", "solved", "closed", "hold"],
-                        "description": "Filter by status.",
-                    },
-                    "date_from": {"type": "string", "description": "ISO date lower bound."},
-                    "date_to": {"type": "string", "description": "ISO date upper bound."},
-                    "keyword": {"type": "string", "description": "Text keyword to match in subject/description."},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_ticket",
-            "description": (
-                "Fetch full details for a single support ticket by its numeric ticket ID. "
-                "Returns description, comments, CBSEs, Jira issues, AI summary, data freshness, "
-                "and cluster topology from the linked snapshot — including node count, CB version, "
-                "service layout, bucket names, RAM per node, auto-failover setting, and health "
-                "(bad/warn item counts). Use this when the user asks about cluster configuration, "
-                "node count, topology, or any infrastructure details for a specific ticket."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticket_id": {
-                        "type": "string",
-                        "description": "The numeric ticket ID (e.g. '123456').",
-                    }
-                },
-                "required": ["ticket_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_data_freshness",
-            "description": (
-                "Check how recently ticket data was scraped from Supportal. "
-                "Use this whenever the user asks about 'current', 'live', 'latest', "
-                "or 'today's' status. Returns last_scraped_at age in hours and the "
-                "Supportal Analytics URL for manual live verification."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticket_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Ticket IDs to check freshness for (from a prior query_tickets call).",
-                    },
-                },
-                "required": ["ticket_ids"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "rescrape_customer_tickets",
-            "description": (
-                "Bulk re-scrape tickets for a customer from Supportal and update Couchbase. "
-                "Use when the user asks to refresh all tickets, update stale data, or rescrape "
-                "a customer's full ticket history. By default only scrapes tickets older than 4 hours. "
-                "Runs sequentially with a short delay between requests to avoid rate-limiting. "
-                "Returns a summary of how many succeeded, failed, or were skipped."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "customer": {
-                        "type": "string",
-                        "description": "Customer/organization name to rescrape. Defaults to the currently scoped customer.",
-                    },
-                    "stale_hours": {
-                        "type": "number",
-                        "description": "Only rescrape tickets not updated within this many hours (default 4). Set to 0 to force-rescrape all.",
-                    },
-                    "max_tickets": {
-                        "type": "integer",
-                        "description": "Safety cap on how many tickets to rescrape in one call (default 50, max 200).",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["open", "pending", "solved", "closed", "hold"],
-                        "description": "Only rescrape tickets with this status. Leave blank for all statuses.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "rescrape_ticket",
-            "description": (
-                "Re-fetch a SINGLE ticket directly from Supportal and update Couchbase "
-                "with the latest status, priority, comments, and metadata. Call once per "
-                "ticket — pass ONE ticket_id string per call. "
-                "To refresh all stale tickets for a customer at once use rescrape_customer_tickets instead."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticket_id": {
-                        "type": "string",
-                        "description": "A single numeric ticket ID, e.g. \"12345\". One call per ticket.",
-                    },
-                },
-                "required": ["ticket_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_chart",
-            "description": (
-                "Renders a real interactive chart in the chat UI. "
-                "MUST be called whenever the user asks for a chart, graph, bar chart, "
-                "pie chart, or any visualization — never substitute with text. "
-                "Supported types: bar, horizontal_bar, line, pie, donut. "
-                "For multi-series data pass series instead of labels+values."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chart_type": {
-                        "type": "string",
-                        "enum": ["bar", "horizontal_bar", "line", "pie", "donut"],
-                        "description": "Chart type.",
-                    },
-                    "title": {"type": "string", "description": "Chart title."},
-                    "labels": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Category labels (x-axis for bar/line, slice names for pie).",
-                    },
-                    "values": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "description": "Numeric values — one per label. Use for single-series charts.",
-                    },
-                    "series": {
-                        "type": "array",
-                        "description": "Multi-series data. Each item: {name, data: [numbers]}.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "data": {"type": "array", "items": {"type": "number"}},
-                            },
-                        },
-                    },
-                    "x_label": {"type": "string", "description": "X-axis label (bar/line only)."},
-                    "y_label": {"type": "string", "description": "Y-axis label (bar/line only)."},
-                },
-                "required": ["chart_type", "title"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_supportal_customers",
-            "description": (
-                "[LIVE / GLOBAL — hits Supportal Analytics API, not local Couchbase] "
-                "Returns every customer Supportal is aware of globally, with snapshot and "
-                "linked ticket counts. Use for questions like: 'how many customers get support?', "
-                "'what customers are in Supportal?', 'show me all customers globally', "
-                "'how many orgs does Couchbase support?'. "
-                "Do NOT use for questions about locally scraped data — use list_organizations for that. "
-                "Requires a valid session cookie in the saved profile."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sort_by": {
-                        "type": "string",
-                        "enum": ["name", "snapshots", "tickets"],
-                        "description": "Sort order: alphabetical by name, by snapshot count, or by linked ticket count. Default: name.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max customers to return (default 200).",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_supportal",
-            "description": (
-                "[LIVE / GLOBAL — hits Supportal Analytics API, not local Couchbase] "
-                "Run a SQL++ query against the live Supportal Analytics API. "
-                "Use for global/live questions not covered by other tools: snapshot details, "
-                "cluster configurations, version distributions, ticket-to-cluster mappings, "
-                "counts of customers/clusters/snapshots as seen by Supportal today. "
-                "Do NOT use for locally scraped ticket data — use query_tickets/count_tickets for that.\n\n"
-                "SCHEMA (scope: v1):\n"
-                "  customer   — name (string). Key: Customer::{id}\n"
-                "  cluster    — ui_name (string), customer (string, customer id). Key: Cluster::{uuid}\n"
-                "  snapshot   — timestamp (ISO string), uuid (cluster uuid), zendesk (array of int ticket IDs). Key: Snapshot::{id}\n\n"
-                "JOIN PATTERNS:\n"
-                "  cluster→customer:  JOIN customer cu ON META(cu).id = (\"Customer::\" || cl.customer)\n"
-                "  snapshot→cluster:  JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.uuid)\n"
-                "  snapshot ticket IDs: UNNEST sn.zendesk AS t_id\n\n"
-                "EXAMPLE QUERIES:\n"
-                "  All customers: SELECT name FROM customer ORDER BY name\n"
-                "  Snapshots per customer: SELECT cu.name, COUNT(*) AS snaps FROM snapshot sn "
-                "JOIN cluster cl ON META(cl).id=(\"Cluster::\"|sn.uuid) "
-                "JOIN customer cu ON META(cu).id=(\"Customer::\"|cl.customer) GROUP BY cu.name ORDER BY snaps DESC\n"
-                "  Clusters for customer: SELECT cl.ui_name FROM cluster cl "
-                "JOIN customer cu ON META(cu).id=(\"Customer::\"|cl.customer) WHERE cu.name=\"Acme Corp\"\n"
-                "  Recent snapshots: SELECT sn.timestamp, cl.ui_name FROM snapshot sn "
-                "JOIN cluster cl ON META(cl).id=(\"Cluster::\"|sn.uuid) ORDER BY sn.timestamp DESC LIMIT 20\n"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "statement": {
-                        "type": "string",
-                        "description": "The SQL++ query to execute against Supportal Analytics.",
-                    },
-                    "limit_rows": {
-                        "type": "integer",
-                        "description": "Truncate result to this many rows before returning (default 100). Add LIMIT in your SQL for best performance.",
-                    },
-                },
-                "required": ["statement"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_organizations",
-            "description": (
-                "[LOCAL — queries your configured Couchbase instance, not Supportal] "
-                "Returns every customer/organization that has tickets stored in the local "
-                "Couchbase database, with ticket counts. Use for questions like: "
-                "'what customers are you aware of?', 'what orgs do you have data for?', "
-                "'which customers have I scraped?', 'who has the most tickets locally?'. "
-                "Always exempt from customer scoping — always returns all orgs. "
-                "Do NOT use for global Supportal data — use list_supportal_customers for that."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "min_tickets": {
-                        "type": "integer",
-                        "description": "Only include organizations with at least this many tickets (default 1).",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_table",
-            "description": (
-                "Renders a real data table in the chat UI with CSV and Excel download buttons. "
-                "MUST be called when the user asks for a table, spreadsheet, or list of tickets "
-                "to export — never substitute with a markdown table. "
-                "Call this before your final text so the table appears above the explanation."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "description": "Table title (also used as filename)."},
-                    "columns": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Column header names.",
-                    },
-                    "rows": {
-                        "type": "array",
-                        "description": "Data rows — each row is an array of cell values.",
-                        "items": {"type": "array", "items": {}},
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Optional short description shown above the table.",
-                    },
-                },
-                "required": ["title", "columns", "rows"],
-            },
-        },
-    },
-]
-
-
-_SUPPORTAL_TICKET_URL = "https://supportal.couchbase.com/zendesk/ticket/{ticket_id}"
-_SUPPORTAL_CUSTOMER_URL = "https://supportal.couchbase.com/customer/{customer}"
-
-# ── Chat artifact rendering ──────────────────────────────────────────────────
-# Fenced blocks ```echart ... ``` and ```table ... ``` are embedded in agent
-# responses and rendered as live ECharts elements or HTML tables with download
-# buttons by _render_chat.
-_ARTIFACT_RE = re.compile(r"```(echart|table)\n(.*?)\n```", re.DOTALL)
-
-
-def _build_agent_echart_option(args: dict) -> dict:
-    """Build an ECharts option dict from generate_chart tool arguments."""
-    chart_type = (args.get("chart_type") or "bar").lower()
-    title      = args.get("title") or ""
-    labels     = args.get("labels") or []
-    values     = args.get("values") or []
-    series     = args.get("series") or []
-    x_label    = args.get("x_label") or ""
-    y_label    = args.get("y_label") or ""
-
-    _CB_PALETTE = ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6",
-                   "#06B6D4","#F97316","#84CC16","#EC4899","#6B7280"]
-
-    if chart_type in ("pie", "donut"):
-        if series:
-            data = [{"name": s["name"], "value": sum(s.get("data") or [0])} for s in series]
+        from couchbase.cluster import Cluster as _Cl  # type: ignore
+        from couchbase.options import ClusterOptions as _CO  # type: ignore
+        from couchbase.auth import PasswordAuthenticator as _PA               # type: ignore
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        _ensure_profiles_collection(cl, bucket)
+        col = cl.bucket(bucket).scope(_PROFILE_SCOPE).collection(_PROFILE_COLLECTION)
+        key = f"profile::{profile_user}"
+        now = int(time.time())
+        try:
+            doc = col.get(key).content_as[dict]
+        except Exception:
+            doc = {"username": profile_user, "top_customers": [], "alert_thresholds": {
+                "new_p1": True, "score_drop_pts": 10, "stale_hours": 12,
+            }, "last_validated_at": 0, "updated_at": 0}
+        customers = doc.get("top_customers") or []
+        entry = next((c for c in customers if (c.get("name") or "").lower() == org.lower()), None)
+        if entry:
+            entry["access_count"] = (entry.get("access_count") or 0) + 1
+            entry["last_accessed_at"] = now
         else:
-            data = [{"name": l, "value": v} for l, v in zip(labels, values)]
-        radius = ["40%", "70%"] if chart_type == "donut" else "60%"
-        return {
-            "title":   {"text": title, "left": "center"},
-            "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
-            "legend":  {"orient": "vertical", "left": "left"},
-            "color":   _CB_PALETTE,
-            "series":  [{"type": "pie", "radius": radius, "data": data,
-                         "label": {"formatter": "{b}: {c}"}}],
-        }
+            customers.append({
+                "name": org, "access_count": 1,
+                "last_accessed_at": now, "validated_at": 0, "is_valid": True,
+            })
+        def _score(c: dict) -> float:
+            days = max(0, (now - (c.get("last_accessed_at") or 0)) / 86400)
+            return (c.get("access_count") or 1) / (1.0 + days)
+        customers.sort(key=_score, reverse=True)
+        doc["top_customers"] = customers[:20]
+        doc["updated_at"] = now
+        col.upsert(key, doc)
+        cl.close()
+    except Exception:
+        pass
 
-    ec_type = "line" if chart_type == "line" else "bar"
-    if series:
-        ec_series = [{"name": s["name"], "type": ec_type, "data": s.get("data") or []}
-                     for s in series]
-        legend_data = [s["name"] for s in series]
-    else:
-        ec_series = [{"type": ec_type, "data": values}]
-        legend_data = []
 
-    cat_axis = {"type": "category", "data": labels}
-    val_axis: dict = {"type": "value"}
-    if x_label: cat_axis["name"] = x_label       # type: ignore[index]
-    if y_label: val_axis["name"] = y_label
+_SETTINGS_SCOPE      = "chat"
+_SETTINGS_COLLECTION = "settings"
+_SETTINGS_KEY        = "strabo::profiles"
 
-    smooth = chart_type == "line"
-    for s in ec_series:
-        if smooth:
-            s["smooth"] = True
 
-    if chart_type == "horizontal_bar":
-        return {
-            "title":   {"text": title},
-            "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-            "legend":  {"data": legend_data} if legend_data else {},
-            "color":   _CB_PALETTE,
-            "grid":    {"left": "20%"},
-            "xAxis":   val_axis,
-            "yAxis":   cat_axis,
-            "series":  ec_series,
-        }
-    return {
-        "title":   {"text": title},
-        "tooltip": {"trigger": "axis"},
-        "legend":  {"data": legend_data} if legend_data else {},
-        "color":   _CB_PALETTE,
-        "xAxis":   cat_axis,
-        "yAxis":   val_axis,
-        "series":  ec_series,
+def _cb_save_settings(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    profiles: dict,
+) -> None:
+    """Persist the profiles dict to a fixed CB doc (best-effort, does not raise)."""
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=15))
+        col = cl.bucket(bucket).scope(scope).collection(collection)
+        col.upsert(_SETTINGS_KEY, profiles)
+        cl.close()
+    except Exception:
+        pass
+
+
+def _cb_load_settings(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+) -> dict:
+    """Load the profiles dict from CB. Returns {} on any error."""
+    if not _CB_AVAILABLE or not cb_url:
+        return {}
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=15))
+        col = cl.bucket(bucket).scope(scope).collection(collection)
+        result = col.get(_SETTINGS_KEY).content_as[dict]
+        cl.close()
+        return result
+    except Exception:
+        return {}
+
+
+def _load_customer_profile(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    profile_user: str,
+) -> dict:
+    """Read the profile doc for profile_user from CB. Returns empty profile on error."""
+    _default = {
+        "username": profile_user,
+        "top_customers": [],
+        "alert_thresholds": {"new_p1": True, "score_drop_pts": 10, "stale_hours": 12},
     }
+    if not _CB_AVAILABLE or not cb_url:
+        return _default
+    try:
+        from couchbase.cluster import Cluster as _Cl
+        from couchbase.options import ClusterOptions as _CO
+        from couchbase.auth import PasswordAuthenticator as _PA
+        conn = _cb_conn_str(cb_url, use_tls)
+        cl = _Cl(conn, _CO(_PA(username, password)))
+        cl.wait_until_ready(timedelta(seconds=10))
+        _ensure_profiles_collection(cl, bucket)
+        col = cl.bucket(bucket).scope(_PROFILE_SCOPE).collection(_PROFILE_COLLECTION)
+        doc = col.get(f"profile::{profile_user}").content_as[dict]
+        cl.close()
+        return doc
+    except Exception:
+        return _default
 
 
-def _agent_filters_from_args(args: dict) -> dict:
-    """Map agent tool args to the filters dict expected by tool_query_tickets."""
-    filters: dict = {}
-    if args.get("organization"):
-        filters["organization"] = args["organization"]
-    if args.get("date_from"):
-        filters["date_from"] = args["date_from"]
-    if args.get("date_to"):
-        filters["date_to"] = args["date_to"]
-    if args.get("priority"):
-        filters["priorities"] = [args["priority"].upper()]
-    if args.get("status"):
-        filters["statuses"] = [args["status"].lower()]
-    struct_kws: list[str] = []
-    if args.get("cbse_only"):
-        struct_kws.append("cbse")
-    if args.get("jira_only"):
-        struct_kws.append("jira")
-    if args.get("cbse_id"):
-        struct_kws.append(args["cbse_id"].lower())
-    if args.get("keyword"):
-        struct_kws.append(args["keyword"].lower())
-    if struct_kws:
-        filters["struct_keywords"] = struct_kws
-    return filters
+def _get_briefing_data(
+    top_customers: list[dict],
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    stale_hours: float = 12.0,
+) -> list[dict]:
+    """Return one health-summary row per customer in top_customers."""
+    rows = []
+    for c in top_customers:
+        org = (c.get("name") or "").strip()
+        if not org:
+            continue
+        try:
+            h = _compute_health_score(org, cb_url, bucket, username, password,
+                                      use_tls, scope, collection)
+            hours_stale = h.get("hours_since_scraped") or 0.0
+            rows.append({
+                "name":        org,
+                "score":       h.get("score", 0),
+                "grade":       h.get("grade", "N/A"),
+                "open_p1":     h.get("open_p1", 0),
+                "open_p2":     h.get("open_p2", 0),
+                "hours_stale": round(float(hours_stale), 1),
+                "alert":       (
+                    h.get("open_p1", 0) > 0
+                    or h.get("score", 100) < 40
+                    or float(hours_stale) > stale_hours
+                ),
+            })
+        except Exception:
+            rows.append({
+                "name": org, "score": 0, "grade": "?",
+                "open_p1": 0, "open_p2": 0, "hours_stale": 0.0, "alert": False,
+            })
+    return rows
 
 
 def _execute_agent_tool(
@@ -15712,8 +10673,40 @@ def _execute_agent_tool(
     cb_url: str, bucket: str, username: str, password: str,
     use_tls: bool, scope: str, collection: str,
     default_customer: str = "",
+    ctx: dict | None = None,
 ) -> str:
-    """Execute an agent tool call and return a string result for the LLM."""
+    """Execute an agent tool call and return a string result for the LLM.
+
+    ctx carries LLM/embedding/cookie config for tools that need to call out:
+      provider, model, api_key, base_url,
+      emb_provider, emb_model, emb_api_key, emb_base_url, emb_dims,
+      cookie
+    """
+    ctx = ctx or {}
+    # ── v1.5.0: session log tracks tools called this conversation ────────────
+    _slog: dict = ctx.setdefault("_session_log", {})
+
+    # ── 3.5: record customer access for profile tracking ─────────────────────
+    _CUSTOMER_SCOPED_TOOLS = {
+        "query_tickets", "count_tickets", "get_ticket", "vector_search",
+        "get_customer_health_score", "check_sla_compliance", "get_digest",
+        "generate_customer_report", "generate_health_report", "rescrape_customer_tickets",
+        "scrape_customer_tickets", "get_cluster_health", "check_data_freshness", "smart_refresh",
+    }
+    if name in _CUSTOMER_SCOPED_TOOLS:
+        _tracked_org = (
+            args.get("organization") or args.get("customer") or
+            args.get("org") or default_customer or ""
+        ).strip()
+        if _tracked_org and cb_url and username:
+            import threading as _thr_profile
+            _thr_profile.Thread(
+                target=_record_customer_access,
+                args=(_tracked_org, cb_url, bucket, username, password,
+                      use_tls, ctx.get("profile_user", "default")),
+                daemon=True,
+            ).start()
+
     if name == "query_tickets":
         limit = min(int(args.get("limit") or 50), 200)
         filters = _agent_filters_from_args(args)
@@ -15725,11 +10718,21 @@ def _execute_agent_tool(
             use_tls, scope, collection, limit=limit,
         )
         if not tickets:
-            return "No tickets found matching the given filters."
+            # BEFORE v1.5.0: just returned "No tickets found."
+            # AFTER v1.5.0: hint at scrape_customer_tickets when data is missing for a scoped customer
+            _org = filters.get("organization") or default_customer
+            if _org:
+                _ingest_hint = (
+                    f" No local tickets for '{_org}'. "
+                    "Call scrape_customer_tickets to pull them from Supportal first."
+                )
+            else:
+                _ingest_hint = ""
+            return f"No tickets found matching the given filters.{_ingest_hint}"
         _now_epoch = time.time()
         lines = [
-            "| Ticket ID | Organization | Subject | Status | Priority | Created | Last Scraped | CBSEs | Jira |",
-            "|-----------|-------------|---------|--------|----------|---------|-------------|-------|------|",
+            "| Ticket ID | Organization | Subject | Status | Priority | Created | Last Reply | Data Age | CBSEs | Jira |",
+            "|-----------|-------------|---------|--------|----------|---------|------------|----------|-------|------|",
         ]
         for t in tickets:
             cbses = ", ".join(t.get("cbses") or []) or "—"
@@ -15738,10 +10741,13 @@ def _execute_agent_tool(
             _lsa = t.get("last_scraped_at") or 0
             _age_h = (_now_epoch - _lsa) / 3600 if _lsa else None
             _age_str = f"{_age_h:.0f}h ago" if _age_h is not None else "unknown"
+            _last_reply = (
+                t.get("last_comment_at") or t.get("updated") or t.get("updated_at") or ""
+            )[:10] or "—"
             lines.append(
                 f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
                 f"| {t.get('status','')} | {t.get('priority','')} "
-                f"| {(t.get('created') or '')[:10]} | {_age_str} | {cbses} | {jiras} |"
+                f"| {(t.get('created') or '')[:10]} | {_last_reply} | {_age_str} | {cbses} | {jiras} |"
             )
         return "\n".join(lines) + f"\n\n**Total: {len(tickets)} tickets**"
 
@@ -15764,18 +10770,43 @@ def _execute_agent_tool(
             [doc_key], cb_url, bucket, username, password, use_tls, scope, collection,
         )
         if not tickets:
-            return f"Ticket {ticket_id} not found."
+            # Live fallback — fetch directly from Supportal and save to CB so future lookups work
+            try:
+                _live_sess = _make_api_session("")
+                _live = fetch_ticket_api(ticket_id, _live_sess)
+                if _live and _live.get("ticket_id"):
+                    _live["last_scraped_at"] = int(time.time())
+                    _live["type"]            = "ticket"
+                    _live["cb_version"]      = extract_ticket_version(_live)
+                    _live["feature_area"]    = classify_ticket_feature(_live)
+                    _live["ticket_origin"]   = classify_ticket_origin(_live)
+                    try:
+                        from couchbase.cluster import Cluster as _GtCl
+                        from couchbase.options import ClusterOptions as _GtCO
+                        from couchbase.auth import PasswordAuthenticator as _GtPA
+                        _gt_cl = _GtCl(_cb_conn_str(cb_url, use_tls), _GtCO(_GtPA(username, password)))
+                        _gt_cl.wait_until_ready(timedelta(seconds=10))
+                        _gt_cl.bucket(bucket).scope(scope).collection(collection).upsert(doc_key, _live)
+                        _gt_cl.close()
+                    except Exception:
+                        pass
+                    tickets = [_live]
+                else:
+                    return f"Ticket {ticket_id} not found in local DB or Supportal."
+            except Exception as _lfe:
+                return f"Ticket {ticket_id} not found locally. Live fetch also failed: {_lfe}"
         t = tickets[0]
         _tid = t.get("ticket_id", ticket_id)
         _lsa = t.get("last_scraped_at") or 0
         _age_h = (time.time() - _lsa) / 3600 if _lsa else None
         _age_str = f"{_age_h:.1f} hours ago" if _age_h is not None else "unknown"
         _supportal_url = _SUPPORTAL_TICKET_URL.format(ticket_id=_tid)
+        _last_reply = (t.get("last_comment_at") or t.get("updated") or t.get("updated_at") or "")[:19] or "—"
         parts = [
             f"**Ticket {_tid}** — {t.get('subject','')}",
             f"Organization: {t.get('organization','')}",
             f"Status: {t.get('status','')} | Priority: {t.get('priority','')}",
-            f"Created: {t.get('created','')} | Closed: {t.get('closed','')}",
+            f"Created: {t.get('created','')} | Last Reply: {_last_reply} | Closed: {t.get('closed','')}",
             f"Requester: {t.get('requester','')}",
             f"**Data freshness:** last scraped {_age_str}",
             f"**Live verification:** {_supportal_url}",
@@ -15822,16 +10853,34 @@ def _execute_agent_tool(
             _bn = topo.get("bucket_names") or []
             if isinstance(_bn, list) and _bn:
                 topo_lines.append(f"  Bucket Names:    {', '.join(_bn[:10])}")
-            if topo.get("ram_per_node_mib"):
+            if topo.get("cpus_per_node"):
+                topo_lines.append(f"  CPUs/Node:       {topo['cpus_per_node']}")
+            if topo.get("ram_used_per_node_mib") and topo.get("ram_per_node_mib"):
+                topo_lines.append(f"  RAM/Node:        {topo['ram_used_per_node_mib']}/{topo['ram_per_node_mib']} MiB used/total")
+            elif topo.get("ram_per_node_mib"):
                 topo_lines.append(f"  RAM/Node:        {topo['ram_per_node_mib']} MiB")
             if topo.get("auto_failover_seconds") is not None:
                 topo_lines.append(f"  Auto-failover:   {topo['auto_failover_seconds']}s")
+            if topo.get("n2n_encryption") is not None:
+                topo_lines.append(f"  N2N Encryption:  {topo['n2n_encryption']}")
+            if topo.get("data_quota_mib"):
+                topo_lines.append(f"  Data Quota:      {topo['data_quota_mib']} MiB")
+            if topo.get("global_index_count") is not None:
+                topo_lines.append(f"  GSI Indexes:     {topo['global_index_count']}")
+            if topo.get("fts_index_count") is not None:
+                topo_lines.append(f"  FTS Indexes:     {topo['fts_index_count']}")
+            if topo.get("eventing_function_count") is not None:
+                topo_lines.append(f"  Eventing Fns:    {topo['eventing_function_count']}")
             bad  = topo.get("bad_items",  topo.get("bad_count",  0)) or 0
             warn = topo.get("warn_items", topo.get("warn_count", 0)) or 0
             if bad or warn:
                 topo_lines.append(f"  Health:          bad={bad}  warn={warn}")
             if topo.get("os_name"):
                 topo_lines.append(f"  OS:              {topo['os_name']}")
+            if not topo.get("cpus_per_node"):
+                _org_hint = t.get("organization") or ""
+                _hint_arg = f'organization="{_org_hint}"' if _org_hint else "organization=<org>"
+                topo_lines.append(f"  CPUs/Node:       [absent from this snapshot — MUST call get_cluster_health({_hint_arg}) to check other snapshots for this cluster]")
             if topo_lines:
                 parts.append("\n**Cluster Topology (snapshot):**\n" + "\n".join(topo_lines))
         elif not topo:
@@ -15862,10 +10911,10 @@ def _execute_agent_tool(
         if not _CB_AVAILABLE:
             return "Couchbase not available."
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             from couchbase.options import QueryOptions  # type: ignore
-            from datetime import timedelta
             conn_str = _cb_conn_str(cb_url, use_tls)
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
             cluster.wait_until_ready(timedelta(seconds=10))
@@ -15911,105 +10960,305 @@ def _execute_agent_tool(
     elif name == "rescrape_customer_tickets":
         cust        = (args.get("customer") or default_customer or "").strip()
         stale_hours = float(args.get("stale_hours") if args.get("stale_hours") is not None else 4.0)
-        max_tix     = min(int(args.get("max_tickets") or 50), 200)
+        max_tix     = min(int(args.get("max_tickets") or 50), 2000)
         status_filt = (args.get("status") or "").strip().lower() or None
 
-        cookie = _get_profile_cookie()
-        if not cookie:
-            return "No session cookie in saved profile — paste a fresh cookie in the Auth tab."
+        cookie = _get_profile_cookie()  # optional as of v2.6.2; retained for re-enablement
 
-        # Gather candidate ticket IDs from CB
-        filters: dict = {}
+        # ── Step 1: Gather existing CB tickets for this customer ──────────────
+        _rs_filters: dict = {}
         if cust and cust.lower() != "all customers":
-            filters["organization"] = cust
+            _rs_filters["organization"] = cust
         if status_filt:
-            filters["status"] = status_filt
+            _rs_filters["status"] = status_filt
 
         candidates = tool_query_tickets(
-            filters, cb_url, bucket, username, password,
-            use_tls, scope, collection, limit=max_tix * 4,
+            _rs_filters, cb_url, bucket, username, password,
+            use_tls, scope, collection, limit=max_tix * 8,
         )
-        if not candidates:
-            return f"No tickets found in Couchbase for {cust or 'all customers'}."
 
-        # Filter to stale tickets
-        now_epoch = time.time()
+        # The candidate list above is capped (stale-refresh pool only); the
+        # new-vs-cached comparison needs the org's COMPLETE local ticket-id set,
+        # otherwise cached tickets beyond the cap get misclassified as "new".
+        cb_ids: set[str] = set()
+        try:
+            _idc = Cluster(
+                _cb_conn_str(cb_url, use_tls),
+                ClusterOptions(PasswordAuthenticator(username, password)),
+            )
+            _idc.wait_until_ready(timedelta(seconds=10))
+            _id_where = ["ticket_id IS NOT MISSING",
+                         "(`_deleted` IS MISSING OR `_deleted` = false)"]
+            _id_params: list = []
+            if cust and cust.lower() != "all customers":
+                _id_params.append(f"%{cust.lower()}%")
+                _id_where.append(f"LOWER(TOSTRING(organization)) LIKE ${len(_id_params)}")
+            _id_rows = list(_idc.query(
+                f"SELECT RAW ticket_id FROM `{bucket}`.`{scope}`.`{collection}` "
+                f"WHERE {' AND '.join(_id_where)}",
+                QueryOptions(positional_parameters=_id_params,
+                             timeout=timedelta(seconds=30)),
+            ))
+            _idc.close()
+            cb_ids = {str(r or "").strip() for r in _id_rows if r}
+        except Exception:
+            cb_ids = set()
+        if not cb_ids:
+            # Fallback: capped candidate set (better than treating everything as new)
+            cb_ids = {str(t.get("ticket_id") or "").strip() for t in candidates if t.get("ticket_id")}
+
+        # ── Step 2: Fetch full Supportal listing to discover new tickets ──────
+        new_stubs: list[dict] = []
+        _listing_note = ""
+        if cust and cust.lower() != "all customers":
+            try:
+                _list_sess = _make_api_session(cookie)
+                _listing = _get_customer_ticket_listing_api(cust, _list_sess)
+                supportal_ids = {str(r.get("id") or "").strip() for r in _listing if r.get("id")}
+                new_ids = supportal_ids - cb_ids
+                if new_ids:
+                    # Apply status filter if requested
+                    if status_filt:
+                        _id_map = {str(r.get("id") or ""): r for r in _listing}
+                        new_ids = {
+                            nid for nid in new_ids
+                            if (_id_map.get(nid, {}).get("status") or "").lower() == status_filt
+                        }
+                    # Newest ticket ID first — sorted() on strings is lexical
+                    # (oldest-first) and a max_tix cap then silently keeps only
+                    # the oldest tickets instead of the newest (e.g. a first-time
+                    # scrape of an org with hundreds of "new" tickets kept only
+                    # 2019-era IDs, making an active account look dormant).
+                    for nid in sorted(new_ids, key=lambda x: int(x) if x.isdigit() else 0, reverse=True):
+                        new_stubs.append({
+                            "ticket_id": nid,
+                            "organization": cust,
+                            "last_scraped_at": 0,  # force scrape
+                        })
+                    _listing_note = f"{len(new_stubs)} new"
+            except Exception as _le:
+                _listing_note = f"(listing unavailable: {_le})"
+
+        # ── Step 3: Apply stale filter to existing candidates ─────────────────
+        now_epoch    = time.time()
         stale_cutoff = now_epoch - stale_hours * 3600
-        if stale_hours > 0:
-            to_scrape = [
-                t for t in candidates
-                if (t.get("last_scraped_at") or 0) < stale_cutoff
-            ]
-        else:
-            to_scrape = list(candidates)
+        stale_existing = (
+            [t for t in candidates if (t.get("last_scraped_at") or 0) < stale_cutoff]
+            if stale_hours > 0 else list(candidates)
+        )
 
-        to_scrape = to_scrape[:max_tix]
+        # Merge: new stubs first, then stale existing (deduped), cap at max_tix
+        _seen_ids: set[str] = set()
+        to_scrape: list[dict] = []
+        for t in new_stubs + stale_existing:
+            tid = str(t.get("ticket_id") or "").strip()
+            if tid and tid not in _seen_ids:
+                _seen_ids.add(tid)
+                to_scrape.append(t)
+            if len(to_scrape) >= max_tix:
+                break
+
+        new_count = min(len(new_stubs), len(to_scrape))  # new stubs are always first in to_scrape
+
         if not to_scrape:
+            if not candidates:
+                return f"No tickets found in Couchbase or Supportal for '{cust or 'all customers'}'."
             return (
                 f"All {len(candidates)} tickets for {cust or 'all customers'} "
                 f"were scraped within the last {stale_hours:.0f} hours — nothing to update."
             )
 
-        # Connect to CB once for all writes
+        _job = _make_scrape_job(cust or "all customers", "rescrape")
+        _job["new_count"] = new_count
+        threading.Thread(
+            target=_run_rescrape_job_bg,
+            args=(
+                _job, cust or "all customers", to_scrape, cookie,
+                {"url": cb_url, "bucket": bucket, "username": username, "password": password,
+                 "use_tls": use_tls, "scope": scope, "collection": collection},
+                {"provider": ctx.get("emb_provider",""), "model": ctx.get("emb_model",""),
+                 "api_key": ctx.get("emb_api_key",""), "base_url": ctx.get("emb_base_url",""),
+                 "dims": ctx.get("emb_dims", 0),
+                 "embed_parallel": ctx.get("embed_parallel", 1),
+                 "score_provider": ctx.get("provider",""), "score_model": ctx.get("model",""),
+                 "score_api_key": ctx.get("api_key",""), "score_base_url": ctx.get("base_url","")},
+            ),
+            daemon=True,
+        ).start()
+        if ctx is not None:
+            ctx.setdefault("_started_jobs", []).append(_job["job_id"])
+
+        _new_label = f"{new_count} new + " if new_count else ""
+        _stale_label = f"{len(to_scrape) - new_count} stale" if new_count else f"{len(to_scrape)} stale"
+        return (
+            f"Started rescrape job **{_job['job_id']}** for '{cust or 'all customers'}' "
+            f"({_new_label}{_stale_label} tickets{f', stale > {stale_hours:.0f}h' if stale_hours > 0 else ''}). "
+            f"Running in the background at ~3 req/s. "
+            f"**I cannot notify you when it finishes — you must ask me.** "
+            f"Ask 'what is the scrape status?' after a minute or two to check progress."
+        )
+
+    elif name == "smart_refresh":
+        cust    = (args.get("organization") or default_customer or "").strip()
+        max_new = min(int(args.get("max_new") or 25), 100)
+
+        if not cust:
+            return "No customer specified and no customer is currently scoped."
+
+        # ── Step 1: Pull rich CB signals for this org ─────────────────────────
+        # (includes status, solved, priority, last_scraped_at, enrichment gaps)
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
-            from couchbase.auth import PasswordAuthenticator        # type: ignore
-            from datetime import timedelta
-            conn_str = _cb_conn_str(cb_url, use_tls)
-            _bcluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
-            _bcluster.wait_until_ready(timedelta(seconds=10))
-            _bcol = _bcluster.bucket(bucket).scope(scope).collection(collection)
-        except Exception as exc:
-            return f"Couchbase connection failed: {exc}"
+            from couchbase.cluster import Cluster as _SrCl
+            from couchbase.options import ClusterOptions as _SrCO, QueryOptions as _SrQO
+            from couchbase.auth import PasswordAuthenticator as _SrPA
+            _idc = _SrCl(_cb_conn_str(cb_url, use_tls), _SrCO(_SrPA(username, password)))
+            _idc.wait_until_ready(timedelta(seconds=10))
+            _now_ep = time.time()
+            _cb_rows = list(_idc.query(
+                f"SELECT META(t).id AS doc_id, t.status, t.solved, t.priority, "
+                f"t.last_scraped_at, t.requester, t.`_deleted`, "
+                f"(t.score IS NOT MISSING AND t.score IS NOT NULL) AS has_score, "
+                f"(t.embedding IS NOT MISSING AND t.embedding IS NOT NULL) AS has_embedding, "
+                f"t.sfdc_matched "
+                f"FROM `{bucket}`.`{scope}`.`{collection}` AS t "
+                f"WHERE META(t).id LIKE 'ticket::%' "
+                f"AND LOWER(TOSTRING(t.organization)) LIKE $1 "
+                f"AND (t.`_deleted` IS MISSING OR t.`_deleted` = false)",
+                _SrQO(positional_parameters=[f"%{cust.lower()}%"], timeout=timedelta(seconds=30)),
+            ))
+            _idc.close()
+        except Exception as _e:
+            return f"smart_refresh: CB query failed — {_e}"
 
-        ok = skipped = errors = 0
-        error_samples: list[str] = []
+        cb_signals: dict[str, dict] = {}
+        for _row in _cb_rows:
+            _tid = str(_row.get("doc_id", "")).split("::")[-1]
+            if _tid:
+                _lsa = _row.get("last_scraped_at") or 0
+                cb_signals[_tid] = {
+                    "status":        (_row.get("status") or "").lower().strip(),
+                    "solved":        (_row.get("solved") or "").strip(),
+                    "priority":      (_row.get("priority") or "").lower().strip(),
+                    "last_scraped_at": _lsa,
+                    "age_hours":     (_now_ep - _lsa) / 3600 if _lsa else None,
+                    "is_stub":       not _row.get("requester"),
+                    "has_score":     bool(_row.get("has_score")),
+                    "has_embedding": bool(_row.get("has_embedding")),
+                    "sfdc_matched":  _row.get("sfdc_matched"),
+                    "_deleted":      bool(_row.get("_deleted")),
+                }
 
-        for t in to_scrape:
-            tid = str(t.get("ticket_id") or "").strip()
-            if not tid:
-                skipped += 1
+        # ── Step 2: Fetch Supportal listing ───────────────────────────────────
+        try:
+            _sess = _make_api_session("")
+            _listing = _get_customer_ticket_listing_api(cust, _sess)
+        except Exception as _e:
+            return f"smart_refresh: Supportal listing failed — {_e}"
+
+        # Normalise listing items into the same shape _filter_changed_tickets expects
+        _listing_summaries: list[dict] = []
+        for _item in _listing:
+            _itid = str(_item.get("id") or "").strip()
+            if not _itid or (_item.get("status") or "").lower() == "deleted":
                 continue
-            try:
-                fresh = scrape_single_ticket_cookie(cookie, tid)
-                if not fresh or not fresh.get("ticket_id"):
-                    skipped += 1
-                    continue
-                fresh["last_scraped_at"] = int(time.time())
-                fresh["type"] = "ticket"
-                doc_key = f"ticket::{tid}"
-                try:
-                    existing = _bcol.get(doc_key).content_as[dict]
-                    merged = {**existing}
-                    for k, v in fresh.items():
-                        if v not in (None, "", [], {}):
-                            merged[k] = v
-                    _bcol.upsert(doc_key, merged)
-                except Exception:
-                    _bcol.upsert(doc_key, fresh)
-                ok += 1
-            except Exception as exc:
-                errors += 1
-                if len(error_samples) < 3:
-                    error_samples.append(f"  ticket {tid}: {exc}")
-            time.sleep(0.35)  # ~3 req/s — stay well under rate limits
+            _listing_summaries.append({
+                "ticket_id": _itid,
+                "status":    (_item.get("status") or "").lower().strip(),
+                "priority":  (_item.get("Priority") or _item.get("priority") or "").lower().strip(),
+                "subject":   _item.get("subject") or _item.get("raw_subject") or "",
+                "created":   _item.get("created_at") or "",
+                "solved":    _item.get("solved_at") or "",
+                "organization": cust,
+                "last_scraped_at": 0,
+            })
 
-        try:
-            _bcluster.close()
-        except Exception:
-            pass
+        if not _listing_summaries:
+            return f"smart_refresh: Supportal returned no tickets for '{cust}'."
 
-        parts = [
-            f"Bulk rescrape complete for **{cust or 'all customers'}**.",
-            f"- Scraped: {ok} tickets updated",
-            f"- Skipped: {skipped} (no ticket ID)",
-            f"- Errors:  {errors}",
+        # ── Step 3: Multi-signal diff ─────────────────────────────────────────
+        # Signals: new ID, status change, solved-date change, priority change,
+        # stub (requester missing), stale-open (open/pending > 4h since last scrape).
+        # Note: Supportal listing has no updated_at; stale-open is the best proxy.
+        to_scrape, n_new, n_changed, n_skipped = _filter_changed_tickets(
+            _listing_summaries, cb_signals, max_tickets=max_new, stale_open_hours=4.0,
+        )
+
+        # ── Step 4: Enrichment-gap report (CB-only, no rescrape needed) ───────
+        _enrich_gaps = [
+            tid for tid, sig in cb_signals.items()
+            if not sig.get("has_score") or not sig.get("has_embedding")
+            or sig.get("sfdc_matched") is None
         ]
-        if error_samples:
-            parts.append("Sample errors:\n" + "\n".join(error_samples))
-        if errors and cookie:
-            parts.append("If errors persist the session cookie may have expired — paste a fresh one in the Auth tab.")
-        return "\n".join(parts)
+        _gap_score   = sum(1 for sig in cb_signals.values() if not sig.get("has_score"))
+        _gap_embed   = sum(1 for sig in cb_signals.values() if not sig.get("has_embedding"))
+        _gap_sfdc    = sum(1 for sig in cb_signals.values() if sig.get("sfdc_matched") is None)
+
+        # ── Step 5: Kick off background scrape + enrich job if needed ─────────
+        _job_note = ""
+        if to_scrape:
+            _job = _make_scrape_job(cust, "smart_refresh")
+            threading.Thread(
+                target=_run_rescrape_job_bg,
+                args=(
+                    _job, cust, to_scrape, "",
+                    {"url": cb_url, "bucket": bucket, "username": username, "password": password,
+                     "use_tls": use_tls, "scope": scope, "collection": collection},
+                    {"provider": ctx.get("emb_provider", ""), "model": ctx.get("emb_model", ""),
+                     "api_key": ctx.get("emb_api_key", ""), "base_url": ctx.get("emb_base_url", ""),
+                     "dims": ctx.get("emb_dims", 0),
+                     "embed_parallel": ctx.get("embed_parallel", 1),
+                     "score_provider": ctx.get("provider", ""), "score_model": ctx.get("model", ""),
+                     "score_api_key": ctx.get("api_key", ""), "score_base_url": ctx.get("base_url", "")},
+                ),
+                daemon=True,
+            ).start()
+            if ctx is not None:
+                ctx.setdefault("_started_jobs", []).append(_job["job_id"])
+            _job_note = f"Background job **{_job['job_id']}** started (scrape → embed → score → SFDC)."
+
+        # ── Step 6: Build human-readable diff report ──────────────────────────
+        _supportal_total = len(_listing_summaries)
+        _cb_total        = len(cb_signals)
+
+        _scrape_lines = []
+        for _s in to_scrape[:20]:   # cap display at 20 lines
+            _reason = _s.get("_change_reason", "new")
+            _scrape_lines.append(
+                f"- #{_s['ticket_id']} [{_s.get('priority','—').upper()}] "
+                f"{_s.get('status','—')} — {_s.get('subject','')[:55]} "
+                f"_({_reason})_"
+            )
+        _more = f"\n  …and {len(to_scrape) - 20} more" if len(to_scrape) > 20 else ""
+
+        _enrich_note = ""
+        if _enrich_gaps:
+            _enrich_note = (
+                f"\n\n**Enrichment gaps** (existing tickets missing pipeline output):\n"
+                f"- Missing score: {_gap_score}\n"
+                f"- Missing embedding: {_gap_embed}\n"
+                f"- SFDC never correlated: {_gap_sfdc}\n"
+                f"Use `batch_score_tickets` or `rescrape_customer_tickets` to fill these."
+            )
+
+        if not to_scrape and not _enrich_gaps:
+            return (
+                f"✓ **{cust}** is fully up to date.\n"
+                f"Supportal: {_supportal_total} tickets | CB: {_cb_total} tickets | "
+                f"{n_skipped} unchanged."
+            )
+
+        _header = (
+            f"**{cust}** diff — Supportal: {_supportal_total} | CB: {_cb_total}\n\n"
+            f"**Changes found:** {n_new} new, {n_changed} updated, {n_skipped} unchanged\n"
+        )
+        _scrape_section = ""
+        if to_scrape:
+            _scrape_section = (
+                f"\n**Queued for scrape + enrich ({len(to_scrape)}):**\n"
+                + "\n".join(_scrape_lines) + _more + "\n\n" + _job_note
+            )
+
+        return _header + _scrape_section + _enrich_note
 
     elif name == "rescrape_ticket":
         ticket_id = str(args.get("ticket_id") or "").strip()
@@ -16029,7 +11278,8 @@ def _execute_agent_tool(
         if not ticket_id:
             return "Error: ticket_id is required. Pass a single numeric ticket ID, e.g. {\"ticket_id\": \"12345\"}. For bulk refresh use rescrape_customer_tickets instead."
 
-        # Read session cookie from saved app profile
+        # Cookie is optional as of v2.6.2 — Supportal endpoints are open.
+        # Retained in case auth is re-added; pass empty string to make an unauthenticated session.
         cookie = ""
         try:
             _settings = _load_settings_file()
@@ -16039,20 +11289,14 @@ def _execute_agent_tool(
         except Exception as _pe:
             print(f"[rescrape_ticket] profile read failed: {_pe}")
 
-        if not cookie:
-            _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
-            return (
-                f"No session cookie found in saved profile — cannot scrape automatically.\n"
-                f"Verify manually: {_url}"
-            )
-
-        # Scrape fresh data from Supportal
+        # Scrape fresh data from Supportal via REST API
         try:
-            fresh = scrape_single_ticket_cookie(cookie, ticket_id)
+            _sess = _make_api_session(cookie)
+            fresh = fetch_ticket_api(ticket_id, _sess)
         except Exception as exc:
             _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
             return (
-                f"Scrape failed ({exc}). Session cookie may have expired.\n"
+                f"Scrape failed ({exc}).\n"
                 f"Verify manually: {_url}"
             )
 
@@ -16063,9 +11307,9 @@ def _execute_agent_tool(
             # Persist the deletion marker so future incremental scrapes skip it
             doc_key = f"ticket::{ticket_id}"
             try:
-                from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+                from couchbase.cluster import Cluster  # type: ignore
+                from couchbase.options import ClusterOptions  # type: ignore
                 from couchbase.auth import PasswordAuthenticator  # type: ignore
-                from datetime import timedelta
                 conn_str = _cb_conn_str(cb_url, use_tls)
                 cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
                 cluster.wait_until_ready(timedelta(seconds=10))
@@ -16087,6 +11331,10 @@ def _execute_agent_tool(
 
         fresh["last_scraped_at"] = int(time.time())
         fresh["type"] = "ticket"
+        # Recompute analytics classification fields from fresh data
+        fresh["cb_version"]    = extract_ticket_version(fresh)
+        fresh["feature_area"]  = classify_ticket_feature(fresh)
+        fresh["ticket_origin"] = classify_ticket_origin(fresh)
         doc_key = f"ticket::{ticket_id}"
 
         # ── Inline snapshot topology enrichment ──────────────────────────────
@@ -16112,9 +11360,9 @@ def _execute_agent_tool(
         # ── Merge onto existing CB doc (preserve score, embedding, etc.) ─────
         _saved = False
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
-            from datetime import timedelta
             conn_str = _cb_conn_str(cb_url, use_tls)
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
             cluster.wait_until_ready(timedelta(seconds=10))
@@ -16138,9 +11386,49 @@ def _execute_agent_tool(
         except Exception as exc:
             print(f"[rescrape_ticket] CB upsert failed: {exc}")
 
+        # ── Embed + score the refreshed ticket ───────────────────────────────
+        _pipeline_notes: list[str] = []
+        if _saved:
+            emb_p = (ctx.get("emb_provider") or "").lower().strip()
+            emb_m = ctx.get("emb_model", "")
+            emb_k = ctx.get("emb_api_key", "")
+            emb_u = ctx.get("emb_base_url", "")
+            emb_d = int(ctx.get("emb_dims") or 0)
+            if emb_p and emb_m and emb_d:
+                if emb_p == "lmstudio":
+                    _lms_base = (emb_u or "http://localhost:1234").rstrip("/v1").rstrip("/")
+                    _lms_emb_id = lmstudio_ensure_model_loaded(_lms_base, emb_m, timeout_s=45, model_type="embeddings")
+                    if _lms_emb_id:
+                        emb_m = _lms_emb_id
+                try:
+                    _done_emb, _errs_emb = embed_all_tickets(
+                        [fresh], cb_url, bucket, username, password,
+                        use_tls, scope, collection,
+                        emb_p, emb_m, emb_k, emb_u, emb_d,
+                        lambda msg, pct: None,
+                    )
+                    _pipeline_notes.append(f"Embedded ✓" if _done_emb else "Embed skipped")
+                except Exception as _ee:
+                    _pipeline_notes.append(f"Embed failed: {_ee}")
+            s_prov = (ctx.get("provider") or "").lower().strip()
+            s_mod  = ctx.get("model", "")
+            s_key  = ctx.get("api_key", "")
+            s_url  = ctx.get("base_url", "")
+            if s_prov and s_mod:
+                try:
+                    _scores = score_tickets_batch(
+                        [fresh], s_prov, s_mod, s_key, s_url,
+                        cb_url, bucket, username, password, use_tls, scope, collection,
+                        save_to_cb=True,
+                    )
+                    _pipeline_notes.append(f"Scored ✓" if _scores else "Score skipped")
+                except Exception as _se:
+                    _pipeline_notes.append(f"Score failed: {_se}")
+
         _url = _SUPPORTAL_TICKET_URL.format(ticket_id=ticket_id)
+        _pipeline_str = " | " + " | ".join(_pipeline_notes) if _pipeline_notes else ""
         summary_lines = [
-            f"**Ticket {ticket_id} re-scraped from Supportal** {'(saved to CB ✓)' if _saved else '(CB save failed ✗)'}",
+            f"**Ticket {ticket_id} re-scraped from Supportal** {'(saved to CB ✓)' if _saved else '(CB save failed ✗)'}{_pipeline_str}",
             f"Status: {fresh.get('status','')} | Priority: {fresh.get('priority','')}",
             f"Subject: {fresh.get('subject','')}",
             f"Created: {fresh.get('created','')} | Closed: {fresh.get('closed','')}",
@@ -16178,12 +11466,7 @@ def _execute_agent_tool(
     elif name == "list_supportal_customers":
         sort_by = (args.get("sort_by") or "name").lower()
         limit   = min(int(args.get("limit") or 200), 500)
-        cookie  = _get_profile_cookie()
-        if not cookie:
-            return (
-                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
-                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
-            )
+        cookie  = _get_profile_cookie()  # unused as of v2.6.2; retained for re-enablement
         try:
             order = {"snapshots": "snaps DESC", "tickets": "tickets DESC"}.get(sort_by, "cu_name ASC")
             statement = f"""
@@ -16216,12 +11499,7 @@ LIMIT {limit}
         limit_rows = min(int(args.get("limit_rows") or 100), 500)
         if not statement:
             return "Error: statement is required."
-        cookie = _get_profile_cookie()
-        if not cookie:
-            return (
-                "No session cookie found in saved profile — cannot reach Supportal Analytics. "
-                "Paste a fresh cookie in the Authentication tab of the NiceGUI app."
-            )
+        cookie = _get_profile_cookie()  # unused as of v2.6.2; retained for re-enablement
         try:
             rows = query_supportal_analytics(statement, cookie)
         except Exception as exc:
@@ -16246,10 +11524,10 @@ LIMIT {limit}
         if not _CB_AVAILABLE:
             return "Couchbase not available."
         try:
-            from couchbase.cluster import Cluster, ClusterOptions  # type: ignore
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
             from couchbase.auth import PasswordAuthenticator  # type: ignore
             from couchbase.options import QueryOptions  # type: ignore
-            from datetime import timedelta
             conn_str = _cb_conn_str(cb_url, use_tls)
             cluster = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
             cluster.wait_until_ready(timedelta(seconds=10))
@@ -16273,6 +11551,82 @@ LIMIT {limit}
             lines.append(f"- **{r['organization']}** ({r['ticket_count']} ticket{'s' if r['ticket_count'] != 1 else ''})")
         return "\n".join(lines)
 
+    elif name == "search_customer_names":
+        _query = (args.get("query") or "").strip()
+        _limit = min(int(args.get("limit") or 10), 20)
+        if not _query:
+            return "Error: query is required."
+        _cookie = ctx.get("cookie") or _get_profile_cookie()
+        hits = resolve_customer_name(
+            _query,
+            cookie=_cookie,
+            cb_url=cb_url, cb_bucket=bucket, cb_user=username,
+            cb_pass=password, cb_tls=use_tls, cb_scope=scope,
+            cb_collection=collection, limit=_limit,
+        )
+        if not hits:
+            return (
+                f"No customers found matching '{_query}'. "
+                "Try a shorter fragment, check spelling, or use list_supportal_customers to browse all."
+            )
+        lines = [f"**{len(hits)} customer(s) matching '{_query}':**\n"]
+        for i, h in enumerate(hits, 1):
+            lines.append(f"{i}. **{h['display_name']}** *(source: {h['source']})*")
+        lines.append(
+            "\nAsk the user which one they mean, then use that exact name as "
+            "`customer=` in all subsequent tool calls for this conversation."
+        )
+        return "\n".join(lines)
+
+    elif name == "get_briefing":
+        _top_n    = min(int(args.get("top_n") or 5), 10)
+        _pu       = ctx.get("profile_user", "default")
+        _stale_h  = 12.0
+        try:
+            _profile = _load_customer_profile(cb_url, bucket, username, password, use_tls, _pu)
+            _stale_h = float((_profile.get("alert_thresholds") or {}).get("stale_hours") or 12)
+            _top = [c for c in (_profile.get("top_customers") or [])
+                    if c.get("is_valid", True)][:_top_n]
+        except Exception:
+            _top = []
+        if not _top:
+            return (
+                "No customer profile found yet — I don't know which accounts you care about. "
+                "Start by asking about specific customers; I'll learn your top accounts over time. "
+                "Or use `list_organizations` to see what's in the local database."
+            )
+        _snap = _get_briefing_data(
+            _top, cb_url, bucket, username, password,
+            use_tls, scope, collection, stale_hours=_stale_h,
+        )
+        alerts = [r for r in _snap if r["alert"]]
+        ok     = [r for r in _snap if not r["alert"]]
+        lines  = [f"## Account Briefing — {len(_snap)} accounts\n"]
+        if alerts:
+            lines.append("### ⚠ Needs Attention")
+            for r in alerts:
+                flags = []
+                if r["open_p1"] > 0:
+                    flags.append(f"{r['open_p1']} open P1")
+                if r["score"] < 40:
+                    flags.append(f"health {r['score']}/100")
+                if r["hours_stale"] > _stale_h:
+                    flags.append(f"data {r['hours_stale']}h old")
+                lines.append(f"- **{r['name']}** — {', '.join(flags)}")
+        if ok:
+            lines.append("\n### ✅ Looking Good")
+            for r in ok:
+                lines.append(
+                    f"- **{r['name']}** — score {r['score']} ({r['grade']})"
+                    + (f", {r['open_p2']} open P2" if r["open_p2"] > 0 else "")
+                    + (f", data {r['hours_stale']}h old" if r["hours_stale"] > 0 else "")
+                )
+        lines.append(
+            f"\n*Briefing covers your top {len(_snap)} accounts by recent activity. "
+            "Ask me to drill into any account for details.*"
+        )
+        return "\n".join(lines)
+
     elif name == "generate_chart":
         opt = _build_agent_echart_option(args)
         # Return a fenced ```echart block — _render_chat renders it as a live ui.echart
@@ -16288,2722 +11642,1261 @@ LIMIT {limit}
             payload["description"] = description
         return "```table\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
 
+    elif name == "vector_search":
+        query = (args.get("query") or "").strip()
+        if not query:
+            return "Error: query is required."
+        limit = min(int(args.get("limit") or 10), 30)
+        emb_p   = ctx.get("emb_provider", "ollama")
+        emb_m   = ctx.get("emb_model", "nomic-embed-text")
+        emb_k   = ctx.get("emb_api_key", "")
+        emb_u   = ctx.get("emb_base_url", "http://localhost:11434")
+        emb_d   = int(ctx.get("emb_dims") or 1024)
+        try:
+            qvec = embed_text(query, emb_p, emb_m, emb_k, emb_u, emb_d)
+        except Exception as exc:
+            return f"Embedding failed — check embedding provider config: {exc}"
+        try:
+            keys = vector_search_cb(qvec, cb_url, bucket, username, password, use_tls, scope, collection, top_k=limit)
+        except Exception as exc:
+            return f"Vector search failed: {exc}"
+        if not keys:
+            return "No semantically similar tickets found."
+        ticket_keys = [k for k in keys if k.startswith("ticket::")]
+        tickets = fetch_tickets_by_keys(ticket_keys, cb_url, bucket, username, password, use_tls, scope, collection)
+        if not tickets:
+            return "Vector search returned results but could not fetch ticket documents."
+        lines = [
+            f"**Semantic search results for:** *{query}*\n",
+            "| Ticket ID | Organization | Subject | Status | Priority | CB Version |",
+            "|-----------|-------------|---------|--------|----------|------------|",
+        ]
+        for t in tickets:
+            topo = t.get("snapshot_topology") or {}
+            cbv = topo.get("cb_version") or ""
+            subj = (t.get("subject") or "")[:55].replace("|", "/")
+            lines.append(
+                f"| {t.get('ticket_id','')} | {t.get('organization','')} | {subj} "
+                f"| {t.get('status','')} | {t.get('priority','')} | {cbv} |"
+            )
+        return "\n".join(lines) + f"\n\n**{len(tickets)} results**"
+
+    elif name == "get_cluster_health":
+        org = (args.get("organization") or default_customer or "").strip()
+        if not org:
+            return "Error: organization is required."
+        # Load snapshots for this org from CB
+        try:
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            from couchbase.options import QueryOptions as _QO
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _snap_ks = f"`{bucket}`.`{scope}`.`snapshots`"
+            _rows = list(_cluster.query(
+                f"SELECT s.* FROM {_snap_ks} AS s "
+                f"WHERE LOWER(s.organization) LIKE $org "
+                f"ORDER BY s.date DESC LIMIT 500",
+                _QO(named_parameters={"org": f"%{org.lower()}%"}, timeout=timedelta(seconds=30)),
+            ))
+            _cluster.close()
+        except Exception as exc:
+            return f"Failed to load snapshots from Couchbase: {exc}"
+        if not _rows:
+            # BEFORE v1.5.0: returned a "use fetch_snapshots first" message and stopped.
+            # AFTER v1.5.0: auto-triggers sync_snapshots if a cookie is available, then re-queries.
+            _auto_cookie = ctx.get("cookie") or _get_profile_cookie()  # unused as of v2.6.2
+            _auto_prefix = f"No snapshots in Couchbase for '{org}' — auto-syncing now.\n\n"
+            _sync_result = _execute_agent_tool(
+                "sync_snapshots", {"organization": org, "max_stubs": 10},
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                default_customer=default_customer, ctx=ctx,
+            )
+            _auto_prefix += _sync_result + "\n\n"
+            # Re-query after sync
+            try:
+                from couchbase.cluster import Cluster as _Cl2
+                from couchbase.options import ClusterOptions as _CO2
+                from couchbase.auth import PasswordAuthenticator as _PA2
+                from couchbase.options import QueryOptions as _QO2
+                _conn2 = _cb_conn_str(cb_url, use_tls)
+                _cl2 = _Cl2(_conn2, _CO2(_PA2(username, password)))
+                _cl2.wait_until_ready(timedelta(seconds=15))
+                _rows = list(_cl2.query(
+                    f"SELECT s.* FROM `{bucket}`.`{scope}`.`snapshots` AS s "
+                    f"WHERE LOWER(s.organization) LIKE $org ORDER BY s.date DESC LIMIT 500",
+                    _QO2(named_parameters={"org": f"%{org.lower()}%"}, timeout=timedelta(seconds=30)),
+                ))
+                _cl2.close()
+            except Exception:
+                pass
+            if not _rows:
+                return _auto_prefix + f"Still no snapshot data for '{org}' after sync. The customer may not exist in Supportal or has no snapshots."
+        else:
+            _auto_prefix = ""
+        tickets = tool_query_tickets(
+            {"organization": org}, cb_url, bucket, username, password, use_tls, scope, collection, limit=500,
+        )
+        health = build_cluster_health_data(_rows, tickets)
+        ci = health.get("cluster_index") or {}
+        if not ci:
+            return f"Snapshot data found ({len(_rows)} snapshots) but cluster index could not be built."
+        lines = [f"**Cluster health for {org}** — {len(_rows)} snapshots, {len(ci)} clusters\n"]
+        lines.append("| Cluster | CB Version | Nodes | CPUs/node | RAM/node | Last Seen | Bad | Warn | Status |")
+        lines.append("|---------|------------|-------|-----------|----------|-----------|-----|------|--------|")
+        for cid, c in sorted(ci.items(), key=lambda x: x[1].get("last_seen") or "", reverse=True):
+            name  = c.get("cluster_name") or cid[:12]
+            ver   = (c.get("version_history") or [""])[-1] or "unknown"
+            nodes = c.get("node_count_last") or c.get("node_count") or "?"
+            cpus  = c.get("cpus_per_node") or "?"
+            ram   = f"{c['ram_per_node_mib']} MiB" if c.get("ram_per_node_mib") else "?"
+            last  = (c.get("last_seen") or "")[:10]
+            bad   = c.get("avg_bad", 0)
+            warn  = c.get("avg_warn", 0)
+            status = "Deprecated" if c.get("is_deprecated") else ("Active" if c.get("is_active") else "Inactive")
+            lines.append(f"| {name} | {ver} | {nodes} | {cpus} | {ram} | {last} | {bad} | {warn} | {status} |")
+        return _auto_prefix + "\n".join(lines)
+
+    elif name == "cluster_hw_chart":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required for cluster_hw_chart."
+        _sf = (args.get("status_filter") or "open_or_pending").lower()
+        _height = int(args.get("height") or 0)
+        try:
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO, QueryOptions as _QO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cl2 = _Cl(_conn, _CO(_PA(username, password)))
+            _cl2.wait_until_ready(timedelta(seconds=15))
+
+            _status_vals = {
+                "open":            ["open", "new"],
+                "pending":         ["pending"],
+                "open_or_pending": ["open", "new", "pending"],
+                "all":             [],
+            }.get(_sf, ["open", "new", "pending"])
+            _status_clause = (
+                "AND LOWER(t.status) IN [" + ",".join(f'"{s}"' for s in _status_vals) + "] "
+                if _status_vals else ""
+            )
+
+            # Hardware is embedded directly in snapshot_topology on each ticket.
+            # Pull cluster name, hw specs, and CBSEs in one query.
+            _tkt_sql = (
+                f"SELECT t.ticket_id, t.cbses, "
+                f"t.snapshot_topology.cluster_name, "
+                f"t.snapshot_topology.total_nodes, "
+                f"t.snapshot_topology.cpus_per_node, "
+                f"t.snapshot_topology.ram_per_node_mib "
+                f"FROM `{bucket}`.`{scope}`.`{collection}` t "
+                f"WHERE t.type='ticket' AND LOWER(t.organization) LIKE $org "
+                f"{_status_clause}"
+                f"AND t.snapshot_topology IS NOT NULL "
+                f"AND t.snapshot_topology.cluster_name IS NOT NULL "
+                f"LIMIT 500"
+            )
+            _tkt_rows = list(_cl2.query(_tkt_sql, _QO(
+                named_parameters={"org": f"%{_org.lower()}%"}, timeout=timedelta(seconds=30)
+            )))
+            _cl2.close()
+
+            if not _tkt_rows:
+                # Diagnose: count tickets without topology
+                return (
+                    f"No {_sf} tickets with embedded snapshot topology found for '{_org}'. "
+                    "Tickets may be missing snapshot data — ask to rescrape or sync_snapshots."
+                )
+
+            # Deduplicate by cluster_name; collect CBSEs per cluster
+            _seen: set = set()
+            _hw: list[dict] = []
+            _cluster_cbses: dict[str, set] = {}
+            for _r in _tkt_rows:
+                _cn = (_r.get("cluster_name") or "").strip()
+                _cbses = [c for c in (_r.get("cbses") or []) if c]
+                if _cn:
+                    _cluster_cbses.setdefault(_cn, set()).update(_cbses)
+                if not _cn or _cn in _seen:
+                    continue
+                _seen.add(_cn)
+                _hw.append({
+                    "cluster": _cn,
+                    "nodes":   int(_r.get("total_nodes") or 0),
+                    "cpus":    int(_r.get("cpus_per_node") or 0),
+                    "ram_gib": round((_r.get("ram_per_node_mib") or 0) / 1024, 1),
+                })
+
+            # Attach de-duped CBSEs
+            for _h in _hw:
+                _h["cbses"] = sorted(_cluster_cbses.get(_h["cluster"], set()))
+
+            if not _hw:
+                return f"Tickets found but no cluster topology could be extracted for '{_org}'."
+
+            # ── 3. Build chart ────────────────────────────────────────────────────
+            # Label: cluster name + ● if has CBSEs
+            _labels = []
+            for _h in _hw:
+                _cbse_list = _h["cbses"]
+                _lbl = _h["cluster"]
+                if _cbse_list:
+                    # Normalise IDs and append indicator
+                    _ids = [c if c.upper().startswith("CBSE-") else f"CBSE-{c}" for c in _cbse_list[:3]]
+                    _lbl += f" ● ({', '.join(_ids)})"
+                _labels.append(_lbl)
+
+            _auto_h = max(300, min(700, 80 + len(_hw) * 26))
+            _opt = _build_agent_echart_option({
+                "chart_type":   "horizontal_bar",
+                "title":        f"Cluster Hardware — Open/Pending Tickets ({_org})",
+                "labels":       _labels,
+                "series": [
+                    {"name": "Nodes",      "data": [_h["nodes"]   for _h in _hw]},
+                    {"name": "CPUs/node",  "data": [_h["cpus"]    for _h in _hw]},
+                    {"name": "RAM GiB/node", "data": [_h["ram_gib"] for _h in _hw]},
+                ],
+                "height":       _height or _auto_h,
+                "description":  "● = cluster has one or more CBSE-linked tickets. "
+                                "Values: physical node count, CPU cores per node, RAM per node in GiB.",
+                "color_scheme": "couchbase",
+            })
+            return "```echart\n" + json.dumps(_opt, ensure_ascii=False) + "\n```"
+
+        except Exception as exc:
+            import traceback as _tb2; _tb2.print_exc()
+            return f"cluster_hw_chart error: {exc}"
+
+    elif name == "query_local_snapshots":
+        org   = (args.get("organization") or "").strip()
+        days  = int(args.get("days") or 30)
+        limit = min(int(args.get("limit") or 50), 500)
+        try:
+            import time as _time
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO, QueryOptions as _QO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _snap_ks = f"`{bucket}`.`{scope}`.`snapshots`"
+            _cutoff  = _time.time() - days * 86400
+            _org_clause = "AND LOWER(s.organization) LIKE $org " if org else ""
+            _sql = (
+                f"SELECT s.organization, s.cluster_name, s.cb_version, "
+                f"s.node_count, s.cpus_per_node, s.ram_per_node_mib, "
+                f"s.topology.disk_total_per_node_mib, s.topology.disk_used_per_node_mib, "
+                f"s.topology.ram_used_per_node_mib, "
+                f"s.bad_count, s.warn_count, s.date, s.last_scraped_at "
+                f"FROM {_snap_ks} AS s "
+                f"WHERE s.last_scraped_at >= $cutoff "
+                f"{_org_clause}"
+                f"ORDER BY s.last_scraped_at DESC LIMIT {limit}"
+            )
+            _params: dict = {"cutoff": _cutoff}
+            if org:
+                _params["org"] = f"%{org.lower()}%"
+            _rows = list(_cluster.query(_sql, _QO(named_parameters=_params, timeout=timedelta(seconds=30))))
+            _cluster.close()
+        except Exception as exc:
+            return f"query_local_snapshots failed: {exc}"
+        if not _rows:
+            _org_hint = f" for '{org}'" if org else ""
+            return f"No snapshots found{_org_hint} in the last {days} days in local Couchbase."
+        _header = (
+            f"**{len(_rows)} snapshots{(' for ' + org) if org else ''} — last {days} days (local CB)**\n\n"
+            "| Organization | Cluster | CB Version | Nodes | CPUs/node | RAM MiB | RAM Used MiB | Disk Total MiB | Disk Used MiB | Bad | Warn | Scraped |\n"
+            "|---|---|---|---|---|---|---|---|---|---|---|---|"
+        )
+        _lines = [_header]
+        import datetime as _dt2
+        for r in _rows:
+            _scraped = r.get("last_scraped_at")
+            _scraped_str = _dt2.datetime.fromtimestamp(_scraped).strftime("%Y-%m-%d") if _scraped else "?"
+            _lines.append(
+                f"| {r.get('organization','?')} | {r.get('cluster_name','?')} | {r.get('cb_version','?')} "
+                f"| {r.get('node_count','?')} | {r.get('cpus_per_node','?')} | {r.get('ram_per_node_mib','?')} "
+                f"| {r.get('ram_used_per_node_mib','?')} | {r.get('disk_total_per_node_mib','?')} "
+                f"| {r.get('disk_used_per_node_mib','?')} "
+                f"| {r.get('bad_count','?')} | {r.get('warn_count','?')} | {_scraped_str} |"
+            )
+        return "\n".join(_lines)
+
+    elif name == "analyze_snapshot":
+        snap_id  = (args.get("snap_id") or "").strip()
+        notes    = (args.get("analysis_notes") or "").strip()
+        save     = bool(args.get("save_notes", False))
+        if not snap_id:
+            return "Error: snap_id is required."
+        try:
+            topo = fetch_snapshot_topology(snap_id, cookie=None)
+        except Exception as exc:
+            return f"Failed to fetch snapshot {snap_id}: {exc}"
+        if not topo:
+            return f"Snapshot {snap_id} returned no topology data."
+
+        bad  = topo.get("bad_items")  or []
+        warn = topo.get("warn_items") or []
+        lines = [
+            f"**Snapshot {snap_id}**",
+            f"Cluster: {topo.get('cluster_name','')} | Version: {topo.get('cb_version','')}",
+            f"Nodes: {topo.get('total_nodes','')} | CPUs/node: {topo.get('cpus_per_node','')} | RAM/node: {topo.get('ram_per_node_mib','')} MiB",
+            f"Bad items ({len(bad)}): {', '.join(bad) if bad else 'none'}",
+            f"Warn items ({len(warn)}): {', '.join(warn) if warn else 'none'}",
+        ]
+        buckets = topo.get("buckets") or []
+        if buckets:
+            lines.append(f"Buckets: {', '.join(b.get('name','') for b in buckets if b.get('name'))}")
+        if notes:
+            lines.append(f"\n**Analysis notes:** {notes}")
+
+        # Save notes + topology back to the snapshot doc in CB if requested
+        if save and snap_id:
+            try:
+                from couchbase.cluster import Cluster as _AsCl
+                from couchbase.options import ClusterOptions as _AsCO
+                from couchbase.auth import PasswordAuthenticator as _AsPA
+                _as_cl = _AsCl(_cb_conn_str(cb_url, use_tls), _AsCO(_AsPA(username, password)))
+                _as_cl.wait_until_ready(timedelta(seconds=10))
+                _as_snap_col = _as_cl.bucket(bucket).scope(scope).collection("snapshots")
+                _snap_key = f"snapshot::{snap_id}"
+                try:
+                    _snap_doc = _as_snap_col.get(_snap_key).content_as[dict]
+                except Exception:
+                    _snap_doc = {"snap_id": snap_id, "type": "snapshot"}
+                _snap_doc["topology"]        = topo
+                _snap_doc["analysis_notes"]  = notes
+                _snap_doc["analyzed_at"]     = int(time.time())
+                _as_snap_col.upsert(_snap_key, _snap_doc)
+                _as_cl.close()
+                lines.append("_(Analysis notes saved to snapshot record.)_")
+            except Exception as exc:
+                lines.append(f"_(Note: could not save to CB — {exc})_")
+
+        return "\n".join(lines)
+
+    elif name == "fetch_snapshots":
+        org   = (args.get("organization") or default_customer or "").strip()
+        limit = min(int(args.get("limit") or 100), 500)
+        if not org:
+            return "Error: organization is required."
+        cookie = ctx.get("cookie") or _get_profile_cookie()  # unused as of v2.6.2; retained for re-enablement
+        try:
+            stubs = fetch_snapshots_via_analytics(org, cookie, limit=limit)
+        except Exception as exc:
+            return f"fetch_snapshots failed: {exc}"
+        if not stubs:
+            return f"No snapshots found for '{org}' in the Analytics API."
+        # Save stubs to CB
+        _saved = 0
+        try:
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _col = _cluster.bucket(bucket).scope(scope).collection("snapshots")
+            for s in stubs:
+                try:
+                    _col.upsert(f"snapshot::{s['snap_id']}", s)
+                    _saved += 1
+                except Exception:
+                    pass
+            _cluster.close()
+        except Exception as exc:
+            return (
+                f"Fetched {len(stubs)} snapshot stubs from Analytics API but CB save failed: {exc}. "
+                "Check your Couchbase connection."
+            )
+        return (
+            f"Fetched and saved **{_saved} snapshot stubs** for '{org}'. "
+            f"Topology detail is not yet loaded — call backfill_snapshot_topology to enrich them."
+        )
+
+    elif name == "backfill_snapshot_topology":
+        org       = (args.get("organization") or default_customer or "").strip()
+        max_stubs = min(int(args.get("max_stubs") or 10), 25)
+        if not org:
+            return "Error: organization is required."
+        cookie = ctx.get("cookie") or _get_profile_cookie()
+        if not cookie:
+            return "No session cookie available — paste a cookie in the Configuration tab first."
+        # Load incomplete stubs from CB
+        try:
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            from couchbase.options import QueryOptions as _QO
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _snap_ks = f"`{bucket}`.`{scope}`.`snapshots`"
+            _incomplete = list(_cluster.query(
+                f"SELECT s.* FROM {_snap_ks} AS s "
+                f"WHERE LOWER(s.organization) LIKE $org "
+                f"AND (s.cb_version IS MISSING OR s.cb_version = '' OR s.cb_version IS NULL) "
+                f"ORDER BY s.date DESC LIMIT {max_stubs}",
+                _QO(named_parameters={"org": f"%{org.lower()}%"}, timeout=timedelta(seconds=30)),
+            ))
+            _cluster.close()
+        except Exception as exc:
+            return f"Failed to load incomplete snapshots from CB: {exc}"
+        if not _incomplete:
+            return f"No incomplete snapshot stubs found for '{org}' — topology already looks complete, or no snapshots exist. Try fetch_snapshots first."
+        def _noop_prog(msg, pct): pass
+        try:
+            enriched = scrape_snapshots_from_stubs(_incomplete, cookie, max_detail_workers=4, progress_cb=_noop_prog)
+        except Exception as exc:
+            return f"Topology backfill failed: {exc}"
+        # Save enriched docs back to CB
+        _saved = 0
+        try:
+            from couchbase.cluster import Cluster as _Cl2
+            from couchbase.options import ClusterOptions as _CO2
+            from couchbase.auth import PasswordAuthenticator as _PA2
+            _conn2 = _cb_conn_str(cb_url, use_tls)
+            _cl2 = _Cl2(_conn2, _CO2(_PA2(username, password)))
+            _cl2.wait_until_ready(timedelta(seconds=15))
+            _col2 = _cl2.bucket(bucket).scope(scope).collection("snapshots")
+            for s in enriched:
+                try:
+                    _col2.upsert(f"snapshot::{s['snap_id']}", s)
+                    _saved += 1
+                except Exception:
+                    pass
+            _cl2.close()
+        except Exception as exc:
+            return f"Enriched {len(enriched)} stubs but CB save failed: {exc}"
+        bad_total  = sum(s.get("bad_count", 0) for s in enriched)
+        warn_total = sum(s.get("warn_count", 0) for s in enriched)
+        return (
+            f"Topology backfill complete — **{_saved}/{len(_incomplete)} stubs enriched**. "
+            f"Total bad items: {bad_total}, warn items: {warn_total}. "
+            f"Call get_cluster_health to see the full summary."
+        )
+
+    elif name == "get_scrape_status":
+        _filter_jid = (args.get("job_id") or "").strip().lower()
+        if not _SCRAPE_JOBS:
+            return "No scrape jobs have been started in this session."
+        jobs_to_show = (
+            [_SCRAPE_JOBS[_filter_jid]] if _filter_jid and _filter_jid in _SCRAPE_JOBS
+            else list(reversed(list(_SCRAPE_JOBS.values())))[:10]
+        )
+        if _filter_jid and _filter_jid not in _SCRAPE_JOBS:
+            return f"Job '{_filter_jid}' not found. Recent job IDs: {', '.join(list(_SCRAPE_JOBS)[-5:])}."
+        _now = time.time()
+        lines: list[str] = []
+        running = [j for j in jobs_to_show if j["status"] == "running"]
+        done    = [j for j in jobs_to_show if j["status"] != "running"]
+        if running:
+            lines.append("## Active Jobs\n")
+            for j in running:
+                elapsed = int(_now - j["started_at"])
+                proc    = j.get("processed") or 0
+                total   = j.get("total")
+                pct_str = f" ({proc/total:.0%})" if total else ""
+                lines.append(
+                    f"**Job {j['job_id']}** — {j['org']} ({j['mode']}) — **RUNNING**\n"
+                    f"  Phase: {j['phase'] or '—'}\n"
+                    f"  Progress: {proc}/{total or '?'} tickets{pct_str}\n"
+                    f"  Elapsed: {elapsed}s\n"
+                    f"  Last: {j['last_message']}\n"
+                )
+        if done:
+            lines.append("## Recent Jobs\n")
+            for j in done:
+                duration = int((j.get("finished_at") or _now) - j["started_at"])
+                ago      = int(_now - (j.get("finished_at") or _now))
+                icon     = "✅" if j["status"] == "done" else "❌"
+                lines.append(
+                    f"**Job {j['job_id']}** — {j['org']} ({j['mode']}) — {icon} {j['status'].upper()}\n"
+                    f"  {j['last_message']}\n"
+                    f"  Duration: {duration}s | Finished: {ago}s ago\n"
+                )
+        return "\n".join(lines).strip()
+
+    elif name == "cancel_scrape_job":
+        _cjid = (args.get("job_id") or "").strip().lower()
+        if not _cjid:
+            return "Error: job_id is required."
+        # Signal the running thread to stop cleanly
+        _cev = _JOB_CANCEL_EVENTS.get(_cjid)
+        if _cev:
+            _cev.set()
+        # Update in-memory record immediately so the monitor sees it
+        _cjob = _SCRAPE_JOBS.get(_cjid)
+        if _cjob:
+            if _cjob.get("status") == "running":
+                _cjob["status"]      = "cancelled"
+                _cjob["phase"]       = None
+                _cjob["finished_at"] = time.time()
+                _cjob["last_message"] = (
+                    f"Cancelled by user at ticket "
+                    f"{_cjob.get('processed',0)}/{_cjob.get('total','?')}. "
+                    f"To resume: rescrape with stale_hours=1 — the "
+                    f"{_cjob.get('saved',0)} already-refreshed tickets will be skipped."
+                )
+                # Write cancelled state to CB so it persists across restarts
+                _persist_job_state(
+                    _cjob, cb_url, bucket, username, password, use_tls, scope, collection
+                )
+                proc = _cjob.get("processed", 0)
+                total_ = _cjob.get("total", "?")
+                saved_ = _cjob.get("saved", 0)
+                return (
+                    f"Job **{_cjid}** cancelled at {proc}/{total_} tickets ({saved_} saved). "
+                    f"To resume from where it stopped, run: "
+                    f"*rescrape {_cjob.get('org','')} with stale_hours=1* — "
+                    f"already-refreshed tickets have fresh timestamps and will be skipped automatically."
+                )
+            else:
+                return f"Job **{_cjid}** is not running (status: {_cjob['status']})."
+        # Job not in memory — look it up in CB and mark cancelled there
+        if cb_url and username:
+            try:
+                from couchbase.cluster import Cluster as _CKCl
+                from couchbase.options import ClusterOptions as _CKCO
+                from couchbase.auth import PasswordAuthenticator as _CKPA
+                _ckconn = _cb_conn_str(cb_url, use_tls)
+                _ckc    = _CKCl(_ckconn, _CKCO(_CKPA(username, password)))
+                _ckc.wait_until_ready(timedelta(seconds=5))
+                _ckcol  = _ckc.bucket(bucket).scope(scope).collection(collection)
+                _ckdoc  = _ckcol.get(f"scrape_job::{_cjid}").content_as[dict]
+                if _ckdoc.get("status") == "running":
+                    _ckdoc["status"]      = "cancelled"
+                    _ckdoc["phase"]       = None
+                    _ckdoc["finished_at"] = time.time()
+                    _ckdoc["last_message"] = "Cancelled by user (post-restart)."
+                    _ckcol.upsert(f"scrape_job::{_cjid}", {**_ckdoc, "type": "scrape_job"})
+                    _ckc.close()
+                    return f"Job **{_cjid}** marked cancelled in Couchbase (thread was already dead after restart)."
+                _ckc.close()
+                return f"Job **{_cjid}** status in CB: {_ckdoc.get('status')} — nothing to cancel."
+            except Exception as _cke:
+                return f"Job **{_cjid}** not found in memory or Couchbase: {_cke}"
+        return f"Job '{_cjid}' not found in this session."
+
+    elif name == "backfill_last_comment_at":
+        _bf_org = (args.get("organization") or "").strip()
+        def _noop_prog(msg, pct): pass
+        try:
+            _bf_updated, _bf_errs = backfill_last_comment_at(
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                _noop_prog, org_filter=_bf_org,
+            )
+        except Exception as exc:
+            return f"Backfill failed: {exc}"
+        scope_desc = f" for '{_bf_org}'" if _bf_org else " across all tickets"
+        return (
+            f"Backfill complete{scope_desc} — **{_bf_updated} tickets updated**, {_bf_errs} errors. "
+            f"The 'Last Reply' column in query_tickets will now show conversation timestamps."
+        )
+
+    elif name == "scrape_customer_tickets":
+        org         = (args.get("organization") or default_customer or "").strip()
+        max_tickets = min(int(args.get("max_tickets") or 25), 50)
+        if not org:
+            return "Error: organization is required."
+        cookie = ctx.get("cookie") or _get_profile_cookie()
+        if not cookie:
+            return "No session cookie available — paste a cookie in the Configuration tab first."
+        _job = _make_scrape_job(org, "scrape")
+        threading.Thread(
+            target=_run_scrape_job_bg,
+            args=(
+                _job, org, cookie, max_tickets,
+                {"url": cb_url, "bucket": bucket, "username": username, "password": password,
+                 "use_tls": use_tls, "scope": scope, "collection": collection},
+                {"provider": ctx.get("emb_provider",""), "model": ctx.get("emb_model",""),
+                 "api_key": ctx.get("emb_api_key",""), "base_url": ctx.get("emb_base_url",""),
+                 "dims": ctx.get("emb_dims", 0),
+                 "embed_parallel": ctx.get("embed_parallel", 1)},
+                {"provider": ctx.get("provider",""), "model": ctx.get("model",""),
+                 "api_key": ctx.get("api_key",""), "base_url": ctx.get("base_url","")},
+            ),
+            daemon=True,
+        ).start()
+        if ctx is not None:
+            ctx.setdefault("_started_jobs", []).append(_job["job_id"])
+        return (
+            f"Started scrape job **{_job['job_id']}** for '{org}' (up to {max_tickets} tickets). "
+            f"The pipeline runs in the background — scraping, saving, embedding, and scoring. "
+            f"**I cannot notify you when it finishes — you must ask me.** "
+            f"Ask 'what is the scrape status?' after a minute or two to check progress."
+        )
+
+    elif name == "score_ticket":
+        ticket_id = str(args.get("ticket_id") or "").strip()
+        if not ticket_id:
+            return "Error: ticket_id is required."
+        tickets = fetch_tickets_by_keys(
+            [f"ticket::{ticket_id}"], cb_url, bucket, username, password, use_tls, scope, collection,
+        )
+        if not tickets:
+            return f"Ticket {ticket_id} not found in Couchbase."
+        t = tickets[0]
+        provider = ctx.get("provider", "claude")
+        model    = ctx.get("model", "claude-sonnet-4-6")
+        api_key  = ctx.get("api_key", "")
+        base_url = ctx.get("base_url", "")
+        try:
+            scored = score_tickets_batch([t], provider, model, api_key, base_url)
+        except Exception as exc:
+            return f"Scoring failed: {exc}"
+        if not scored:
+            return f"Scoring returned no results for ticket {ticket_id}."
+        s = scored[0]
+        # Save scores back to CB
+        try:
+            from couchbase.cluster import Cluster as _Cl
+            from couchbase.options import ClusterOptions as _CO
+            from couchbase.auth import PasswordAuthenticator as _PA
+            _conn = _cb_conn_str(cb_url, use_tls)
+            _cluster = _Cl(_conn, _CO(_PA(username, password)))
+            _cluster.wait_until_ready(timedelta(seconds=15))
+            _col = _cluster.bucket(bucket).scope(scope).collection(collection)
+            try:
+                existing = _col.get(f"ticket::{ticket_id}").content_as[dict]
+                existing.update({k: v for k, v in s.items() if v is not None})
+                _col.upsert(f"ticket::{ticket_id}", existing)
+            except Exception:
+                pass
+            _cluster.close()
+        except Exception:
+            pass
+        lines = [f"**Score results for ticket {ticket_id}**\n"]
+        for field in ("stars", "temperature", "complexity", "resolution_quality",
+                      "response_timeliness", "communication_clarity"):
+            val = s.get(field)
+            if val is not None:
+                lines.append(f"- **{field}**: {val}")
+        summary = s.get("interaction_summary") or s.get("summary") or ""
+        if summary:
+            lines.append(f"\n**Summary:** {summary[:500]}")
+        return "\n".join(lines)
+
+    # ── v1.5.0 new tools ──────────────────────────────────────────────────────
+
+    elif name == "sync_snapshots":
+        # BEFORE v1.5.0: agent had to call fetch_snapshots then backfill_snapshot_topology
+        #   separately — often only completing step 1.
+        # AFTER v1.5.0: single tool that does both atomically.
+        org       = (args.get("organization") or default_customer or "").strip()
+        max_stubs = min(int(args.get("max_stubs") or 10), 25)
+        if not org:
+            return "Error: organization is required."
+        fetch_r = _execute_agent_tool(
+            "fetch_snapshots", {"organization": org, "limit": 200},
+            cb_url, bucket, username, password, use_tls, scope, collection,
+            default_customer=default_customer, ctx=ctx,
+        )
+        backfill_r = _execute_agent_tool(
+            "backfill_snapshot_topology", {"organization": org, "max_stubs": max_stubs},
+            cb_url, bucket, username, password, use_tls, scope, collection,
+            default_customer=default_customer, ctx=ctx,
+        )
+        return (
+            f"**Snapshot sync complete for '{org}'**\n\n"
+            f"**Step 1 — Stub fetch:** {fetch_r}\n\n"
+            f"**Step 2 — Topology backfill:** {backfill_r}"
+        )
+
+    elif name == "batch_score_tickets":
+        # BEFORE v1.5.0: score_ticket processed one ticket per call, burning 5-turn limit.
+        # AFTER v1.5.0: scores up to 10 tickets per call, returns a summary table.
+        raw_ids     = args.get("ticket_ids") or []
+        org         = (args.get("organization") or default_customer or "").strip()
+        limit       = min(int(args.get("limit") or 10), 50)
+        unscored_only = bool(args.get("unscored_only", True))
+        status_filt = (args.get("status") or "").strip().lower() or None
+        provider = ctx.get("provider", "claude")
+        model    = ctx.get("model", "claude-sonnet-4-6")
+        api_key  = ctx.get("api_key", "")
+        base_url = ctx.get("base_url", "")
+
+        ticket_ids = [str(t).strip() for t in raw_ids if t]
+        if not ticket_ids:
+            if not org:
+                return "Error: provide ticket_ids list or organization to run batch scoring."
+            _filt: dict = {"organization": org}
+            if status_filt:
+                _filt["status"] = status_filt
+            candidates = tool_query_tickets(
+                _filt, cb_url, bucket, username, password, use_tls, scope, collection, limit=limit * 6,
+            )
+            if unscored_only:
+                candidates = [t for t in candidates if not (t.get("score") or {}).get("stars")]
+            ticket_ids = [str(t.get("ticket_id")) for t in candidates[:limit] if t.get("ticket_id")]
+
+        ticket_ids = ticket_ids[:limit]
+        if not ticket_ids:
+            return f"No tickets to score{' (all already scored)' if unscored_only else ''}."
+
+        tickets = fetch_tickets_by_keys(
+            [f"ticket::{tid}" for tid in ticket_ids],
+            cb_url, bucket, username, password, use_tls, scope, collection,
+        )
+        if not tickets:
+            return f"Could not fetch tickets from Couchbase."
+
+        try:
+            scored = score_tickets_batch(tickets, provider, model, api_key, base_url)
+        except Exception as exc:
+            return f"Scoring failed: {exc}"
+        if not scored:
+            return "Scoring returned no results."
+
+        _saved = 0
+        try:
+            from couchbase.cluster import Cluster as _ScCl
+            from couchbase.options import ClusterOptions as _ScCO
+            from couchbase.auth import PasswordAuthenticator as _ScPA
+            _sc_conn = _cb_conn_str(cb_url, use_tls)
+            _sc_cl = _ScCl(_sc_conn, _ScCO(_ScPA(username, password)))
+            _sc_cl.wait_until_ready(timedelta(seconds=15))
+            _sc_col = _sc_cl.bucket(bucket).scope(scope).collection(collection)
+            for s in scored:
+                _stid = str(s.get("ticket_id") or "").strip()
+                if not _stid:
+                    continue
+                try:
+                    _ex = _sc_col.get(f"ticket::{_stid}").content_as[dict]
+                    # Score fields belong nested under doc["score"] (like every
+                    # other scoring path) — a flat update leaves reports reading
+                    # the stale nested score while new values sit top-level.
+                    _sc_data = {k: v for k, v in s.items() if v is not None and k != "ticket_id"}
+                    _ex["score"] = {
+                        **(_ex.get("score") or {}),
+                        **_sc_data,
+                        "scored_at": int(time.time()),
+                    }
+                    _sc_col.upsert(f"ticket::{_stid}", _ex)
+                    _saved += 1
+                except Exception:
+                    pass
+            _sc_cl.close()
+        except Exception:
+            pass
+
+        lines = [f"**Batch scoring — {len(scored)} tickets scored, {_saved} saved**\n"]
+        lines.append("| Ticket ID | Stars | Temperature | Complexity |")
+        lines.append("|-----------|-------|-------------|------------|")
+        for s in scored:
+            lines.append(
+                f"| {s.get('ticket_id','')} "
+                f"| {s.get('stars','?')} "
+                f"| {s.get('temperature','?')} "
+                f"| {s.get('complexity','?')} |"
+            )
+        return "\n".join(lines)
+
+    elif name == "batch_rescrape_tickets":
+        # BEFORE v1.5.0: rescrape_ticket took one ID per call, agent called it N times
+        #   burning the 5-turn limit and often stopping after 2-3 tickets.
+        # AFTER v1.5.0: re-fetches up to 20 tickets per call, returns per-ticket results.
+        raw_ids    = args.get("ticket_ids") or []
+        limit      = min(int(args.get("limit") or 10), 20)
+        ticket_ids = [str(t).strip() for t in raw_ids if t][:limit]
+        if not ticket_ids:
+            return "Error: ticket_ids list is required and must not be empty."
+
+        cookie = ctx.get("cookie") or _get_profile_cookie()
+        if not cookie:
+            return "No session cookie available — paste a cookie in the Configuration tab first."
+
+        try:
+            from couchbase.cluster import Cluster as _BrCl
+            from couchbase.options import ClusterOptions as _BrCO
+            from couchbase.auth import PasswordAuthenticator as _BrPA
+            _br_conn = _cb_conn_str(cb_url, use_tls)
+            _br_cl = _BrCl(_br_conn, _BrCO(_BrPA(username, password)))
+            _br_cl.wait_until_ready(timedelta(seconds=10))
+            _br_col = _br_cl.bucket(bucket).scope(scope).collection(collection)
+        except Exception as exc:
+            return f"Couchbase connection failed: {exc}"
+
+        _ok = _skipped = _errors = 0
+        _result_rows: list[str] = []
+        for tid in ticket_ids:
+            try:
+                _sess = _make_api_session(cookie)
+                fresh = fetch_ticket_api(tid, _sess)
+                if not fresh or not fresh.get("ticket_id"):
+                    _skipped += 1
+                    _result_rows.append(f"| {tid} | ⚠ skipped (no data returned) |")
+                    continue
+                fresh["last_scraped_at"] = int(time.time())
+                fresh["type"]            = "ticket"
+                fresh["cb_version"]      = extract_ticket_version(fresh)
+                fresh["feature_area"]    = classify_ticket_feature(fresh)
+                fresh["ticket_origin"]   = classify_ticket_origin(fresh)
+                _doc_key = f"ticket::{tid}"
+                try:
+                    _ex = _br_col.get(_doc_key).content_as[dict]
+                    _merged = {**_ex}
+                    for _k, _v in fresh.items():
+                        if _v not in (None, "", [], {}):
+                            _merged[_k] = _v
+                        elif _k not in _merged:
+                            _merged[_k] = _v
+                    _br_col.upsert(_doc_key, _merged)
+                except Exception:
+                    _br_col.upsert(_doc_key, fresh)
+                _ok += 1
+                _result_rows.append(
+                    f"| {tid} | ✓ {fresh.get('status','')} / {fresh.get('priority','')} |"
+                )
+            except Exception as exc:
+                _errors += 1
+                _result_rows.append(f"| {tid} | ✗ {str(exc)[:60]} |")
+            time.sleep(0.3)
+
+        try:
+            _br_cl.close()
+        except Exception:
+            pass
+
+        lines = [f"**Batch rescrape: {_ok} updated, {_skipped} skipped, {_errors} errors**\n"]
+        lines.append("| Ticket ID | Result |")
+        lines.append("|-----------|--------|")
+        lines.extend(_result_rows)
+        return "\n".join(lines)
+
+    # ── v1.6.0: feature set tools ─────────────────────────────────────────────
+
+    elif name == "get_customer_health_score":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required."
+        try:
+            h = _compute_health_score(_org, cb_url, bucket, username, password,
+                                       use_tls, scope, collection)
+            lines = [
+                f"## Health Score: {_org}",
+                f"**{h['score']}/100** — {h['grade']}\n",
+                f"| Dimension | Value |",
+                f"|---|---|",
+                f"| Open P1 | {h['open_p1']} |",
+                f"| Open P2 | {h['open_p2']} |",
+                f"| Total tickets | {h['total_tickets']} |",
+                f"| Escalation rate | {h['escalation_rate_pct']}% |",
+                f"| Avg resolution | {h['avg_resolution_days']} days |",
+                f"| Data age | {h['hours_since_scraped']}h |",
+                f"| Cluster bad ratio | {h['cluster_bad_ratio']} |",
+            ]
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Health score error: {exc}"
+
+    elif name == "check_sla_compliance":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required."
+        try:
+            s = _compute_sla_compliance(
+                _org, cb_url, bucket, username, password, use_tls, scope, collection,
+                date_from=args.get("date_from") or "",
+                date_to=args.get("date_to") or "",
+            )
+            lines = [
+                f"## SLA Compliance: {_org}",
+                f"**Overall: {s['overall_compliance_pct']}%** ({s['tickets_analyzed']} tickets analyzed)\n",
+                "| Priority | Compliance | Met | Breached | Avg Hours | SLA Threshold |",
+                "|---|---|---|---|---|---|",
+            ]
+            for p, d in s.get("by_priority", {}).items():
+                lines.append(
+                    f"| {p.capitalize()} | {d['compliance_pct']}% | {d['met']} | {d['breached']} "
+                    f"| {d['avg_resolution_hours']}h | {d['sla_threshold_hours']}h |"
+                )
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"SLA compliance error: {exc}"
+
+    elif name == "get_portfolio_status":
+        limit           = min(int(args.get("limit") or 20), 50)
+        incl_cluster    = bool(args.get("include_cluster"))
+        snap_collection = ctx.get("snap_collection", "snapshots")
+        try:
+            from couchbase.cluster import Cluster  # type: ignore
+            from couchbase.options import ClusterOptions  # type: ignore
+            from couchbase.auth import PasswordAuthenticator        # type: ignore
+            conn = _cb_conn_str(cb_url, use_tls)
+            cl_  = Cluster(conn, ClusterOptions(PasswordAuthenticator(username, password)))
+            cl_.wait_until_ready(timedelta(seconds=10))
+            orgs_rows = list(cl_.query(
+                f"SELECT DISTINCT t.organization FROM `{bucket}`.`{scope}`.`{collection}` t "
+                f"WHERE t.type='ticket' AND t.organization IS NOT NULL LIMIT {limit * 2}",
+            ))
+            cl_.close()
+            orgs = [r.get("organization") for r in orgs_rows if r.get("organization")][:limit]
+            results = []
+            _errs: list[str] = []
+            for org in orgs:
+                try:
+                    if incl_cluster:
+                        h = _compute_health_score_with_cluster(
+                            org, cb_url, bucket, username, password,
+                            use_tls, scope, collection, snap_collection)
+                    else:
+                        h = _compute_health_score(org, cb_url, bucket, username, password,
+                                                   use_tls, scope, collection)
+                    results.append(h)
+                except Exception as _e:
+                    _errs.append(f"{org}: {_e}")
+            if not results:
+                err_detail = "; ".join(_errs[:3]) if _errs else "no organizations found in ticket collection"
+                return f"Portfolio status: no data returned. {err_detail}"
+            results.sort(key=lambda x: x["score"])
+            if incl_cluster:
+                lines = [
+                    "## Portfolio Status (ranked by urgency)\n",
+                    "| Customer | Score | Grade | Open P1 | Open P2 | Esc% | Clusters | Bad Ratio | Data Age |",
+                    "|---|---|---|---|---|---|---|---|---|",
+                ]
+                for h in results:
+                    lines.append(
+                        f"| {h['organization']} | {h['score']} | {h['grade']} "
+                        f"| {h['open_p1']} | {h['open_p2']} | {h['escalation_rate_pct']}% "
+                        f"| {h.get('cluster_count', '—')} | {h.get('cluster_bad_ratio', '—')} "
+                        f"| {h['hours_since_scraped']}h |"
+                    )
+            else:
+                lines = [
+                    "## Portfolio Status (ranked by urgency)\n",
+                    "| Customer | Score | Grade | Open P1 | Open P2 | Esc% | Data Age |",
+                    "|---|---|---|---|---|---|---|",
+                ]
+                for h in results:
+                    lines.append(
+                        f"| {h['organization']} | {h['score']} | {h['grade']} "
+                        f"| {h['open_p1']} | {h['open_p2']} "
+                        f"| {h['escalation_rate_pct']}% | {h['hours_since_scraped']}h |"
+                    )
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Portfolio error: {exc}"
+
+    elif name == "query_fleet_tickets":
+        _group_by      = args.get("group_by", "organization")
+        _status_filter = args.get("status_filter", "open")
+        _limit         = min(int(args.get("limit") or 30), 100)
+        try:
+            rows = _query_fleet_tickets(
+                cb_url, bucket, username, password, use_tls, scope, collection,
+                group_by=_group_by, status_filter=_status_filter, limit=_limit,
+            )
+            if not rows:
+                return f"No tickets found (group_by={_group_by}, status={_status_filter})."
+            _status_label = {"open": "open", "solved": "resolved", "all": "all"}.get(_status_filter, _status_filter)
+            def _fmt_cbse_id(raw):
+                s = str(raw or "?").strip()
+                return s if (s == "?" or s.upper().startswith("CBSE-")) else f"CBSE-{s}"
+
+            if _group_by == "cbse":
+                lines = [
+                    f"## Fleet Tickets by CBSE ({_status_label})\n",
+                    "| CBSE | Tickets | Orgs Affected |",
+                    "|---|---|---|",
+                ]
+                for r in rows:
+                    lines.append(f"| {_fmt_cbse_id(r.get('label'))} | {r.get('ticket_count',0)} | {r.get('org_count',0)} |")
+            else:
+                lines = [
+                    f"## Fleet Tickets by {_group_by.replace('_',' ').title()} ({_status_label})\n",
+                    "| Label | Tickets | P1 | P2 |",
+                    "|---|---|---|---|",
+                ]
+                for r in rows:
+                    lines.append(
+                        f"| {r.get('label','?')} | {r.get('ticket_count',0)} "
+                        f"| {r.get('p1_count',0)} | {r.get('p2_count',0)} |"
+                    )
+            lines.append(f"\n*{len(rows)} rows · grouped by {_group_by} · filter: {_status_filter}*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Fleet query error: {exc}"
+
+    elif name == "list_at_risk_clusters":
+        _bad_t  = int(args.get("bad_threshold")  or 0)
+        _warn_t = int(args.get("warn_threshold") or 3)
+        _lim    = min(int(args.get("limit") or 25), 100)
+        snap_collection = ctx.get("snap_collection", "snapshots")
+        try:
+            rows = _list_at_risk_clusters(
+                cb_url, bucket, username, password, use_tls, scope,
+                snap_collection=snap_collection, ticket_collection=collection,
+                bad_threshold=_bad_t, warn_threshold=_warn_t, limit=_lim,
+            )
+            if not rows:
+                return "No at-risk clusters found matching the thresholds — fleet looks clean."
+            lines = [
+                f"## At-Risk Clusters (bad > {_bad_t} OR warn > {_warn_t}, no open ticket)\n",
+                "| Cluster | Org | CB Version | Bad Items | Warn Items | Risk Score |",
+                "|---|---|---|---|---|---|",
+            ]
+            for r in rows:
+                lines.append(
+                    f"| {r.get('cluster_name','?')} | {r.get('organization','?')} "
+                    f"| {r.get('cb_version','?')} | {r.get('bad_items',0)} "
+                    f"| {r.get('warn_items',0)} | **{r.get('risk_score',0)}** |"
+                )
+            lines.append(f"\n*{len(rows)} clusters · risk score = bad×3 + warn*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"At-risk cluster query error: {exc}"
+
+    elif name == "fleet_version_distribution":
+        snap_collection = ctx.get("snap_collection", "snapshots")
+        try:
+            rows = _fleet_version_distribution(
+                cb_url, bucket, username, password, use_tls, scope, snap_collection,
+            )
+            if not rows:
+                return "No snapshot version data found."
+            lines = [
+                "## Fleet CB Version Distribution\n",
+                "| CB Version | Clusters | Orgs |",
+                "|---|---|---|",
+            ]
+            for r in rows:
+                lines.append(f"| {r.get('version','?')} | {r.get('cluster_count',0)} | {r.get('org_count',0)} |")
+            total_c = sum(r.get("cluster_count", 0) for r in rows)
+            lines.append(f"\n*{len(rows)} distinct versions across {total_c} clusters*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Version distribution error: {exc}"
+
+    elif name == "fleet_cbse_impact":
+        _lim = min(int(args.get("limit") or 20), 50)
+        try:
+            rows = _fleet_cbse_impact(
+                cb_url, bucket, username, password, use_tls, scope, collection, limit=_lim,
+            )
+            if not rows:
+                return "No CBSE data found in ticket records."
+
+            def _fmt_cbse(raw):
+                s = str(raw or "?").strip()
+                if s == "?":
+                    return s
+                return s if s.upper().startswith("CBSE-") else f"CBSE-{s}"
+
+            lines = [
+                "## Fleet CBSE Blast Radius (ranked by orgs affected)\n",
+                "| CBSE | Orgs Affected | Tickets |",
+                "|---|---|---|",
+            ]
+            for r in rows:
+                lines.append(
+                    f"| {_fmt_cbse(r.get('cbse'))} | {r.get('org_count',0)} | {r.get('ticket_count',0)} |"
+                )
+            lines.append(f"\n*{len(rows)} CBSEs found across all tickets*")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"CBSE impact query error: {exc}"
+
+    elif name == "record_feedback":
+        try:
+            from supportal.cb_helpers import save_feedback
+            _corr = None
+            if args.get("correction_field") or args.get("correction_old") or args.get("correction_new"):
+                _corr = {"field": args.get("correction_field", ""),
+                         "old": args.get("correction_old", ""),
+                         "new": args.get("correction_new", "")}
+            _fb_key = save_feedback(
+                cb_url, bucket, username, password, use_tls, scope,
+                source="chat",
+                kind="correction" if _corr else "rating",
+                subject_kind=str(args.get("subject_kind") or ""),
+                subject_ref=str(args.get("subject_ref") or ""),
+                verdict=str(args.get("verdict") or ""),
+                details=str(args.get("details") or ""),
+                correction=_corr,
+                organization=default_customer or "",
+            )
+            return f"Feedback recorded ({_fb_key}). It will feed future eval and training data."
+        except Exception as exc:
+            return f"Failed to record feedback: {exc}"
+
+    elif name == "tag_ticket":
+        tid  = str(args.get("ticket_id") or "").strip()
+        tags = args.get("tags") or []
+        repl = bool(args.get("replace"))
+        if not tid:
+            return "Error: ticket_id is required."
+        if not tags:
+            return "Error: tags list is required."
+        return _tag_ticket_in_cb(tid, tags, cb_url, bucket, username, password,
+                                  use_tls, scope, collection, replace=repl)
+
+    elif name == "get_digest":
+        _org    = (args.get("organization") or default_customer or "").strip()
+        _hours  = max(1, min(168, int(args.get("since_hours") or 24)))
+        try:
+            d = _get_digest(_org, cb_url, bucket, username, password, use_tls, scope, collection, _hours)
+            _new = d["new_tickets"]
+            _res = d["resolved_tickets"]
+            _stl = d["stale_open_tickets"]
+            lines = [
+                f"## What's New{' — ' + _org if _org else ''} (last {_hours}h)\n",
+                f"**{len(_new)} new** · **{len(_res)} resolved** · **{len(_stl)} stale open**\n",
+            ]
+            if _new:
+                lines.append("### New Tickets")
+                for t in _new[:15]:
+                    lines.append(f"- [{t.get('ticket_id','')}] **{t.get('priority','')}** {(t.get('subject') or '')[:70]}")
+            if _res:
+                lines.append("\n### Resolved")
+                for t in _res[:10]:
+                    lines.append(f"- [{t.get('ticket_id','')}] {(t.get('subject') or '')[:70]}")
+            if _stl:
+                lines.append("\n### Stale Open (not refreshed in window)")
+                for t in _stl[:10]:
+                    lines.append(f"- [{t.get('ticket_id','')}] {t.get('priority','')} — {(t.get('subject') or '')[:60]}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Digest error: {exc}"
+
+    elif name == "save_query":
+        _name = (args.get("name") or "").strip()
+        _q    = (args.get("question") or "").strip()
+        _org  = (args.get("organization") or default_customer or "").strip()
+        if not _name or not _q:
+            return "Error: name and question are required."
+        try:
+            key = _save_query_to_cb(_name, _q, _org, cb_url, bucket, username, password,
+                                     use_tls, scope, collection)
+            return f"Query saved as **{_name}** (key: `{key}`). Run it anytime with list_saved_queries."
+        except Exception as exc:
+            return f"Save query error: {exc}"
+
+    elif name == "list_saved_queries":
+        _org = (args.get("organization") or default_customer or "").strip()
+        try:
+            rows = _list_saved_queries(cb_url, bucket, username, password,
+                                        use_tls, scope, collection, org=_org)
+            if not rows:
+                return "No saved queries found."
+            lines = ["## Saved Queries\n",
+                     "| Name | Question | Customer | Saved |",
+                     "|---|---|---|---|"]
+            for r in rows:
+                lines.append(f"| **{r.get('name','')}** | {(r.get('question') or '')[:60]} | {r.get('organization','—')} | {(r.get('created_at') or '')[:10]} |")
+            lines.append("\nTo run a saved query, just paste or type the question above.")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"List saved queries error: {exc}"
+
+    elif name == "generate_health_report":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required."
+        try:
+            from apps.mcp.server import generate_health_report as _gen_html_report
+            _result = _gen_html_report(
+                organization=_org,
+                ae_name=args.get("ae_name", ""),
+                tse_name=args.get("tse_name", ""),
+                pse_name=args.get("pse_name", ""),
+                date_from=args.get("date_from", ""),
+                date_to=args.get("date_to", ""),
+                annotations=args.get("annotations", ""),
+            )
+            import json as _json
+            try:
+                _r = _json.loads(_result)
+                if "error" in _r:
+                    return f"Report generation error: {_r['error']}"
+                _aid = _r.get("asset_id", "")
+                _fname = _r.get("filename", "")
+                _count = _r.get("ticket_count", "")
+                _date = _r.get("report_date", "")
+                return (
+                    f"Health report generated for **{_org}** ({_count} tickets analyzed, {_date}). "
+                    f"The branded HTML report has been saved to the Reports tab. "
+                    f"Asset ID: `{_aid}` · Filename: `{_fname}`"
+                )
+            except Exception:
+                return _result
+        except Exception as exc:
+            return f"Report generation error: {exc}"
+
+    elif name == "generate_customer_report":
+        _org = (args.get("organization") or default_customer or "").strip()
+        if not _org:
+            return "Error: organization is required."
+        try:
+            _report_md = _generate_customer_report(
+                _org, cb_url, bucket, username, password,
+                use_tls, scope, collection,
+            )
+            try:
+                import threading as _thr
+                _thr.Thread(
+                    target=_save_asset_to_cb,
+                    args=(cb_url, bucket, username, password, use_tls, scope,
+                          "report", f"{_org} Report", _report_md,
+                          ctx.get("session_id", ""), _org, f"{_org.lower().replace(' ','_')}_report.md"),
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
+            return _report_md
+        except Exception as exc:
+            return f"Report generation error: {exc}"
+
+    elif name == "save_artifact":
+        _title    = (args.get("title") or "untitled").strip()
+        _atype    = args.get("asset_type", "report")
+        _content  = args.get("content", "")
+        _filename = args.get("filename", "")
+        _org      = default_customer or ""
+        if not _content:
+            return "Error: content is required."
+        try:
+            aid = _save_asset_to_cb(
+                cb_url, bucket, username, password, use_tls, scope,
+                _atype, _title, _content,
+                session_id=ctx.get("session_id", ""),
+                org=_org, filename=_filename,
+            )
+            return f"Asset saved: **{_title}** (ID: `{aid}`). View it in the **Assets** tab."
+        except Exception as exc:
+            return f"Failed to save asset: {exc}"
+
+    elif name == "get_current_time":
+        import datetime as _dt_mod
+        _tz_name = (args.get("timezone") or "").strip()
+        try:
+            if _tz_name:
+                import zoneinfo as _zi
+                _tz = _zi.ZoneInfo(_tz_name)
+                _now = _dt_mod.datetime.now(_tz)
+            else:
+                _now = _dt_mod.datetime.now(_dt_mod.timezone.utc).astimezone()
+        except Exception:
+            _now = _dt_mod.datetime.now(_dt_mod.timezone.utc).astimezone()
+        _iso_week = _now.isocalendar()[1]
+        _quarter = (_now.month - 1) // 3 + 1
+        return (
+            f"Current date/time: {_now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"Day of week: {_now.strftime('%A')}\n"
+            f"ISO week: {_iso_week}\n"
+            f"Quarter: Q{_quarter} {_now.year}\n"
+            f"UTC offset: {_now.strftime('%z')}"
+        )
+
     else:
         return f"Unknown tool: {name}"
 
 
-# Regex patterns for text-encoded tool calls that some local models emit
-# in message content instead of the proper tool_calls JSON field.
-_TC_PATTERNS = [
-    # Qwen/LMStudio native: <|tool_call>call:name{...}<tool_call|>
-    re.compile(r"<\|tool_call\>call:(\w+)\s*(\{.*?\})\s*<tool_call\|>", re.DOTALL),
-    # Hermes / ChatML: <tool_call>{"name":"...","arguments":{...}}</tool_call>
-    re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL),
-    # Qwen3 formal: <|tool_call|>{...}<|/tool_call|>
-    re.compile(r"<\|tool_call\|>\s*(\{.*?\})\s*<\|/tool_call\|>", re.DOTALL),
-]
 
-
-def _extract_text_tool_calls(content: str) -> list[tuple[str, dict]]:
-    """
-    Parse text-encoded tool calls from model content.
-    Returns [(tool_name, args_dict), ...] for each detected call.
-    Falls back to empty list if nothing parseable is found.
-    """
-    import json as _j, re as _re
-
-    results: list[tuple[str, dict]] = []
-
-    def _try_parse_args(raw: str) -> dict:
-        """Best-effort JSON parse with light cleanup for common model quirks."""
-        raw = raw.strip()
-        # Replace <|"|> (Qwen string-escape artifact) with real quotes
-        raw = raw.replace("<|\"|\">", '"').replace('<|"|>', '"')
-        try:
-            return _j.loads(raw)
-        except Exception:
-            pass
-        # Try quoting unquoted keys: {Ticket ID: 123} → {"Ticket ID": 123}
-        fixed = _re.sub(r'([{,])\s*([A-Za-z_][A-Za-z0-9_ ]*)\s*:', r'\1"\2":', raw)
-        try:
-            return _j.loads(fixed)
-        except Exception:
-            return {}
-
-    for pat in _TC_PATTERNS:
-        for m in pat.finditer(content):
-            groups = m.groups()
-            if len(groups) == 2 and not groups[0].startswith("{"):
-                # Pattern 1: (name, args_block)
-                name, args_raw = groups[0].strip(), groups[1]
-                args = _try_parse_args(args_raw)
-                results.append((name, args))
-            else:
-                # Patterns 2/3: single JSON blob with name + arguments
-                blob = _try_parse_args(groups[0])
-                if "name" in blob:
-                    results.append((blob["name"], blob.get("arguments") or blob.get("args") or {}))
-
-    return results
-
-
-def _normalise_tool_args(name: str, args: dict) -> dict:
-    """
-    Fix common arg-format mismatches from models that don't follow the schema.
-    generate_table: model may pass data=[{col:val,...}] instead of columns+rows.
-    generate_chart: model may pass data=[...] instead of labels+values.
-    """
-    if name == "generate_table":
-        if "data" in args and not args.get("columns") and not args.get("rows"):
-            data = args["data"]
-            if isinstance(data, list) and data:
-                if isinstance(data[0], dict):
-                    cols = list(data[0].keys())
-                    rows = [[str(row.get(c, "")) for c in cols] for row in data]
-                    args = {**args, "columns": cols, "rows": rows}
-    if name == "generate_chart":
-        if "data" in args and not args.get("values") and not args.get("series"):
-            data = args["data"]
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                keys = list(data[0].keys())
-                if len(keys) >= 2:
-                    args = {**args,
-                            "labels": [str(row.get(keys[0], "")) for row in data],
-                            "values": [float(row.get(keys[1], 0) or 0) for row in data]}
-    return args
-
-
-def call_llm_with_tools(
-    messages: list[dict],
-    tools: list[dict],
-    cb_url: str, bucket: str, username: str, password: str,
-    use_tls: bool, scope: str, collection: str,
-    provider: str, model: str, api_key: str, base_url: str,
-    max_tokens: int = 8192,
-    max_rounds: int = 5,
-    default_customer: str = "",
-) -> str:
-    """
-    Agentic tool-calling loop. Sends messages + tools to the LLM, executes
-    any tool calls, appends results, and loops until the model produces a
-    final text answer or max_rounds is reached.
-
-    OpenAI-compatible function calling: lmstudio, ollama, openai, gemini.
-    Native Anthropic tool use: claude (requires anthropic package).
-    All others: falls back to plain call_llm (no tools).
-    """
-    import json as _json
-    import traceback as _tb
-
-    # ── Artifact stash shared by all provider paths ──────────────────────────
-    # generate_chart / generate_table return echart/table fenced blocks.
-    # Models often write prose as their final turn instead of echoing the block,
-    # so we collect every artifact produced by tool execution and prepend it to
-    # whatever text the model returns as its final answer.
-    _artifact_stash: list[str] = []
-
-    def _collect_artifact(result: str) -> None:
-        if "```echart" in result or "```table" in result:
-            _artifact_stash.append(result)
-
-    def _apply_stash(content: str) -> str:
-        prefix_parts = [a for a in _artifact_stash if a not in content]
-        if not prefix_parts:
-            return content
-        return "\n\n".join(prefix_parts) + ("\n\n" + content if content else "")
-
-    _openai_compat_providers = ("lmstudio", "ollama", "openai", "gemini")
-
-    if provider in _openai_compat_providers:
-        _base = (base_url or "").rstrip("/")
-        if provider == "lmstudio":
-            _base = _base or "http://localhost:1234/v1"
-            if not _base.endswith("/v1"):
-                _base += "/v1"
-        elif provider == "ollama":
-            _base = _base or "http://localhost:11434/v1"
-            if not _base.endswith("/v1"):
-                _base += "/v1"
-        elif provider == "gemini":
-            _base = _base or "https://generativelanguage.googleapis.com/v1beta/openai"
-
-        import openai as _oai
-        print(f"[agent] base_url={_base!r}  → will POST to {_base}/chat/completions")
-        client = _oai.OpenAI(api_key=api_key or "lm-studio", base_url=_base)
-
-        def _safe_choice(r):
-            """Return the first choice or raise with a clear diagnostic."""
-            choices = getattr(r, "choices", None)
-            if not choices:
-                _err = getattr(r, "error", None)
-                print(f"[agent] EMPTY choices — raw resp: {r!r}")
-                if _err:
-                    raise RuntimeError(
-                        f"LMStudio rejected the request: {_err}\n"
-                        "To fix: in LMStudio → select your model → Server tab → "
-                        "enable 'Tool Use' (function calling) → restart server."
-                    )
-                raise RuntimeError(
-                    "LLM returned no choices — model may not support function calling. "
-                    "In LMStudio: select model → Server tab → enable 'Tool Use' → restart."
-                )
-            return choices[0]
-
-        _msgs: list[dict] = list(messages)
-        _tool_calls_made = False
-
-        try:
-            for _round in range(max_rounds):
-                print(f"[agent] round={_round} msgs={len(_msgs)} tools_active={not _tool_calls_made}")
-                # Per LMStudio docs: after tool results are in the history,
-                # send the final request WITHOUT tools so the model writes
-                # a natural-language answer rather than calling more tools.
-                _req_tools = tools if not _tool_calls_made else None
-                _kwargs: dict = {"model": model, "messages": _msgs, "max_tokens": max_tokens}
-                if _req_tools:
-                    _kwargs["tools"] = _req_tools
-                resp = client.chat.completions.create(**_kwargs)
-                choice = _safe_choice(resp)
-                _tc_count = len(choice.message.tool_calls) if choice.message.tool_calls else 0
-                print(f"[agent] finish_reason={choice.finish_reason!r} "
-                      f"tool_calls_count={_tc_count} "
-                      f"content={repr((choice.message.content or '')[:120])}")
-
-                # Check tool_calls first — some models return finish_reason='stop'
-                # even when they've made tool calls (Gemma, some Qwen variants).
-                if not choice.message.tool_calls:
-                    _raw_content = choice.message.content or ""
-                    # Detect text-encoded tool calls in content (Qwen/Hermes/LMStudio
-                    # native formats that bypass the tool_calls field entirely).
-                    _text_calls = _extract_text_tool_calls(_raw_content)
-                    if not _text_calls:
-                        # Strip any residual noise from prior rounds before returning
-                        for _tp in _TC_PATTERNS:
-                            _raw_content = _tp.sub("", _raw_content).strip()
-                        return _apply_stash(_raw_content)
-
-                    # Execute each text-encoded tool call and inject results
-                    print(f"[agent] detected {len(_text_calls)} text-encoded tool call(s) in content — executing and retrying")
-                    _msgs.append({"role": "assistant", "content": _raw_content})
-                    for _tc_name, _tc_args in _text_calls:
-                        _tc_args = _normalise_tool_args(_tc_name, _tc_args)
-                        print(f"[agent] text-call executing tool={_tc_name!r} args_keys={list(_tc_args.keys())}")
-                        _tc_result = _execute_agent_tool(
-                            _tc_name, _tc_args,
-                            cb_url, bucket, username, password, use_tls, scope, collection,
-                            default_customer=default_customer,
-                        )
-                        print(f"[agent] text-call result length={len(_tc_result)}")
-                        _collect_artifact(_tc_result)
-                        # Inject as a user-visible tool result so the model can reference it
-                        _msgs.append({"role": "user", "content": f"[Tool result for {_tc_name}]:\n{_tc_result}"})
-                    _tool_calls_made = True
-                    continue  # retry: model will now write a clean final response
-
-                # Build assistant turn dict — omit content when null (matches LMStudio format)
-                _tool_calls_serial = []
-                for tc in choice.message.tool_calls:
-                    _fn = getattr(tc, "function", None)
-                    if _fn is None:
-                        print(f"[agent] WARNING: tool_call {tc!r} has no .function, skipping")
-                        continue
-                    print(f"[agent] serializing tool_call: name={_fn.name!r} id={tc.id!r}")
-                    _tool_calls_serial.append({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": _fn.name, "arguments": _fn.arguments or "{}"},
-                    })
-                _asst_msg: dict = {"role": "assistant", "tool_calls": _tool_calls_serial}
-                if choice.message.content:
-                    _asst_msg["content"] = choice.message.content
-                _msgs.append(_asst_msg)
-
-                for tc in choice.message.tool_calls:
-                    _fn = getattr(tc, "function", None)
-                    if _fn is None:
-                        continue
-                    try:
-                        _args = _json.loads(_fn.arguments or "{}")
-                    except _json.JSONDecodeError:
-                        _args = {}
-                    print(f"[agent] executing tool={_fn.name!r} args={_args}")
-                    result = _execute_agent_tool(
-                        _fn.name, _args,
-                        cb_url, bucket, username, password, use_tls, scope, collection,
-                        default_customer=default_customer,
-                    )
-                    print(f"[agent] tool result length={len(result)}")
-                    _collect_artifact(result)
-                    _msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-
-                _tool_calls_made = True  # next round: no tools in request
-
-            # Exhausted rounds — final answer without tools
-            resp = client.chat.completions.create(
-                model=model, messages=_msgs, max_tokens=max_tokens,
-            )
-            _final = _safe_choice(resp)
-            _final_content = _final.message.content or ""
-            # Strip any residual text-encoded tool call blocks from the output
-            for _tp in _TC_PATTERNS:
-                _final_content = _tp.sub("", _final_content).strip()
-            return _apply_stash(_final_content)
-
-        except Exception:
-            _tb.print_exc()
-            raise
-
-    elif provider == "claude":
-        try:
-            import anthropic as _ant
-        except ImportError:
-            raise RuntimeError("anthropic package not installed — pip install anthropic")
-
-        _ant_client = _ant.Anthropic(api_key=api_key or "")
-        # Convert OpenAI-format tools → Anthropic format
-        _ant_tools = [
-            {
-                "name": t["function"]["name"],
-                "description": t["function"]["description"],
-                "input_schema": t["function"]["parameters"],
-            }
-            for t in tools
-        ]
-        _sys = next((m["content"] for m in messages if m["role"] == "system"), "")
-        _conv = [m for m in messages if m["role"] != "system"]
-
-        for _round in range(max_rounds):
-            resp = _ant_client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=_sys,
-                messages=_conv,
-                tools=_ant_tools,
-            )
-            if resp.stop_reason == "end_turn":
-                return _apply_stash(next((b.text for b in resp.content if hasattr(b, "text")), ""))
-
-            tool_use_blocks = [b for b in resp.content if b.type == "tool_use"]
-            if not tool_use_blocks:
-                return _apply_stash(next((b.text for b in resp.content if hasattr(b, "text")), ""))
-
-            _conv.append({"role": "assistant", "content": resp.content})
-            tool_results = []
-            for tb in tool_use_blocks:
-                _args = tb.input if isinstance(tb.input, dict) else {}
-                print(f"[agent/claude] tool={tb.name} args={_args}")
-                result = _execute_agent_tool(
-                    tb.name, _args,
-                    cb_url, bucket, username, password, use_tls, scope, collection,
-                    default_customer=default_customer,
-                )
-                _collect_artifact(result)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tb.id,
-                    "content": result,
-                })
-            _conv.append({"role": "user", "content": tool_results})
-
-        _final_text = next(
-            (b.text for b in resp.content if hasattr(b, "text")), ""
-        ) if resp else ""
-        return _apply_stash(_final_text) or "Max tool-calling rounds reached without a final answer."
-
-    else:
-        # Bedrock or unknown — strip tools and fall back to plain call_llm
-        return call_llm(messages, provider, model, api_key, base_url, max_tokens)
-
-
-# ─────────────────────────── Phase 3: Scoring & Analytics ────────────────────
-
-# ── Few-shot scoring prompt ───────────────────────────────────────────────────
-SCORING_SYSTEM_PROMPT = """\
-You are a JSON-only scoring engine for Couchbase support tickets.
-
-YOUR ENTIRE RESPONSE MUST BE A SINGLE VALID JSON ARRAY — nothing else.
-Do NOT write prose, analysis, recommendations, markdown, headers, or explanations.
-Do NOT analyze cluster topology. Do NOT suggest fixes. Do NOT describe issues.
-ONLY output the JSON array.
-
-For each ticket, assess the CUSTOMER'S OVERALL SUPPORT EXPERIENCE based on ticket metadata: \
-quality of resolution, responsiveness, communication, and whether the issue is part of a \
-recurring pattern. The cluster topology field (if present) is context only — use it to \
-inform complexity/sentiment scores, but do not write about it.
-
-When Origin is "Proactive (Couchbase-initiated)", Couchbase opened the ticket on the \
-customer's behalf due to an internal alert — the customer did not report a problem. \
-Score response_timeliness and communication_clarity based on how well Couchbase \
-communicated and resolved the issue. stars and sentiment_summary should reflect that \
-proactive outreach is a positive signal unless the resolution was poor.
-
-CRITICAL: For each ticket the "ticket_id" in your JSON output MUST be the exact value shown \
-after "=== TICKET_ID:" in the input header. Never invent, modify, or omit ticket IDs.
-
-Schema per object:
-{
-  "ticket_id": "<id>",
-  "stars": <1-5>,
-  "temperature": "<cold|warm|hot>",
-  "resolution_quality": <1-5>,
-  "response_timeliness": <1-5>,
-  "communication_clarity": <1-5>,
-  "complexity": <1-5>,
-  "complexity_reason": "<one sentence>",
-  "sentiment_summary": "<one sentence customer experience summary>",
-  "interaction_summary": "<2-4 sentence technical summary: who reported the issue (requester), when it was opened and closed, the application and cluster(s) affected, the problem reported, key investigation findings or root cause, resolution outcome, and any notable patterns (recurring issue, escalation, workaround). Include specific CB component names, error types, version numbers, and resolution steps so this field is useful for semantic search.>"
-}
-
-Definitions:
-  stars               — overall experience (1=very poor, 5=excellent)
-  temperature         — cold: resolved cleanly in one pass; warm: moderate back-and-forth;
-                        hot: repeated contacts, escalations, or unresolved recurring frustration
-  resolution_quality  — how completely and correctly the issue was resolved
-  response_timeliness — how quickly support engaged and progressed
-  communication_clarity — clarity, professionalism, and usefulness of responses
-  complexity          — technical difficulty and scope (1=trivial how-to, 5=multi-team production incident)
-  complexity_reason   — brief justification for complexity score
-  sentiment_summary   — one-sentence description of the customer's experience
-  interaction_summary — 2-4 sentence technical narrative: who reported, when opened/closed, app + clusters affected, problem, investigation, resolution, patterns
-
---- FEW-SHOT EXAMPLES ---
-
-=== TICKET_ID: EXAMPLE-A ===
-  ID: EXAMPLE-A | Priority: normal | Status: solved | Comments: 2 | Escalations: none
-  Requester: jsmith@example.com | Created: 2025-03-01 | Closed: 2025-03-01
-  Subject: How do I enable SSL for Python SDK connection to Capella
-  Description: Customer asking for SSL configuration steps for the Python SDK.
-  Last comment: "Thank you, the certificate configuration worked perfectly."
-
-Output:
-[{"ticket_id":"EXAMPLE-A","stars":5,"temperature":"cold","resolution_quality":5,
-  "response_timeliness":5,"communication_clarity":5,"complexity":1,
-  "complexity_reason":"Simple how-to answered in a single exchange.",
-  "sentiment_summary":"Customer received a clear, immediate answer and confirmed success.",
-  "interaction_summary":"jsmith@example.com opened ticket on 2025-03-01 and it was closed the same day. No cluster or application specified. Customer asked how to configure SSL/TLS for a Python SDK connection to Capella. Support provided certificate configuration steps in a single exchange and customer confirmed success. No escalation required."}]
-
----
-
-=== TICKET_ID: EXAMPLE-B ===
-  ID: EXAMPLE-B | Priority: urgent | Status: solved | Comments: 18 | Escalations: ESC-441, ESC-442
-  Requester: ops-team@acme.com | Created: 2025-01-10 | Closed: 2025-01-31
-  Subject: Production cluster completely unresponsive — possible data loss after failover
-  Application: PAYMENTS
-  Clusters: prod-cbec-node01
-  Description: Customer reports all nodes showing as failed, application fully down since 2am.
-  Last comment: "We finally recovered but this took 3 weeks and we lost confidence in the product."
-
-Output:
-[{"ticket_id":"EXAMPLE-B","stars":2,"temperature":"hot","resolution_quality":2,
-  "response_timeliness":1,"communication_clarity":3,"complexity":5,
-  "complexity_reason":"Multi-node production failure with data loss risk requiring two escalations and three weeks to resolve.",
-  "sentiment_summary":"Customer experienced a prolonged critical outage and left the engagement with significantly damaged confidence.",
-  "interaction_summary":"ops-team@acme.com opened on 2025-01-10 for the PAYMENTS application (cluster prod-cbec-node01); resolved 2025-01-31 (21 days). All Couchbase nodes reported as failed after an overnight failover event causing full application downtime and potential data loss. Two escalations (ESC-441, ESC-442) engaged engineering to diagnose the cluster-wide failure. Recovery was achieved but without a definitive permanent fix, leaving the customer with seriously damaged confidence."}]
-
----
-
-=== TICKET_ID: EXAMPLE-C ===
-  ID: EXAMPLE-C | Priority: high | Status: solved | Comments: 7 | Escalations: none
-  Subject: N1QL index not being selected by query optimizer after 7.2 upgrade
-  Description: After upgrading to 7.2, the query planner ignores a covering index, causing full scans.
-  Last comment: "The USE INDEX hint resolved it for now but we'd like a permanent fix in the next release."
-
-Output:
-[{"ticket_id":"EXAMPLE-C","stars":3,"temperature":"warm","resolution_quality":3,
-  "response_timeliness":3,"communication_clarity":4,"complexity":3,
-  "complexity_reason":"Post-upgrade query planner regression requiring multi-step investigation with a workaround rather than a root-cause fix.",
-  "sentiment_summary":"Issue was mitigated but not fully resolved, leaving the customer with a workaround and lingering concern about the next release.",
-  "interaction_summary":"After upgrading to Couchbase Server 7.2, the N1QL query planner stopped selecting a covering index, causing full collection scans and degraded query performance. Support and engineering investigated the query optimizer behavior change introduced in 7.2. A USE INDEX hint was provided as a workaround, but no root-cause fix was available. A permanent fix was deferred to a future release."}]
-
----
-
-=== TICKET_ID: EXAMPLE-D ===
-  ID: EXAMPLE-D | Priority: normal | Status: solved | Comments: 4 | Escalations: none
-  Subject: RBAC permission error after upgrading to 7.2 — breaking change not in release notes
-  Description: New RBAC behavior in 7.2 broke customer's application; they found no mention in docs.
-  Last comment: "Got it working after your guidance. Would have been nice to have this in the upgrade notes."
-
-Output:
-[{"ticket_id":"EXAMPLE-D","stars":4,"temperature":"cold","resolution_quality":4,
-  "response_timeliness":4,"communication_clarity":5,"complexity":2,
-  "complexity_reason":"Undocumented breaking change in RBAC resolved quickly with clear guidance.",
-  "sentiment_summary":"Customer resolved the issue efficiently but noted a documentation gap that could affect other users.",
-  "interaction_summary":"Customer's application broke after upgrading to Couchbase Server 7.2 due to a breaking change in RBAC permission behavior that was not documented in the release notes. Support identified the new RBAC requirement and provided configuration steps to restore access. Issue was resolved in four comments. Customer flagged the missing documentation as a risk for other users upgrading to 7.2."}]
-
----
-
-=== TICKET_ID: EXAMPLE-E ===
-  ID: EXAMPLE-E | Priority: high | Status: open | Comments: 12 | Escalations: ESC-389
-  Requester: admin@bigcorp.com | Created: 2025-08-15 | Closed: open
-  Subject: Memory usage climbing indefinitely on analytics nodes — 4th report this year
-  Application: ANALYTICS-PLATFORM
-  Clusters: analytics-cbec-prod01
-  Description: Customer has opened tickets about this exact issue in January, April, and July.
-  Last comment: "This is the same problem again. We keep reporting it and nothing changes permanently."
-
-Output:
-[{"ticket_id":"EXAMPLE-E","stars":1,"temperature":"hot","resolution_quality":1,
-  "response_timeliness":2,"communication_clarity":2,"complexity":4,
-  "complexity_reason":"Recurring memory leak affecting analytics nodes with no permanent fix across four separate tickets.",
-  "sentiment_summary":"Customer is visibly frustrated by the same unresolved issue recurring repeatedly with no lasting resolution.",
-  "interaction_summary":"admin@bigcorp.com opened on 2025-08-15 (still open) for ANALYTICS-PLATFORM (cluster analytics-cbec-prod01). Indefinitely climbing memory usage on Couchbase Analytics nodes — fourth occurrence this year (January, April, July, and August). ESC-389 was opened. Each prior ticket resulted in a temporary fix or restart with no permanent root-cause resolution. Customer expressed strong frustration and loss of confidence in the support process."}]
-
---- END EXAMPLES ---
-
-Now score the following tickets. Return ONLY the JSON array.
-"""
-
-
-_UUID_RE = re.compile(
-    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
-    re.IGNORECASE,
-)
-# Couchbase snapshot IDs: 32 hex chars followed by ::N  (e.g. 3e6c0e495ca6228d421554aa8e239320::0)
-_SNAP_ID_RE = re.compile(r"\b([0-9a-f]{32}::\d+)\b", re.IGNORECASE)
-
-
-def _highest_snap_id(snap_ids: list[str]) -> str:
-    """Return the snapshot ID with the highest ::N sequence number (most recent)."""
-    def _seq(s: str) -> int:
-        m = re.search(r"::(\d+)$", s)
-        return int(m.group(1)) if m else -1
-    return max(snap_ids, key=_seq)
-# Cluster name patterns found in comments/description
-_CLUSTERS_AFFECTED_RE = re.compile(
-    r"[Cc]lusters?\s+(?:affected|involved|impacted)[:\s]+(.+?)(?:\.|$|\n)",
-    re.IGNORECASE,
-)
-_CLUSTER_NAME_RE = re.compile(
-    r"\b([A-Za-z0-9][A-Za-z0-9_\-\.]{3,})\s+cluster\b",
-    re.IGNORECASE,
-)
-
-
-def extract_cluster_snapshot_info(ticket: dict) -> dict:
-    """
-    Parse cluster names/IDs and snapshot metadata from a ticket without calling
-    the LLM.  Looks in:
-      - ticket['snapshots']    — free-text snapshot block from the detail page
-      - ticket['ticket_fields']— structured key/value table (JSON string or dict)
-      - ticket['description'] / ticket['comments'] — fallback text scan
-
-    Returns a dict with:
-      cluster_names     list[str]  — unique cluster name strings found
-      cluster_ids       list[str]  — unique cluster UUIDs found (standard UUID format)
-      snapshot_count    int        — number of discrete snapshot entries
-      last_snapshot_id  str|None   — last snapshot ID ({32hex}::N format)
-    """
-    _sv0 = ticket.get("snapshots")
-    snapshots_raw   = _sv0 if isinstance(_sv0, str) else ""
-    fields_raw      = ticket.get("ticket_fields") or {}
-    if isinstance(fields_raw, str):
-        try:
-            fields_raw = json.loads(fields_raw)
-        except Exception:
-            fields_raw = {}
-
-    cluster_names: list[str] = []
-    cluster_ids:   list[str] = []
-
-    # ── ticket_fields: look for cluster-related keys ───────────────────────────
-    _cluster_key_re = re.compile(r"cluster|cb_cluster|cloud.*cluster", re.IGNORECASE)
-    _guid_key_re    = re.compile(r"cluster.*id|id.*cluster|cluster.*guid", re.IGNORECASE)
-    for k, v in fields_raw.items():
-        if not v:
-            continue
-        v_str = str(v).strip()
-        # Keys are now normalized (underscores), match against normalized form
-        k_norm = _normalize_field_key(k)
-        if _guid_key_re.search(k_norm):
-            for m in _UUID_RE.findall(v_str):
-                if m not in cluster_ids:
-                    cluster_ids.append(m)
-        elif _cluster_key_re.search(k_norm):
-            for m in _UUID_RE.findall(v_str):
-                if m not in cluster_ids:
-                    cluster_ids.append(m)
-            name = _UUID_RE.sub("", v_str).strip(" ()-,")
-            if name and name not in cluster_names:
-                cluster_names.append(name)
-
-    # ── snapshots block ────────────────────────────────────────────────────────
-    # Each non-empty line is one snapshot entry (e.g. "2026-04-01T14:54:17 - 3e6c0e...::0")
-    snap_lines = [ln.strip() for ln in snapshots_raw.splitlines() if ln.strip()]
-    snapshot_count = len(snap_lines)
-
-    # Extract snapshot IDs in {32hex}::N format; fall back to UUIDs
-    all_snap_ids = _SNAP_ID_RE.findall(snapshots_raw)
-    if not all_snap_ids:
-        all_snap_ids = _UUID_RE.findall(snapshots_raw)
-    last_snapshot_id = _highest_snap_id(all_snap_ids) if all_snap_ids else None
-
-    # ── scan description + comments for cluster names ──────────────────────────
-    desc = ticket.get("description") or ""
-    comments_raw = ticket.get("comments") or "[]"
-    try:
-        comments_list = json.loads(comments_raw) if isinstance(comments_raw, str) else comments_raw
-        full_text = desc + "\n" + "\n".join(c.get("body", "") for c in comments_list)
-    except Exception:
-        full_text = desc
-
-    # Pattern 1: "Clusters affected: A, B, C and D"
-    for m in _CLUSTERS_AFFECTED_RE.finditer(full_text):
-        raw_list = m.group(1)
-        # split on commas, "and", semicolons
-        parts = re.split(r"[,;]\s*|\s+and\s+", raw_list, flags=re.IGNORECASE)
-        for part in parts:
-            name = re.sub(r'[^a-zA-Z0-9\-_]+$', '', part.strip())
-            if not name or len(name) < 5:
-                continue
-            if name not in cluster_names:
-                cluster_names.append(name)
-
-    # Pattern 2: "<name> cluster" (e.g. "p-csmohsm09-cb52 cluster logs")
-    # Accept names that: start with a letter, are >= 7 chars, contain a digit
-    # or hyphen/underscore (so plain English words like "starting" are excluded).
-    # Trailing punctuation (e.g. "starting.") is stripped before testing.
-    _CLUSTER_NAME_STOPWORDS = {
-        # articles / pronouns / prepositions
-        "the", "a", "an", "this", "that", "these", "those",
-        "each", "every", "any", "all", "both", "some", "such",
-        "our", "your", "my", "their", "its", "his", "her",
-        "from", "into", "onto", "upon", "with", "within",
-        "about", "above", "after", "along", "among", "around",
-        "before", "between", "during", "since", "through",
-        # common adjectives used near "cluster"
-        "same", "another", "other", "different", "similar",
-        "remote", "local", "current", "existing", "original",
-        "second", "third", "fourth", "first", "last", "next",
-        "new", "old", "fresh", "single", "entire", "whole",
-        "main", "additional", "separate", "standalone",
-        "active", "passive", "healthy", "unhealthy", "affected",
-        "target", "source", "destination", "backup", "replica",
-        "primary", "secondary", "tertiary", "master", "slave",
-        # generic nouns that appear before "cluster"
-        "couchbase", "server", "test", "dev", "prod", "stage",
-        "production", "development", "staging", "testing",
-        "cloud", "data", "index", "query", "node", "virtual",
-        "physical", "external", "internal", "custom", "example",
-    }
-    for m in _CLUSTER_NAME_RE.finditer(full_text):
-        # Strip trailing punctuation (catches "starting." captured by the regex)
-        name = re.sub(r'[^a-zA-Z0-9\-_]+$', '', m.group(1).strip())
-        if not name or len(name) < 7:
-            continue
-        # Must start with a letter — filters "24-node", "25-node", etc.
-        if not re.match(r'^[a-zA-Z]', name):
-            continue
-        if name.lower() in _CLUSTER_NAME_STOPWORDS:
-            continue
-        # Require at least one digit or hyphen/underscore — pure English words excluded
-        if not re.search(r"[\d\-_]", name):
-            continue
-        if name not in cluster_names:
-            cluster_names.append(name)
-
-    # Also pick up any standard UUIDs in full_text as cluster IDs (for clusters
-    # reported via Cluster ID field or UUID-style names)
-    if not cluster_ids:
-        for m in _UUID_RE.findall(full_text):
-            if m not in cluster_ids:
-                cluster_ids.append(m)
-
-    # ── snapshot_topology: authoritative cluster info from fetched snapshot ────
-    # Topology data (added by the Enrich pipeline step) is the most reliable
-    # source — prefer it over heuristic text extraction above.
-    topo = ticket.get("snapshot_topology") or {}
-    topo_name = topo.get("cluster_name")
-    topo_uuid = topo.get("cluster_uuid")
-    if topo_name:
-        # Insert at front so analytics/scoring sees the confirmed name first
-        if topo_name in cluster_names:
-            cluster_names.remove(topo_name)
-        cluster_names.insert(0, topo_name)
-    if topo_uuid:
-        if topo_uuid in cluster_ids:
-            cluster_ids.remove(topo_uuid)
-        cluster_ids.insert(0, topo_uuid)
-
-    return {
-        "cluster_names":    cluster_names,
-        "cluster_ids":      cluster_ids,
-        "snapshot_count":   snapshot_count,
-        "last_snapshot_id": last_snapshot_id,
-    }
-
-
-def _normalize_checker_name(name: str, full_line: str = "") -> str:
-    """
-    Normalize a checker name to remove node-specific details so identical
-    issues on different nodes/interfaces collapse to a single entry.
-
-    Examples:
-      "Interface 'eth0' (10.1.2.3) failures"   → "Interface 'eth0' RX failures"
-      "Interface 'ens192' (192.168.1.5) failures" → "Interface 'ens192' failures"
-      "Slow Operations (Total)"                 → "Slow Operations"
-      "Slow Operations (Internal)"              → "Slow Operations"
-      "Slow Operations (SDK)"                   → "Slow Operations"
-      "Resident Items 'my_bucket'"              → "Resident Items"
-      "View Indexing 'bucket_name'"             → "View Indexing"
-      "MB-59817"                                → "MB-59817"   (kept as-is)
-    """
-    # Strip IP/CIDR from interface names: Interface 'ethX' (a.b.c.d) → Interface 'ethX'
-    name = re.sub(r"\s*\([0-9a-f:./%]+\)", "", name).strip()
-    # For interface failures, add RX/TX direction from the value part of the line
-    if re.match(r"interface\s+'[^']+'\s+failures$", name, re.I) and full_line:
-        _rx = re.search(r"RX\s*:\s*(\d+)", full_line, re.I)
-        _tx = re.search(r"TX\s*:\s*(\d+)", full_line, re.I)
-        _rx_n = int(_rx.group(1)) if _rx else 0
-        _tx_n = int(_tx.group(1)) if _tx else 0
-        if _rx_n > 0 and _tx_n == 0:
-            name = re.sub(r"\s+failures$", " RX failures", name, flags=re.I)
-        elif _tx_n > 0 and _rx_n == 0:
-            name = re.sub(r"\s+failures$", " TX failures", name, flags=re.I)
-        elif _rx_n > 0 and _tx_n > 0:
-            name = re.sub(r"\s+failures$", " RX+TX failures", name, flags=re.I)
-    # Collapse "Slow Operations (Total/Internal/SDK/...)" → "Slow Operations"
-    name = re.sub(r"^(Slow Operations)\s*\([^)]*\)\s*$", r"\1", name, flags=re.I).strip()
-    # Strip node hostnames after colon (e.g. Slow Operations (Total): ns_1@host)
-    name = re.sub(r"\s*:\s*ns_\d+@\S+.*$", "", name).strip()
-    # Strip trailing quoted names: "Resident Items 'bucket'" / "View Indexing 'bucket'"
-    name = re.sub(r"\s+'[^']+'$", "", name).strip()
-    return name
-
-
-def _parse_snapshot_checker_text(text: str) -> dict:
-    """
-    Parse cbcollect checker output from a Supportal snapshot page.
-
-    Accepts raw HTML (ANSI→HTML span format) or plain text.
-    Uses direct line-by-line field extraction — no section-header regex dependency.
-
-    Field format on the page:
-        CLUSTER_NAME          ← first unlabelled line after section header
-        [info]  UUID                : <uuid>
-        [info]  Node Count          : <n>
-        [info]  Orchestrator        : <host>
-        [info]  Auto-failover       : <n> seconds
-        [info]  External Authentication: Enabled/Disabled
-        [warn]  Installed RAM different : ...
-        [ok]    Installed RAM       : <n> MiB
-        [ok]    Installed CPUs      : <n>
-        [info]  CB Version          : <version>
-        [info]  OS Version          : <os>
-        * Multi-Dimensional Scaling
-          Service  Total  Nodes
-          kv       3      ...
-          n1ql     4      ...
-        * Rack Zone Awareness Information
-          Server Group  Nodes
-          us-west-2a    ...
-        * Bucket Details
-          Bucket  Type  Quota (MB) ...
-          name    CB    10000      ...
-          Total (5 buckets)  -  49950  ...
-    """
-    topo: dict = {
-        "cluster_name":          None,
-        "cluster_uuid":          None,
-        "total_nodes":           None,
-        "data_nodes":            0,
-        "query_nodes":           0,
-        "index_nodes":           0,
-        "fts_nodes":             0,
-        "eventing_nodes":        0,
-        "analytics_nodes":       0,
-        "backup_nodes":          0,
-        "cb_version":            None,
-        "ram_per_node_mib":      None,
-        "cpus_per_node":         None,
-        "os_name":               None,
-        "bucket_count":          0,
-        "bucket_names":          [],
-        "total_bucket_quota_mb": None,
-        "server_groups":         [],
-        "auto_failover_seconds": None,
-        "orchestrator":          None,
-        "ldap_enabled":          None,
-        "bad_count":             0,
-        "warn_count":            0,
-    }
-    if not text:
-        return topo
-
-    # ── Unwrap Supportal JSON envelope ────────────────────────────────────────
-    _stripped = text.lstrip()
-    if _stripped.startswith("{"):
-        try:
-            import json as _json
-            _env = _json.loads(text)
-            if isinstance(_env, dict):
-                # New API format: nutshell_output is the ANSI HTML; nutshell_beta_output/nutshell are structured
-                text = (_env.get("nutshell_output") or _env.get("results")
-                        or _env.get("html") or _env.get("content") or text)
-        except Exception:
-            pass
-
-    # ── Strip HTML → clean plain text ─────────────────────────────────────────
-    # The page renders ANSI colour codes as <span class="ansiNN"> elements.
-    # Parse with BeautifulSoup to get properly line-separated plain text.
-    if "<" in text and ">" in text:
-        from bs4 import BeautifulSoup as _BS
-        _soup = _BS(text, "html.parser")
-        # Prefer <pre> blocks that contain checker markers; fall back to body
-        _pre = next(
-            (p for p in _soup.find_all("pre")
-             if "[info]" in p.get_text() or "===Checker" in p.get_text()),
-            None,
-        )
-        if _pre:
-            text = _pre.get_text("\n")
-        else:
-            # Insert newlines before block-level tags so structure is preserved
-            for tag in _soup.find_all(["div", "p", "br", "li", "tr"]):
-                tag.insert_before("\n")
-            text = _soup.get_text("\n")
-
-    lines = text.splitlines()
-
-    # ── Severity counts + checker names ───────────────────────────────────────
-    _bad_names:  set[str] = set()
-    _warn_names: set[str] = set()
-    for _line in lines:
-        _m = re.match(r"\s*\[(BAD|warn|WARN|WARNING|ALERT)\]\s*([^:]+)", _line, re.I)
-        if _m:
-            _sev, _name = _m.group(1).upper(), _normalize_checker_name(_m.group(2).strip(), _line)
-            if _sev in ("BAD", "ALERT"):
-                _bad_names.add(_name)
-            else:
-                _warn_names.add(_name)
-    topo["bad_count"]  = sum(1 for l in lines if re.match(r"\s*\[BAD\]",  l, re.I))
-    topo["warn_count"] = sum(1 for l in lines if re.match(r"\s*\[warn\]", l, re.I))
-    topo["bad_items"]  = sorted(_bad_names)
-    topo["warn_items"] = sorted(_warn_names)
-
-    # ── Section tracking ──────────────────────────────────────────────────────
-    _SVC_MAP = {
-        "data": "data_nodes", "kv": "data_nodes",
-        "query": "query_nodes", "n1ql": "query_nodes",
-        "index": "index_nodes",
-        "fts": "fts_nodes", "search": "fts_nodes",
-        "eventing": "eventing_nodes",
-        "analytics": "analytics_nodes", "cbas": "analytics_nodes",
-        "backup": "backup_nodes",
-    }
-    _section = None          # "mds" | "rack" | "buckets" | "users" | None
-    _in_checker_block = False
-    _cluster_name_set = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        # ── Detect === section headers ─────────────────────────────────────
-        if stripped.startswith("==="):
-            _in_checker_block = True
-            _section = None
-            # Extract cluster name from header: ===Checker results for 'NAME'===
-            m = re.search(r"===Checker results for\s+['\"]?([^'\"=\n]+?)['\"]?===", stripped)
-            if m and not topo["cluster_name"]:
-                topo["cluster_name"] = m.group(1).strip()
-                _cluster_name_set = True
-            continue
-
-        # Also trigger on first [level] line — handles pages where the ===
-        # header is absent or not extracted from the HTML.
-        if not _in_checker_block:
-            if re.match(r"\[(info|ok|BAD|warn)\]", stripped):
-                _in_checker_block = True
-            elif stripped.startswith("* "):
-                _in_checker_block = True
-            else:
-                continue
-
-        # ── Detect * subsection headers ───────────────────────────────────
-        if stripped.startswith("* "):
-            header_lc = stripped[2:].lower()
-            if "multi-dimensional" in header_lc or "mds" in header_lc:
-                _section = "mds"
-            elif "rack zone" in header_lc or "server group" in header_lc:
-                _section = "rack"
-            elif "bucket details" in header_lc:
-                _section = "buckets"
-            elif "cluster users" in header_lc:
-                _section = "users"
-            elif "vbucket" in header_lc or "global indexes" in header_lc or "xdcr" in header_lc:
-                _section = "other"
-            else:
-                _section = "other"
-            continue
-
-        # ── MDS table rows: "  service  total  nodes..." ──────────────────
-        if _section == "mds":
-            parts = stripped.split()
-            if len(parts) >= 2 and not stripped.startswith("-") and not stripped.lower().startswith("service"):
-                svc = parts[0].lower()
-                field = _SVC_MAP.get(svc)
-                if field:
-                    try:
-                        topo[field] = int(parts[1])
-                    except ValueError:
-                        pass
-            continue
-
-        # ── Rack/server-group rows ────────────────────────────────────────
-        if _section == "rack":
-            if stripped and not stripped.startswith("-") and not stripped.lower().startswith("server group") and not stripped.lower().startswith("nodes"):
-                parts = stripped.split()
-                if parts:
-                    grp = parts[0]
-                    if grp not in ("Group", "us-", "eu-", "ap-") and len(grp) > 2:
-                        if grp not in topo["server_groups"]:
-                            topo["server_groups"].append(grp)
-            continue
-
-        # ── Bucket details rows ───────────────────────────────────────────
-        if _section == "buckets":
-            # Summary line: "Total (N buckets)  -  QUOTA  ..."
-            m = re.match(r"Total\s+\((\d+)\s+buckets?\)", stripped)
-            if m:
-                topo["bucket_count"] = int(m.group(1))
-                continue
-            # Bucket row: "name  CB|Eph|Mem  quota  ..."
-            parts = stripped.split()
-            if len(parts) >= 3 and parts[1] in ("CB", "Eph", "Mem"):
-                if parts[0] not in topo["bucket_names"]:
-                    topo["bucket_names"].append(parts[0])
-                try:
-                    quota = int(parts[2])
-                    topo["total_bucket_quota_mb"] = (topo["total_bucket_quota_mb"] or 0) + quota
-                except (ValueError, IndexError):
-                    pass
-            continue
-
-        # ── [level]  Field  :  Value lines ───────────────────────────────
-        m = re.match(r"\[(info|ok|BAD|warn)\]\s+(.+?)\s{2,}:\s*(.+)", stripped)
-        if not m:
-            m = re.match(r"\[(info|ok|BAD|warn)\]\s+(.+?)\s*:\s*(.+)", stripped)
-        if m:
-            field_raw = m.group(2).strip().lower()
-            value     = m.group(3).strip()
-
-            if field_raw in ("ui cluster name", "cluster name") and value:
-                topo["cluster_name"] = value
-            elif field_raw == "uuid":
-                uuid_m = re.search(r"[0-9a-f]{32}", value, re.I)
-                if uuid_m and not topo["cluster_uuid"]:
-                    topo["cluster_uuid"] = uuid_m.group(0)
-            elif field_raw == "node count":
-                try:
-                    topo["total_nodes"] = int(value.split()[0])
-                except (ValueError, IndexError):
-                    pass
-            elif field_raw in ("auto-failover", "auto failover"):
-                af_m = re.search(r"(\d+)", value)
-                if af_m and topo["auto_failover_seconds"] is None:
-                    topo["auto_failover_seconds"] = int(af_m.group(1))
-            elif field_raw == "orchestrator":
-                if not topo["orchestrator"]:
-                    topo["orchestrator"] = value
-            elif field_raw in ("external authentication", "ldap", "ldap enabled"):
-                topo["ldap_enabled"] = value.lower() in ("enabled", "true", "yes", "1")
-            elif field_raw in ("cb version", "couchbase version", "version"):
-                if not topo["cb_version"]:
-                    topo["cb_version"] = value
-            elif field_raw == "installed ram":
-                ram_m = re.search(r"(\d+)", value)
-                if ram_m and topo["ram_per_node_mib"] is None:
-                    topo["ram_per_node_mib"] = int(ram_m.group(1))
-            elif field_raw == "installed cpus":
-                cpu_m = re.search(r"(\d+)", value)
-                if cpu_m and topo["cpus_per_node"] is None:
-                    topo["cpus_per_node"] = int(cpu_m.group(1))
-            elif field_raw in ("os version", "os name"):
-                if not topo["os_name"]:
-                    topo["os_name"] = value
-            continue
-
-        # ── Unlabelled cluster name: first plain non-tag line ────────────
-        if not _cluster_name_set and not topo["cluster_name"] and _section is None:
-            if stripped and not stripped.startswith(("[", "*", "=", "-", "Service", "Bucket")):
-                if len(stripped) < 128 and not stripped.startswith("http"):
-                    topo["cluster_name"] = stripped
-                    _cluster_name_set = True
-
-    return topo
-
-
-def _fetch_snapshot_combined_playwright(url: str, cookie: str | None = None) -> dict:
-    """
-    Navigate to the snapshot page ONCE and capture both:
-      • text_content  — Original/Couchbase Server tab (===Checker results format)
-      • nutshell_html — Beta UI/nutshell-alternative tab (Bootstrap table HTML)
-
-    Both are captured via XHR response interception so we never need to wait for
-    Vue to fully render — the raw API responses arrive before the DOM updates.
-
-    Returns: {"text": str, "nutshell": str, "structured": dict}
-    """
-    text_captured:       list[str]  = []
-    nutshell_captured:   list[str]  = []
-    structured_captured: list[dict] = []
-    page_html_captured:  list[str]  = []  # full body HTML before tab switch (has header section)
-
-    def _on_response(resp):
-        try:
-            ct = resp.headers.get("content-type", "")
-            # Skip JS/CSS/image/font bundles
-            if any(x in ct for x in ("javascript", "css", "image", "font")):
-                return
-            if resp.url.lower().split("?")[0].endswith((".js", ".css", ".png", ".woff", ".woff2")):
-                return
-            body = resp.text()
-            # Skip minified JS bundles that slipped through
-            if body.lstrip().startswith(("/*!", "(()=>", "!function", "define([")):
-                return
-            # Unwrap JSON envelope
-            if body.lstrip().startswith("{"):
-                try:
-                    import json as _json
-                    _data = _json.loads(body)
-                    if isinstance(_data, dict):
-                        # New Supportal API format: {"nutshell_output": "<html>...", "nutshell_beta_output": {...}, "nutshell": {...}}
-                        if "nutshell_output" in _data or "nutshell_beta_output" in _data or "nutshell" in _data:
-                            # Store structured data for direct field extraction
-                            if "nutshell_beta_output" in _data or "nutshell" in _data:
-                                structured_captured.append(_data)
-                            # Extract ANSI HTML for text parser fallback
-                            no = _data.get("nutshell_output")
-                            if no and isinstance(no, str):
-                                body = no
-                        else:
-                            body = _data.get("results") or _data.get("html") or _data.get("content") or body
-                except Exception:
-                    pass
-            # Nutshell: HTML with Bootstrap table structure (must start with HTML tag)
-            if "table-bordered" in body and "Checker results" in body and "<" in body[:50]:
-                nutshell_captured.append(body)
-            # Text: ANSI-HTML or plain-text checker output
-            elif "===Checker results" in body or "===Cluster" in body:
-                text_captured.append(body)
-        except Exception:
-            pass
-
-    with sync_playwright() as pw:
-        _browser = None
-        if cookie:
-            _browser = pw.chromium.launch(headless=True, args=["--ignore-certificate-errors"])
-            _parsed  = urllib.parse.urlparse(url)
-            _domain  = _parsed.netloc
-            _cookies: list[dict] = []
-            for part in cookie.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    name, val = part.split("=", 1)
-                    _cookies.append({"name": name.strip(), "value": val.strip(),
-                                     "domain": _domain, "path": "/"})
-            ctx = _browser.new_context(user_agent=UA, ignore_https_errors=True)
-            if _cookies:
-                ctx.add_cookies(_cookies)
-        else:
-            ctx = pw.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_DIR, headless=True,
-                user_agent=UA, ignore_https_errors=True,
-            )
-
-        page = ctx.new_page()
-        page.on("response", _on_response)
-        page.set_default_timeout(20_000)
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            page.wait_for_timeout(500)
-
-            # Dismiss any intro.js tutorial overlays that would block tab clicks
-            try:
-                page.evaluate("""() => {
-                    document.querySelectorAll(
-                        '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                        '[class*="introjs"], .modal-backdrop'
-                    ).forEach(el => el.remove());
-                }""")
-            except Exception:
-                pass
-
-            # ── Capture full page body HTML (includes Cluster Information header) ─
-            # This is captured BEFORE clicking any tab so the page header section
-            # (Customer Name, Cluster, Capella Cluster Id) is still in the DOM.
-            try:
-                _body_html = page.inner_html("body")
-                if _body_html and len(_body_html) > 200:
-                    page_html_captured.append(_body_html)
-            except Exception:
-                pass
-
-            # ── Step 1: click "Original" / "Couchbase Server" tab ─────────────
-            for sel in [
-                "a:has-text('Couchbase Server')",
-                "li:has-text('Couchbase Server') > a",
-                "[role='tab']:has-text('Couchbase Server')",
-                "a:has-text('Original')",
-                ".nav-link:has-text('Couchbase Server')",
-                ".nav-item:has-text('Couchbase Server') a",
-            ]:
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        try:
-                            el.first.click(timeout=5_000)
-                        except Exception:
-                            # Overlay may have appeared — dismiss and force-click
-                            page.evaluate("document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())")
-                            el.first.click(force=True, timeout=5_000)
-                        break
-                except Exception:
-                    continue
-
-            # Wait for the text checker response to arrive
-            try:
-                page.wait_for_function(
-                    "() => document.body.innerText.includes('===Checker results')"
-                    " || document.body.innerText.includes('===Cluster')",
-                    timeout=8_000,
-                )
-            except Exception:
-                page.wait_for_timeout(1_000)
-
-            # Snapshot the DOM text NOW before switching tabs — Vue will replace it
-            if not text_captured:
-                _dom_text = page.inner_text("body")
-                if "===Checker results" in _dom_text or "===Cluster" in _dom_text:
-                    text_captured.append(_dom_text)
-
-            # ── Step 2: click "Beta UI" / nutshell tab ─────────────────────────
-            try:
-                page.evaluate("""() => {
-                    document.querySelectorAll(
-                        '.introjs-overlay, .introjs-helperLayer, .introjs-tooltip, ' +
-                        '[class*="introjs"], .modal-backdrop'
-                    ).forEach(el => el.remove());
-                }""")
-            except Exception:
-                pass
-            for sel in [
-                "a[href='#nutshell-alternative']",
-                "a[href*='nutshell']",
-                "a:has-text('Beta UI')",
-                "[role='tab']:has-text('Beta UI')",
-                ".nav-link:has-text('Beta UI')",
-                ".nav-item:has-text('Beta UI') a",
-            ]:
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        try:
-                            el.first.click(timeout=5_000)
-                        except Exception:
-                            page.evaluate("document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())")
-                            el.first.click(force=True, timeout=5_000)
-                        break
-                except Exception:
-                    continue
-
-            # Wait for nutshell API response — it can be slow; cap at 8s
-            try:
-                page.wait_for_function(
-                    "() => document.body.innerHTML.includes('table-bordered')"
-                    " && document.body.innerHTML.includes('Checker results')",
-                    timeout=8_000,
-                )
-            except Exception:
-                page.wait_for_timeout(2_000)
-
-            # Capture nutshell from DOM if interception missed it
-            if not nutshell_captured:
-                # Try the specific tab container first, then full body
-                for dom_sel in ["#nutshell-alternative", ".tab-pane.active", "body"]:
-                    try:
-                        dom_html = page.inner_html(dom_sel)
-                        if "table-bordered" in dom_html and "Checker results" in dom_html:
-                            nutshell_captured.append(dom_html)
-                            break
-                    except Exception:
-                        continue
-
-            text_out     = text_captured[0]     if text_captured     else page.inner_text("body")
-            nutshell_out = nutshell_captured[0] if nutshell_captured else ""
-            page_html_out = page_html_captured[0] if page_html_captured else ""
-            return {
-                "text": text_out,
-                "nutshell": nutshell_out,
-                "structured": structured_captured[0] if structured_captured else {},
-                "page_html": page_html_out,
-            }
-        finally:
-            try:
-                page.close()
-            except Exception:
-                pass
-            try:
-                ctx.close()
-            except Exception:
-                pass
-            try:
-                if _browser:
-                    _browser.close()
-            except Exception:
-                pass
-
-
-# Keep old name as alias so any other callers still work
-def _fetch_snapshot_text_playwright(url: str, cookie: str | None = None) -> str:
-    result = _fetch_snapshot_combined_playwright(url, cookie=cookie)
-    return result.get("text", "")
-
-
-def _parse_cluster_info_header(html_or_text: str) -> dict:
-    """
-    Extract cluster metadata from the Supportal snapshot page header section.
-
-    The "Cluster Information" card appears BEFORE the tab bar (Logfile /
-    Couchbase Server / Beta UI) and contains:
-      Customer Name: eCollege.com, Inc.
-      Cluster:       PRODUCTION-CLS-1
-      Capella Cluster Id: c9785e04-06c7-4288-87ab-695b9a210028
-
-    These are distinct from the fields inside the accordion:
-      - "Cluster" here is the human-readable cluster name (e.g. "PRODUCTION-CLS-1")
-      - "Capella Cluster Id" is the Capella-level UUID (different from the CB
-        internal UUID stored as cluster_uuid in the accordion's UUID row)
-
-    Works on both raw HTML (inner_html) and plain text (inner_text) inputs.
-    Returns a dict with any of: cluster_name, capella_cluster_id, header_customer_name.
-    """
-    result: dict = {}
-    if not html_or_text:
-        return result
-
-    # ── Convert HTML to searchable plain text ─────────────────────────────────
-    search_text = html_or_text
-    if "<" in html_or_text[:200]:
-        try:
-            _soup = BeautifulSoup(html_or_text, "html.parser")
-
-            # Strategy A: find a container whose heading is "Cluster Information"
-            # then search only within that container
-            for heading_tag in _soup.find_all(re.compile(r"h[1-6]|strong|b|th|dt")):
-                if "Cluster Information" in heading_tag.get_text(strip=True):
-                    container = heading_tag.find_parent(
-                        lambda t: t.name in ("div", "section", "card", "article", "tbody", "table", "dl", "ul")
-                    )
-                    if container:
-                        search_text = container.get_text("\n")
-                        break
-            else:
-                # Strategy B: grab all text before the first tab label
-                full_text = _soup.get_text("\n")
-                for tab_marker in ("Couchbase Server", "Beta UI", "Logfile", "===Checker", "===Cluster"):
-                    pos = full_text.find(tab_marker)
-                    if 0 < pos < len(full_text):
-                        full_text = full_text[:pos]
-                        break
-                search_text = full_text
-
-            # Strategy C: look for label/value in <dl>, <table>, <div class="row">
-            # This is more precise than regex-on-text and covers Bootstrap dl/dt/dd grids
-            for dt in _soup.find_all(["dt", "th", "label", "strong", "b"]):
-                lbl = dt.get_text(strip=True).rstrip(":").strip().lower()
-                if lbl not in ("cluster", "capella cluster id", "customer name"):
-                    continue
-                # Try <dd> sibling, then next <td>, then parent container next text
-                sibling = dt.find_next_sibling(["dd", "td"])
-                if not sibling:
-                    # Bootstrap row: <div class="col-..."><strong>Label</strong></div>
-                    # followed by another <div class="col-..."> with the value
-                    parent = dt.parent
-                    if parent:
-                        next_sib = parent.find_next_sibling()
-                        if next_sib:
-                            sibling = next_sib
-                if sibling:
-                    val = sibling.get_text(strip=True)
-                    if val:
-                        if lbl == "cluster" and val.lower() != "information":
-                            result.setdefault("cluster_name", val)
-                        elif lbl == "capella cluster id":
-                            result.setdefault("capella_cluster_id", val)
-                        elif lbl == "customer name":
-                            result.setdefault("header_customer_name", val)
-        except Exception:
-            pass
-
-    # ── Regex scan on the plain-text portion ──────────────────────────────────
-    # Capella Cluster Id — UUID format: 8-4-4-4-12
-    m = re.search(
-        r"Capella Cluster Id\s*:?\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
-        search_text, re.IGNORECASE,
-    )
-    if m and "capella_cluster_id" not in result:
-        result["capella_cluster_id"] = m.group(1).strip()
-
-    # Cluster: NAME  (but not "Cluster Information:")
-    m = re.search(
-        r"(?:^|\n)\s*Cluster\s*:\s*(?!Information)([^\n/]{1,120})",
-        search_text, re.MULTILINE,
-    )
-    if m and "cluster_name" not in result:
-        val = m.group(1).strip()
-        if val:
-            result["cluster_name"] = val
-
-    # Customer Name: NAME
-    m = re.search(r"Customer Name\s*:?\s*([^\n/]{1,120})", search_text, re.IGNORECASE)
-    if m and "header_customer_name" not in result:
-        val = m.group(1).strip()
-        if val:
-            result["header_customer_name"] = val
-
-    return result
-
-
-def _parse_snapshot_nutshell_html(html: str) -> dict:
-    """
-    Parse the #nutshell-alternative tab HTML from a Supportal snapshot page.
-
-    Actual structure (confirmed from Chrome DevTools):
-      <div class="card-block">
-        <b>Checker results for cluster NODE1,...</b>
-        <span>
-          <table class="table table-bordered">  ← 3-cell rows: icon | label | <p>value</p>
-        </span>
-        <b>Analyser results for cluster NODE1,...</b>
-        <span>
-          <table class="table table-bordered">  ← 2-cell rows: section | <table.striped>
-        </span>
-      </div>
-
-    Fields mapped to canonical topo keys; everything kept verbatim in raw_fields.
-    """
-    topo: dict = {
-        "cluster_name": None,
-        "cluster_uuid": None,
-        "capella_cluster_id": None,   # Capella-level UUID from page header (≠ CB internal UUID)
-        "cluster_hostname": None,
-        "total_nodes": None,
-        "data_nodes": 0,
-        "query_nodes": 0,
-        "index_nodes": 0,
-        "fts_nodes": 0,
-        "eventing_nodes": 0,
-        "analytics_nodes": 0,
-        "backup_nodes": 0,
-        "cb_version": None,
-        "ram_per_node_mib": None,
-        "cpus_per_node": None,
-        "os_name": None,
-        "bucket_count": 0,
-        "bucket_names": [],
-        "total_bucket_quota_mb": None,
-        "server_groups": [],
-        "auto_failover_seconds": None,
-        "orchestrator": None,
-        "ldap_enabled": None,
-        "bad_count": 0,
-        "warn_count": 0,
-        "raw_fields": {},
-    }
-    if not html:
-        return topo
-
-    # Unwrap JSON envelope {"results": "<html>..."} if present
-    if html.lstrip().startswith("{"):
-        try:
-            import json as _json
-            _env = _json.loads(html)
-            if isinstance(_env, dict):
-                html = _env.get("results") or _env.get("html") or _env.get("content") or html
-        except Exception:
-            pass
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # ── Helpers ────────────────────────────────────────────────────────────────
-    def _set_auto_failover(v: str, t: dict) -> None:
-        m = re.search(r"(\d+)", v)
-        if m:
-            t["auto_failover_seconds"] = int(m.group(1))
-
-    def _set_ldap(v: str, t: dict) -> None:
-        t["ldap_enabled"] = v.strip().lower() in ("enabled", "true", "yes", "1")
-
-    def _set_node_count(v: str, t: dict) -> None:
-        try:
-            t["total_nodes"] = int(v.strip())
-        except ValueError:
-            pass
-
-    _LABEL_MAP: dict[str, object] = {
-        "ui cluster name":   "cluster_name",
-        "cluster name":      "cluster_name",
-        "uuid":              "cluster_uuid",
-        "cluster uuid":      "cluster_uuid",
-        "node count":        _set_node_count,
-        "number of nodes":   _set_node_count,
-        "orchestrator":      "orchestrator",
-        "auto-failover":     _set_auto_failover,
-        "auto failover":     _set_auto_failover,
-        "ldap":              _set_ldap,
-        "cb version":        "cb_version",
-        "couchbase version": "cb_version",
-        "version":           "cb_version",
-        "installed ram":     lambda v, t: t.update(
-            {"ram_per_node_mib": int(re.search(r"\d+", v).group())}
-            if re.search(r"\d+", v) else {}),
-        "installed cpus":    lambda v, t: t.update(
-            {"cpus_per_node": int(re.search(r"\d+", v).group())}
-            if re.search(r"\d+", v) else {}),
-        "os version":        "os_name",
-    }
-
-    def _find_next_bordered_table(b_tag):
-        """Return the first table.table-bordered that is a sibling or child-of-sibling of b_tag."""
-        for sib in b_tag.next_siblings:
-            if not hasattr(sib, "name"):
-                continue
-            # Table wrapped in a <span> (most common structure)
-            if sib.name == "span":
-                tbl = sib.find("table", class_=lambda c: c and "table-bordered" in c)
-                if tbl:
-                    return tbl
-            # Direct table sibling
-            if sib.name == "table" and "table-bordered" in (sib.get("class") or []):
-                return sib
-        return None
-
-    def _apply_label(label: str, value: str) -> None:
-        topo["raw_fields"][label] = value
-        handler = _LABEL_MAP.get(label.strip().lower())
-        if handler is None:
-            return
-        if callable(handler):
-            try:
-                handler(value, topo)
-            except Exception:
-                pass
-        else:
-            if not topo.get(handler):
-                topo[handler] = value or None
-
-    # ── Walk all <b> tags — each heads a section ───────────────────────────────
-    for b_tag in soup.find_all("b"):
-        section_text = b_tag.get_text(strip=True)
-        table = _find_next_bordered_table(b_tag)
-        if not table:
-            continue
-
-        # ── Checker results ── rows: [icon, label, <p>value</p>]  (3-cell)
-        #                       OR   [label, <p>value</p>]         (2-cell, no icon)
-        if "Checker results" in section_text:
-            # Also try to extract cluster hostname from the section title itself
-            # e.g. "Checker results for cluster node1.example.com,node2.example.com"
-            host_m = re.search(r"for cluster\s+(.+)", section_text)
-            if host_m and not topo["cluster_hostname"]:
-                topo["cluster_hostname"] = host_m.group(1).strip()
-
-            for row in table.select("tr"):
-                cells = row.select("td")
-                n = len(cells)
-                if n == 3:
-                    # Standard: [icon | label | value]
-                    label = cells[1].get_text(strip=True)
-                    val_cell = cells[2]
-                elif n == 2:
-                    # No icon column: [label | value]
-                    label = cells[0].get_text(strip=True)
-                    val_cell = cells[1]
-                else:
-                    continue
-                p = val_cell.find("p")
-                value = p.get_text(strip=True) if p else val_cell.get_text(" ", strip=True)
-                if label:
-                    topo["raw_fields"].setdefault("_html_labels_seen", [])
-                    if isinstance(topo["raw_fields"]["_html_labels_seen"], list):
-                        topo["raw_fields"]["_html_labels_seen"].append(label)
-                    _apply_label(label, value)
-
-        # ── Analyser results ── 2-cell rows: [section, nested-table] ───────────
-        elif "Analyser results" in section_text:
-            for row in table.select("tr"):
-                cells = row.select("td")
-                if len(cells) < 2:
-                    continue
-                section = cells[0].get_text(strip=True)
-                nested = cells[1].find("table")
-                if not nested:
-                    continue
-
-                # ── Bucket Details ─────────────────────────────────────────────
-                if "Bucket Details" in section:
-                    bucket_names: list[str] = []
-                    total_quota = 0
-                    for brow in nested.select("tr"):
-                        bcells = brow.select("td")
-                        if not bcells:
-                            continue
-                        first = bcells[0].get_text(strip=True)
-                        # Summary row: "Total (9 buckets)"
-                        m = re.search(r"Total\s*\((\d+)\s*buckets?\)", first, re.I)
-                        if m:
-                            topo["bucket_count"] = int(m.group(1))
-                            continue
-                        # Skip header/empty rows
-                        if not first or first.lower() in ("bucket", "name"):
-                            continue
-                        # Bucket data row — cell[1] is bucket type
-                        if len(bcells) >= 2:
-                            btype = bcells[1].get_text(strip=True).upper()
-                            if btype in ("CB", "EPH", "MEM", "EPHEMERAL", "MEMCACHED", "COUCHBASE"):
-                                bucket_names.append(first)
-                                if len(bcells) >= 3:
-                                    try:
-                                        quota_str = re.sub(r"[^\d]", "", bcells[2].get_text(strip=True))
-                                        if quota_str:
-                                            total_quota += int(quota_str)
-                                    except (ValueError, AttributeError):
-                                        pass
-                    if bucket_names:
-                        topo["bucket_names"] = bucket_names
-                        if not topo["bucket_count"]:
-                            topo["bucket_count"] = len(bucket_names)
-                    if total_quota:
-                        topo["total_bucket_quota_mb"] = total_quota
-
-                # ── Multi-Dimensional Scaling (MDS) ────────────────────────────
-                elif "Multi-Dimensional" in section or "MDS" in section:
-                    for mrow in nested.select("tr"):
-                        mcells = mrow.select("td")
-                        if len(mcells) < 2:
-                            continue
-                        svc = mcells[0].get_text(strip=True).lower()
-                        count_str = re.sub(r"[^\d]", "", mcells[1].get_text(strip=True))
-                        if not count_str:
-                            continue
-                        count = int(count_str)
-                        if "data" in svc or svc == "kv":
-                            topo["data_nodes"] = count
-                        elif "query" in svc or "n1ql" in svc:
-                            topo["query_nodes"] = count
-                        elif "index" in svc:
-                            topo["index_nodes"] = count
-                        elif "fts" in svc or "search" in svc:
-                            topo["fts_nodes"] = count
-                        elif "eventing" in svc:
-                            topo["eventing_nodes"] = count
-                        elif "analytics" in svc or "cbas" in svc:
-                            topo["analytics_nodes"] = count
-                        elif "backup" in svc:
-                            topo["backup_nodes"] = count
-
-                # ── Server Group Awareness ─────────────────────────────────────
-                elif "Server Group" in section:
-                    groups: list[str] = []
-                    for grow in nested.select("tr"):
-                        gcells = grow.select("td")
-                        if gcells:
-                            gname = gcells[0].get_text(strip=True)
-                            if gname and gname.lower() not in ("group", "name", "server group", ""):
-                                groups.append(gname)
-                    if groups:
-                        topo["server_groups"] = groups
-
-    # NOTE: do NOT fall back to UUID for cluster_name — that pollutes the
-    # names chart with UUIDs.  Leave cluster_name as None when absent;
-    # analytics and drill-down already handle None gracefully.
-
-    return topo
-
-
-def _fetch_snapshot_nutshell_playwright(url: str, cookie: str | None = None) -> str:
-    """
-    Navigate to the snapshot #nutshell-alternative tab and return the inner HTML
-    of the page body so BeautifulSoup can parse the accordion structure.
-
-    Uses the same cookie-injection / persistent-context dual strategy as the
-    existing Couchbase Server tab fetcher.
-    """
-    base_url = url.split("#")[0]
-    nutshell_url = base_url + "#nutshell-alternative"
-
-    with sync_playwright() as pw:
-        _browser = None
-        if cookie:
-            _browser = pw.chromium.launch(headless=True, args=["--ignore-certificate-errors"])
-            _parsed  = urllib.parse.urlparse(url)
-            _domain  = _parsed.netloc
-            _cookies: list[dict] = []
-            for part in cookie.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    name, val = part.split("=", 1)
-                    _cookies.append({"name": name.strip(), "value": val.strip(),
-                                     "domain": _domain, "path": "/"})
-            ctx = _browser.new_context(user_agent=UA, ignore_https_errors=True)
-            if _cookies:
-                ctx.add_cookies(_cookies)
-        else:
-            ctx = pw.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_DIR, headless=True,
-                user_agent=UA, ignore_https_errors=True,
-            )
-
-        page = ctx.new_page()
-        page.set_default_timeout(25_000)
-
-        # Intercept API responses — nutshell data may arrive via XHR
-        nutshell_api_html: list[str] = []
-        def _on_nutshell_response(resp):
-            try:
-                if "nutshell" in resp.url.lower() or "checker" in resp.url.lower():
-                    body = resp.text()
-                    if "Checker results" in body or "table-bordered" in body:
-                        nutshell_api_html.append(body)
-            except Exception:
-                pass
-        page.on("response", _on_nutshell_response)
-
-        try:
-            # Navigate to base URL (fragment isn't sent to server, Vue handles it client-side)
-            page.goto(nutshell_url, wait_until="domcontentloaded", timeout=25_000)
-            # Give Vue/JS time to boot before trying to interact
-            page.wait_for_timeout(1_000)
-
-            # Try clicking the "Beta UI" tab (= #nutshell-alternative)
-            clicked = False
-            for sel in [
-                "a[href='#nutshell-alternative']",
-                "a[href*='nutshell-alternative']",
-                "a[href*='nutshell']",
-                "a:has-text('Beta UI')",
-                "[role='tab']:has-text('Beta UI')",
-                ".nav-link:has-text('Beta UI')",
-                ".nav-item:has-text('Beta UI') a",
-                "a:has-text('Nutshell')",
-                "[role='tab']:has-text('Nutshell')",
-                ".nav-link[href*='nutshell']",
-            ]:
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        el.first.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-
-            # Wait longer after click for Vue to render the accordion
-            page.wait_for_timeout(2_000 if clicked else 1_000)
-
-            # Wait for the actual nutshell content structure
-            try:
-                page.wait_for_selector("div.card-block table.table-bordered", timeout=10_000)
-            except Exception:
-                try:
-                    page.wait_for_selector("table.table-bordered", timeout=5_000)
-                except Exception:
-                    # Last resort: wait for any <b> tag containing "Checker results"
-                    try:
-                        page.wait_for_function(
-                            "() => [...document.querySelectorAll('b')].some(b => b.textContent.includes('Checker results'))",
-                            timeout=5_000,
-                        )
-                    except Exception:
-                        page.wait_for_timeout(1_500)
-
-            # If API interception captured nutshell HTML, prefer that
-            if nutshell_api_html:
-                return nutshell_api_html[0]
-            return page.inner_html("body")
-        finally:
-            ctx.close()
-            if _browser:
-                _browser.close()
-
-
-_SNAP_DEBUG_DIR = Path(os.path.expanduser("~")) / "Downloads" / "Apps" / "Scraper" / "snap_debug"
-
-
-def _write_snap_debug(snap_id: str, stage: str, content: str) -> None:
-    """Write debug HTML/text for a snapshot fetch stage to ~/Downloads/Apps/Scraper/snap_debug/."""
-    try:
-        _SNAP_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-        safe_id = re.sub(r"[^\w\-]", "_", snap_id)[:60]
-        ext = "html" if "<" in content else "txt"
-        path = _SNAP_DEBUG_DIR / f"{safe_id}__{stage}.{ext}"
-        path.write_text(content, encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-
-def _parse_structured_api_json(data: dict) -> dict:
-    """
-    Parse Supportal API response with structured nutshell_beta_output / nutshell keys.
-
-    The Supportal API returns a JSON object with these keys:
-      - nutshell_output       : ANSI-HTML string (Original tab)
-      - nutshell_beta_output  : dict  {node: {node_id: {checkers: {...}}}, cluster: {name: {checkers: {...}, analysers: {...}}}}
-      - nutshell              : dict  {results: {node: [...], cluster: [...]}, git_rev, type}
-
-    Both nutshell_beta_output and nutshell.results have the same data — we prefer
-    nutshell.results (list format) as it is consistent.
-
-    Returns a topology dict with all canonical fields populated.
-    """
-    topo: dict = {
-        "cluster_name": None, "cluster_uuid": None,
-        "capella_cluster_id": None,   # Capella-level UUID from page header (≠ CB internal UUID)
-        "cluster_hostname": None,
-        "total_nodes": None,
-        "data_nodes": 0, "query_nodes": 0, "index_nodes": 0,
-        "fts_nodes": 0, "eventing_nodes": 0, "analytics_nodes": 0, "backup_nodes": 0,
-        "cb_version": None, "ram_per_node_mib": None, "cpus_per_node": None,
-        "os_name": None, "bucket_count": 0, "bucket_names": [],
-        "total_bucket_quota_mb": None, "server_groups": [],
-        "auto_failover_seconds": None, "orchestrator": None,
-        "ldap_enabled": None, "bad_count": 0, "warn_count": 0, "raw_fields": {},
-    }
-
-    # Resolve to a canonical results dict with "node" list and "cluster" list
-    results: dict | None = None
-    nutshell = data.get("nutshell")
-    beta = data.get("nutshell_beta_output")
-    if isinstance(nutshell, dict) and isinstance(nutshell.get("results"), dict):
-        results = nutshell["results"]
-    elif isinstance(beta, dict):
-        results = beta
-
-    if not results:
-        return topo
-
-    # ── Cluster-level checkers ────────────────────────────────────────────────
-    cluster_list = results.get("cluster", [])
-    cluster_checkers: dict = {}
-    cluster_analysers: dict = {}
-
-    if isinstance(cluster_list, list) and cluster_list:
-        cr = cluster_list[0].get("results", {}) if isinstance(cluster_list[0], dict) else {}
-        cluster_checkers = cr.get("checkers", {})
-        cluster_analysers = cr.get("analysers", {})
-    elif isinstance(cluster_list, dict):
-        # beta_output format: cluster is a dict keyed by cluster node-set string
-        first = next(iter(cluster_list.values()), {})
-        cluster_checkers = first.get("checkers", {})
-        cluster_analysers = first.get("analysers", {})
-
-    # Build a case-insensitive index so we don't miss keys like
-    # "ui cluster name" vs "UI Cluster Name" vs "Ui Cluster Name"
-    _cci = {k.lower(): v for k, v in cluster_checkers.items()}
-
-    def _raw(d: dict, key: str):
-        # Exact match first, then case-insensitive fallback via _cci
-        entry = d.get(key)
-        if entry is None:
-            entry = _cci.get(key.lower())
-        return entry.get("raw") if isinstance(entry, dict) else None
-
-    # Log the actual checker keys present so snap_debug shows what was available
-    _cci_keys_str = ", ".join(sorted(_cci.keys())[:30])  # first 30 keys
-    topo["raw_fields"]["_checker_keys"] = _cci_keys_str
-
-    topo["cluster_name"] = _raw(cluster_checkers, "UI Cluster Name")
-    topo["cluster_uuid"] = _raw(cluster_checkers, "UUID")
-
-    _nc = _raw(cluster_checkers, "Node Count")
-    if _nc is not None:
-        try:
-            topo["total_nodes"] = int(_nc)
-        except (ValueError, TypeError):
-            pass
-
-    _af = _raw(cluster_checkers, "Auto-failover")
-    if _af is not None:
-        try:
-            topo["auto_failover_seconds"] = int(_af)
-        except (ValueError, TypeError):
-            m = re.search(r"(\d+)", str(_af))
-            if m:
-                topo["auto_failover_seconds"] = int(m.group(1))
-
-    _ldap = _raw(cluster_checkers, "External Authentication")
-    if _ldap is not None:
-        topo["ldap_enabled"] = str(_ldap).lower() not in ("disabled", "off", "false", "0", "none", "")
-
-    _orch = _raw(cluster_checkers, "Orchestrator")
-    if _orch:
-        topo["orchestrator"] = str(_orch)
-
-    # ── MDS from analysers ────────────────────────────────────────────────────
-    mds = cluster_analysers.get("Multi-Dimensional Scaling", {})
-    mds_raw = mds.get("raw", {}) if isinstance(mds, dict) else {}
-    if isinstance(mds_raw, dict):
-        _SVC_MAP = {
-            "kv": "data_nodes", "data": "data_nodes",
-            "n1ql": "query_nodes", "query": "query_nodes",
-            "index": "index_nodes", "idx": "index_nodes",
-            "fts": "fts_nodes", "search": "fts_nodes",
-            "eventing": "eventing_nodes",
-            "cbas": "analytics_nodes", "analytics": "analytics_nodes",
-            "backup": "backup_nodes",
-        }
-        for svc, svc_nodes in mds_raw.items():
-            field = _SVC_MAP.get(svc.lower())
-            if field:
-                topo[field] = len(svc_nodes) if isinstance(svc_nodes, list) else int(svc_nodes or 0)
-
-    # ── Bucket count ──────────────────────────────────────────────────────────
-    bd = cluster_analysers.get("Bucket Details", {})
-    bd_rows = bd.get("rows", []) if isinstance(bd, dict) else []
-    if isinstance(bd_rows, list):
-        topo["bucket_count"] = len(bd_rows)
-        topo["bucket_names"] = [
-            row[0]["content"] for row in bd_rows
-            if isinstance(row, list) and row and isinstance(row[0], dict) and row[0].get("content")
-        ]
-
-    # ── Server groups from analysers ──────────────────────────────────────────
-    sg = cluster_analysers.get("Server Groups", {})
-    sg_rows = sg.get("rows", []) if isinstance(sg, dict) else []
-    if isinstance(sg_rows, list) and len(sg_rows) > 1:
-        groups = []
-        for row in sg_rows:
-            if isinstance(row, list) and row and isinstance(row[0], dict):
-                grp_name = row[0].get("content", "")
-                if grp_name:
-                    groups.append(grp_name)
-        if groups:
-            topo["server_groups"] = groups
-
-    # ── Node-level checkers ───────────────────────────────────────────────────
-    node_list = results.get("node", [])
-    cb_versions: list[str] = []
-    ram_values:  list[int] = []
-    cpu_values:  list[int] = []
-    bad_count = warn_count = 0
-    bad_names:  set[str] = set()
-    warn_names: set[str] = set()
-
-    def _process_node_checkers(nc: dict) -> None:
-        nonlocal bad_count, warn_count
-        _v = nc.get("CB Version", {})
-        if isinstance(_v, dict):
-            raw_ver = _v.get("raw")
-            if raw_ver and isinstance(raw_ver, str):
-                cb_versions.append(raw_ver)
-        _r = nc.get("Installed RAM", {})
-        if isinstance(_r, dict):
-            raw_ram = _r.get("raw")
-            if isinstance(raw_ram, (int, float)):
-                ram_values.append(int(raw_ram))
-            elif isinstance(raw_ram, dict):
-                tot = raw_ram.get("total")
-                if tot:
-                    ram_values.append(int(tot))
-        _c = nc.get("Installed CPUs", {})
-        if isinstance(_c, dict):
-            raw_cpu = _c.get("raw")
-            if isinstance(raw_cpu, (int, float)):
-                cpu_values.append(int(raw_cpu))
-        _on = nc.get("OS Name", {})
-        if isinstance(_on, dict) and not topo["os_name"]:
-            raw_os = _on.get("raw")
-            if raw_os:
-                topo["os_name"] = str(raw_os)
-        for _ck_name, _ck_val in nc.items():
-            if not isinstance(_ck_val, dict):
-                continue
-            st = _ck_val.get("status", "").upper()
-            if st in ("ALERT", "BAD"):
-                bad_count += 1
-                bad_names.add(_normalize_checker_name(_ck_name))
-            elif st in ("WARN", "WARNING"):
-                warn_count += 1
-                warn_names.add(_normalize_checker_name(_ck_name))
-
-    if isinstance(node_list, list):
-        for ne in node_list:
-            if isinstance(ne, dict):
-                _process_node_checkers(ne.get("results", {}).get("checkers", {}))
-    elif isinstance(node_list, dict):
-        for nd in node_list.values():
-            if isinstance(nd, dict):
-                _process_node_checkers(nd.get("checkers", {}))
-
-    # Also collect names from cluster-level checkers
-    for _ck_name, _ck_val in cluster_checkers.items():
-        if not isinstance(_ck_val, dict):
-            continue
-        st = _ck_val.get("status", "").upper()
-        if st in ("ALERT", "BAD"):
-            bad_count += 1
-            bad_names.add(_normalize_checker_name(_ck_name))
-        elif st in ("WARN", "WARNING"):
-            warn_count += 1
-            warn_names.add(_normalize_checker_name(_ck_name))
-
-    if cb_versions:
-        from collections import Counter as _Counter
-        topo["cb_version"] = _Counter(cb_versions).most_common(1)[0][0]
-    if ram_values:
-        topo["ram_per_node_mib"] = int(sorted(ram_values)[len(ram_values) // 2])
-    if cpu_values:
-        topo["cpus_per_node"] = int(sorted(cpu_values)[len(cpu_values) // 2])
-    topo["bad_count"]  = bad_count
-    topo["warn_count"] = warn_count
-    topo["bad_items"]  = sorted(bad_names)
-    topo["warn_items"] = sorted(warn_names)
-
-    # NOTE: do NOT fall back to UUID for cluster_name — that pollutes the
-    # names chart with UUIDs.  Leave cluster_name as None when absent.
-
-    return topo
-
-
-def fetch_snapshot_topology(snap_id: str, cookie: str | None = None) -> dict:
-    """
-    Fetch a Supportal snapshot page and extract Couchbase cluster topology.
-
-    Strategy (in order):
-      1. Playwright → #nutshell-alternative tab HTML → _parse_snapshot_nutshell_html
-         (primary: this tab has the structured Bootstrap accordion with all fields)
-      2. requests + cookie → look for checker plain-text in <pre> tags or body
-         (fast fallback for server-rendered deployments)
-      3. Playwright → Couchbase Server tab plain-text → _parse_snapshot_checker_text
-         (legacy fallback)
-
-    Returns an empty dict on complete failure.
-    """
-    url = f"{BASE_URL}/snapshot/{urllib.parse.quote(snap_id, safe='')}"
-
-    _snap_log: list[str] = []
-
-    # ── Strategy 1: requests fast-path (plain-text checker format only) ────────
-    # NOTE: only use this for pages that serve raw checker text — NOT for
-    # Vue.js-rendered nutshell tabs.  The [info] check was removed because it
-    # matched generic HTML content and caused this strategy to fire incorrectly.
-    if cookie:
-        try:
-            sess = requests.Session()
-            sess.headers.update({"User-Agent": UA, "Accept": "text/html,*/*", "Cookie": cookie})
-            resp = sess.get(url, timeout=15, allow_redirects=True, verify=False)
-            resp.raise_for_status()
-            raw_html = resp.text
-            _snap_log.append(f"s1: status={resp.status_code} len={len(raw_html)}")
-
-            # Only fire if the page clearly contains plain-text checker markers
-            if "===Checker results" in raw_html or "===Cluster" in raw_html:
-                _snap_log.append("s1: plain-text checker detected in raw HTML → text parser")
-                _write_snap_debug(snap_id, "s1_raw", raw_html)
-                return _parse_snapshot_checker_text(raw_html)
-            soup_fast = BeautifulSoup(raw_html, "html.parser")
-            body_text = soup_fast.get_text("\n")
-            if "===Checker results" in body_text or "===Cluster" in body_text:
-                _snap_log.append("s1: plain-text checker detected in body text → text parser")
-                _write_snap_debug(snap_id, "s1_body", body_text)
-                return _parse_snapshot_checker_text(body_text)
-            _snap_log.append("s1: no text-format checker markers — skipping to Playwright")
-        except Exception as _e:
-            _snap_log.append(f"s1: exception {_e}")
-
-    # ── Strategy 2+3: single Playwright session — captures BOTH tabs ───────────
-    # _fetch_snapshot_combined_playwright clicks the text tab then the nutshell
-    # tab in one browser session, intercepting XHR responses for both.
-    try:
-        combined = _run_in_playwright_thread(
-            _fetch_snapshot_combined_playwright, url, cookie=cookie, timeout=60
-        )
-        nutshell_html   = combined.get("nutshell", "")
-        text_content    = combined.get("text", "")
-        structured_data = combined.get("structured", {})
-        page_html       = combined.get("page_html", "")
-        _snap_log.append(f"combined: nutshell_html len={len(nutshell_html)} text len={len(text_content)} page_html len={len(page_html)} structured={'yes' if structured_data else 'no'}")
-
-        # ── Pre-parse Cluster Information header section ──────────────────────
-        # The header appears on the page before any tab is clicked; it contains
-        # the human-readable cluster name and Capella Cluster Id that are NOT
-        # present in the accordion content captured by the other strategies.
-        _header_info = _parse_cluster_info_header(page_html or text_content)
-        _snap_log.append(f"header_info: {_header_info}")
-
-        def _apply_header_info(topo: dict) -> dict:
-            """Supplement topo with fields extracted from the page header section."""
-            if not _header_info:
-                return topo
-            if not topo.get("cluster_name") and _header_info.get("cluster_name"):
-                topo["cluster_name"] = _header_info["cluster_name"]
-                _snap_log.append(f"header_info: set cluster_name={topo['cluster_name']}")
-            if not topo.get("capella_cluster_id") and _header_info.get("capella_cluster_id"):
-                topo["capella_cluster_id"] = _header_info["capella_cluster_id"]
-                _snap_log.append(f"header_info: set capella_cluster_id={topo['capella_cluster_id']}")
-            # Store header customer name for cross-validation (not authoritative)
-            if _header_info.get("header_customer_name"):
-                topo.setdefault("raw_fields", {})["header_customer_name"] = _header_info["header_customer_name"]
-            return topo
-
-        # ── Strategy A: structured JSON — all fields in one shot ─────────────
-        if structured_data and (structured_data.get("nutshell") or structured_data.get("nutshell_beta_output")):
-            _write_snap_debug(snap_id, "s2_structured", str(structured_data)[:8000])
-            topo = _parse_structured_api_json(structured_data)
-            topo = _apply_header_info(topo)
-            # Log the checker keys that were present in the structured JSON so
-            # we can diagnose "UI Cluster Name" lookup failures in snap_debug
-            _checker_keys = topo.get("raw_fields", {}).get("_checker_keys", "")
-            _snap_log.append(
-                f"structured topo: cluster_name={topo.get('cluster_name')} "
-                f"capella_id={topo.get('capella_cluster_id')} "
-                f"nodes={topo.get('total_nodes')} cb_ver={topo.get('cb_version')} "
-                f"checker_keys=[{_checker_keys}]"
-            )
-            if topo.get("total_nodes") or topo.get("cluster_uuid") or topo.get("cluster_name"):
-                _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
-                return topo
-
-        # ── Strategy B: parse text content (has cb_version, ram, cpus) ───────
-        text_topo: dict = {}
-        if text_content and ("===Checker results" in text_content or "===Cluster" in text_content):
-            _write_snap_debug(snap_id, "s3_text", text_content)
-            text_topo = _parse_snapshot_checker_text(text_content)
-            _snap_log.append(f"text topo: cluster_name={text_topo.get('cluster_name')} cb_ver={text_topo.get('cb_version')} ram={text_topo.get('ram_per_node_mib')}")
-
-        # ── Strategy C: nutshell HTML + supplement with text fields ───────────
-        if nutshell_html and "Checker results" in nutshell_html:
-            _write_snap_debug(snap_id, "s2_nutshell", nutshell_html)
-            topo = _parse_snapshot_nutshell_html(nutshell_html)
-            topo = _apply_header_info(topo)
-            _html_labels = topo.get("raw_fields", {}).get("_html_labels_seen") or []
-            _snap_log.append(
-                f"nutshell topo: cluster_name={topo.get('cluster_name')} "
-                f"capella_id={topo.get('capella_cluster_id')} "
-                f"nodes={topo.get('total_nodes')} buckets={topo.get('bucket_count')} "
-                f"html_labels=[{', '.join(_html_labels[:20])}]"
-            )
-            # Supplement nutshell with per-node fields only available in text tab
-            _TEXT_ONLY_FIELDS = ("cb_version", "ram_per_node_mib", "cpus_per_node",
-                                 "os_name", "bad_count", "warn_count", "orchestrator",
-                                 "bad_items", "warn_items")
-            for _f in _TEXT_ONLY_FIELDS:
-                if not topo.get(_f) and text_topo.get(_f):
-                    topo[_f] = text_topo[_f]
-            _snap_log.append(f"merged: cb_ver={topo.get('cb_version')} ram={topo.get('ram_per_node_mib')} bad={topo.get('bad_count')}")
-            if topo.get("total_nodes") or topo.get("cluster_uuid") or topo.get("cluster_name"):
-                _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
-                return topo
-
-        # ── Strategy D: text-only result ──────────────────────────────────────
-        if text_topo.get("cluster_name") or text_topo.get("cluster_uuid") or text_topo.get("total_nodes"):
-            _apply_header_info(text_topo)
-            _snap_log.append("using text-only topo as final fallback")
-            _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
-            return text_topo
-
-    except Exception as _e:
-        _snap_log.append(f"combined: exception {type(_e).__name__}: {_e}")
-        _write_snap_debug(snap_id, "combined_exception", f"{type(_e).__name__}: {_e}")
-
-    _write_snap_debug(snap_id, "summary", "\n".join(_snap_log))
-    return {}
-
-
-def enrich_tickets_with_snapshots(
-    tickets: list[dict],
-    cookie: str | None,
-    progress_cb: Callable[[str, float], None],
-    cancel_event,
-    max_workers: int = 4,
-    snap_upsert_fn: "Callable[[dict], None] | None" = None,
-) -> tuple[int, int]:
-    """
-    Pipeline step: for each ticket with snapshot IDs, fetch the most-recent snapshot,
-    parse the cluster topology, and merge it into the ticket dict in-place.
-
-    Also sets ticket["snap_ids"] (all IDs found in the ticket text) and
-    ticket["snapshot_summary"] (lightweight flattened fields for display).
-
-    If snap_upsert_fn is provided it is called with a complete snapshot dict so the
-    caller can persist snapshots to Couchbase during the same pass.
-
-    Fetches are parallelised (max_workers threads) and deduplicated — the same
-    snapshot ID is only fetched once even if multiple tickets reference it.
-
-    Returns (enriched_count, error_count).
-    """
-    import concurrent.futures
-
-    with_snaps = [t for t in tickets if t.get("snapshots")]
-    total = len(with_snaps)
-    if total == 0:
-        progress_cb("No tickets with snapshots — skipping enrichment.", 1.0)
-        return 0, 0
-
-    # Pre-populate snap_ids on every ticket from its raw snapshots text (all IDs, not just highest)
-    for ticket in with_snaps:
-        _sv = ticket.get("snapshots")
-        all_found = _SNAP_ID_RE.findall(_sv if isinstance(_sv, str) else "")
-        if all_found:
-            deduped: list[str] = []
-            for sid in all_found:
-                if sid not in deduped:
-                    deduped.append(sid)
-            ticket["snap_ids"] = deduped
-
-    # Build a map: snap_id → list of tickets that reference it (dedup fetch)
-    snap_to_tickets: dict[str, list[dict]] = {}
-    for ticket in with_snaps:
-        _sv2 = ticket.get("snapshots")
-        snap_ids = _SNAP_ID_RE.findall(_sv2 if isinstance(_sv2, str) else "")
-        if not snap_ids:
-            continue
-        snap_id = _highest_snap_id(snap_ids)  # use highest ::N (most recent) snapshot
-        snap_to_tickets.setdefault(snap_id, []).append(ticket)
-
-    unique_snaps = list(snap_to_tickets.keys())
-    total_unique = len(unique_snaps)
-    if total_unique == 0:
-        progress_cb("No parseable snapshot IDs found — skipping enrichment.", 1.0)
-        return 0, 0
-
-    progress_cb(
-        f"Fetching {total_unique} unique snapshots across {total} tickets "
-        f"({max_workers} parallel workers)…", 0.0
-    )
-
-    enriched = errors = 0
-    completed = 0
-    lock = threading.Lock()
-
-    def _fetch_one(snap_id: str):
-        nonlocal enriched, errors, completed
-        if cancel_event and cancel_event.is_set():
-            return
-        try:
-            topo = fetch_snapshot_topology(snap_id, cookie=cookie)
-        except Exception as exc:
-            with lock:
-                errors += 1
-                completed += 1
-                pct = completed / total_unique
-                progress_cb(f"Snapshot {snap_id[:16]}… error: {exc}", pct)
-            return
-
-        with lock:
-            completed += 1
-            pct = completed / total_unique
-            if topo:
-                summary = {
-                    "snap_id":      snap_id,
-                    "cluster_name": topo.get("cluster_name") or "",
-                    "cb_version":   topo.get("cb_version") or "",
-                    "bad_count":    topo.get("bad_count", 0),
-                    "warn_count":   topo.get("warn_count", 0),
-                    "node_count":   topo.get("total_nodes", 0),
-                }
-                ticket_ids_for_snap: list[str] = []
-                for ticket in snap_to_tickets[snap_id]:
-                    ticket["snapshot_topology"] = topo
-                    ticket["snapshot_summary"]  = summary
-                    tid = ticket.get("ticket_id") or ticket.get("id", "")
-                    if tid and tid not in ticket_ids_for_snap:
-                        ticket_ids_for_snap.append(str(tid))
-                enriched += len(snap_to_tickets[snap_id])
-                # Optionally persist the snapshot doc to Couchbase
-                if snap_upsert_fn is not None:
-                    first_ticket = snap_to_tickets[snap_id][0]
-                    now_iso = (
-                        datetime.datetime.now(datetime.timezone.utc)
-                        .isoformat()
-                        .replace("+00:00", "Z")
-                    )
-                    snap_doc = {
-                        "snap_id":            snap_id,
-                        "cluster_id":         snap_id.split("::")[0],
-                        "url":                f"{BASE_URL}/snapshot/{snap_id}",
-                        "date":               None,
-                        "organization":       first_ticket.get("organization") or "",
-                        "customer_url":       first_ticket.get("customer_url") or "",
-                        "cluster_name":       topo.get("cluster_name") or "",
-                        "cluster_uuid":       topo.get("cluster_uuid") or "",
-                        "capella_cluster_id": topo.get("capella_cluster_id") or "",
-                        "topology":           topo,
-                        "ticket_ids":         ticket_ids_for_snap,
-                        "scraped_at":         now_iso,
-                        "bad_count":          topo.get("bad_count", 0),
-                        "warn_count":         topo.get("warn_count", 0),
-                        "bad_items":          topo.get("bad_items") or [],
-                        "warn_items":         topo.get("warn_items") or [],
-                        "cb_version":         topo.get("cb_version") or "",
-                        "node_count":         topo.get("total_nodes", 0),
-                        "bucket_names":       topo.get("bucket_names") or [],
-                        "auto_failover_seconds": topo.get("auto_failover_seconds"),
-                        "ram_per_node_mib":   topo.get("ram_per_node_mib"),
-                        "bucket_count":       topo.get("bucket_count", 0),
-                        "server_groups":      topo.get("server_groups") or [],
-                    }
-                    try:
-                        snap_upsert_fn(snap_doc)
-                    except Exception:
-                        pass
-                progress_cb(
-                    f"[{completed}/{total_unique}] Snapshot {snap_id[:16]}… OK"
-                    f" ({len(snap_to_tickets[snap_id])} ticket(s))", pct
-                )
-            else:
-                progress_cb(
-                    f"[{completed}/{total_unique}] Snapshot {snap_id[:16]}… no data", pct
-                )
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_fetch_one, sid): sid for sid in unique_snaps}
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                fut.result()
-            except Exception:
-                pass
-            if cancel_event and cancel_event.is_set():
-                break
-
-    progress_cb(
-        f"Enriched {enriched} ticket(s) from {total_unique} unique snapshots"
-        + (f" ({errors} errors)" if errors else "") + ".",
-        1.0,
-    )
-    return enriched, errors
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Snapshot listing scraper  (independent of ticket scrape)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_SNAP_HREF_RE = re.compile(r"/snapshot/([0-9a-f]{32}::\d+)", re.IGNORECASE)
-
-
-def _find_snapshots_tab_url(html: str, current_url: str) -> Optional[str]:
-    """Find the Snapshots tab link on a customer page (same pattern as _find_tickets_tab_url)."""
-    soup = BeautifulSoup(html, "html.parser")
-    customer_base = current_url.rstrip("/")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(strip=True).lower()
-        abs_href = href if href.startswith("http") else urllib.parse.urljoin(current_url, href)
-        if not abs_href.startswith(customer_base):
-            continue
-        if text == "snapshots" or re.search(r"/snapshots(?:/|\?|$|#)", abs_href, re.I):
-            return abs_href
-    return None
-
-
-def _extract_snapshot_rows(html: str) -> list[dict]:
-    """
-    Extract snapshot summary rows from a Supportal snapshot listing page.
-    Returns list of dicts with snap_id, url, date, cluster_name, cluster_id, ticket_ids.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    out: list[dict] = []
-    seen: set[str] = set()
-
-    for a in soup.find_all("a", href=True):
-        m = _SNAP_HREF_RE.search(a["href"])
-        if not m:
-            continue
-        snap_id = m.group(1)
-        if snap_id in seen:
-            continue
-        seen.add(snap_id)
-        row: dict = {
-            "snap_id":      snap_id,
-            "url":          f"{BASE_URL}/snapshot/{snap_id}",
-            "date":         None,
-            "cluster_name": None,
-            "cluster_id":   snap_id.split("::")[0],
-            "ticket_ids":   [],
-        }
-        # Walk up to parent <tr> to read sibling cells and ZD links
-        tr = a
-        for _ in range(6):
-            if tr is None or tr.name == "tr":
-                break
-            tr = tr.parent
-        if tr and tr.name == "tr":
-            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-            for cell in cells:
-                if not cell:
-                    continue
-                if re.search(r"\d{4}[-/]\d{2}[-/]\d{2}", cell) and not row["date"]:
-                    row["date"] = cell
-                elif (
-                    not re.match(r"^[0-9a-f]{32}::\d+$", cell, re.I)
-                    and not cell.isdigit()
-                    and len(cell) > 2
-                    and cell.lower() not in ("open", "pending", "solved", "closed", "snapshots")
-                    and not row["cluster_name"]
-                ):
-                    row["cluster_name"] = cell
-            # Capture ZD ticket IDs from links within the same row
-            for a_link in tr.find_all("a", href=True):
-                href = a_link.get("href", "")
-                m_zd = re.search(r"/zendesk/ticket/(\d+)", href)
-                if m_zd:
-                    zd_id = f"ZD-{m_zd.group(1)}"
-                    if zd_id not in row["ticket_ids"]:
-                        row["ticket_ids"].append(zd_id)
-                else:
-                    txt = a_link.get_text(strip=True)
-                    if re.match(r"^ZD-\d+$", txt) and txt not in row["ticket_ids"]:
-                        row["ticket_ids"].append(txt)
-        out.append(row)
-    return out
-
-
-def _scrape_snapshot_listing_playwright(
-    page,
-    customer_url: str,
-    max_pages: int,
-    progress_cb: Callable[[str, float], None],
-) -> list[dict]:
-    """
-    Navigate to the customer Snapshots tab and paginate through all pages.
-    Returns list of snapshot summary dicts.
-    """
-    import math as _math
-
-    def log(msg: str, pct: float):
-        print(f"[SNAP-LIST] {msg}")
-        progress_cb(msg, pct)
-
-    all_snaps: list[dict] = []
-    seen_ids: set[str] = set()
-
-    # Navigate to the customer base page (no hash). The Snapshots tab content is
-    # Bootstrap-lazy-loaded via AJAX when the tab link is clicked — navigating
-    # directly with a hash only sets the fragment and does NOT trigger the AJAX.
-    _base_url = customer_url.split("#")[0]
-    log(f"Loading customer page: {_base_url}", 0.01)
-    try:
-        page.goto(_base_url, wait_until="commit", timeout=60_000)
-    except Exception as _ge:
-        _es = str(_ge)
-        if "ERR_ABORTED" in _es or "frame was detached" in _es:
-            pass  # SSO redirect — check where we landed below
-        else:
-            raise
-
-    # Wait for the page skeleton to be interactive (nav tabs present)
-    try:
-        page.wait_for_selector('a[data-toggle="tab"][href="#snapshots_tab"]', timeout=30_000)
-    except Exception:
-        page.wait_for_timeout(5_000)
-
-    # Capture the ACTUAL normalized base URL the server settled on after any
-    # redirects/encoding (e.g. american-express-az → American%20Express%20AZ).
-    _settled_base = page.url.split("?")[0].split("#")[0].lower()
-    log(f"Customer page settled at: {page.url}", 0.02)
-
-    def _on_customer_page() -> bool:
-        current = page.url.split("?")[0].split("#")[0].lower()
-        return current == _settled_base
-
-    if not _on_customer_page():
-        log(f"Unexpected redirect to {page.url} — aborting", 0.0)
-        return []
-
-    # Dismiss intro.js overlays before clicking the tab
-    try:
-        page.evaluate(
-            "document.querySelectorAll('.introjs-overlay,.introjs-helperLayer,"
-            ".introjs-tooltip,[class*=\"introjs\"],.modal-backdrop').forEach(e=>e.remove())"
-        )
-    except Exception:
-        pass
-
-    # Activate the Bootstrap Snapshots tab to trigger its AJAX data load.
-    # Strategy:
-    #   1. Try jQuery $(...).tab('show') — forces show.bs.tab even if already active.
-    #   2. Fall back to plain click() if jQuery or Bootstrap tab plugin unavailable.
-    # This handles the case where the tab is already marked active on page load
-    # (Bootstrap won't re-fire show.bs.tab on a plain click in that case).
-    tab_result = page.evaluate("""
-        (() => {
-            const link = document.querySelector('a[data-toggle="tab"][href="#snapshots_tab"]');
-            if (!link) return 'not_found';
-            // Prefer jQuery + Bootstrap tab plugin (forces show.bs.tab regardless of state)
-            if (window.$ && typeof window.$(link).tab === 'function') {
-                window.$(link).tab('show');
-                return 'jquery_tab_show';
-            }
-            // Fallback: deactivate first if needed, then click
-            const li = link.closest('li');
-            if (li && li.classList.contains('active')) {
-                const other = document.querySelector(
-                    'a[data-toggle="tab"]:not([href="#snapshots_tab"])'
-                );
-                if (other) other.click();
-            }
-            link.click();
-            return 'click';
-        })()
-    """)
-    log(f"Snapshots tab activation: {tab_result}", 0.03)
-
-    if tab_result == "not_found":
-        # No Bootstrap tab — snapshots may already be in the DOM (different page layout)
-        log("No Bootstrap tab found — will collect from full page", 0.04)
-    else:
-        # Wait for the AJAX content to replace the loader spinner with actual rows.
-        # Also accept an empty-state indicator (no rows means this customer has no snapshots).
-        try:
-            page.wait_for_selector(
-                "#snapshots_tab a[href*='/snapshot/'], "
-                "#snapshots_tab .empty, #snapshots_tab p, #snapshots_tab td",
-                timeout=30_000,
-            )
-        except Exception:
-            log("Timed out waiting for snapshot tab content", 0.04)
-            _tab_state = page.evaluate("""
-                (() => {
-                    const el = document.querySelector('#snapshots_tab');
-                    if (!el) return 'NOT FOUND';
-                    return el.innerHTML.substring(0, 400);
-                })()
-            """)
-            log(f"#snapshots_tab after timeout: {_tab_state[:200]}", 0.04)
-            page.wait_for_timeout(3_000)
-
-    log(f"Final URL before collect: {page.url}", 0.05)
-
-    # ── Debug dump ────────────────────────────────────────────────────────────
-    import os as _os
-    _dbg_dir = _os.path.join(_os.path.dirname(__file__), "snap_debug")
-    _os.makedirs(_dbg_dir, exist_ok=True)
-    try:
-        _full_html = page.content()
-        with open(_os.path.join(_dbg_dir, "page1_full.html"), "w", encoding="utf-8") as _f:
-            _f.write(_full_html)
-        _tab_inner = page.evaluate("""
-            (() => {
-                const el = document.querySelector('#snapshots_tab');
-                return el ? el.innerHTML : '<!-- #snapshots_tab NOT FOUND -->';
-            })()
-        """)
-        with open(_os.path.join(_dbg_dir, "page1_snapshots_tab.html"), "w", encoding="utf-8") as _f:
-            _f.write(_tab_inner)
-        _pag_info = page.evaluate("""
-            (() => {
-                const scope = document.querySelector('#snapshots_tab');
-                const scopedLinks = scope
-                    ? Array.from(scope.querySelectorAll('ul.pagination li a')).map(a => a.textContent.trim())
-                    : [];
-                const globalLinks = Array.from(document.querySelectorAll('ul.pagination li a')).map(a => ({
-                    text: a.textContent.trim(),
-                    inScope: scope ? scope.contains(a) : false
-                }));
-                const countTexts = Array.from(document.querySelectorAll('*')).filter(
-                    e => /showing\\s+\\d+\\s+of\\s+\\d+/i.test(e.innerText || '')
-                        && e.children.length === 0
-                ).map(e => ({text: e.innerText.trim(), id: e.closest('[id]')?.id || ''}));
-                return {scopedLinks, globalLinks: globalLinks.slice(0,40), countTexts: countTexts.slice(0,10)};
-            })()
-        """)
-        import json as _json
-        with open(_os.path.join(_dbg_dir, "page1_pagination.json"), "w", encoding="utf-8") as _f:
-            _json.dump(_pag_info, _f, indent=2)
-        print(f"[SNAP-DEBUG] Scoped pagination links: {_pag_info.get('scopedLinks')}")
-        print(f"[SNAP-DEBUG] Count texts found: {_pag_info.get('countTexts')}")
-    except Exception as _de:
-        print(f"[SNAP-DEBUG] dump error: {_de}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _collect() -> list[dict]:
-        # Context guard: skip if we've navigated away from the customer page
-        if not _on_customer_page():
-            log(f"Context guard: drifted to {page.url} — skipping", 0.0)
-            return []
-        # Scope extraction to #snapshots_tab to avoid picking up ticket links
-        _tab_html = page.evaluate(
-            "(() => { const el = document.querySelector('#snapshots_tab'); return el ? el.innerHTML : ''; })()"
-        ) or ""
-        if _tab_html:
-            return [r for r in _extract_snapshot_rows(_tab_html) if r["snap_id"] not in seen_ids]
-        # Fallback to full page if tab panel not found
-        return [r for r in _extract_snapshot_rows(page.content()) if r["snap_id"] not in seen_ids]
-
-    new_rows = _collect()
-    for r in new_rows:
-        all_snaps.append(r)
-        seen_ids.add(r["snap_id"])
-    log(f"Page 1: {len(new_rows)} snapshots", 0.06)
-
-    # Scope the "Showing X of Y" search to the snapshots tab only
-    _snap_tab_html = page.evaluate(
-        "(() => { const el = document.querySelector('#snapshots_tab'); return el ? el.innerHTML : ''; })()"
-    ) or ""
-    m_total = re.search(r"Showing\s+\d+\s+of\s+(\d+)\s+matching", _snap_tab_html, re.I)
-    if not m_total:
-        # Fallback: try full page but log a warning
-        m_total = re.search(r"Showing\s+\d+\s+of\s+(\d+)\s+matching", page.content(), re.I)
-        if m_total:
-            print(f"[SNAP-DEBUG] WARNING: total count from full page (not scoped): {m_total.group(1)}")
-    total_snaps = int(m_total.group(1)) if m_total else None
-    per_page = max(len(new_rows), 1)
-    total_pages = _math.ceil(total_snaps / per_page) if total_snaps else 9999
-    if total_snaps:
-        log(f"Total: {total_snaps} snapshots → {total_pages} pages", 0.07)
-
-    def _current_snap_ids() -> set:
-        """Return the set of snap_id values visible in #snapshots_tab."""
-        _html = page.evaluate(
-            "(() => { const el = document.querySelector('#snapshots_tab'); return el ? el.innerHTML : ''; })()"
-        ) or ""
-        return {r["snap_id"] for r in _extract_snapshot_rows(_html)}
-
-    page_num = 1
-    while page_num < total_pages:
-        if max_pages and page_num >= max_pages:
-            break
-        next_num = page_num + 1
-        pct = min(0.07 + 0.88 * (page_num / max(total_pages, 1)), 0.94)
-        # Only look for pagination inside #snapshots_tab
-        btn = page.locator("#snapshots_tab ul.pagination li a").filter(
-            has_text=re.compile(rf"^\s*{next_num}\s*$")
-        )
-        if btn.count() == 0:
-            log(f"No button for page {next_num} in snapshots tab — done at page {page_num}", 0.95)
-            break
-        log(f"Clicking page {next_num}…", pct)
-        try:
-            page.evaluate(
-                "document.querySelectorAll('.introjs-overlay,[class*=\"introjs\"],"
-                ".modal-backdrop').forEach(e=>e.remove())"
-            )
-            prev_ids = _current_snap_ids()
-            # JS click scoped strictly to #snapshots_tab pagination
-            clicked = page.evaluate(
-                """(n) => {
-                    const scope = document.querySelector('#snapshots_tab');
-                    if (!scope) return false;
-                    const btn = Array.from(scope.querySelectorAll('ul.pagination li a'))
-                        .find(a => a.textContent.trim() === String(n));
-                    if (btn) { btn.click(); return true; }
-                    return false;
-                }""",
-                next_num,
-            )
-            if not clicked:
-                btn.first.click(force=True, timeout=8_000)
-            # Wait for the snapshot row set inside #snapshots_tab to change
-            for _ in range(20):
-                page.wait_for_timeout(500)
-                if _current_snap_ids() != prev_ids:
-                    break
-            new_rows = _collect()
-            for r in new_rows:
-                all_snaps.append(r)
-                seen_ids.add(r["snap_id"])
-            log(f"Page {next_num}: +{len(new_rows)} → {len(all_snaps)} total", pct)
-            page_num = next_num
-            time.sleep(0.3)
-        except Exception as exc:
-            log(f"Page {next_num} error: {exc}", pct)
-            break
-
-    return all_snaps
-
-
-def query_supportal_analytics(statement: str, cookie: str | None) -> list[dict]:
-    """Send a SQL++ statement to the Supportal analytics endpoint.
-
-    Uses POST /api/support360/query with JSON body {statement, scope: "v1"}.
-    The endpoint requires the same session cookie used for HTML scraping.
-    """
-    url = f"{BASE_URL}/api/support360/query"
-    headers = {
-        "User-Agent": UA,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-
-    resp = requests.post(
-        url,
-        json={"statement": statement, "scope": "v1"},
-        headers=headers,
-        timeout=60,
-        verify=False,
-    )
-
-    resp.raise_for_status()
-    body = resp.text.strip()
-    if not body:
-        raise ValueError(
-            f"Analytics endpoint returned HTTP {resp.status_code} with empty body. "
-            "Session cookie is likely missing or expired — paste a fresh cookie "
-            "in the Authentication tab and try again."
-        )
-    if body.lstrip().startswith("<"):
-        snippet = body[:200].replace("\n", " ")
-        raise ValueError(
-            f"Analytics endpoint returned HTML (HTTP {resp.status_code}). "
-            f"Session cookie is missing or expired. Response: {snippet!r}"
-        )
-    try:
-        payload = resp.json()
-    except Exception:
-        snippet = body[:300].replace("\n", " ")
-        raise ValueError(
-            f"Analytics endpoint returned non-JSON (HTTP {resp.status_code}): {snippet!r}"
-        )
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        raise ValueError(f"Unexpected analytics response type: {type(payload).__name__}: {str(payload)[:200]}")
-    rows = payload.get("results") or payload.get("rows") or []
-    if not isinstance(rows, list):
-        raise ValueError(f"Unexpected analytics response shape: {list(payload.keys())}")
-    return rows
-
-
-def fetch_snapshots_via_analytics(
-    customer_name: str,
-    cookie: str | None,
-    limit: int = 200,
-    progress_cb: Callable[[str, float], None] | None = None,
-) -> list[dict]:
-    """Fetch snapshot listing + Zendesk ticket IDs via the Supportal analytics API.
-
-    Much faster than Playwright scraping — one SQL++ query returns all snapshots
-    for the customer with their associated ticket IDs in a single round-trip.
-
-    Returns snapshot dicts compatible with the rest of the app (same keys as the
-    Playwright scraper, topology fields left empty since they require detail pages).
-    """
-    def _log(msg: str, pct: float = 0.0):
-        print(f"[SNAP-ANALYTICS] {msg}")
-        if progress_cb:
-            progress_cb(msg, pct)
-
-    customer_name = customer_name.strip().strip('"\'')
-    _log(f"Querying analytics for customer: {customer_name!r}", 0.05)
-
-    def _make_statement(name_expr: str) -> str:
-        return f"""
-SELECT
-    REPLACE(META(sn).id, "Snapshot::", "") AS snap_id,
-    sn.`timestamp`                         AS date,
-    sn.`uuid`                              AS cluster_uuid,
-    cl.`ui_name`                           AS cluster_name,
-    cu.`name`                              AS organization,
-    sn.`zendesk`                           AS ticket_ids
-FROM snapshot sn
-JOIN cluster cl ON META(cl).id = ("Cluster::" || sn.`uuid`)
-JOIN customer cu ON META(cu).id = ("Customer::" || cl.`customer`)
-WHERE {name_expr}
-ORDER BY sn.`timestamp` DESC
-LIMIT {int(limit)}
-""".strip()
-
-    # Exact match first
-    rows = query_supportal_analytics(
-        _make_statement(f"cu.`name` = {json.dumps(customer_name)}"), cookie
-    )
-    # If no results, retry with case-insensitive LIKE match
-    if not rows:
-        _log(f"No exact match for {customer_name!r} — retrying with LOWER() match …", 0.1)
-        rows = query_supportal_analytics(
-            _make_statement(f"LOWER(cu.`name`) = {json.dumps(customer_name.lower())}"), cookie
-        )
-    # If still nothing, try LIKE prefix
-    if not rows:
-        like_val = customer_name.lower().replace("%", "\\%").replace("_", "\\_") + "%"
-        _log(f"No case-insensitive match — retrying with LIKE {like_val!r} …", 0.15)
-        rows = query_supportal_analytics(
-            _make_statement(f"LOWER(cu.`name`) LIKE {json.dumps(like_val)}"), cookie
-        )
-
-    if not rows:
-        raise ValueError(
-            f"No snapshots found for customer {customer_name!r} in the analytics database. "
-            "Check the customer name matches Supportal exactly, and that the session cookie is valid."
-        )
-    _log(f"Analytics returned {len(rows)} snapshot records.", 0.5)
-
-    now_iso = (
-        datetime.datetime.now(datetime.timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    results: list[dict] = []
-    for row in rows:
-        snap_id = row.get("snap_id") or ""
-        cluster_uuid = row.get("cluster_uuid") or (snap_id.split("::")[0] if "::" in snap_id else "")
-        ticket_ids_raw = row.get("ticket_ids") or []
-        # zendesk field is array of integers; convert to strings to match app convention
-        ticket_ids = [str(t) for t in ticket_ids_raw if t]
-        results.append({
-            "snap_id":            snap_id,
-            "cluster_id":         cluster_uuid,
-            "url":                f"{BASE_URL}/snapshot/{urllib.parse.quote(snap_id, safe='')}",
-            "date":               row.get("date") or "",
-            "organization":       row.get("organization") or customer_name,
-            "customer_url":       f"{BASE_URL}/customer/{urllib.parse.quote(customer_name, safe='')}",
-            "cluster_name":       row.get("cluster_name") or "",
-            "cluster_uuid":       cluster_uuid,
-            "capella_cluster_id": "",
-            "topology":           {},
-            "ticket_ids":         ticket_ids,
-            "scraped_at":         now_iso,
-            # Topology detail fields empty — fetch full topology separately if needed
-            "bad_count":          0,
-            "warn_count":         0,
-            "bad_items":          [],
-            "warn_items":         [],
-            "cb_version":         "",
-            "node_count":         0,
-            "bucket_names":       [],
-            "auto_failover_seconds": None,
-            "ram_per_node_mib":   None,
-            "bucket_count":       0,
-            "server_groups":      [],
-        })
-
-    _log(f"Done — {len(results)} snapshots with ticket IDs.", 1.0)
-    return results
-
-
-def fetch_ticket_clusters_via_analytics(
-    ticket_ids: list[str],
-    cookie: str | None,
-) -> dict[str, list[str]]:
-    """Query Analytics API for cluster UI names linked to each ticket via snapshots.
-    Returns {ticket_id: [cluster_ui_name, ...]}."""
-    if not ticket_ids:
-        return {}
-    id_list = ", ".join(json.dumps(str(tid)) for tid in ticket_ids[:500])
-    statement = (
-        "SELECT DISTINCT t_id, cl.ui_name AS cluster_ui_name "
-        "FROM snapshot sn "
-        "UNNEST sn.`zendesk` AS t_id "
-        "JOIN cluster cl ON META(cl).id = (\"Cluster::\" || sn.`uuid`) "
-        f"WHERE t_id IN [{id_list}]"
-    )
-    rows = query_supportal_analytics(statement, cookie)
-    result: dict[str, list[str]] = {}
-    for row in rows:
-        tid   = str(row.get("t_id") or "").strip()
-        cname = (row.get("cluster_ui_name") or "").strip()
-        if not tid or not cname:
-            continue
-        if tid not in result:
-            result[tid] = []
-        if cname not in result[tid]:
-            result[tid].append(cname)
-    return result
 
 
 def enrich_ticket_apps_via_analytics(
@@ -19016,425 +12909,153 @@ def enrich_ticket_apps_via_analytics(
     use_tls: bool,
     scope: str,
     collection: str,
-    llm_provider: str = "",
-    llm_model: str = "",
-    llm_api_key: str = "",
-    llm_base_url: str = "",
-    progress_cb: Callable[[str, float], None] | None = None,
+    llm_provider: str,
+    llm_model: str,
+    llm_api_key: str,
+    llm_base_url: str,
+    progress_cb: Callable[[str, float], None] = lambda m, p: None,
 ) -> tuple[int, int]:
-    """Enrich application labels for tickets missing them.
-
-    Two-stage approach:
-    1. Analytics API: query which clusters (ui_name) are linked to each ticket via
-       snapshots. Match ui_name against known app aliases.
-    2. LLM fallback: for tickets still unlabeled after stage 1, send a batch prompt
-       asking the LLM to extract the app name from each ticket subject. AmEx encodes
-       the application name directly in the subject (e.g. "Enterprise Wallet - Unable
-       to process transactions" → "Enterprise Wallet").
-
-    Writes results to score.analytics_app_labels and score.analytics_cluster_names
-    on each updated CB ticket document.
+    """
+    For tickets that are missing app labels (no entry in the cluster→app map),
+    use the LLM to infer the Couchbase product name from the cluster hostname,
+    then write analytics_app_labels into ticket["score"] and re-upsert to CB.
 
     Returns (enriched_count, error_count).
     """
-    def _log(msg: str, pct: float = 0.0):
-        print(f"[APP-ENRICH] {msg}")
-        if progress_cb:
-            progress_cb(msg, pct)
-
     if not _CB_AVAILABLE:
-        raise RuntimeError("couchbase SDK not installed")
-
-    from couchbase.cluster import Cluster
-    from couchbase.options import ClusterOptions, QueryOptions
-    from couchbase.auth import PasswordAuthenticator
+        raise RuntimeError("Couchbase SDK not installed")
 
     conn_str = _cb_conn_str(cb_url, use_tls)
     cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
     cluster.wait_until_ready(timedelta(seconds=15))
-    col = cluster.bucket(bucket).scope(scope).collection(collection)
-    ks  = f"`{bucket}`.`{scope}`.`{collection}`"
+    col      = cluster.bucket(bucket).scope(scope).collection(collection)
 
-    # Load tickets — only id, subject, and score fields needed
-    _cust_filter = ""
-    if customer_name and customer_name.lower() != "all customers":
-        _esc = customer_name.replace("'", "\\'")
-        _cust_filter = f" AND LOWER(t.organization) LIKE '%{_esc.lower()}%'"
-
-    _log(f"Loading tickets for {customer_name!r}…", 0.02)
-    q = (
-        f"SELECT META(t).id AS _key, t.ticket_id, t.subject, t.organization, "
-        f"t.score.cluster_names AS _cluster_names, "
-        f"t.score.analytics_app_labels AS _existing_labels "
-        f"FROM {ks} AS t "
-        f"WHERE t.ticket_id IS NOT MISSING{_cust_filter} LIMIT 5000"
-    )
+    progress_cb("Loading tickets from Couchbase…", 0.05)
     try:
-        rows = list(cluster.query(q, QueryOptions(scan_consistency=0)))
+        ks = f"`{bucket}`.`{scope}`.`{collection}`"
+        _cf = customer_name.strip().lower().replace("%", "\\%").replace("_", "\\_")
+        q   = (
+            f"SELECT META().id AS _key, t.* "
+            f"FROM {ks} t "
+            f"WHERE t.type = 'ticket' "
+            f"AND LOWER(t.organization) LIKE {json.dumps(_cf + '%')}"
+        )
+        rows = list(cluster.query(q))
     except Exception as exc:
         cluster.close()
         raise RuntimeError(f"CB query failed: {exc}") from exc
 
-    _c2a = _get_cluster_to_app()
+    progress_cb(f"Loaded {len(rows)} tickets for '{customer_name}'.", 0.15)
 
-    def _has_label(row: dict) -> bool:
-        if row.get("_existing_labels"):
-            return True
-        for cname in (row.get("_cluster_names") or []):
-            if _c2a.get((cname or "").lower()):
-                return True
-        return False
+    c2a = _get_cluster_to_app()
 
-    needs = [r for r in rows if not _has_label(r)]
-    _log(f"{len(needs)}/{len(rows)} tickets need app label enrichment.", 0.05)
+    # Collect tickets lacking app labels + their unmapped cluster names
+    to_enrich: list[dict] = []
+    all_unmapped: set[str] = set()
+    for row in rows:
+        ticket = dict(row)
+        ticket.pop("_key", None)
+        cids = _ticket_cluster_ids(ticket)
+        has_label = any(c2a.get(cid) for cid in cids)
+        if not has_label:
+            # Also check stored analytics_app_labels
+            _sc = ticket.get("score") or {}
+            if _sc.get("analytics_app_labels"):
+                continue  # already enriched
+            to_enrich.append(ticket)
+            for cid in cids:
+                if cid and not c2a.get(cid):
+                    all_unmapped.add(cid)
 
-    if not needs:
-        _log("All tickets already have app labels.", 1.0)
+    if not to_enrich:
+        progress_cb("All tickets already have app labels — nothing to enrich.", 1.0)
         cluster.close()
         return 0, 0
 
-    ticket_ids_str = [str(r["ticket_id"]) for r in needs if r.get("ticket_id")]
-
-    # ── Stage 1: Analytics API ────────────────────────────────────────────────
-    _log(f"Stage 1: querying Analytics API for {len(ticket_ids_str)} tickets…", 0.1)
-    analytics_map: dict[str, list[str]] = {}
-    _batch = 200
-    for i in range(0, len(ticket_ids_str), _batch):
-        chunk = ticket_ids_str[i:i + _batch]
-        pct = 0.1 + 0.3 * (i / len(ticket_ids_str))
-        _log(f"  Analytics batch {i // _batch + 1}…", pct)
-        try:
-            analytics_map.update(fetch_ticket_clusters_via_analytics(chunk, cookie))
-        except Exception as exc:
-            _log(f"  Analytics batch error: {exc}", pct)
-
-    _log(f"Analytics returned cluster info for {len(analytics_map)} tickets.", 0.4)
-
-    # Map ui_name → app alias using known alias keys (longest match first)
-    _known_apps = sorted(_get_app_cluster_aliases().keys(), key=len, reverse=True)
-
-    def _ui_name_to_app(ui_name: str) -> str | None:
-        ui_lc = ui_name.lower()
-        for app in _known_apps:
-            if app in ui_lc:
-                return app
-        return None
-
-    # ── Stage 2: LLM subject extraction for remaining unlabeled tickets ───────
-    # Build list of tickets that stage 1 didn't resolve
-    stage1_resolved: set[str] = set()
-    for tid, ui_names in analytics_map.items():
-        if any(_ui_name_to_app(u) for u in ui_names):
-            stage1_resolved.add(tid)
-
-    still_needs_llm = [r for r in needs if str(r.get("ticket_id") or "") not in stage1_resolved]
-    llm_labels: dict[str, str] = {}
-
-    if still_needs_llm and llm_provider and llm_model:
-        _log(f"Stage 2: LLM extraction for {len(still_needs_llm)} remaining tickets…", 0.45)
-        _BATCH_LLM = 40
-        for i in range(0, len(still_needs_llm), _BATCH_LLM):
-            chunk = still_needs_llm[i:i + _BATCH_LLM]
-            pct = 0.45 + 0.3 * (i / len(still_needs_llm))
-            _log(f"  LLM batch {i // _BATCH_LLM + 1}/{(len(still_needs_llm)-1)//_BATCH_LLM + 1}…", pct)
-            lines = "\n".join(
-                f'- #{r["ticket_id"]}: "{(r.get("subject") or "").strip()}"'
-                for r in chunk
-            )
-            prompt = (
-                "You are analyzing support tickets. For each ticket below, extract the "
-                "application or product name from the subject line. Return a JSON array "
-                "where each element is {\"ticket_id\": \"<id>\", \"app_label\": \"<name>\"} "
-                "or {\"ticket_id\": \"<id>\", \"app_label\": null} if no specific application "
-                "is identifiable. Use only the information in the subject — do not invent names. "
-                "Common patterns: app names appear at the start of the subject before a dash or "
-                "colon, e.g. 'Enterprise Wallet - issue' → 'Enterprise Wallet', "
-                "'DQF Application timeout' → 'DQF', 'Griffin-Tier 0 cluster' → 'Griffin'.\n\n"
-                f"Tickets:\n{lines}\n\n"
-                "Return ONLY the JSON array, no other text."
-            )
-            try:
-                raw = call_llm(
-                    [{"role": "user", "content": prompt}],
-                    llm_provider, llm_model, llm_api_key, llm_base_url,
-                    max_tokens=1024,
-                )
-                # Parse JSON — strip markdown fences if present
-                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-                parsed = json.loads(raw)
-                for item in (parsed if isinstance(parsed, list) else []):
-                    tid_v = str(item.get("ticket_id") or "").strip()
-                    lbl_v = (item.get("app_label") or "").strip()
-                    if tid_v and lbl_v and lbl_v.lower() not in ("null", "none", "unknown", "n/a"):
-                        llm_labels[tid_v] = lbl_v
-            except Exception as exc:
-                _log(f"  LLM batch error: {exc}", pct)
-
-        _log(f"LLM extracted labels for {len(llm_labels)} tickets.", 0.75)
-    elif still_needs_llm:
-        _log(f"Stage 2 skipped ({len(still_needs_llm)} tickets remain unlabeled — no LLM configured).", 0.45)
-
-    # ── Write results to CB ───────────────────────────────────────────────────
-    enriched = errors = 0
-    total = len(needs)
-    for i, row in enumerate(needs):
-        tid      = str(row.get("ticket_id") or "")
-        doc_key  = row.get("_key") or f"ticket::{tid}"
-        pct      = 0.75 + 0.23 * (i / total)
-
-        ui_names = analytics_map.get(tid, [])
-        inferred: list[str] = []
-
-        # Stage 1 result
-        for uname in ui_names:
-            lbl = _ui_name_to_app(uname)
-            if lbl and lbl not in inferred:
-                inferred.append(lbl)
-        # If no alias match from ui_names, store ui_names themselves as labels
-        if not inferred and ui_names:
-            for uname in ui_names:
-                clean = uname.strip()
-                if clean and clean not in inferred:
-                    inferred.append(clean)
-
-        # Stage 2 result
-        if not inferred and tid in llm_labels:
-            inferred = [llm_labels[tid]]
-
-        if not inferred:
-            continue
-
-        _log(f"  [{i+1}/{total}] #{tid} → {inferred}", pct)
-        try:
-            result = col.get(doc_key)
-            doc    = result.content_as[dict]
-            _score = doc.get("score") or {}
-            _score["analytics_app_labels"]    = inferred
-            if ui_names:
-                _score["analytics_cluster_names"] = ui_names
-            doc["score"] = _score
-            col.replace(doc_key, doc)
-            enriched += 1
-        except Exception as exc:
-            errors += 1
-            _log(f"  Error updating #{tid}: {exc}", pct)
-
-    cluster.close()
-    _log(f"Done — {enriched} labels written, {errors} errors.", 1.0)
-    return enriched, errors
-
-
-def scrape_snapshots_from_stubs(
-    stubs: list[dict],
-    cookie: str | None,
-    max_detail_workers: int,
-    progress_cb: Callable[[str, float], None],
-) -> list[dict]:
-    """
-    Fetch full topology for a list of analytics-fetched snapshot stubs.
-
-    Each stub must have at least ``snap_id``.  This skips listing-page
-    enumeration entirely — the snap_ids are already known from the analytics
-    API so we go straight to the Playwright detail-fetch phase.
-
-    Returns a list of fully-populated snapshot dicts (same schema as
-    ``scrape_snapshots_for_customer``).
-    """
-    import concurrent.futures
-
-    def log(msg: str, pct: float):
-        print(f"[SNAP-DIRECT] {msg}")
-        progress_cb(msg, pct)
-
-    if not stubs:
-        log("No stubs to scrape.", 1.0)
-        return []
-
-    total = len(stubs)
-    log(f"Direct-scraping topology for {total} snapshots…", 0.0)
-
-    results: list[dict] = []
-    done_n = [0]
-    errors_n = [0]
-    lock = threading.Lock()
-
-    def _fetch_one(stub: dict) -> None:
-        snap_id = stub.get("snap_id", "")
-        if not snap_id:
-            return
-        try:
-            topo = fetch_snapshot_topology(snap_id, cookie)
-            now_iso = (
-                datetime.datetime.now(datetime.timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-            doc = {
-                "snap_id":            snap_id,
-                "cluster_id":         snap_id.split("::")[0],
-                "url":                f"{BASE_URL}/snapshot/{urllib.parse.quote(snap_id, safe='')}",
-                "date":               stub.get("date"),
-                "organization":       stub.get("organization", ""),
-                "customer_url":       "",
-                "cluster_name":       topo.get("cluster_name") or stub.get("cluster_name") or "",
-                "cluster_uuid":       topo.get("cluster_uuid") or stub.get("cluster_uuid") or "",
-                "capella_cluster_id": topo.get("capella_cluster_id") or "",
-                "topology":           topo,
-                "ticket_ids":         stub.get("ticket_ids") or [],
-                "scraped_at":         now_iso,
-                "bad_count":          topo.get("bad_count", 0),
-                "warn_count":         topo.get("warn_count", 0),
-                "bad_items":          topo.get("bad_items") or [],
-                "warn_items":         topo.get("warn_items") or [],
-                "cb_version":         topo.get("cb_version") or "",
-                "node_count":         topo.get("total_nodes") or 0,
-                "bucket_names":       topo.get("bucket_names") or [],
-                "auto_failover_seconds": topo.get("auto_failover_seconds"),
-                "ram_per_node_mib":   topo.get("ram_per_node_mib"),
-                "bucket_count":       topo.get("bucket_count", 0),
-                "server_groups":      topo.get("server_groups") or [],
-            }
-            with lock:
-                done_n[0] += 1
-                results.append(doc)
-                pct = done_n[0] / total
-                log(f"[{done_n[0]}/{total}] {snap_id[:16]}… bad={doc['bad_count']} warn={doc['warn_count']}", pct)
-        except Exception as exc:
-            with lock:
-                done_n[0] += 1
-                errors_n[0] += 1
-                log(f"[{done_n[0]}/{total}] Error {snap_id[:16]}…: {exc}",
-                    done_n[0] / total)
-
-    workers = max(1, min(max_detail_workers, total))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(_fetch_one, stubs))
-
-    log(f"Done — {len(results)} scraped, {errors_n[0]} errors.", 1.0)
-    return results
-
-
-def scrape_snapshots_for_customer(
-    customer: str,
-    cookie: Optional[str],
-    max_listing_pages: int,
-    max_detail_workers: int,
-    progress_cb: Callable[[str, float], None],
-    skip_ids: Optional[set] = None,
-    max_snapshots: int = 0,
-) -> list[dict]:
-    """
-    Full snapshot scrape for a customer:
-      1. Enumerate snapshot listing (paginated) → snap summaries
-      2. Fetch full topology for each new snapshot in parallel
-      3. Return list of snapshot dicts ready for storage
-    """
-    skip_ids = skip_ids or set()
-    customer = customer.strip().strip('"\'')
-    customer_url = (
-        customer if customer.startswith("http")
-        else f"{BASE_URL}/customer/{urllib.parse.quote(customer, safe='')}"
+    progress_cb(
+        f"{len(to_enrich)} ticket(s) missing app labels; "
+        f"{len(all_unmapped)} unique unmapped cluster name(s).",
+        0.2,
     )
 
-    def log(msg: str, pct: float):
-        print(f"[SNAP] {msg}")
-        progress_cb(msg, pct)
-
-    # ── Phase 1: enumerate listing ─────────────────────────────────────────
-    log("Enumerating snapshot listing…", 0.0)
-    parsed_cookies = []
-    if cookie:
-        for part in cookie.split(";"):
-            part = part.strip()
-            if "=" in part:
-                name, _, value = part.partition("=")
-                parsed_cookies.append({"name": name.strip(), "value": value.strip(), "url": BASE_URL})
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
-        if parsed_cookies:
-            ctx.add_cookies(parsed_cookies)
-        page = ctx.new_page()
-        page.set_default_timeout(60_000)
+    # ── LLM: infer app name from cluster hostname ────────────────────────────
+    cname_to_app: dict[str, str] = {}
+    if all_unmapped and llm_provider and llm_model:
+        names_list = "\n".join(f"- {n}" for n in sorted(all_unmapped))
+        prompt = (
+            "You are a Couchbase product expert. Given a list of Couchbase cluster "
+            "hostnames or names, identify which Couchbase product each cluster is "
+            "running. Reply with a JSON object mapping each cluster name to the "
+            "product label. Use these exact labels when applicable: "
+            "\"Couchbase Server\", \"Sync Gateway\", \"App Services\", \"Mobile\", "
+            "\"Analytics\", \"Eventing\", \"Search\", \"MLE\", \"Columnar\". "
+            "If you cannot determine the product, use \"Unknown\". "
+            "Reply ONLY with valid JSON, no explanation.\n\n"
+            f"Cluster names:\n{names_list}"
+        )
         try:
-            summaries = _scrape_snapshot_listing_playwright(
-                page, customer_url, max_listing_pages,
-                lambda m, p: log(m, p * 0.4),
+            progress_cb("Calling LLM to infer app labels from cluster names…", 0.35)
+            raw = call_llm(
+                [{"role": "user", "content": prompt}],
+                llm_provider, llm_model, llm_api_key, llm_base_url,
+                max_tokens=512,
             )
-        finally:
-            ctx.close()
-            browser.close()
-
-    new_summaries = [s for s in summaries if s["snap_id"] not in skip_ids]
-    log(f"Listing: {len(summaries)} snapshots found, {len(new_summaries)} new", 0.40)
-    if max_snapshots > 0 and len(new_summaries) > max_snapshots:
-        log(f"Capping at {max_snapshots} snapshots (of {len(new_summaries)} new).", 0.40)
-        new_summaries = new_summaries[:max_snapshots]
-    if not new_summaries:
-        log("No new snapshots to fetch.", 1.0)
-        return []
-
-    # ── Phase 2: fetch topology for each snapshot ──────────────────────────
-    results: list[dict] = []
-    total = len(new_summaries)
-    done_n = [0]
-    errors_n = [0]
-    lock = threading.Lock()
-
-    def _fetch_one(summary: dict) -> None:
-        snap_id = summary["snap_id"]
-        try:
-            topo = fetch_snapshot_topology(snap_id, cookie)
-            now_iso = (
-                datetime.datetime.now(datetime.timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
+            # Strip markdown fences if present
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:])
+            if raw.endswith("```"):
+                raw = raw.rsplit("```", 1)[0]
+            parsed = json.loads(raw.strip())
+            for cname, label in parsed.items():
+                if label and label.strip().lower() != "unknown":
+                    cname_to_app[cname.strip()] = label.strip()
+            progress_cb(
+                f"LLM mapped {len(cname_to_app)} cluster name(s) to app labels.",
+                0.50,
             )
-            doc = {
-                "snap_id":           snap_id,
-                "cluster_id":        snap_id.split("::")[0],
-                "url":               summary["url"],
-                "date":              summary.get("date"),
-                "organization":      customer,
-                "customer_url":      customer_url,
-                "cluster_name":      topo.get("cluster_name") or summary.get("cluster_name") or "",
-                "cluster_uuid":      topo.get("cluster_uuid") or "",
-                "capella_cluster_id": topo.get("capella_cluster_id") or "",
-                "topology":          topo,
-                "ticket_ids":        summary.get("ticket_ids") or [],
-                "scraped_at":        now_iso,
-                # Flattened for fast CB querying / charting
-                "bad_count":         topo.get("bad_count", 0),
-                "warn_count":        topo.get("warn_count", 0),
-                "bad_items":         topo.get("bad_items") or [],
-                "warn_items":        topo.get("warn_items") or [],
-                "cb_version":        topo.get("cb_version") or "",
-                "node_count":        topo.get("total_nodes") or 0,
-                "bucket_names":      topo.get("bucket_names") or [],
-                "auto_failover_seconds": topo.get("auto_failover_seconds"),
-                "ram_per_node_mib":  topo.get("ram_per_node_mib"),
-                "bucket_count":      topo.get("bucket_count", 0),
-                "server_groups":     topo.get("server_groups") or [],
-            }
-            with lock:
-                done_n[0] += 1
-                results.append(doc)
-                pct = 0.40 + 0.58 * (done_n[0] / total)
-                log(f"[{done_n[0]}/{total}] {snap_id[:16]}… bad={doc['bad_count']} warn={doc['warn_count']}", pct)
         except Exception as exc:
-            with lock:
-                done_n[0] += 1
-                errors_n[0] += 1
-                log(f"[{done_n[0]}/{total}] Error {snap_id[:16]}…: {exc}",
-                    0.40 + 0.58 * (done_n[0] / total))
+            progress_cb(f"LLM inference warning: {exc} — will skip unmapped clusters.", 0.50)
 
-    import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=max_detail_workers) as pool:
-        list(pool.map(_fetch_one, new_summaries))
+    # ── Apply labels and upsert ──────────────────────────────────────────────
+    enriched = errors = 0
+    total = len(to_enrich)
+    for i, ticket in enumerate(to_enrich):
+        pct = 0.5 + 0.5 * (i / total)
+        tid = ticket.get("ticket_id") or ticket.get("id", "?")
+        doc_key = f"ticket::{tid}"
 
-    log(f"Done: {len(results)} snapshots fetched, {errors_n[0]} errors.", 1.0)
-    return results
+        cids   = _ticket_cluster_ids(ticket)
+        labels = sorted({
+            cname_to_app[cid]
+            for cid in cids
+            if cname_to_app.get(cid)
+        })
+        if not labels:
+            continue  # LLM had no mapping for this ticket's clusters either
+
+        sc = dict(ticket.get("score") or {})
+        sc["analytics_app_labels"] = labels
+        ticket = {**ticket, "score": sc}
+
+        try:
+            col.upsert(doc_key, ticket)
+            enriched += 1
+            progress_cb(
+                f"[{i+1}/{total}] #{tid} → {', '.join(labels)}",
+                pct,
+            )
+        except Exception as exc:
+            errors += 1
+            progress_cb(f"[{i+1}/{total}] CB upsert error for {tid}: {exc}", pct)
+
+    cluster.close()
+    progress_cb(
+        f"App label enrichment complete: {enriched} ticket(s) updated"
+        + (f", {errors} error(s)" if errors else "") + ".",
+        1.0,
+    )
+    return enriched, errors
 
 
 # ─────────────────── Snapshot Couchbase storage ───────────────────────────────
@@ -19511,6 +13132,28 @@ def load_snapshots_from_couchbase(
         return []
     finally:
         cluster.close()
+
+
+def list_orgs_from_cb(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+) -> list[str]:
+    """Return a sorted list of distinct organization names from the tickets collection."""
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    keyspace = f"`{bucket}`.`{scope}`.`{collection}`"
+    q = f"SELECT DISTINCT RAW organization FROM {keyspace} WHERE organization IS NOT MISSING"
+    rows = [r for r in cluster.query(q) if r]
+    cluster.close()
+    return sorted(rows)
 
 
 def query_customer_directory_from_cb(
@@ -19861,6 +13504,9 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
                 "node_count_min":    None,
                 "node_count_max":    None,
                 "node_count_last":   None,
+                "cpus_per_node":     None,
+                "ram_per_node_mib":  None,
+                "os_name":           None,
                 "version_history":   [],
                 "bucket_names_seen": set(),
                 "bad_counts":        [],
@@ -19870,7 +13516,9 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
             }
         ci = index[cid]
 
-        name = (snap.get("cluster_name") or "").strip()
+        _cn = snap.get("cluster_name") or ""
+        _cn_val = (_cn[0] if isinstance(_cn, list) else _cn)
+        name = str(_cn_val).strip() if _cn_val else ""
         if name and name not in ci["cluster_names"]:
             ci["cluster_names"].append(name)
 
@@ -19889,7 +13537,17 @@ def build_cluster_index(snapshots: list[dict]) -> dict[str, dict]:
             if ci["node_count_last"] is None:   # first (=newest) wins when sorted desc
                 ci["node_count_last"] = nc
 
-        ver = (snap.get("cb_version") or "").strip()
+        # Promote hardware fields from top-level snap field or nested topology
+        _topo_d = snap.get("topology") or {}
+        for _hw_field in ("cpus_per_node", "ram_per_node_mib", "os_name"):
+            if ci[_hw_field] is None:
+                _val = snap.get(_hw_field) or _topo_d.get(_hw_field)
+                if _val:
+                    ci[_hw_field] = _val
+
+        _ver = snap.get("cb_version") or ""
+        _ver_val = (_ver[0] if isinstance(_ver, list) else _ver)
+        ver = str(_ver_val).strip() if _ver_val else ""
         if ver and ver not in ci["version_history"]:
             ci["version_history"].append(ver)
 
@@ -20386,8 +14044,16 @@ def score_tickets_batch(
     model: str,
     api_key: str,
     base_url: str,
+    cb_url: str = "",
+    bucket: str = "",
+    username: str = "",
+    password: str = "",
+    use_tls: bool = False,
+    scope: str = "transcripts",
+    collection: str = "tickets",
     num_ctx: int | None = None,
     no_think: bool = False,
+    save_to_cb: bool = False,
 ) -> list[dict]:
     """Send one batch to the LLM and return parsed score objects.
 
@@ -20721,6 +14387,168 @@ def backfill_analytics_fields(
     return updated, errors
 
 
+def backfill_missing_cbse_fields(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    progress_cb: Callable[[str, float], None],
+) -> tuple[int, int]:
+    """
+    Find tickets where `cbses` or `jira_issues` is MISSING (never written, not null).
+    For each ticket, derive cbses from ticket_fields.CBSE if present; otherwise write
+    null so the field is no longer MISSING. Returns (updated, errors).
+    """
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str = _cb_conn_str(cb_url, use_tls)
+    cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    col       = scope_obj.collection(collection)
+    fqn       = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    progress_cb("Querying for tickets with MISSING cbses/jira_issues …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, * FROM {fqn} "
+        f"WHERE META().id LIKE 'ticket::%' "
+        f"AND (cbses IS MISSING OR jira_issues IS MISSING)",
+        QueryOptions(timeout=timedelta(seconds=120)),
+    ))
+
+    total   = len(rows)
+    updated = errors = 0
+
+    if total == 0:
+        progress_cb("No tickets with MISSING cbses/jira_issues found.", 1.0)
+        cluster.close()
+        return 0, 0
+
+    progress_cb(f"Found {total} tickets to backfill …", 0.0)
+
+    for i, row in enumerate(rows, 1):
+        doc_key = row.get("doc_key") or row.get(collection, {}).get("doc_key")
+        ticket  = row.get(collection) or {k: v for k, v in row.items() if k != "doc_key"}
+        if not doc_key or not ticket:
+            errors += 1
+            continue
+        try:
+            if "cbses" not in ticket:
+                tf       = ticket.get("ticket_fields") or {}
+                cbse_raw = tf.get("CBSE") or tf.get("cbse") or ""
+                if cbse_raw and str(cbse_raw).strip():
+                    cbses = [
+                        c.strip().upper()
+                        for c in re.split(r"[,\s]+", str(cbse_raw))
+                        if c.strip()
+                    ]
+                    ticket["cbses"] = cbses if cbses else None
+                else:
+                    ticket["cbses"] = None
+
+            if "jira_issues" not in ticket:
+                ticket["jira_issues"] = None
+
+            col.upsert(doc_key, ticket)
+            updated += 1
+        except Exception as exc:
+            errors += 1
+            progress_cb(f"Error on {doc_key}: {exc}", i / total)
+            continue
+        if i % 50 == 0 or i == total:
+            progress_cb(f"Backfilled {i}/{total} …", i / total)
+
+    cluster.close()
+    return updated, errors
+
+
+def backfill_last_comment_at(
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+    progress_cb: Callable[[str, float], None],
+    org_filter: str = "",
+) -> tuple[int, int]:
+    """
+    Derive last_comment_at from the stored comments array for tickets that are
+    missing the field. Falls back to ticket_fields Updated/Last_Updated entries
+    for tickets with no comments. Returns (updated, errors).
+    """
+    if not _CB_AVAILABLE:
+        raise RuntimeError("couchbase SDK not installed")
+
+    conn_str  = _cb_conn_str(cb_url, use_tls)
+    cluster   = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+    cluster.wait_until_ready(timedelta(seconds=15))
+    scope_obj = cluster.bucket(bucket).scope(scope)
+    col       = scope_obj.collection(collection)
+    fqn       = f"`{bucket}`.`{scope}`.`{collection}`"
+
+    org_clause = ""
+    params: list = []
+    if org_filter.strip():
+        org_clause = " AND LOWER(TOSTRING(t.organization)) LIKE $1"
+        params.append(f"%{org_filter.strip().lower()}%")
+
+    progress_cb("Querying for tickets missing last_comment_at …", 0.0)
+    rows = list(scope_obj.query(
+        f"SELECT META().id AS doc_key, t.* FROM {fqn} AS t "
+        f"WHERE META().id LIKE 'ticket::%' "
+        f"AND t.last_comment_at IS MISSING{org_clause}",
+        QueryOptions(positional_parameters=params, timeout=timedelta(seconds=120)),
+    ))
+
+    total   = len(rows)
+    updated = errors = 0
+
+    if total == 0:
+        progress_cb("All tickets already have last_comment_at — nothing to do.", 1.0)
+        cluster.close()
+        return 0, 0
+
+    progress_cb(f"Found {total} tickets to backfill …", 0.0)
+
+    for i, row in enumerate(rows, 1):
+        doc_key = row.get("doc_key")
+        ticket  = {k: v for k, v in row.items() if k != "doc_key"}
+        if not doc_key or not ticket.get("ticket_id"):
+            errors += 1
+            continue
+        try:
+            last_comment_at: str | None = None
+            for c in reversed(ticket.get("comments") or []):
+                ts = c.get("timestamp") if isinstance(c, dict) else None
+                if ts:
+                    last_comment_at = ts
+                    break
+            if not last_comment_at:
+                tf = ticket.get("ticket_fields") or {}
+                for _k in ("Updated", "Last_Updated", "Last_Comment", "Last_Reply", "updated"):
+                    if tf.get(_k):
+                        last_comment_at = tf[_k]
+                        break
+            ticket["last_comment_at"] = last_comment_at
+            col.upsert(doc_key, ticket)
+            updated += 1
+        except Exception as exc:
+            errors += 1
+            progress_cb(f"Error on {doc_key}: {exc}", i / total)
+            continue
+        if i % 100 == 0 or i == total:
+            progress_cb(f"Backfilled {i}/{total} …", i / total)
+
+    cluster.close()
+    return updated, errors
+
+
 def embed_snapshots_from_cb(
     cb_url: str,
     bucket: str,
@@ -20815,37 +14643,7 @@ def embed_snapshots_from_cb(
 
 # ─────────────────────────── Phase 2a: Ticket Summaries ──────────────────────
 
-_SUMMARY_SYSTEM = (
-    "You are a Couchbase support engineer writing concise internal ticket summaries "
-    "for a knowledge base. Be factual, technical, and brief."
-)
-
-_SUMMARY_PROMPT_TMPL = """\
-Summarize this Couchbase support ticket for an internal knowledge base.
-
-## Ticket
-- ID: {ticket_id}
-- Customer: {organization}
-- Subject: {subject}
-- Priority: {priority}
-- Status: {status}
-- Requester: {requester}
-- Created: {created_at}
-
-## Description (truncated)
-{description}
-{cluster_block}{cbse_block}
-## Instructions
-Write 2–4 sentences covering: (1) the core problem and customer impact, \
-(2) relevant cluster health if a snapshot was attached, \
-(3) how it was resolved or current status.
-
-Then output EXACTLY these tagged lines (no extra text after the block):
-CLUSTER: <cluster name or unknown>
-CB_VERSION: <version or unknown>
-HEALTH: <healthy|degraded|critical|unknown>
-RESOLUTION: <one sentence or "open">
-"""
+# (moved to supportal/ package, imported at top of file)
 
 
 def _build_summary_prompt(ticket: dict) -> str:
@@ -21140,6 +14938,12 @@ def fetch_ticket_summary(
         return None
 
 
+def _org_slug(org: str) -> str:
+    """Convert an org name to a lowercase underscore-separated slug for use as a doc key."""
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", "_", org.lower()).strip("_")
+
+
 def rescore_all_customers_cb(
     cb_url: str,
     bucket: str,
@@ -21372,6 +15176,41 @@ def recover_score_cluster_fields_cb(
     return recovered, errors
 
 
+def upsert_inventory_doc(
+    org: str,
+    pipeline_steps: dict,
+    cb_url: str,
+    bucket: str,
+    username: str,
+    password: str,
+    use_tls: bool,
+    scope: str,
+    collection: str,
+) -> None:
+    """Write/merge a customer_inventory doc to Couchbase (best-effort, does not raise)."""
+    import datetime as _dt
+    if not _CB_AVAILABLE or not cb_url:
+        return
+    try:
+        conn_str = _cb_conn_str(cb_url, use_tls)
+        cluster  = Cluster(conn_str, ClusterOptions(PasswordAuthenticator(username, password)))
+        cluster.wait_until_ready(timedelta(seconds=15))
+        col = cluster.bucket(bucket).scope(scope).collection(collection)
+        key = f"inventory::{_org_slug(org)}"
+        try:
+            inv_doc = col.get(key).content_as[dict]
+        except Exception:
+            inv_doc = {"type": "customer_inventory", "organization": org, "pipeline": {}}
+        inv_doc["updated_at"] = (
+            _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        inv_doc.setdefault("pipeline", {}).update(pipeline_steps)
+        col.upsert(key, inv_doc)
+        cluster.close()
+    except Exception:
+        pass
+
+
 def persist_scores_to_cb(
     scores: dict[str, dict],
     cb_url: str,
@@ -21493,33 +15332,6 @@ def load_scores_from_cb(
 
 # ── Analytics helpers ─────────────────────────────────────────────────────────
 
-def _parse_ticket_fields(ticket: dict) -> dict:
-    """
-    Return the ticket_fields custom-field dict with normalized keys, or {}.
-
-    Handles three formats:
-      - New: already a dict with normalized keys (post-fix scrape)
-      - Old: JSON string with original spaced keys (pre-fix data in Couchbase)
-      - Missing: returns {}
-
-    Keys from old-format strings are normalized on read via _normalize_field_key
-    so callers always see the same canonical key names regardless of when the
-    document was scraped.
-    """
-    raw = ticket.get("ticket_fields") or ticket.get("fields") or {}
-    if isinstance(raw, dict):
-        # Check if keys are already normalized (no spaces) — new format
-        if all(" " not in k and "(" not in k for k in raw):
-            return raw
-        # Dict with old-style spaced keys — normalize on read
-        return {_normalize_field_key(k): v for k, v in raw.items()}
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return {_normalize_field_key(k): v for k, v in parsed.items()}
-        return {}
-    except Exception:
-        return {}
 
 
 _EOL_FIELD_PAIRS = [
@@ -21595,7 +15407,7 @@ def extract_ticket_version(ticket: dict) -> str:
             except Exception:
                 topo = {}
         if isinstance(topo, dict):
-            snap_ver = (topo.get("cb_version") or "").strip()
+            snap_ver = _topo_str(topo.get("cb_version"))
             if snap_ver:
                 # Strip build suffix: "7.2.3-6705-enterprise" → "7.2.3"
                 m2 = re.match(r"(\d+\.\d+(?:\.\d+)?)", snap_ver)
@@ -21678,15 +15490,55 @@ def classify_ticket_feature(ticket: dict) -> str:
             or "component__search" in tags or "full-text" in subject or "fts" in subject):
         return "Full-Text Search"
     if ("query" in comp or "n1ql" in comp
-            or "component__query" in tags or "n1ql" in subject or "sql++" in subject):
+            or "component__query" in tags or "component__n1ql__" in tags
+            or "component__server__query" in tags
+            or "n1ql" in subject or "sql++" in subject):
         return "Query / N1QL / SQL++"
-    if ("index" in comp or "component__index" in tags or "index" in subject):
+    if ("index" in comp or "component__index" in tags
+            or "component__server__secondary_index" in tags or "index" in subject):
         return "Indexing"
     if ("kv" in comp or "key_value" in comp or "bucket" in comp
-            or "component__server__couchbase_bucket" in tags or "key value" in subject):
+            or "component__server__couchbase_bucket" in tags
+            or "component__server__service__data" in tags or "key value" in subject):
         return "Data / KV"
     if "eventing" in comp or "eventing" in tags or "eventing" in subject:
         return "Eventing"
+    if "component__client__" in tags or "component__framework_and_library__" in tags:
+        return "SDK"
+    if "component__sync_gateway__" in tags:
+        return "Sync Gateway / App Services"
+    if "component__server__tools__cbbackup" in tags or "component__server__tools__cbrestore" in tags:
+        return "Backup / Restore"
+    if ("component__server__tools__" in tags or "component__tools__cbtools" in tags):
+        return "CLI Tools"
+    if "component__server__cluster_manager" in tags:
+        return "Cluster Management"
+    if "component__server__rebalance" in tags:
+        return "Rebalance / Cluster Ops"
+    if "component__server__installer" in tags:
+        return "Installation / Upgrade"
+    if "component__server__certificates" in tags or "component__server__ldap" in tags:
+        return "Security / Certificates"
+    if "component__server__ui" in tags:
+        return "Web UI"
+    if "component__server__views" in tags:
+        return "Views"
+    if "component__server__storage_engine__" in tags:
+        return "Storage Engine"
+    if "component__server__rest_api" in tags:
+        return "REST API"
+    if "component__kubernetes_operator__" in tags:
+        return "Kubernetes / Operator"
+    if "component__connector__" in tags:
+        return "Connectors"
+    if "component__lite__" in tags:
+        return "Couchbase Lite"
+    if "component__documentation" in tags:
+        return "Documentation"
+    if "component__other__sizing" in tags:
+        return "Sizing / Capacity Planning"
+    if "component__other__networking" in tags:
+        return "Networking"
     return "Other / General"
 
 
@@ -21795,8 +15647,8 @@ def build_customer_profile(
     for t in org_tickets:
         topo = t.get("snapshot_topology")
         if isinstance(topo, dict):
-            name = (topo.get("cluster_name") or "").strip()
-            uuid = (topo.get("cluster_uuid") or "").strip()
+            name = _topo_str(topo.get("cluster_name"))
+            uuid = _topo_str(topo.get("cluster_uuid"))
             if name:
                 clusters.add(name)
             elif uuid:
@@ -21839,10 +15691,33 @@ def build_customer_profile(
     )
 
     # ── CB version distribution ───────────────────────────────────────────────
-    version_counts: Counter = Counter(
-        v for t in org_tickets
-        for v in [extract_ticket_version(t)] if v
-    )
+    version_counts: Counter = Counter()
+    _p_eol_count   = 0
+    _p_admin_count = 0
+    _p_blank_count = 0
+    for t in org_tickets:
+        ver = extract_ticket_version(t)
+        if ver and ver != "Unknown":
+            version_counts[ver] += 1
+        else:
+            _tf_p = _parse_ticket_fields(t)
+            _cs_p = (_tf_p.get("Couchbase_Server") or "").strip().lower()
+            if "Couchbase_Server" not in _tf_p:
+                _p_admin_count += 1
+            elif "end of life" in _cs_p:
+                _p_eol_count += 1
+            else:
+                _p_blank_count += 1
+
+    _prof_ver_breakdown: list[tuple[str, int, str]] = [
+        (v, c, "version") for v, c in version_counts.most_common(12)
+    ]
+    if _p_eol_count:
+        _prof_ver_breakdown.append(("EOL / End of Life", _p_eol_count, "eol"))
+    if _p_admin_count:
+        _prof_ver_breakdown.append(("Admin / No Product Fields", _p_admin_count, "admin"))
+    if _p_blank_count:
+        _prof_ver_breakdown.append(("Version Not Specified", _p_blank_count, "blank"))
 
     return {
         "org":                  org,
@@ -21872,8 +15747,12 @@ def build_customer_profile(
         # Composition
         "feature_labels":       [f for f, _ in feature_counts.most_common()],
         "feature_values":       [c for _, c in feature_counts.most_common()],
-        "version_labels":       [v for v, _ in version_counts.most_common(12)],
-        "version_values":       [c for _, c in version_counts.most_common(12)],
+        "version_labels":          [v for v, _ in version_counts.most_common(12)],
+        "version_values":          [c for _, c in version_counts.most_common(12)],
+        "version_breakdown":       _prof_ver_breakdown,
+        "version_eol_count":       _p_eol_count,
+        "version_admin_count":     _p_admin_count,
+        "version_blank_count":     _p_blank_count,
     }
 
 
@@ -22090,10 +15969,10 @@ def build_cluster_timeline(tickets: list[dict], cluster_key: str) -> list[dict]:
         # cluster_uuid (internal CB hex UUID) is kept for dedup but not shown to users.
         tf = _parse_ticket_fields(ticket)
         identifiers = [
-            (topo.get("cluster_name") or "").lower(),
-            (topo.get("capella_cluster_id") or "").lower(),
-            (topo.get("cluster_uuid") or "").lower(),
-            (tf.get("Cluster_ID") or "").lower(),
+            _topo_str(topo.get("cluster_name")).lower(),
+            _topo_str(topo.get("capella_cluster_id")).lower(),
+            _topo_str(topo.get("cluster_uuid")).lower(),
+            _topo_str(tf.get("Cluster_ID")).lower(),
         ]
         if key_lower not in identifiers:
             continue
@@ -22103,14 +15982,21 @@ def build_cluster_timeline(tickets: list[dict], cluster_key: str) -> list[dict]:
         if dt is None:
             continue
 
+        # SDK version from ticket fields (Zendesk custom field)
+        sdk_ver = _topo_str(tf.get("Couchbase_Server_SDK_or_Connector"))
+        if not sdk_ver:
+            sdk_ver = _topo_str(tf.get("Couchbase_Analytics_SDK"))
+
         points.append({
             "dt":                dt,
+            "ts_ms":             int(dt.timestamp() * 1000),
             "date_label":        dt.strftime("%Y-%m-%d"),
             "ticket_id":         ticket.get("ticket_id", ""),
             "subject":           (ticket.get("subject") or "")[:80],
             "node_count":        topo.get("total_nodes"),
             "bucket_count":      topo.get("bucket_count"),
             "cb_version":        topo.get("cb_version"),
+            "sdk_version":       sdk_ver or None,
             "bad_count":         topo.get("bad_count", 0),
             "warn_count":        topo.get("warn_count", 0),
             "auto_failover_sec": topo.get("auto_failover_seconds"),
@@ -22134,17 +16020,91 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
     Convert a sorted list of timeline points into a list of ECharts option
     dicts ready to be passed to ui.echart().  Each dict has a '_height' key
     (popped at render time) so the caller can set the container height.
+
+    All x-axes use type="time" so points are spaced by actual date gap, not
+    evenly as category labels.  Series data is [[ts_ms, value], ...] pairs.
     Returns an empty list when there is no plottable data.
     """
     if not points:
         return []
 
-    dates = [p["date_label"] for p in points]
-    _zoom = [{"type": "inside"}, {"type": "slider", "bottom": 30}]
+    _zoom = [{"type": "inside"}, {"type": "slider", "bottom": 30, "height": 20}]
+    _xaxis_time = {
+        "type": "time",
+        "name": "Date",
+        "nameLocation": "end",
+        "axisLabel": {"formatter": "{yyyy}-{MM}-{dd}", "rotate": 30},
+    }
+    _tooltip_time = {
+        "trigger": "axis",
+        "axisPointer": {"type": "cross", "snap": True},
+    }
 
     charts = []
 
-    # ── 1. Node count over time ────────────────────────────────────────────────
+    # ── 1. CB Version & SDK version over time ─────────────────────────────────
+    # Scatter chart: y-axis is version string category, x-axis is time.
+    # Each row in the scatter data is [ts_ms, category_index].
+    _ver_set = sorted(set(p["cb_version"] for p in points if p["cb_version"]))
+    _sdk_set  = sorted(set(p["sdk_version"] for p in points if p["sdk_version"]))
+    _has_sdk  = bool(_sdk_set)
+
+    if _ver_set:
+        # Build combined category list: CB versions first, then SDK versions with prefix
+        _cb_labels  = _ver_set
+        _sdk_labels = [f"SDK {v}" for v in _sdk_set] if _has_sdk else []
+        _all_labels = _cb_labels + _sdk_labels
+        _label_idx  = {lbl: i for i, lbl in enumerate(_all_labels)}
+
+        _cb_scatter = [
+            [p["ts_ms"], _label_idx[p["cb_version"]], p["date_label"], str(p["ticket_id"]), p["cb_version"]]
+            for p in points if p["cb_version"] and p["cb_version"] in _label_idx
+        ]
+        _sdk_scatter = [
+            [p["ts_ms"], _label_idx[f"SDK {p['sdk_version']}"], p["date_label"], str(p["ticket_id"]), p["sdk_version"]]
+            for p in points if p["sdk_version"] and f"SDK {p['sdk_version']}" in _label_idx
+        ] if _has_sdk else []
+
+        _dims = ["ts", "y_idx", "Date", "Ticket", "Version"]
+        _ver_series = [{
+            "name": "CB Server",
+            "type": "scatter",
+            "symbolSize": 14,
+            "color": "#1565C0",
+            "dimensions": _dims,
+            "encode": {"x": "ts", "y": "y_idx", "tooltip": ["Date", "Ticket", "Version"]},
+            "data": _cb_scatter,
+        }]
+        if _sdk_scatter:
+            _ver_series.append({
+                "name": "SDK",
+                "type": "scatter",
+                "symbolSize": 10,
+                "symbol": "diamond",
+                "color": "#E65100",
+                "dimensions": _dims,
+                "encode": {"x": "ts", "y": "y_idx", "tooltip": ["Date", "Ticket", "Version"]},
+                "data": _sdk_scatter,
+            })
+
+        charts.append({
+            "_height": max(200, len(_all_labels) * 32 + 120),
+            "title":   {"text": "CB Server & SDK Version History"},
+            "tooltip": {"trigger": "item"},
+            "legend":  {"bottom": 0} if _has_sdk else {},
+            "dataZoom": _zoom,
+            "grid":    {"bottom": 70, "left": 120, "right": 30},
+            "xAxis":   dict(_xaxis_time),
+            "yAxis":   {
+                "type": "category",
+                "data": _all_labels,
+                "axisLabel": {"fontSize": 11},
+                "splitLine": {"show": True, "lineStyle": {"type": "dashed", "opacity": 0.4}},
+            },
+            "series": _ver_series,
+        })
+
+    # ── 2. Node count over time ────────────────────────────────────────────────
     node_vals = [p["node_count"] for p in points]
     if any(v is not None for v in node_vals):
         svc_fields = [
@@ -22161,10 +16121,15 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
                 "legend":   {"bottom": 0},
                 "dataZoom": _zoom,
                 "grid":     {"bottom": 70},
-                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
-                "yAxis":    {"type": "value", "name": "Nodes"},
+                "xAxis":    dict(_xaxis_time),
+                "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1},
                 "series":   [
-                    {"name": label, "type": "bar", "stack": "total", "data": [p.get(field, 0) or 0 for p in points]}
+                    {
+                        "name": label,
+                        "type": "bar",
+                        "stack": "total",
+                        "data": [[p["ts_ms"], p.get(field, 0) or 0] for p in points],
+                    }
                     for label, field in svc_fields
                     if any(p.get(field, 0) for p in points)
                 ],
@@ -22173,76 +16138,82 @@ def _cluster_timeline_charts(points: list[dict]) -> list[dict]:
             charts.append({
                 "_height": 280,
                 "title":    {"text": "Node Count Over Time"},
-                "tooltip":  {"trigger": "axis"},
+                "tooltip":  _tooltip_time,
                 "dataZoom": _zoom,
                 "grid":     {"bottom": 70},
-                "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+                "xAxis":    dict(_xaxis_time),
                 "yAxis":    {"type": "value", "name": "Nodes", "minInterval": 1},
                 "color":    ["#1E88E5"],
-                "series":   [{"name": "Total Nodes", "type": "line", "smooth": True, "data": [p["node_count"] for p in points]}],
+                "series":   [{"name": "Total Nodes", "type": "line", "smooth": True,
+                              "data": [[p["ts_ms"], p["node_count"]] for p in points]}],
             })
 
-    # ── 2. Bucket count over time ──────────────────────────────────────────────
+    # ── 3. Bucket count over time ──────────────────────────────────────────────
     bucket_vals = [p["bucket_count"] for p in points]
     if any(v is not None for v in bucket_vals):
         charts.append({
-            "_height": 280,
+            "_height": 260,
             "title":    {"text": "Bucket Count Over Time"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "Buckets", "minInterval": 1},
             "color":    ["#43A047"],
-            "series":   [{"name": "Buckets", "type": "line", "smooth": True, "data": [p["bucket_count"] for p in points]}],
+            "series":   [{"name": "Buckets", "type": "line", "smooth": True,
+                          "data": [[p["ts_ms"], p["bucket_count"]] for p in points]}],
         })
 
-    # ── 3. Checker health (BAD + WARN) over time ───────────────────────────────
+    # ── 4. Checker health (BAD + WARN) over time ───────────────────────────────
     if any(p["bad_count"] or p["warn_count"] for p in points):
         charts.append({
             "_height": 280,
             "title":    {"text": "Checker Health Over Time", "subtext": "Lower is better"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "legend":   {"bottom": 0},
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "Issue Count", "minInterval": 1},
             "color":    ["#E53935", "#FB8C00"],
             "series":   [
-                {"name": "BAD checks",  "type": "line", "smooth": True, "data": [p["bad_count"]  for p in points]},
-                {"name": "WARN checks", "type": "line", "smooth": True, "data": [p["warn_count"] for p in points]},
+                {"name": "BAD checks",  "type": "line", "smooth": True,
+                 "data": [[p["ts_ms"], p["bad_count"]]  for p in points]},
+                {"name": "WARN checks", "type": "line", "smooth": True,
+                 "data": [[p["ts_ms"], p["warn_count"]] for p in points]},
             ],
         })
 
-    # ── 4. Auto-failover setting over time ────────────────────────────────────
+    # ── 5. Auto-failover setting over time ────────────────────────────────────
     af_vals = [p["auto_failover_sec"] for p in points]
     if any(v is not None for v in af_vals):
         charts.append({
-            "_height": 280,
+            "_height": 260,
             "title":    {"text": "Auto-Failover Threshold Over Time"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "Seconds", "minInterval": 1},
             "color":    ["#8E24AA"],
-            "series":   [{"name": "Auto-failover (s)", "type": "line", "step": "start", "data": [p["auto_failover_sec"] for p in points]}],
+            "series":   [{"name": "Auto-failover (s)", "type": "line", "step": "start",
+                          "data": [[p["ts_ms"], p["auto_failover_sec"]] for p in points]}],
         })
 
-    # ── 5. RAM per node over time ─────────────────────────────────────────────
+    # ── 6. RAM per node over time ─────────────────────────────────────────────
     ram_vals = [p["ram_mib"] for p in points]
     if any(v is not None for v in ram_vals):
         charts.append({
-            "_height": 280,
+            "_height": 260,
             "title":    {"text": "RAM per Node Over Time"},
-            "tooltip":  {"trigger": "axis"},
+            "tooltip":  _tooltip_time,
             "dataZoom": _zoom,
             "grid":     {"bottom": 70},
-            "xAxis":    {"type": "category", "data": dates, "name": "Ticket Date", "axisLabel": {"rotate": 45}},
+            "xAxis":    dict(_xaxis_time),
             "yAxis":    {"type": "value", "name": "MiB", "minInterval": 1},
             "color":    ["#FB8C00"],
-            "series":   [{"name": "RAM (MiB)", "type": "line", "smooth": True, "data": [p["ram_mib"] for p in points]}],
+            "series":   [{"name": "RAM (MiB)", "type": "line", "smooth": True,
+                          "data": [[p["ts_ms"], p["ram_mib"]] for p in points]}],
         })
 
     return charts
@@ -22255,6 +16226,8 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
     """
     from collections import Counter
     import datetime
+
+    _sf = _topo_str  # local alias for readability inside this function
 
     # Frequency over time — total and per origin
     month_by_origin: dict[str, Counter] = {
@@ -22328,17 +16301,33 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
     _uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
     all_unique_cluster_uuids: set = set()
     clusters_by_version: dict[str, set] = {}
+    _snap_info_cache: dict[str, dict] = {}  # ticket_id → extract_cluster_snapshot_info result
+
+    _ver_eol_count   = 0  # Couchbase_Server = "End of Life*"
+    _ver_admin_count = 0  # No product version fields at all (Account Admin schema)
+    _ver_blank_count = 0  # Couchbase_Server key present but blank (SE didn't fill in)
 
     for t in tickets:
         ver = extract_ticket_version(t)
+        # Parse ticket_fields once per ticket (used for version fallback + cluster UUID)
+        tf = _parse_ticket_fields(t)
         if ver and ver != "Unknown":
             version_counts[ver] += 1
+        else:
+            _cs = (tf.get("Couchbase_Server") or "").strip().lower()
+            if "Couchbase_Server" not in tf:
+                _ver_admin_count += 1
+            elif "end of life" in _cs:
+                _ver_eol_count += 1
+            else:
+                _ver_blank_count += 1
 
-        # Collect cluster UUIDs from all available sources
+        # Collect cluster UUIDs from fast structured sources only.
+        # Source 3 (extract_cluster_snapshot_info over description+comments) is omitted here —
+        # it is O(n * comment_size) and produces many false positives for analytics charts.
         ticket_uuids: set = set()
 
         # Source 1: ticket_fields["Cluster ID"]
-        tf = _parse_ticket_fields(t)
         cf_uuid = (tf.get("Cluster_ID") or "").strip()
         if _uuid_re.match(cf_uuid):
             ticket_uuids.add(cf_uuid.lower())
@@ -22352,19 +16341,19 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
                     topo_d = json.loads(topo_raw)
                 except Exception:
                     topo_d = {}
-            # Prefer capella_cluster_id (matches Zendesk Cluster_ID format)
             for _uid_key in ("capella_cluster_id", "cluster_uuid"):
                 _uid_val = (topo_d.get(_uid_key) or "").strip()
                 if _uuid_re.match(_uid_val):
                     ticket_uuids.add(_uid_val.lower())
 
-        # Source 3: UUIDs parsed from comments/description/snapshots
-        info = extract_cluster_snapshot_info(t)
-        for cid in (info.get("cluster_ids") or []):
-            if _uuid_re.match(cid):
-                ticket_uuids.add(cid.lower())
-
         all_unique_cluster_uuids.update(ticket_uuids)
+
+        # Lightweight snapshot count — just count non-empty lines in the snapshots field
+        _snaps_raw = t.get("snapshots") or ""
+        if isinstance(_snaps_raw, list):
+            _snaps_raw = "\n".join(str(s) for s in _snaps_raw)
+        _snap_count = sum(1 for ln in str(_snaps_raw).splitlines() if ln.strip())
+        _snap_info_cache[str(t.get("ticket_id", ""))] = {"snapshot_count": _snap_count}
 
         # Map each UUID to the ticket's version (skip if no real version)
         if ver and ver != "Unknown":
@@ -22372,6 +16361,18 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
     version_counts.pop("Unknown", None)
     version_items = sorted(version_counts.items())   # sort by version string
+
+    # Build a combined breakdown list for the color-coded chart:
+    #   (label, count, category)  — category drives bar colour + checkbox visibility
+    _version_breakdown: list[tuple[str, int, str]] = [
+        (v, c, "version") for v, c in version_items
+    ]
+    if _ver_eol_count:
+        _version_breakdown.append(("EOL / End of Life", _ver_eol_count, "eol"))
+    if _ver_admin_count:
+        _version_breakdown.append(("Admin / No Product Fields", _ver_admin_count, "admin"))
+    if _ver_blank_count:
+        _version_breakdown.append(("Version Not Specified", _ver_blank_count, "blank"))
 
     # Build parallel lists for chart: versions with ≥1 known cluster UUID
     _ver_with_clusters = sorted(clusters_by_version.keys())
@@ -22409,11 +16410,10 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
         tid = str(ticket.get("ticket_id", ""))
         score = scores.get(tid, {})
 
-        # Snapshot count: use score pre-computed value if available, else extract
+        # Snapshot count: score field first, then lightweight cache from first loop.
         s_count = score.get("snapshot_count") if score else None
         if s_count is None:
-            info    = extract_cluster_snapshot_info(ticket)
-            s_count = info["snapshot_count"]
+            s_count = _snap_info_cache.get(tid, {}).get("snapshot_count", 0)
 
         # For analytics charts use ONLY authoritative sources — snapshot_topology
         # (from the nutshell API) and the structured ticket_fields "Cluster ID".
@@ -22432,7 +16432,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
         # Cluster name: only from snapshot_topology.cluster_name
         # Skip UUID-shaped values — those are IDs that leaked into the name field
-        cn = (topo.get("cluster_name") or "").strip()
+        cn = _sf(topo.get("cluster_name"))
         if cn and not re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-", cn, re.IGNORECASE):
             cluster_name_counts[cn] += 1
 
@@ -22440,8 +16440,8 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
         # Don't count cluster_uuid (CB internal 32-hex UUID, no dashes) — users don't
         # recognise it and it doesn't match Zendesk Cluster_ID format.
         tf = _parse_ticket_fields(ticket)
-        cid_field     = (tf.get("Cluster_ID") or "").strip()
-        capella_cid   = (topo.get("capella_cluster_id") or "").strip()
+        cid_field   = _sf(tf.get("Cluster_ID"))
+        capella_cid = _sf(topo.get("capella_cluster_id"))
         # De-duplicate: ticket_fields.Cluster_ID and capella_cluster_id are often
         # the same value; only count a given UUID once per ticket.
         _seen_cids: set = set()
@@ -22536,7 +16536,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
             bucket_dist_counts[str(int(bc))] += 1
 
         # Orchestrator hotspot (top 10)
-        orch = topo.get("orchestrator")
+        orch = _sf(topo.get("orchestrator"))
         if orch:
             orchestrator_counts[orch] += 1
 
@@ -22554,7 +16554,7 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
 
     for ticket in tickets:
         tf = _parse_ticket_fields(ticket)
-        raw_cbse = (tf.get("CBSE") or "").strip()
+        raw_cbse = _sf(tf.get("CBSE"))
         if not raw_cbse or not _cbse_re.search(raw_cbse):
             continue
         cbse_total += 1
@@ -22613,8 +16613,12 @@ def build_analytics_data(tickets: list[dict], scores: dict[str, dict]) -> dict:
         "proactive_by_subject":       proactive_by_subject,
         "proactive_by_comment":       proactive_by_comment,
         "proactive_tickets_sample":   proactive_tickets_sample[:50],
-        "version_labels":    [v for v, _ in version_items],
-        "version_values":    [c for _, c in version_items],
+        "version_labels":          [v for v, _ in version_items],
+        "version_values":          [c for _, c in version_items],
+        "version_breakdown":       _version_breakdown,
+        "version_eol_count":       _ver_eol_count,
+        "version_admin_count":     _ver_admin_count,
+        "version_blank_count":     _ver_blank_count,
         "unique_cluster_total":          unique_cluster_total,
         "clusters_by_version_labels":    _ver_with_clusters,
         "clusters_by_version_values":    [len(clusters_by_version[v]) for v in _ver_with_clusters],
@@ -22677,9 +16681,9 @@ if __name__ == "__main__":
     _ngcore.sio.eio.max_http_buffer_size = 16 * 1024 * 1024
 
     ui.run(
-        title=f"Supportal Scraper v{__version__}",
-        port=8765,
+        title=f"Strabo v{__version__}",
+        port=int(os.environ.get("STRABO_PORT", 8765)),
         reload=False,   # reload=True would destroy _browser_state mid-session
-        show=True,
+        show=os.environ.get("STRABO_OPEN_BROWSER", "1") == "1",
         favicon="🔍",
     )

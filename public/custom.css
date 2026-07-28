@@ -1,3 +1,14 @@
+/* Couchbase branding — watermark logo in the empty chat state */
+.watermark img,
+[class*="watermark"] img,
+[class*="logo"] img,
+img[src*="logo_light"],
+img[src*="logo_dark"] {
+    content: url('/public/couchbase-logo.svg') !important;
+    max-height: 64px !important;
+    opacity: 0.55 !important;
+}
+
 /* Widen the chat content area so tables don't overflow */
 .main > .MuiBox-root,
 .main > .MuiContainer-root {

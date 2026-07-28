@@ -22,27 +22,11 @@ env/
 # Network capture logs (may contain session tokens)
 network_log_*.json
 
-# Debug / scratch
-debug_html/
-diag_html/
-snap_debug/
-errors.txt
-diag.py
+# Debug / scratch outputs
+scratch/
 
-# Data exports
-*.csv
-*.json
-tickets.json
-
-# Old versions / archived scripts
-supportal_nicegui_app_v*.py
-supportal_nicegui_app_v*.py
-couchbase_supportal_scraper.py
-supportal_playwright_scraper.py
-supportal_scraper1.py
-supportal_streamlit_app.py
+# Old scraper/ bootstrap dir (kept for historical lib refs only)
 scraper/
-analysis/
 
 # macOS
 .DS_Store
@@ -59,3 +43,10 @@ analysis/
 
 # Chainlit temp uploads
 .files/
+
+# Snapshot debug dumps
+snap_debug/
+
+# Generated PowerPoint / office lock files
+docs/*.pptx
+docs/~$*

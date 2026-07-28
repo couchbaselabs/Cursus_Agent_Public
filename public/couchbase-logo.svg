@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 120" fill="none">
+  <!-- Couchbase bucket/C icon -->
+  <g transform="translate(10,10)">
+    <!-- Outer C arc -->
+    <path d="M50 5 C22 5 2 26 2 52 C2 78 22 99 50 99 C66 99 80 93 89 83 L76 70 C70 77 61 82 50 82 C32 82 18 68 18 52 C18 36 32 22 50 22 C61 22 70 27 76 34 L89 21 C80 11 66 5 50 5 Z" fill="#EA2328"/>
+    <!-- Inner dot (Couchbase signature element) -->
+    <circle cx="76" cy="52" r="8" fill="#EA2328"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="120" y="80" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+        font-size="52" font-weight="600" letter-spacing="-1" fill="#1a1a1a">Couchbase</text>
+</svg>

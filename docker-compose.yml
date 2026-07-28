@@ -1,0 +1,71 @@
+services:
+
+  # ── Strabo + Corax ───────────────────────────────────────────────────────────
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8765:8765"   # Strabo dashboard
+      - "8766:8766"   # Corax chat
+      - "8767:8767"   # Cursus Unified (fleet dashboard + assistant)
+      - "8768:8768"   # Cursus MCP server (SSE transport — for remote MCP clients)
+    environment:
+      - SUPPORTAL_COOKIE=${SUPPORTAL_COOKIE:-}
+      - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET:-}
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}   # stdio or sse; sse recommended inside Docker
+      - UNIFIED_PORT=8767
+    volumes:
+      # Persist settings profiles and saved cookies between restarts
+      - app-home:/root
+    depends_on:
+      couchbase-init:
+        condition: service_completed_successfully
+
+  # ── Couchbase ────────────────────────────────────────────────────────────────
+  # To use a local Couchbase instead: comment out the couchbase and
+  # couchbase-init services, then set the Strabo CB URL to
+  # "couchbase://host.docker.internal" in the Configuration tab.
+  couchbase:
+    image: couchbase/server:enterprise-8.0.1
+    restart: unless-stopped
+    ports:
+      - "8091:8091"     # Admin UI
+      - "8092:8092"     # Views
+      - "8093:8093"     # Query (N1QL)
+      - "8094:8094"     # FTS
+      - "11210:11210"   # KV (data service)
+    volumes:
+      - cb-data:/opt/couchbase/var
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8091/pools"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── Couchbase one-shot init ───────────────────────────────────────────────────
+  # Runs once after couchbase is healthy, then exits.
+  # Creates the cluster, bucket, scopes, collections, and all GSI indexes.
+  # Idempotent — safe to restart; skips everything if already initialised.
+  couchbase-init:
+    image: couchbase/server:enterprise-8.0.1
+    restart: "no"
+    environment:
+      - CB_HOST=couchbase
+      - CB_USER=${CB_USER:-Administrator}
+      - CB_PASS=${CB_PASS:-password}
+      - CB_BUCKET=${CB_BUCKET:-supportal}
+      - CB_RAMSIZE=${CB_RAMSIZE:-1024}
+      - CB_INDEX_RAMSIZE=${CB_INDEX_RAMSIZE:-512}
+      - CB_FTS_RAMSIZE=${CB_FTS_RAMSIZE:-512}
+      - CB_BUCKET_RAMSIZE=${CB_BUCKET_RAMSIZE:-256}
+    volumes:
+      - ./docker/couchbase-init.sh:/init/couchbase-init.sh:ro
+    entrypoint: ["sh", "/init/couchbase-init.sh"]
+    depends_on:
+      couchbase:
+        condition: service_healthy
+
+volumes:
+  app-home:
+  cb-data:

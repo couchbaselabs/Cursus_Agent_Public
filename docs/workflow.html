@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Supportal AI Agent — User Workflow</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #f8fafc; color: #1e293b; min-height: 100vh; padding: 32px; }
+  h1 { font-size: 1.6rem; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+  .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 36px; }
+  .version { display: inline-block; background: #f1f5f9; border: 1px solid #64748b;
+             border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; color: #64748b;
+             margin-left: 10px; vertical-align: middle; }
+
+  /* ── step container ── */
+  .step { display: grid; grid-template-columns: 48px 1fr; gap: 0; margin-bottom: 36px; }
+  .step-num { width: 36px; height: 36px; border-radius: 50%;
+              display: flex; align-items: center; justify-content: center;
+              font-size: 0.85rem; font-weight: 800; flex-shrink: 0;
+              margin-top: 2px; margin-right: 12px; }
+  .step-num.blue   { background: #dbeafe; color: #1d4ed8; border: 2px solid #3b82f6; }
+  .step-num.green  { background: #dcfce7; color: #166534; border: 2px solid #22c55e; }
+  .step-num.amber  { background: #fef3c7; color: #92400e; border: 2px solid #f59e0b; }
+  .step-num.purple { background: #f3e8ff; color: #6b21a8; border: 2px solid #a855f7; }
+
+  .step-body { flex: 1; }
+  .step-title { font-size: 1rem; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+  .step-desc  { font-size: 0.78rem; color: #64748b; margin-bottom: 14px; }
+
+  /* ── outcome pill ── */
+  .outcome { display: inline-flex; align-items: center; gap: 6px; font-size: 0.7rem;
+             font-weight: 600; padding: 4px 12px; border-radius: 20px; margin-top: 14px; }
+  .outcome.blue   { background: #eff6ff; border: 1px solid #3b82f6; color: #1d4ed8; }
+  .outcome.green  { background: #f0fdf4; border: 1px solid #22c55e; color: #166534; }
+  .outcome.amber  { background: #fffbeb; border: 1px solid #f59e0b; color: #92400e; }
+  .outcome.purple { background: #faf5ff; border: 1px solid #a855f7; color: #6b21a8; }
+
+  /* ── card grid ── */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+           gap: 14px; margin-bottom: 6px; }
+  .card { background: #ffffff; border: 1px solid #94a3b8; border-radius: 10px; padding: 14px; }
+  .card.alt { border-color: #64748b; background: #f8fafc; }
+  .card-title { font-size: 0.78rem; font-weight: 700; color: #334155; margin-bottom: 8px;
+                display: flex; align-items: center; gap: 6px; }
+
+  /* ── code blocks ── */
+  pre { background: #f8fafc; border: 1px solid #94a3b8; border-radius: 6px;
+        padding: 10px 14px; font-family: "SF Mono","Fira Code",monospace;
+        font-size: 0.7rem; color: #374151; overflow-x: auto; margin: 6px 0 10px; }
+  code { font-family: "SF Mono","Fira Code",monospace; font-size: 0.7rem;
+         background: #eff6ff; color: #1d4ed8; padding: 1px 5px; border-radius: 3px; }
+
+  /* ── lists ── */
+  ul { list-style: none; padding: 0; }
+  li { font-size: 0.73rem; color: #64748b; padding: 3px 0 3px 16px; position: relative; }
+  li::before { content: "›"; position: absolute; left: 0; color: #94a3b8; }
+  li strong { color: #334155; }
+
+  /* ── tool chips ── */
+  .tool { display: inline-block; font-size: 0.62rem; font-weight: 600; padding: 2px 8px;
+          border-radius: 4px; background: #dbeafe; color: #1d4ed8;
+          border: 1px solid #bfdbfe; margin: 2px 2px 2px 0; font-family: "SF Mono","Fira Code",monospace; }
+
+  /* ── example queries ── */
+  .examples { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .example { background: #f8fafc; border: 1px solid #94a3b8; border-radius: 8px;
+             padding: 12px 14px; }
+  .example q { display: block; font-size: 0.75rem; color: #1e293b; font-style: italic;
+               margin-bottom: 8px; quotes: "\201C" "\201D"; }
+  .example q::before { content: open-quote; color: #94a3b8; }
+  .example q::after  { content: close-quote; color: #94a3b8; }
+
+  /* ── tips ── */
+  .tips { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .tip { background: #f8fafc; border-left: 3px solid #64748b; border-radius: 0 8px 8px 0;
+         padding: 10px 14px; }
+  .tip-title { font-size: 0.72rem; font-weight: 700; color: #334155; margin-bottom: 5px; }
+  .tip p { font-size: 0.7rem; color: #64748b; line-height: 1.55; }
+  .tip p code { font-size: 0.67rem; }
+
+  /* ── section label ── */
+  .section-label { font-size: 0.7rem; font-weight: 700; letter-spacing: .12em;
+                   text-transform: uppercase; color: #94a3b8; margin: 32px 0 16px;
+                   padding-bottom: 6px; border-bottom: 1px solid #94a3b8; }
+</style>
+</head>
+<body>
+
+<h1>Cursus Agent — User Workflow <span class="version">v2.7.60</span></h1>
+<p class="subtitle">Step-by-step guide: setup → authentication → data ingestion → SFDC sync → analysis</p>
+
+<!-- ══ STEP 1 ══ -->
+<div class="step">
+  <div class="step-num blue">1</div>
+  <div class="step-body">
+    <div class="step-title">Initial Setup — one time</div>
+    <div class="step-desc">Start both servers and configure your connection profile</div>
+    <div class="cards">
+
+      <div class="card" style="border-color:#22c55e;background:#f0fdf4">
+        <div class="card-title">🚀 Start Cursus Unified <small style="color:#166534;font-weight:600">(recommended)</small></div>
+        <pre>cd ~/Downloads/Apps/Scraper
+source venv/bin/activate
+python run_unified.py</pre>
+        <ul>
+          <li>Fleet-management shell on <code>localhost:8767</code></li>
+          <li>Overview KPIs, Customers tab, embedded assistant</li>
+          <li>SFDC auto-sync starts on launch (every 6 hours)</li>
+          <li>Ctrl+C to stop</li>
+        </ul>
+      </div>
+
+      <div class="card" style="border-color:#f59e0b;background:#fffbeb">
+        <div class="card-title">⚡ Start Strabo + Corax — Cursus</div>
+        <pre>python run_cursus.py</pre>
+        <ul>
+          <li>Starts Strabo on <code>localhost:8765</code> and Corax on <code>localhost:8766</code></li>
+          <li>Coloured prefixed output: <code>[strabo]</code> / <code>[corax]</code></li>
+          <li>Ctrl+C stops both cleanly</li>
+        </ul>
+      </div>
+
+      <div class="card alt">
+        <div class="card-title">🖥 Start Strabo only</div>
+        <pre>python run_strabo.py</pre>
+        <ul><li>Dashboard only — <code>localhost:8765</code></li></ul>
+      </div>
+
+      <div class="card alt">
+        <div class="card-title">💬 Start Corax only</div>
+        <pre>python run_corax.py</pre>
+        <ul><li>Chat only — <code>localhost:8766</code></li></ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">⚙️ Create a Profile</div>
+        <ul>
+          <li>Strabo → <strong>Configuration</strong> tab</li>
+          <li>Set Couchbase URL, bucket, username &amp; password</li>
+          <li>Click <strong>Test Connection</strong> to verify</li>
+          <li>Choose LLM provider (Claude / Ollama / LMStudio)</li>
+          <li>Choose embedding provider + model + dimensions</li>
+          <li>Save profile — applies to both UIs</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔍 Create FTS Index</div>
+        <ul>
+          <li>Still in <strong>Configuration</strong></li>
+          <li>Click <strong>Create / Update FTS Index</strong></li>
+          <li>Builds hybrid BM25 + vector index on the <code>supportal</code> scope</li>
+          <li>Only needed once, or after changing embedding dimensions</li>
+          <li>Index name: <code>supportal_hybrid</code></li>
+        </ul>
+      </div>
+
+    </div>
+    <div class="outcome blue">✓ profile saved → ready to authenticate</div>
+  </div>
+</div>
+
+<!-- ══ STEP 2 ══ -->
+<div class="step">
+  <div class="step-num amber">2</div>
+  <div class="step-body">
+    <div class="step-title">Authenticate with Supportal — refresh when cookie expires (~8 h)</div>
+    <div class="step-desc">Choose whichever method you have available</div>
+    <div class="cards">
+
+      <div class="card">
+        <div class="card-title">🍪 Option A — Paste Cookie <small style="color:#22c55e;font-weight:600">(recommended)</small></div>
+        <ul>
+          <li>Log into <code>supportal.couchbase.com</code> in your browser</li>
+          <li>Open DevTools → Application → Cookies</li>
+          <li>Copy the full <strong>Cookie</strong> header value</li>
+          <li>Paste into the <strong>Cookie</strong> field in Strabo Configuration</li>
+          <li>Click <strong>Save Cookie</strong> — all scraping runs headless</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🌐 Option B — Browser SSO Login</div>
+        <ul>
+          <li>Click <strong>Login with Browser</strong> in Configuration tab</li>
+          <li>A Chromium window opens — complete the SSO flow</li>
+          <li>Cookie is extracted automatically and saved to profile</li>
+          <li>Chromium closes — all subsequent scraping is headless</li>
+          <li>Re-run on <code>403</code> errors or session expiry</li>
+        </ul>
+      </div>
+
+    </div>
+    <div class="outcome amber">✓ cookie active → ready to ingest data</div>
+  </div>
+</div>
+
+<!-- ══ STEP 3 ══ -->
+<div class="step">
+  <div class="step-num green">3</div>
+  <div class="step-body">
+    <div class="step-title">Ingest Data — per customer, run periodically or via agent</div>
+    <div class="step-desc">Pull tickets and cluster snapshots from Supportal into Couchbase</div>
+    <div class="cards">
+
+      <div class="card">
+        <div class="card-title">🎫 Scrape Tickets</div>
+        <ul>
+          <li>Strabo → <strong>Scraping</strong> tab</li>
+          <li>Enter customer org name (or alias)</li>
+          <li>Click <strong>Scrape Tickets</strong></li>
+          <li>Change-detection skips unchanged tickets on re-runs</li>
+          <li>Reconcile step removes deleted Zendesk tickets from CB</li>
+          <li>Results stored in <code>supportal.tickets</code></li>
+          <li>Or via agent: <em>"Scrape latest tickets for Acme Corp"</em></li>
+        </ul>
+        <div style="margin-top:8px"><span class="tool">scrape_customer_tickets</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">📸 Fetch Snapshot Stubs</div>
+        <ul>
+          <li>Strabo → <strong>Scraping</strong> tab → Snapshots section</li>
+          <li>Click <strong>Fetch Snapshot Stubs</strong></li>
+          <li>Uses <code>POST /api/support360/query</code> — one round-trip</li>
+          <li>Stubs saved to <code>supportal.snapshots</code> (no topology yet)</li>
+          <li>Or via agent: <em>"Fetch snapshot stubs for Acme"</em></li>
+        </ul>
+        <div style="margin-top:8px"><span class="tool">fetch_snapshots</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔬 Backfill Topology</div>
+        <ul>
+          <li>Strabo → <strong>Scraping</strong> tab → click <strong>Backfill Topology</strong></li>
+          <li>Fetches <code>GET /snapshot/{enc}/nutshell</code> per stub</li>
+          <li>Adds: CB version, node layout, services, bad/warn items</li>
+          <li>RAM/node, CPUs/node, GSI/FTS/Eventing counts</li>
+          <li>Skips stubs already fully populated</li>
+          <li>Or: <em>"Backfill topology for pending snapshots"</em></li>
+        </ul>
+        <div style="margin-top:8px"><span class="tool">backfill_snapshot_topology</span> <span class="tool">sync_snapshots</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🧠 Embed Tickets</div>
+        <ul>
+          <li>Strabo → <strong>Scoring &amp; Analysis</strong> tab</li>
+          <li>Click <strong>Embed All Tickets</strong> (or new tickets only)</li>
+          <li>Generates vectors via configured embedding model</li>
+          <li>Vectors stored in <code>supportal.tickets</code> alongside text</li>
+          <li>Required for <code>vector_search</code> to work in chat</li>
+        </ul>
+      </div>
+
+    </div>
+    <div class="outcome green">✓ data in Couchbase → ready to analyze</div>
+  </div>
+</div>
+
+<!-- ══ STEP 4 ══ -->
+<div class="step">
+  <div class="step-num purple">4</div>
+  <div class="step-body">
+    <div class="step-title">Analyze &amp; Query</div>
+    <div class="step-desc">Use either UI — full agent parity, different strengths</div>
+    <div class="cards">
+
+      <div class="card">
+        <div class="card-title">🖥 Strabo Chat — <code>localhost:8765</code></div>
+        <ul>
+          <li>Quick queries, admin ops, pipeline control</li>
+          <li>Inline ECharts (12 types, SVG/PNG export)</li>
+          <li>Assets tab — browse saved charts, CSVs, reports</li>
+          <li>Analytics tab — drill-down charts with click handlers</li>
+          <li>Customers tab — health scores + P1 count badges</li>
+          <li>Good for: day-to-day triage, dashboard review</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">💬 Corax — <code>localhost:8766</code></div>
+        <ul>
+          <li>Threaded sessions with full history sidebar</li>
+          <li>Live tool status updates per agent turn</li>
+          <li>Job monitors survive tab close + reconnect</li>
+          <li>Assets restored on session resume from CB</li>
+          <li>Mobile-friendly layout</li>
+          <li>Good for: multi-session research, sharing findings</li>
+        </ul>
+      </div>
+
+    </div>
+
+    <div class="section-label" style="margin-top:20px">Example questions &amp; tools used</div>
+    <div class="examples">
+      <div class="example">
+        <q>Show me all P1 tickets for Acme open more than 30 days</q>
+        <span class="tool">query_tickets</span> <span class="tool">generate_table</span>
+      </div>
+      <div class="example">
+        <q>Find tickets related to XDCR replication failures</q>
+        <span class="tool">vector_search</span> <span class="tool">generate_table</span>
+      </div>
+      <div class="example">
+        <q>What's the cluster health for ticket 98765?</q>
+        <span class="tool">get_ticket</span> <span class="tool">get_cluster_health</span> <span class="tool">generate_chart</span>
+      </div>
+      <div class="example">
+        <q>Morning briefing — where should I focus today?</q>
+        <span class="tool">get_portfolio_status</span>
+      </div>
+      <div class="example">
+        <q>Is our Couchbase data for Acme still fresh?</q>
+        <span class="tool">check_data_freshness</span> <span class="tool">scrape_customer_tickets</span>
+      </div>
+      <div class="example">
+        <q>Score ticket 98765 for complexity and sentiment</q>
+        <span class="tool">get_ticket</span> <span class="tool">score_ticket</span>
+      </div>
+      <div class="example">
+        <q>Fetch the latest snapshots for Globex and fill in topology</q>
+        <span class="tool">fetch_snapshots</span> <span class="tool">backfill_snapshot_topology</span>
+      </div>
+      <div class="example">
+        <q>Which customers have the most unresolved P1s right now?</q>
+        <span class="tool">query_fleet_tickets</span> <span class="tool">generate_chart</span>
+      </div>
+      <div class="example">
+        <q>Give me account intelligence for Western Union</q>
+        <span class="tool">get_account_intelligence</span>
+      </div>
+      <div class="example">
+        <q>List my SFDC accounts with renewal this quarter</q>
+        <span class="tool">get_my_sfdc_accounts</span> <span class="tool">get_account_opportunities</span>
+      </div>
+    </div>
+    <div class="outcome purple">✓ findings → export / act</div>
+  </div>
+</div>
+
+<!-- ══ SFDC SYNC WORKFLOW ══ -->
+<div class="section-label">Salesforce sync workflow</div>
+
+<div class="cards" style="margin-bottom:28px">
+
+  <div class="card" style="border-color:#0ea5e9;background:#f0f9ff">
+    <div class="card-title">☁ Configure Salesforce (one-time)</div>
+    <ul>
+      <li>Open <strong>Cursus Unified</strong> → <strong>Settings → Salesforce</strong></li>
+      <li>Enter Connected App credentials: <code>SFDC_CLIENT_ID</code> / <code>SFDC_CLIENT_SECRET</code></li>
+      <li>Enter <code>SFDC_USERNAME</code> and <code>SFDC_PASSWORD</code> (password + security token)</li>
+      <li>Click <strong>Save &amp; Sync Now</strong> to trigger the first sync</li>
+      <li>Alternatively, set env vars before launch — sync runs automatically on startup</li>
+    </ul>
+  </div>
+
+  <div class="card" style="border-color:#0ea5e9;background:#f0f9ff">
+    <div class="card-title">🔄 Automatic sync schedule</div>
+    <ul>
+      <li>Cursus Unified runs <code>sfdc_sync.sync_all()</code> on startup, then every <strong>6 hours</strong></li>
+      <li>Syncs only SE-scoped accounts: accounts where you are <strong>Primary_SE</strong> or <strong>Opp_SE_Supporting</strong> on an open opportunity</li>
+      <li><code>se_name</code> is derived from the open opportunity's <code>Primary_SE__c</code> field</li>
+      <li>Results land in <code>transcripts.accounts</code> (keyed <code>account::{sfdc_id}</code>) and <code>transcripts.opportunities</code> (keyed <code>opp::{sfdc_id}</code>)</li>
+      <li>Trigger on-demand via MCP: <span class="tool">sync_sfdc_data</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🧠 Account intelligence</div>
+    <ul>
+      <li>After sync, ask the agent: <em>"Give me account intelligence for Western Union"</em></li>
+      <li>Calls <span class="tool">get_account_intelligence</span> — returns correlated brief:</li>
+      <li><strong>SFDC context:</strong> ARR, products, SE/AE/CSM, contract end date</li>
+      <li><strong>Support context:</strong> open tickets, open P1s, recent activity</li>
+      <li><strong>Opportunities:</strong> open opps with stage and close date</li>
+      <li>Or from MCP: <em>"What's the account intel for Acme?"</em></li>
+    </ul>
+    <div style="margin-top:8px">
+      <span class="tool">get_account_intelligence</span>
+      <span class="tool">get_my_sfdc_accounts</span>
+      <span class="tool">list_sfdc_accounts</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- ══ CURSUS UNIFIED WORKFLOW ══ -->
+<div class="section-label">Cursus Unified — recommended onboarding path</div>
+
+<div class="cards" style="margin-bottom:28px">
+
+  <div class="card" style="border-color:#22c55e;background:#f0fdf4">
+    <div class="card-title">🚀 Overview tab — fleet KPIs</div>
+    <ul>
+      <li>Open <code>localhost:8767</code> — Overview loads automatically</li>
+      <li>KPI tiles: <strong>Open Tickets</strong> · <strong>Open P1s</strong> · <strong>At-Risk Clusters</strong> · <strong>Accounts</strong> · <strong>Opportunities</strong></li>
+      <li>KPIs reflect your SE-scoped portfolio (SFDC sync determines scope)</li>
+      <li>Click any KPI to navigate to the relevant tab</li>
+    </ul>
+  </div>
+
+  <div class="card" style="border-color:#22c55e;background:#f0fdf4">
+    <div class="card-title">👤 Customers tab — role filter chips</div>
+    <ul>
+      <li>Filter by role: <strong>Primary</strong> / <strong>Supporting</strong> / <strong>Other</strong> / <strong>Pinned</strong></li>
+      <li><strong>Primary</strong> = you are the Primary_SE on an open opportunity</li>
+      <li><strong>Supporting</strong> = you are Opp_SE_Supporting on an open opportunity</li>
+      <li>Click <strong>× All Customers</strong> to descope and see all accounts in CB</li>
+      <li>Click any customer row to open the customer detail panel</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">💬 Embedded assistant panel</div>
+    <ul>
+      <li>Accessible from any tab — open the panel from the sidebar</li>
+      <li>Full access to 40+ agent tools including SFDC tools</li>
+      <li>Customer scope set to selected account automatically</li>
+      <li>Ask: <em>"Give me a morning briefing"</em> → <span class="tool">get_morning_briefing</span></li>
+      <li>Ask: <em>"What's the account intel for this customer?"</em> → <span class="tool">get_account_intelligence</span></li>
+    </ul>
+  </div>
+
+</div>
+
+<!-- ══ CHAINLIT TRIGGERS ══ -->
+<div class="section-label">Corax — interactive triggers</div>
+
+<div class="cards" style="margin-bottom:28px">
+
+  <div class="card">
+    <div class="card-title">🚀 Chat Starters <small style="color:#475569;font-weight:400">(shown before first message)</small></div>
+    <ul>
+      <li><strong>Morning Briefing</strong> → calls <span class="tool">get_portfolio_status</span> — fleet-wide urgency rank</li>
+      <li><strong>What's New?</strong> → asks for 24 h digest for the current customer</li>
+      <li><strong>Open P1 Tickets</strong> → queries all open P1s</li>
+      <li><strong>Customer Health Dashboard</strong> → <span class="tool">get_customer_health_score</span> summary</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">⚡ Quick Actions bar <small style="color:#475569;font-weight:400">(sent after chat start / settings save)</small></div>
+    <ul>
+      <li><strong>☀ Morning Briefing</strong> → <span class="tool">get_portfolio_status</span> — always visible</li>
+      <li><strong>📊 Quick Dashboard</strong> → portfolio health score summary — always visible</li>
+      <li><strong>🆕 What's New? (Customer)</strong> → 24 h digest — only shown when a customer is set</li>
+      <li><strong>🔖 Saved Queries</strong> → browse + re-run CB-persisted queries — only when customer is set</li>
+      <li><strong>📚 Prompt Library</strong> → two-step category browser (see below) — always visible</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📚 Prompt Library flow <small style="color:#475569;font-weight:400">(supportal/prompt_library.py — 28 prompts, 7 categories)</small></div>
+    <ul>
+      <li>Click <strong>📚 Prompt Library</strong> → shows 7 category buttons (Morning Routine, Health &amp; SLA, Fleet Analysis, Ticket Investigation, Cluster &amp; Snapshot, Data Freshness, Reporting)</li>
+      <li>Select a category → shows up to 5 prompt buttons for that category; <code>customer_required</code> prompts are hidden when no customer is set</li>
+      <li>Click a prompt → <code>{customer}</code> placeholder is substituted with the active customer name, then sent through the full agent loop</li>
+      <li><strong>← Back</strong> button returns to the category list without re-sending a message</li>
+      <li>Strabo equivalent: nested expansion panels under <em>Prompt Library</em> in the sidebar</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🔄 Post-response actions <small style="color:#475569;font-weight:400">(appear after each agent reply)</small></div>
+    <ul>
+      <li><strong>Retry</strong> → re-sends the same message if the agent errored</li>
+      <li><strong>Follow-up chips</strong> → AI-generated suggestions (up to 3) based on Q&amp;A context</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🔖 Saved Queries flow</div>
+    <ul>
+      <li>Click <strong>Saved Queries</strong> → lists CB-persisted queries for current customer</li>
+      <li>Each query gets a <strong>▶ Run</strong> action button</li>
+      <li>Clicking Run re-executes the query through the full agent loop</li>
+      <li>Save a new query via agent: <em>"Save this query for next time"</em> → <span class="tool">save_query</span></li>
+    </ul>
+  </div>
+
+</div>
+
+<!-- ══ TIPS ══ -->
+<div class="section-label">Tips &amp; Shortcuts</div>
+<div class="tips">
+
+  <div class="tip">
+    <div class="tip-title">Cookie expiry</div>
+    <p>Supportal sessions last ~8 hours. If scraping returns <code>403</code> errors or the agent reports empty results, your cookie has expired. Re-paste or re-run browser login.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Incremental scraping</div>
+    <p>Re-running <code>scrape_customer_tickets</code> is safe — change-detection skips tickets whose content hasn't changed. Deleted Zendesk tickets are automatically removed from CB (reconcile step).</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Embedding after ingest</div>
+    <p>New tickets won't appear in semantic search until embedded. Run <strong>Embed Tickets</strong> in the Scoring tab after any scrape, or ask the agent to embed as part of the ingest.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Snapshot two-step</div>
+    <p>Stub fetch is fast (one Analytics API call). Topology backfill is slow (one REST call per snapshot). Run stub fetch first to see what's available, then backfill in background. Or use <code>sync_snapshots</code> to do both in one agent call.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Agent data routing</div>
+    <p>The agent automatically chooses LOCAL (Couchbase) vs LIVE (Supportal API) based on your question. Ask explicitly if needed: <em>"using live data, show me…"</em> or <em>"from our local copy, …"</em></p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Corax thread resume</div>
+    <p>Prior sessions appear in the sidebar. Click any thread to resume — charts and tables are restored from <code>chat.assets</code>. Job monitors re-attach automatically on reconnect.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Results tab export</div>
+    <p>The Strabo Results tab provides quick CSV / Excel export without asking the agent. Use it for bulk extracts; use the agent for analysis and visualisation.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">Profile = shared config</div>
+    <p>The active Strabo profile drives the Corax app too — LLM provider, embedding model, CB connection, and cookie are all read from the same saved profile. Change once, applies everywhere.</p>
+  </div>
+
+  <div class="tip">
+    <div class="tip-title">MCP server</div>
+    <p>Run <code>venv/bin/python run_mcp.py</code> and add it to Claude Code / Claude Desktop / Cursor. Full setup: <code>docs/mcp-getting-started.md</code>.</p>
+  </div>
+
+</div>
+
+<!-- ══ MCP WORKFLOW ══ -->
+<div class="section-label">Cursus MCP — Claude Code / Claude Desktop workflow</div>
+
+<div class="cards" style="margin-bottom:28px">
+
+  <div class="card">
+    <div class="card-title">🔌 Setup (one-time)</div>
+    <ul>
+      <li>Install: <code>venv/bin/pip install -r requirements.txt</code></li>
+      <li>Add to <code>~/.claude.json</code> → <code>mcpServers.cursus</code></li>
+      <li>Add <code>"cursus"</code> to <code>enabledMcpjsonServers</code> in <code>~/.claude/settings.json</code></li>
+      <li>Add <code>"mcp__cursus__*"</code> to permissions allowlist</li>
+      <li>Restart Claude Code — tools appear as <code>mcp__cursus__*</code></li>
+      <li>Full guide: <code>docs/mcp-getting-started.md</code></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📋 Ticket queries</div>
+    <ul>
+      <li><em>"Show all open P1s for Western Union"</em> → <span class="tool">query_tickets</span></li>
+      <li><em>"Find tickets about XDCR replication failures"</em> → <span class="tool">search_tickets</span></li>
+      <li><em>"Get full detail on ticket 79105"</em> → <span class="tool">get_ticket</span></li>
+      <li><em>"Score ticket 79105 for complexity and sentiment"</em> → <span class="tool">score_ticket</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🏢 Customer &amp; portfolio</div>
+    <ul>
+      <li><em>"Morning briefing — where should I focus?"</em> → <span class="tool">get_portfolio_status</span></li>
+      <li><em>"What's Western Union's health right now?"</em> → <span class="tool">get_customer_health</span></li>
+      <li><em>"List all customers with open tickets"</em> → <span class="tool">list_customers</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">⚙ Scrape job management</div>
+    <ul>
+      <li><em>"Refresh Acme tickets from Supportal"</em> → <span class="tool">rescrape_customer_tickets</span></li>
+      <li><em>"Refresh Acme — scrape only, no embedding or scoring"</em> → <span class="tool">rescrape_customer_tickets</span> <code>embed=false score=false</code></li>
+      <li><em>"Refresh Acme — scrape and enrich but skip embedding"</em> → <span class="tool">rescrape_customer_tickets</span> <code>embed=false</code></li>
+      <li><em>"Is the Western Union rescrape still running?"</em> → <span class="tool">get_scrape_status</span></li>
+      <li><em>"Kill job e02827"</em> → <span class="tool">cancel_scrape_job</span></li>
+      <li><em>"Resume the interrupted job"</em> → <span class="tool">rescrape_customer_tickets</span> with <code>stale_hours=1</code></li>
+      <li><em>"What tools does Cursus have?"</em> → ask Claude directly — it reads tool schemas and docstrings at runtime</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📦 Assets</div>
+    <ul>
+      <li><em>"List saved charts for Western Union"</em> → <span class="tool">list_assets</span></li>
+      <li><em>"Show me the content of asset abc123"</em> → <span class="tool">get_asset</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🔗 MCP Resources (browseable)</div>
+    <ul>
+      <li><code>customers://list</code> — all orgs with open ticket counts</li>
+      <li><code>tickets://{organization}</code> — open tickets for a customer</li>
+      <li><code>health://{organization}</code> — health summary for a customer</li>
+    </ul>
+    <div style="margin-top:8px;font-size:11px;color:#475569">
+      Resources appear in Claude Desktop's attachment picker and Cursor's context menu.
+    </div>
+  </div>
+
+</div>
+
+<p style="font-size:0.65rem;color:#94a3b8;margin-top:32px;text-align:center">
+  Cursus Agent · user workflow · v2.7.60 · updated 2026-07-27
+</p>
+
+</body>
+</html>

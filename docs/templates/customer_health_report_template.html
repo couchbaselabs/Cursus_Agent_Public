@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ORG_NAME — Customer Health Report · REPORT_DATE</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #F0F3F7;
+    --surface: #FFFFFF;
+    --text: #0D1926;
+    --text-2: #5C6880;
+    --text-3: #8C96A8;
+    --border: #D4DAE6;
+    --border-light: #E6EAF2;
+    --cb: #1A6FD4;
+    --cb-light: #EAF1FB;
+    --good: #1DAA72;
+    --good-light: #E6F7F0;
+    --warn: #E8920A;
+    --warn-light: #FEF3E2;
+    --crit: #CC2E2E;
+    --crit-light: #FDEAEA;
+    --neutral: #6B7A99;
+    --neutral-light: #EEF0F5;
+    --mono: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  }
+
+  body {
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Top Banner ── */
+  .fleet-banner {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .fleet-banner-inner {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 10px 24px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  .fleet-logo { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
+  .fleet-logo-mark {
+    width: 28px; height: 28px;
+    background: var(--cb);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .fleet-org { font-size: 13px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+  .fleet-date { font-size: 11px; color: var(--text-2); margin-top: 1px; }
+
+  .fleet-divider { width: 1px; height: 28px; background: var(--border); flex-shrink: 0; }
+
+  .fleet-contacts {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-2);
+    text-align: right;
+    line-height: 1.5;
+  }
+  .fleet-contacts strong { color: var(--text); }
+
+  .renewal-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: var(--crit-light); color: var(--crit);
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em;
+    padding: 2px 7px; border-radius: 3px; border: 1px solid #F5C2C2;
+  }
+
+  /* ── Page shell ── */
+  .page {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 28px 24px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .page-header {
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .page-title { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; text-wrap: balance; }
+  .page-subtitle { font-size: 13px; color: var(--text-2); margin-top: 3px; }
+
+  .prepared-by { font-size: 11px; color: var(--text-3); text-align: right; line-height: 1.6; flex-shrink: 0; }
+  .prepared-by strong { color: var(--text-2); }
+
+  .section-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: #fff;
+    background: var(--cb);
+    padding: 7px 14px;
+    border-radius: 6px;
+    margin-top: 8px;
+  }
+  .section-label.no-break { margin-top: 0; }
+
+  /* ── KPI grid ── */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 10px;
+  }
+
+  .kpi-tile {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .kpi-val {
+    font-size: 22px;
+    font-weight: 800;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+  .kpi-val.crit { color: var(--crit); }
+  .kpi-val.warn { color: var(--warn); }
+  .kpi-val.good { color: var(--good); }
+  .kpi-val.cb { color: var(--cb); }
+
+  .kpi-lbl {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .kpi-sub {
+    font-size: 10px;
+    color: var(--text-2);
+    margin-top: 1px;
+  }
+
+  /* ── Card shell ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+  }
+
+  .card-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    margin-bottom: 12px;
+  }
+
+  /* ── Volume trend bars ── */
+  .trend-chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    height: 110px;
+    padding-top: 8px;
+    border-bottom: 1px solid var(--border-light);
+  }
+
+  .trend-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    height: 100%;
+    justify-content: flex-end;
+  }
+
+  .trend-bar {
+    width: 100%;
+    max-width: 36px;
+    background: var(--cb-light);
+    border: 1px solid #AECDF5;
+    border-radius: 3px 3px 0 0;
+    position: relative;
+    min-height: 3px;
+  }
+
+  .trend-bar.current { background: var(--cb); border-color: #0D4FA0; }
+
+  .trend-bar-val {
+    position: absolute;
+    top: -16px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .trend-labels {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
+  .trend-lbl {
+    flex: 1;
+    text-align: center;
+    font-size: 10px;
+    color: var(--text-3);
+    font-weight: 600;
+  }
+
+  /* ── Priority mix bar ── */
+  .mix-bar {
+    display: flex;
+    height: 28px;
+    border-radius: 5px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+
+  .mix-seg {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    color: #fff;
+  }
+
+  .mix-legend {
+    display: flex;
+    gap: 16px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+  }
+
+  .mix-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text-2);
+  }
+
+  .mix-swatch {
+    width: 9px; height: 9px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  /* ── Feature area bars (horizontal) ── */
+  .hbar-row {
+    display: grid;
+    grid-template-columns: 170px 1fr 38px;
+    gap: 10px;
+    align-items: center;
+    padding: 5px 0;
+  }
+
+  .hbar-label { font-size: 12px; color: var(--text); font-weight: 500; }
+
+  .hbar-track {
+    height: 14px;
+    background: var(--bg);
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid var(--border-light);
+  }
+
+  .hbar-fill {
+    height: 100%;
+    background: var(--cb);
+    border-radius: 3px 0 0 3px;
+  }
+
+  .hbar-fill.recent { background: var(--warn); }
+
+  .hbar-val {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-2);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .hbar-group-title {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    margin-top: 12px;
+    margin-bottom: 2px;
+  }
+  .hbar-group-title:first-child { margin-top: 0; }
+
+  /* ── Data quality callout ── */
+  .callout {
+    border-radius: 6px;
+    padding: 12px 14px;
+    display: flex;
+    gap: 10px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .callout-warn { background: var(--warn-light); border: 1px solid #F5D89A; color: #7A4A06; }
+  .callout-info { background: var(--cb-light); border: 1px solid #AECDF5; color: #0D3A6B; }
+  .callout-good { background: var(--good-light); border: 1px solid #A8DFC6; color: #0E6040; }
+  .callout-icon { font-size: 15px; font-weight: 900; flex-shrink: 0; line-height: 1.4;
+                  color: color-mix(in srgb, currentColor 60%, black); }
+  .callout-body { flex: 1; }
+  .callout-body strong { font-weight: 700; }
+
+  /* ── P1 incident table ── */
+  .inc-table-wrap { overflow-x: auto; }
+  .inc-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+
+  .inc-table th {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-3); padding: 6px 10px; text-align: left; background: var(--bg);
+    border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+
+  .inc-table td {
+    padding: 9px 10px; border-bottom: 1px solid var(--border-light); vertical-align: top; color: var(--text-2);
+    overflow-wrap: anywhere; white-space: normal;
+  }
+  .mini-subject { overflow-wrap: anywhere; white-space: normal; }
+  .inc-table tr:last-child td { border-bottom: none; }
+  .inc-table td:first-child { font-family: var(--mono); font-size: 11px; color: var(--cb); font-weight: 600; white-space: nowrap; }
+  .inc-table td strong { color: var(--text); }
+
+  .days-pill {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 44px;
+    padding: 2px 7px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Pill text mixed 65% toward black for contrast on the light backgrounds */
+  .days-fast { background: var(--good-light); color: color-mix(in srgb, var(--good) 65%, black); }
+  .days-mid { background: var(--warn-light); color: color-mix(in srgb, var(--warn) 65%, black); }
+  .days-slow { background: var(--crit-light); color: color-mix(in srgb, var(--crit) 65%, black); }
+  .days-open { background: var(--neutral-light); color: color-mix(in srgb, var(--neutral) 65%, black); }
+
+  /* ── Open snapshot mini list ── */
+  .mini-list { display: flex; flex-direction: column; gap: 0; }
+  .mini-row {
+    display: grid;
+    grid-template-columns: 70px 1fr auto auto;
+    gap: 12px;
+    align-items: center;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--border-light);
+    font-size: 12px;
+  }
+  .mini-row:last-child { border-bottom: none; }
+  .mini-id { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--cb); }
+  .mini-subject { color: var(--text); }
+  .mini-age { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 3px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 2px 8px; border-radius: 3px; white-space: nowrap;
+  }
+  .pill-crit { background: var(--crit-light); color: var(--crit); border: 1px solid #F0BABA; }
+  .pill-warn { background: var(--warn-light); color: var(--warn); border: 1px solid #F5D89A; }
+  .pill-neutral { background: var(--neutral-light); color: var(--neutral); border: 1px solid #C8CEDC; }
+
+  /* ── Executive summary ── */
+  .exec-summary { display: flex; flex-direction: column; gap: 16px; }
+
+  .exec-lede {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--text);
+    text-wrap: balance;
+  }
+
+  .exec-points { display: flex; flex-direction: column; gap: 12px; }
+
+  .exec-point {
+    display: flex;
+    gap: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-light);
+  }
+  .exec-point:last-child { border-bottom: none; padding-bottom: 0; }
+
+  .exec-point-icon {
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px;
+    font-weight: 800;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .exec-point-icon.good { background: var(--good-light); color: color-mix(in srgb, var(--good) 60%, black); }
+  .exec-point-icon.warn { background: var(--warn-light); color: color-mix(in srgb, var(--warn) 60%, black); }
+  .exec-point-icon.crit { background: var(--crit-light); color: color-mix(in srgb, var(--crit) 60%, black); }
+  .exec-point-icon.cb { background: var(--cb-light); color: color-mix(in srgb, var(--cb) 60%, black); }
+
+  .exec-point-body { font-size: 13px; color: var(--text-2); line-height: 1.6; }
+  .exec-point-body strong { color: var(--text); }
+
+  /* ── Next steps ── */
+  .next-steps { display: flex; flex-direction: column; gap: 8px; }
+  .next-step {
+    display: flex; gap: 10px; font-size: 12.5px; color: var(--text-2); line-height: 1.55;
+    padding-bottom: 8px; border-bottom: 1px solid var(--border-light);
+  }
+  .next-step:last-child { border-bottom: none; padding-bottom: 0; }
+  .step-owner {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 2px 7px; border-radius: 3px; white-space: nowrap; flex-shrink: 0; margin-top: 2px; height: fit-content;
+  }
+  .step-owner.cb { background: var(--cb-light); color: var(--cb); }
+  .step-owner.wu { background: var(--warn-light); color: #7A4A06; }
+  .step-owner.both { background: var(--neutral-light); color: var(--neutral); }
+  .step-body strong { color: var(--text); font-weight: 600; }
+
+  /* ── Print ── */
+  /* ── Internal/customer view toggle ── */
+  .view-toggle {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    z-index: 200;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--text-2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  }
+  .view-toggle input { margin: 0; }
+  body.hide-internal .internal-only { display: none !important; }
+
+  @media print {
+    .view-toggle { display: none !important; }
+    @page { margin: 18mm 16mm; size: A4; }
+    body { background: #fff; font-size: 11px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    /* Chrome cannot fragment flex/grid containers across pages — a flex .page
+       prints as a single truncated page. Flatten to block flow for print. */
+    .page { display: block; }
+    .page > * { margin-bottom: 10pt; }
+    .fleet-banner { position: static; border-bottom: 2px solid var(--border); margin-bottom: 12pt; box-shadow: none; }
+    .page { padding: 0; gap: 10pt; }
+    .card, .kpi-tile, .callout, .exec-point, .mini-row, .inc-table tr {
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+    .section-label {
+      break-before: page;
+      page-break-before: always;
+      margin-top: 0;
+    }
+    .section-label.no-break {
+      break-before: auto;
+      page-break-before: auto;
+    }
+    .kpi-grid { grid-template-columns: repeat(6, 1fr); }
+    .page-header { break-after: avoid; page-break-after: avoid; }
+    .exec-summary { break-before: auto; }
+    .card-title { break-after: avoid; page-break-after: avoid; }
+  }
+
+  @media (max-width: 700px) {
+    .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<label class="view-toggle">
+  <input type="checkbox" id="hideInternalToggle" onchange="document.body.classList.toggle('hide-internal', this.checked)">
+  Hide internal-only info (for customer copy)
+</label>
+
+<div class="fleet-banner">
+  <div class="fleet-banner-inner">
+    <div class="fleet-logo">
+      <div class="fleet-logo-mark">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <rect x="2" y="2" width="5" height="5" rx="1" fill="white"/>
+          <rect x="9" y="2" width="5" height="5" rx="1" fill="white" opacity="0.7"/>
+          <rect x="2" y="9" width="5" height="5" rx="1" fill="white" opacity="0.7"/>
+          <rect x="9" y="9" width="5" height="5" rx="1" fill="white" opacity="0.4"/>
+        </svg>
+      </div>
+      <div>
+        <div class="fleet-org">ORG_NAME</div>
+        <div class="fleet-date">Customer Health Report · REPORT_DATE</div>
+      </div>
+    </div>
+    <div class="fleet-divider"></div>
+    <span class="renewal-badge internal-only">⚠ Critical Renewal</span>
+    <div class="fleet-contacts">
+      <strong>AE:</strong> AE_NAME · AE_EMAIL<br>
+      <strong>TSE:</strong> TSE_NAME · <strong>Principal SE:</strong> PSE_NAME
+    </div>
+  </div>
+</div>
+
+<div class="page">
+
+  <div class="page-header">
+    <div>
+      <div class="page-title">Customer Health Report — ORG_NAME</div>
+      <div class="page-subtitle">949 tickets on record since Feb 2017 · Capella + Server Enterprise</div>
+    </div>
+    <div class="prepared-by">
+      <strong>Prepared by</strong><br>
+      PSE_NAME<br>
+      Couchbase Field Engineering
+    </div>
+  </div>
+
+  <!-- ── EXECUTIVE SUMMARY ── -->
+  <div class="section-label no-break">Executive Summary</div>
+
+  <div class="card exec-summary">
+    <p class="exec-lede">ORG_NAME's account health is <strong>stable</strong>. The current open queue (5 tickets, 1 P1) is upgrade-cycle volume tied to WU's Capella OS patch rollout, not a quality or relationship signal — and the one open P1 is functionally resolved, pending a documentation deliverable from Couchbase.</p>
+
+    <div class="exec-points">
+      <div class="exec-point">
+        <span class="exec-point-icon good">✓</span>
+        <div class="exec-point-body"><strong>P1 response remains healthy.</strong> Excluding two multi-day OS-upgrade P1s with active WAR-room engagement, average resolution across the last 8 P1s is well under 24 hours. There is no triage-delay pattern in this account.</div>
+      </div>
+      <div class="exec-point">
+        <span class="exec-point-icon warn">↗</span>
+        <div class="exec-point-body"><strong>Capella platform tickets are concentrating.</strong> 78% of the last 90 days of tickets are Capella platform/control-plane issues, up from a 35% lifetime share — directly attributable to the active OS upgrade wave across WU's fleet (#79105, #78803, #78588, #78807). Expect this to normalize once the upgrade cycle closes.</div>
+      </div>
+      <div class="exec-point">
+        <span class="exec-point-icon cb">→</span>
+        <div class="exec-point-body"><strong>One action stands between Couchbase and a clean queue.</strong> The NLB target-group root-cause fix from #79105 needs to be documented for WU before their next OS upgrade cycle — everything else in the open queue is either awaiting customer confirmation or ready to close.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── KPI STRIP ── -->
+  <div class="section-label no-break">Account Snapshot</div>
+
+  <div class="kpi-grid">
+    <div class="kpi-tile">
+      <span class="kpi-val cb">949</span>
+      <span class="kpi-lbl">Total Tickets</span>
+      <span class="kpi-sub">Since Feb 2017</span>
+    </div>
+    <div class="kpi-tile">
+      <span class="kpi-val crit">5</span>
+      <span class="kpi-lbl">Open Now</span>
+      <span class="kpi-sub">1 P1 · 1 P3 · 3 P4</span>
+    </div>
+    <div class="kpi-tile">
+      <span class="kpi-val warn">57</span>
+      <span class="kpi-lbl">P1s Lifetime</span>
+      <span class="kpi-sub">6.0% of all tickets</span>
+    </div>
+    <div class="kpi-tile">
+      <span class="kpi-val warn">4</span>
+      <span class="kpi-lbl">P1s Last 90 Days</span>
+      <span class="kpi-sub">vs. ~9/yr historical rate</span>
+    </div>
+    <div class="kpi-tile">
+      <span class="kpi-val good">10.3d</span>
+      <span class="kpi-lbl">Avg P1 Resolution</span>
+      <span class="kpi-sub">2026 YTD, n=3 solved</span>
+    </div>
+    <div class="kpi-tile">
+      <span class="kpi-val good">98.5%</span>
+      <span class="kpi-lbl">Closed Rate</span>
+      <span class="kpi-sub">935 closed / 949 total</span>
+    </div>
+  </div>
+
+  <!-- ── VOLUME TREND ── -->
+  <div class="section-label">Ticket Volume — Last 10 Months</div>
+
+  <div class="card">
+    <div class="card-title">Tickets opened per month</div>
+    <div class="trend-chart">
+      <div class="trend-col"><div class="trend-bar" style="height: 67%;"><span class="trend-bar-val">13</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 51%;"><span class="trend-bar-val">10</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 26%;"><span class="trend-bar-val">5</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 57%;"><span class="trend-bar-val">11</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 41%;"><span class="trend-bar-val">8</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 31%;"><span class="trend-bar-val">6</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 21%;"><span class="trend-bar-val">4</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 31%;"><span class="trend-bar-val">6</span></div></div>
+      <div class="trend-col"><div class="trend-bar" style="height: 46%;"><span class="trend-bar-val">9</span></div></div>
+      <div class="trend-col"><div class="trend-bar current" style="height: 67%;"><span class="trend-bar-val">13</span></div></div>
+    </div>
+    <div class="trend-labels">
+      <span class="trend-lbl">Sep</span>
+      <span class="trend-lbl">Oct</span>
+      <span class="trend-lbl">Nov</span>
+      <span class="trend-lbl">Dec</span>
+      <span class="trend-lbl">Jan</span>
+      <span class="trend-lbl">Feb</span>
+      <span class="trend-lbl">Mar</span>
+      <span class="trend-lbl">Apr</span>
+      <span class="trend-lbl">May</span>
+      <span class="trend-lbl">Jun</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Lifetime priority mix (949 tickets)</div>
+    <div class="mix-bar">
+      <div class="mix-seg" style="width: 6.0%; background: var(--crit);" title="P1: 57">P1</div>
+      <div class="mix-seg" style="width: 32.8%; background: var(--warn);" title="P2: 311">P2</div>
+      <div class="mix-seg" style="width: 30.9%; background: var(--cb);" title="P3: 293">P3</div>
+      <div class="mix-seg" style="width: 25.5%; background: var(--neutral);" title="P4: 242">P4</div>
+      <div class="mix-seg" style="width: 4.8%; background: var(--border);"></div>
+    </div>
+    <div class="mix-legend">
+      <div class="mix-legend-item"><span class="mix-swatch" style="background: var(--crit);"></span> P1 — 57 (6.0%)</div>
+      <div class="mix-legend-item"><span class="mix-swatch" style="background: var(--warn);"></span> P2 — 311 (32.8%)</div>
+      <div class="mix-legend-item"><span class="mix-swatch" style="background: var(--cb);"></span> P3 — 293 (30.9%)</div>
+      <div class="mix-legend-item"><span class="mix-swatch" style="background: var(--neutral);"></span> P4 — 242 (25.5%)</div>
+      <div class="mix-legend-item"><span class="mix-swatch" style="background: var(--border);"></span> Unset — 46 (4.8%)</div>
+    </div>
+  </div>
+
+  <!-- ── FEATURE AREA SHIFT ── -->
+  <div class="section-label">Where the Pain Is Concentrating</div>
+
+  <div class="card">
+    <div class="card-title">Feature area — lifetime (top 8 of 949)</div>
+
+    <div class="hbar-row">
+      <div class="hbar-label">Other / General</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 100%;"></div></div>
+      <div class="hbar-val">257</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Capella / Cloud Platform</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 92%;"></div></div>
+      <div class="hbar-val">237</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Capella — Control Plane</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 40%;"></div></div>
+      <div class="hbar-val">102</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">SDK</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 35%;"></div></div>
+      <div class="hbar-val">91</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Capella — Server</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 35%;"></div></div>
+      <div class="hbar-val">89</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Indexing</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 18%;"></div></div>
+      <div class="hbar-val">46</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">XDCR</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 14%;"></div></div>
+      <div class="hbar-val">37</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Capella — XDCR</div>
+      <div class="hbar-track"><div class="hbar-fill" style="width: 9%;"></div></div>
+      <div class="hbar-val">22</div>
+    </div>
+
+    <div class="hbar-group-title" style="margin-top: 18px;">Last 90 days (28 tickets) — concentration shift</div>
+
+    <div class="hbar-row">
+      <div class="hbar-label">Capella / Cloud Platform</div>
+      <div class="hbar-track"><div class="hbar-fill recent" style="width: 100%;"></div></div>
+      <div class="hbar-val">12</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Capella — Control Plane</div>
+      <div class="hbar-track"><div class="hbar-fill recent" style="width: 83%;"></div></div>
+      <div class="hbar-val">10</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Capella — Query</div>
+      <div class="hbar-track"><div class="hbar-fill recent" style="width: 25%;"></div></div>
+      <div class="hbar-val">3</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">SDK</div>
+      <div class="hbar-track"><div class="hbar-fill recent" style="width: 17%;"></div></div>
+      <div class="hbar-val">2</div>
+    </div>
+    <div class="hbar-row">
+      <div class="hbar-label">Capella — Indexing</div>
+      <div class="hbar-track"><div class="hbar-fill recent" style="width: 8%;"></div></div>
+      <div class="hbar-val">1</div>
+    </div>
+  </div>
+
+  <div class="callout callout-info">
+    <span class="callout-icon">ℹ</span>
+    <div class="callout-body"><strong>Trend:</strong> 78% of WU's last 90 days of tickets (22 of 28) are Capella platform/control-plane issues — up from a 35% lifetime share. This tracks with the active OS upgrade cycle across WU's Capella fleet (see #79105, #78807) and is the operational driver behind the current open queue, not a broad-based quality regression.</div>
+  </div>
+
+  <!-- ── P1 INCIDENT LOG ── -->
+  <div class="section-label">P1 Incident Log — Last 12 Months</div>
+
+  <div class="card">
+    <div class="card-title">8 P1s since Jul 2025</div>
+    <div class="inc-table-wrap">
+      <table class="inc-table">
+        <thead>
+          <tr>
+            <th>Ticket</th>
+            <th>Subject</th>
+            <th>Assignee</th>
+            <th>Opened</th>
+            <th>Resolved In</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>#79105</td>
+            <td><strong>Capella OS Upgrade — N1QL Connectivity</strong></td>
+            <td>TSE_NAME</td>
+            <td>Jun 27</td>
+            <td><span class="days-pill days-open">Open</span></td>
+          </tr>
+          <tr>
+            <td>#78803</td>
+            <td>Mandatory OS upgrade — NRT-Archive-Prod</td>
+            <td>Umar Tariq</td>
+            <td>Jun 14</td>
+            <td><span class="days-pill days-mid">11 days</span></td>
+          </tr>
+          <tr>
+            <td>#78588</td>
+            <td>Compute-Service-Magma-Prod upgrade — WAR room</td>
+            <td>Jishnu Surendran T.</td>
+            <td>Jun 4</td>
+            <td><span class="days-pill days-slow">20 days</span></td>
+          </tr>
+          <tr>
+            <td>#77469</td>
+            <td>Unable to enable audit for event IDs</td>
+            <td>Pavvan Pradeep</td>
+            <td>Apr 17</td>
+            <td><span class="days-pill days-fast">&lt;1 day</span></td>
+          </tr>
+          <tr>
+            <td>#73156</td>
+            <td>Application query response time increased</td>
+            <td>Shramith Srinivas</td>
+            <td>Sep 22, 2025</td>
+            <td><span class="days-pill days-fast">&lt;1 day</span></td>
+          </tr>
+          <tr>
+            <td>#71798</td>
+            <td>Events are getting timed out</td>
+            <td>Abhinay Garg</td>
+            <td>Jul 29, 2025</td>
+            <td><span class="days-pill days-mid">14 days</span></td>
+          </tr>
+          <tr>
+            <td>#71180</td>
+            <td>Scaling failed for NRT_BATCH_PROD_DR</td>
+            <td>Manoj Kumar P.</td>
+            <td>Jul 3, 2025</td>
+            <td><span class="days-pill days-mid">11 days</span></td>
+          </tr>
+          <tr>
+            <td>#71112</td>
+            <td>Delay in batch jobs from application</td>
+            <td>Pruthvi Kodmurgi</td>
+            <td>Jul 1, 2025</td>
+            <td><span class="days-pill days-fast">&lt;1 day</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="callout callout-good">
+    <span class="callout-icon">✓</span>
+    <div class="callout-body"><strong>P1 response is healthy.</strong> Excluding the two OS-upgrade-driven P1s (#78803, #78588 — both inherently multi-day infrastructure operations, not triage delays), average resolution is well under 24 hours. The two longer-running 2026 P1s are upgrade projects with active WAR-room engagement, not stalled investigations.</div>
+  </div>
+
+  <!-- ── OPEN SNAPSHOT ── -->
+  <div class="section-label">Currently Open (5 Tickets)</div>
+
+  <div class="card">
+    <div class="mini-list">
+      <div class="mini-row">
+        <span class="mini-id">#79105</span>
+        <span class="mini-subject">Capella OS Upgrade — N1QL Connectivity / NLB Timeout</span>
+        <span class="pill pill-crit">P1</span>
+        <span class="mini-age">3 days old</span>
+      </div>
+      <div class="mini-row">
+        <span class="mini-id">#78641</span>
+        <span class="mini-subject">Full backup failing — bdp_variabledata (recurring stall)</span>
+        <span class="pill pill-warn">P3</span>
+        <span class="mini-age">24 days old</span>
+      </div>
+      <div class="mini-row">
+        <span class="mini-id">#78964</span>
+        <span class="mini-subject">Query timeout — UnambiguousTimeoutException</span>
+        <span class="pill pill-neutral">P4</span>
+        <span class="mini-age">11 days old</span>
+      </div>
+      <div class="mini-row">
+        <span class="mini-id">#78970</span>
+        <span class="mini-subject">Proactive: scheduled backup failed — CustomerProfile</span>
+        <span class="pill pill-neutral">P4</span>
+        <span class="mini-age">9 days old</span>
+      </div>
+      <div class="mini-row">
+        <span class="mini-id">#78807</span>
+        <span class="mini-subject">Mandatory maintenance upgrade — Track-A-Transfer Prod-DR</span>
+        <span class="pill pill-neutral">P4</span>
+        <span class="mini-age">16 days · WU confirmed close Jun 28</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── RECOMMENDATIONS ── -->
+  <div class="section-label">Recommendations</div>
+
+  <div class="card">
+    <div class="next-steps">
+      <div class="next-step">
+        <span class="step-owner both">CB + WU</span>
+        <div class="step-body"><strong>Treat the current open queue as upgrade-cycle volume, not a quality signal.</strong> 78% of the last 90 days of tickets are tied to the Capella OS upgrade rollout across WU's fleet. Once the upgrade cycle completes (pending #79105 documentation), volume in this category should normalize toward the lifetime baseline.</div>
+      </div>
+      <div class="next-step">
+        <span class="step-owner cb">CB</span>
+        <div class="step-body"><strong>Document the NLB root-cause fix from #79105</strong> before WU's next OS upgrade wave — this is the one open item standing between the current P1 and a fully clean queue.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
