@@ -735,12 +735,21 @@ def query_se_opportunities(se_name: str,
         ))
         if not rows:
             return f"No open opportunities found for SE '{se_name}'."
-        lines = ["| Account | Opp Name | Stage | Close Date | Role | ARR | Blocking CBSEs |",
-                 "|---------|----------|-------|------------|------|-----|----------------|"]
-        for r in rows:
+
+        # Cross-validate opportunity-level SE against the account-level book.
+        # The opps filter matches o.se_name (Salesforce Primary_SE__c), which is
+        # known-unreliable for some accounts (it has shown the wrong SE even after
+        # a fresh sync). The account mirror (`accounts`) is SE-scoped by account-
+        # team membership and is the more trustworthy signal. When the JOIN finds
+        # no account row (org_name is null), the opp claims you as SE but the
+        # account is NOT in your book — treat it as UNVERIFIED rather than
+        # asserting it's yours. Segregate instead of dropping: a missing account
+        # row could also just mean the account wasn't synced, so surface it with
+        # a caveat and let the user confirm against Salesforce.
+        def _fmt(r: dict) -> str:
             role = "Primary SE" if se_name.lower() in (r.get("se_name") or "").lower() else "Supporting SE"
             acct = r.get("org_name") or r.get("sfdc_account_id", "")
-            lines.append(
+            return (
                 f"| {acct} "
                 f"| {r.get('opp_name','')[:45]} "
                 f"| {r.get('stage','')} "
@@ -749,7 +758,32 @@ def query_se_opportunities(se_name: str,
                 f"| ${r.get('arr') or 0:,.0f} "
                 f"| {r.get('blocking_cbses') or '—'} |"
             )
-        return "\n".join(lines)
+
+        confirmed  = [r for r in rows if (r.get("org_name") or "").strip()]
+        unverified = [r for r in rows if not (r.get("org_name") or "").strip()]
+
+        hdr = ["| Account | Opp Name | Stage | Close Date | Role | ARR | Blocking CBSEs |",
+               "|---------|----------|-------|------------|------|-----|----------------|"]
+        out: list[str] = []
+        if confirmed:
+            out.append(f"**Confirmed — {se_name} on both the account team and the opportunity ({len(confirmed)}):**")
+            out.extend(hdr)
+            out.extend(_fmt(r) for r in confirmed)
+        if unverified:
+            if out:
+                out.append("")
+            out.append(
+                f"**⚠ Unverified — opportunity-level SE only ({len(unverified)}):** "
+                f"these opportunities list {se_name} as SE, but the account is not in "
+                f"your account-team book, so the assignment could not be confirmed. "
+                f"Salesforce's opportunity `Primary_SE__c` has been wrong for some "
+                f"accounts. Verify each against the opportunity's **SE Related "
+                f"Information → SE Opp Primary** panel in Salesforce before treating "
+                f"it as yours. (Accounts show as a raw ID because they are not in your book.)"
+            )
+            out.extend(hdr)
+            out.extend(_fmt(r) for r in unverified)
+        return "\n".join(out)
     except Exception as e:
         return f"query_se_opportunities error: {e}"
 

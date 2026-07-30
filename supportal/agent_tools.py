@@ -1418,11 +1418,17 @@ _AGENT_TOOLS: list[dict] = [
         "function": {
             "name": "get_my_sfdc_accounts",
             "description": (
-                "Get the open Salesforce opportunities and account assignments for the current user — "
-                "the SE whose name is stored in the active settings profile (sfdc_user_name). "
-                "Use when the user asks 'what accounts am I on?', 'show me my pipeline', "
-                "'my opportunities', 'my deals', 'what customers am I responsible for?', or "
-                "'who are my accounts?'. No arguments needed."
+                "Get the current user's open Salesforce OPPORTUNITIES (the SE whose name is "
+                "stored in sfdc_user_name). Use for 'show me my pipeline', 'my opportunities', "
+                "'my deals'. The result is split into two sections: **Confirmed** (you are on "
+                "both the account team AND the opportunity) and **⚠ Unverified** (the opportunity "
+                "names you as SE but the account is NOT in your account-team book — Salesforce's "
+                "opportunity Primary_SE__c is known to be wrong for some accounts). "
+                "ALWAYS relay both sections and their caveat verbatim — never merge them into one "
+                "list or assert the full set is 'your pipeline'. If the user asks for their "
+                "ACCOUNTS (not opportunities) or their 'local'/'assigned' accounts, call "
+                "list_sfdc_accounts with your name instead — that reads the account-team book. "
+                "No arguments needed."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
