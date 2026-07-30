@@ -431,8 +431,14 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
     )
     ps_idx: dict[str, int] = {r["pse__Account__c"]: int(r.get("cnt", 0)) for r in ps_raw if r.get("pse__Account__c")}
 
-    # Build per-account SE name from open opportunities (Primary_SE__r.Name).
-    # This covers accounts that are in scope via opportunity but have no ATM SE entry.
+    # Build per-account SE name from opportunities (Primary_SE__r.Name).
+    # This covers accounts that are in scope via opportunity but have no ATM SE
+    # entry. Must match the account-scope filter (open OR closed-won) — otherwise
+    # a mature account in the book only via closed-won opps (e.g. Western Union)
+    # gets an empty se_name and is filtered out of any se_name-scoped query
+    # (list_sfdc_accounts(se_name=...), get_my_sfdc_accounts). ORDER BY IsClosed
+    # so OPEN opps are seen first and their SE wins; closed-won only fills the
+    # gap for accounts with no open-opp SE.
     opp_se_idx: dict[str, str] = {}
     opp_sup_se_idx: dict[str, str] = {}
     if se_user_id and accounts_raw:
@@ -443,7 +449,8 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
         try:
             opp_se_rows = sfdc.query_all(
                 f"SELECT AccountId, {f_se_rel}.Name, {f_se_sup_rel}.Name "
-                f"FROM Opportunity WHERE IsClosed = false AND AccountId IN ({id_list})"
+                f"FROM Opportunity WHERE (IsClosed = false OR IsWon = true) "
+                f"AND AccountId IN ({id_list}) ORDER BY IsClosed ASC"
             )
             for r in opp_se_rows:
                 aid = r.get("AccountId", "")
