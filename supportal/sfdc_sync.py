@@ -39,6 +39,12 @@ DEFAULT_FIELD_MAPPING: dict[str, str] = {
     "opp_se_primary":       "Primary_SE__c",       # SFDC label: "SE Opp Primary"
     "opp_se_supporting":    "Opp_SE_Supporting__c",  # SFDC label: "SE Opp Supporting SE"
     "opp_arr":              "ACV_Enterprise_Total__c",
+    # Closed-won TCV rollup field. Standard Opportunity.Amount, NOT the
+    # enterprise-ACV field: verified that Capella-consumption accounts (GoDaddy,
+    # DaVita) carry $0 in ACV_Enterprise_Total__c and their real value lives in
+    # Amount (which rolls up Cloud + Services + license). Amount is populated for
+    # both enterprise and consumption deal types, so it's the faithful TCV total.
+    "opp_tcv":              "Amount",
     "opp_renewal_arr":      "ACV_Enterprise_Renewal__c",
     "opp_renewal_date":     "REN_Target_Renewal_Close_Date__c",
     "opp_blocking_cbses":   "Blocking_CBSEs__c",
@@ -430,6 +436,29 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
     )
     ps_idx: dict[str, int] = {r["pse__Account__c"]: int(r.get("cnt", 0)) for r in ps_raw if r.get("pse__Account__c")}
 
+    # Closed-won TCV rollup. The open-opp views (get_account_opportunities etc.)
+    # report $0 ARR for mature accounts whose revenue is all closed-won (e.g.
+    # Western Union) — that's the empty open-pipeline view, NOT a worthless
+    # account. Sum ACV across IsWon opps per account so reports show real value.
+    # SUM/COUNT are aggregate exprs, so SOQL field aliases are allowed here.
+    print("[sfdc_sync] Rolling up closed-won TCV…")
+    f_tcv = fm.get("opp_tcv", "Amount")
+    won_where = f" AND AccountId IN ({id_list})" if se_user_id else ""
+    won_acv_idx: dict[str, float] = {}
+    won_cnt_idx: dict[str, int] = {}
+    try:
+        won_raw = sfdc.query_all(
+            f"SELECT AccountId, SUM({f_tcv}) tcv, COUNT(Id) cnt "
+            f"FROM Opportunity WHERE IsWon = true{won_where} GROUP BY AccountId"
+        )
+        for r in won_raw:
+            aid = r.get("AccountId")
+            if aid:
+                won_acv_idx[aid] = float(r.get("tcv") or 0)
+                won_cnt_idx[aid] = int(r.get("cnt") or 0)
+    except Exception as e:
+        print(f"[sfdc_sync] closed-won TCV rollup (non-fatal): {e}")
+
     # Build per-account primary/supporting SE name from OPEN opportunities.
     # Scope is already open-opp-only, so every in-scope account has an open opp;
     # deriving SE names from open opps keeps both fields reflecting the current
@@ -488,6 +517,8 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
             "contract_end_date":  ctr.get("contract_end_date", ""),
             "contract_number":    ctr.get("contract_number", ""),
             "active_ps_projects": ps_idx.get(aid, 0),
+            "closed_won_acv":     won_acv_idx.get(aid, 0),
+            "closed_won_count":   won_cnt_idx.get(aid, 0),
             "last_synced":        now,
         }
         try:
@@ -816,7 +847,8 @@ def query_sfdc_accounts(se_name: str = "",
         if se_name:
             rows = list(cluster.query(
                 f"SELECT a.org_name, a.ae_name, a.se_name, a.csm_name, "
-                f"a.contract_end_date, a.active_ps_projects "
+                f"a.contract_end_date, a.active_ps_projects, "
+                f"a.closed_won_acv, a.closed_won_count "
                 f"FROM `{_bucket}`.`{_scope}`.`{_ACCTS_COLL}` a "
                 f"WHERE a._type = 'account' "
                 f"  AND (LOWER(a.se_name) LIKE $1 "
@@ -829,7 +861,8 @@ def query_sfdc_accounts(se_name: str = "",
         else:
             rows = list(cluster.query(
                 f"SELECT a.org_name, a.ae_name, a.se_name, a.csm_name, "
-                f"a.contract_end_date, a.active_ps_projects "
+                f"a.contract_end_date, a.active_ps_projects, "
+                f"a.closed_won_acv, a.closed_won_count "
                 f"FROM `{_bucket}`.`{_scope}`.`{_ACCTS_COLL}` a "
                 f"WHERE a._type = 'account' "
                 f"ORDER BY a.org_name LIMIT 200",
@@ -837,16 +870,19 @@ def query_sfdc_accounts(se_name: str = "",
             ))
         if not rows:
             return "No accounts found." + (f" (filtered by SE: {se_name})" if se_name else "")
-        lines = ["| Account | AE | SE | CSM | Contract End | PS Projects |",
-                 "|---------|----|----|-----|-------------|-------------|"]
+        lines = ["| Account | AE | SE | CSM | Contract End | PS Projects | Closed-Won TCV | Won Opps |",
+                 "|---------|----|----|-----|-------------|-------------|----------------|----------|"]
         for r in rows:
+            _tcv = r.get("closed_won_acv") or 0
             lines.append(
                 f"| {r.get('org_name','')} "
                 f"| {r.get('ae_name','—')} "
                 f"| {r.get('se_name','—')} "
                 f"| {r.get('csm_name','—')} "
                 f"| {(r.get('contract_end_date') or '—')[:10]} "
-                f"| {r.get('active_ps_projects', 0)} |"
+                f"| {r.get('active_ps_projects', 0)} "
+                f"| ${_tcv:,.0f} "
+                f"| {r.get('closed_won_count', 0)} |"
             )
         return "\n".join(lines)
     except Exception as e:
@@ -922,7 +958,7 @@ def get_account_sfdc_context(organization: str,
         acct_rows = list(cluster.query(
             f"SELECT a.org_name, a.sfdc_id, a.arr, a.account_type, "
             f"       a.contract_end_date, a.ae_name, a.se_name, a.csm_name, "
-            f"       a.active_ps_projects "
+            f"       a.active_ps_projects, a.closed_won_acv, a.closed_won_count "
             f"FROM `{_bucket}`.`{_scope}`.`{_ACCTS_COLL}` a "
             f"WHERE LOWER(a.org_name) LIKE $1 "
             f"   OR ANY al IN a.org_aliases SATISFIES LOWER(al) LIKE $1 END "
@@ -977,6 +1013,8 @@ def get_account_sfdc_context(organization: str,
             "se_name":            acct.get("se_name", ""),
             "csm_name":           acct.get("csm_name", ""),
             "active_ps_projects": acct.get("active_ps_projects") or 0,
+            "closed_won_acv":     acct.get("closed_won_acv") or 0.0,
+            "closed_won_count":   acct.get("closed_won_count") or 0,
             "licensed_products":  licensed_products,
             "open_opportunities": open_opportunities,
         }

@@ -3853,8 +3853,13 @@ def get_account_intelligence(organization: str) -> str:
         cb_url, bucket, username, password, use_tls, scope = _sfdc_cb_args()
         ctx = get_account_sfdc_context(organization, cb_url, bucket, username, password, use_tls, scope)
         if ctx:
+            _won_acv = ctx.get('closed_won_acv') or 0
+            _won_cnt = ctx.get('closed_won_count') or 0
+            _open_arr = ctx.get('arr') or 0
             parts.append(f"\n### SFDC Account")
-            parts.append(f"- **ARR**: ${ctx.get('arr') or 0:,.0f}")
+            parts.append(f"- **Closed-Won TCV**: ${_won_acv:,.0f} across {_won_cnt} won opps")
+            parts.append(f"- **Open-pipeline ARR**: ${_open_arr:,.0f} "
+                         f"(open opps only — $0 here just means no open deals, not an inactive account)")
             parts.append(f"- **Type**: {ctx.get('account_type') or '—'}")
             parts.append(f"- **Contract End**: {(ctx.get('contract_end_date') or '—')[:10]}")
             parts.append(f"- **AE**: {ctx.get('ae_name') or '—'} | **SE**: {ctx.get('se_name') or '—'} | **CSM**: {ctx.get('csm_name') or '—'}")
