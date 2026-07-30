@@ -3750,6 +3750,89 @@ def get_account_opportunities(organization: str) -> str:
 
 
 @mcp.tool()
+def pin_opportunity(opp_id: str, tag: str = "owned", label: str = "", note: str = "") -> str:
+    """Pin/tag a Salesforce OPPORTUNITY as the current user's (e.g. "owned").
+
+    A personal lens, NOT an SFDC override — the synced opp data stays faithful.
+    Use after seeing an opp in get_account_opportunities/get_my_sfdc_accounts and
+    the user says "that's mine" / "tag this as owned". tag is free-form
+    (owned | watching | priority | …). Get the opp_id (006…) from the opp listing.
+    """
+    try:
+        from supportal.pins import pin_target
+        r = pin_target(_sfdc_user_name(), opp_id, target_type="opp",
+                       tag=tag, label=label, note=note)
+        return json.dumps(r, default=str)
+    except Exception as exc:
+        return f"pin_opportunity error: {exc}"
+
+
+@mcp.tool()
+def pin_account(account_id: str, tag: str = "owned", label: str = "", note: str = "") -> str:
+    """Pin/tag a Salesforce ACCOUNT as the current user's (e.g. "owned").
+
+    Personal lens, not an override. Use for support/ownership relationships that
+    aren't captured by an open opp (the Western Union pattern). account_id is the
+    SFDC account id (001…). tag is free-form.
+    """
+    try:
+        from supportal.pins import pin_target
+        r = pin_target(_sfdc_user_name(), account_id, target_type="account",
+                       tag=tag, label=label, note=note)
+        return json.dumps(r, default=str)
+    except Exception as exc:
+        return f"pin_account error: {exc}"
+
+
+@mcp.tool()
+def unpin(target_id: str, target_type: str = "opp") -> str:
+    """Remove a pin. target_type = 'opp' (default) or 'account'."""
+    try:
+        from supportal.pins import unpin_target
+        return json.dumps(unpin_target(_sfdc_user_name(), target_id, target_type), default=str)
+    except Exception as exc:
+        return f"unpin error: {exc}"
+
+
+@mcp.tool()
+def list_pins(tag: str = "") -> str:
+    """List the current user's pinned opportunities/accounts, optionally by tag."""
+    try:
+        from supportal.pins import list_pins as _lp
+        pins = _lp(_sfdc_user_name(), tag=tag)
+        if not pins:
+            return "No pins." + (f" (tag={tag})" if tag else "")
+        lines = ["| Type | Tag | Label | Target ID | Note |",
+                 "|------|-----|-------|-----------|------|"]
+        for p in pins:
+            lines.append(
+                f"| {p.get('target_type','')} | {p.get('tag','')} "
+                f"| {p.get('label','') or '—'} | {p.get('target_id','')} "
+                f"| {p.get('note','') or '—'} |"
+            )
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"list_pins error: {exc}"
+
+
+@mcp.tool()
+def reconcile_pins() -> str:
+    """Compare the current user's 'owned' pins against what SFDC says the SE is.
+
+    Governance surface for the faithful-mirror rule — surfaces disagreements for
+    a human to fix in Salesforce; never changes SFDC or the synced data:
+      - pinned but NOT SE in SFDC → confirm/update the opp in Salesforce
+      - SE in SFDC but NOT pinned → confirm ownership
+    """
+    try:
+        from supportal.pins import reconcile
+        r = reconcile(_sfdc_user_name())
+        return json.dumps(r, indent=2, default=str)
+    except Exception as exc:
+        return f"reconcile_pins error: {exc}"
+
+
+@mcp.tool()
 def get_se_opportunities(se_name: str) -> str:
     """Get open Salesforce opportunities owned by a specific SE by name."""
     try:
