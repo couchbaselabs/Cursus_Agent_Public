@@ -1226,6 +1226,20 @@ async def api_agent(request: Request):
     _pinned = _load_pinned_accounts()
     _profile_hint = ", ".join(_pinned) if _pinned else ""
     sys_content = _bsp(customer=customer or "", profile_hint=_profile_hint)
+    # Surface-specific rendering contract. The Unified assistant renders ONLY
+    # your final message text (as GitHub-Flavored Markdown — tables supported).
+    # Unlike Strabo/Corax there is NO separate panel that shows tool output, so
+    # tool results are invisible to the user unless you reproduce them.
+    sys_content += (
+        "\n\n## Output rendering (this interface)\n"
+        "Your final reply is shown as GitHub-Flavored Markdown; there is no "
+        "separate table or chart panel here. When a tool returns tabular or "
+        "structured data, reproduce it as a full GFM Markdown table **directly "
+        "in your reply** (header row, `|---|` separator, one row per record). "
+        "Never write 'the table above', 'as shown above', or otherwise refer to "
+        "output outside your message — the user cannot see tool output, only "
+        "your text. Put the table first, then any explanation."
+    )
     msgs = [{"role": "system", "content": sys_content}]
     msgs.extend(conv_history)
     msgs.append({"role": "user", "content": text})
@@ -1250,7 +1264,19 @@ async def api_agent(request: Request):
     tool_label = " · ".join(
         _TOOL_LABELS.get(t, t.replace("_", " ")) for t in dict.fromkeys(tools_used)
     ) if tools_used else None
-    raw = result_text or ""
+    raw = (result_text or "").strip()
+    # Empty-output guard: some models return only tool calls and no final prose,
+    # which would render as a blank bubble. Surface a useful message instead.
+    if not raw:
+        if tools_used:
+            raw = (
+                "I ran "
+                + (tool_label or "the requested tools")
+                + " but didn't produce a written answer. Try rephrasing, or ask "
+                "me to \"show the results as a table\"."
+            )
+        else:
+            raw = "I didn't get a response for that — please try rephrasing."
     try:
         rendered_html = mistune.html(raw)
     except Exception:
