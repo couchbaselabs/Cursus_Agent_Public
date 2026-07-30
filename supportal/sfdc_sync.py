@@ -448,20 +448,26 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
         f_se_sup_rel = _rel_name(f_se_sup)
         try:
             opp_se_rows = sfdc.query_all(
-                f"SELECT AccountId, {f_se_rel}.Name, {f_se_sup_rel}.Name "
+                f"SELECT AccountId, {f_se_rel}.Name, {f_se_sup_rel}.Name, IsClosed "
                 f"FROM Opportunity WHERE (IsClosed = false OR IsWon = true) "
                 f"AND AccountId IN ({id_list}) ORDER BY IsClosed ASC"
             )
             for r in opp_se_rows:
                 aid = r.get("AccountId", "")
                 if aid:
+                    is_open = not r.get("IsClosed", True)
                     _se_rel_obj  = r.get(f_se_rel) or {}
                     _sup_rel_obj = r.get(f_se_sup_rel) or {}
                     se_nm  = (_se_rel_obj.get("Name") if isinstance(_se_rel_obj, dict) else "") or ""
                     sup_nm = (_sup_rel_obj.get("Name") if isinstance(_sup_rel_obj, dict) else "") or ""
+                    # PRIMARY SE establishes account ownership → derive from open
+                    # OR closed-won (so mature won accounts like WU resolve to the
+                    # SE who owns them). SUPPORTING SE is a transient per-opp role
+                    # → derive from OPEN opps only, else a years-old closed-won opp
+                    # wrongly shows someone as the account's current supporting SE.
                     if se_nm and aid not in opp_se_idx:
                         opp_se_idx[aid] = se_nm
-                    if sup_nm and aid not in opp_sup_se_idx:
+                    if sup_nm and is_open and aid not in opp_sup_se_idx:
                         opp_sup_se_idx[aid] = sup_nm
         except Exception as e:
             print(f"[sfdc_sync] opp se lookup (non-fatal): {e}")
