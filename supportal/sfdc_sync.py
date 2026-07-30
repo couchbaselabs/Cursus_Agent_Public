@@ -36,7 +36,7 @@ _SYNC_LOCK = threading.Lock()
 # Update via update_sfdc_field_mapping() when SFDC renames a field.
 DEFAULT_FIELD_MAPPING: dict[str, str] = {
     # Opportunity fields
-    "opp_se_primary":       "Primary_SE__c",
+    "opp_se_primary":       "Opp_SE_Primary__c",
     "opp_se_supporting":    "Opp_SE_Supporting__c",
     "opp_arr":              "ACV_Enterprise_Total__c",
     "opp_renewal_arr":      "ACV_Enterprise_Renewal__c",
