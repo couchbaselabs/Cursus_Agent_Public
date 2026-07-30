@@ -349,18 +349,17 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
             f"SELECT AccountId FROM AccountTeamMember "
             f"WHERE UserId = '{uid}' AND AccountId != null"
         )
-        # "Active book" scope: an account is the SE's if they are primary/
-        # supporting SE on an opp that is either OPEN or CLOSED-WON. This keeps
-        # mature customers whose opps are all closed-won (e.g. Western Union:
-        # closed-won opps with the user as SE, 0 open — and this org does not
-        # populate standard AccountTeamMember, so opps are the only scope signal)
-        # while excluding closed-lost / "No Opportunity" one-off dabbles that a
-        # bare open-only or ever-touched filter would respectively miss or over-
-        # include. The open/closed distinction still applies in the pipeline view.
+        # Active-opp book: an account is in the SE's scope only if they are
+        # primary/supporting SE on an OPEN opportunity. This is the tight current
+        # working book (~8 accounts). Accounts owned only via closed-won opps
+        # (e.g. Western Union — 0 open opps with the user as SE) are intentionally
+        # NOT in the SFDC book; they are supported/PS accounts covered by the
+        # ticket + topology tooling, not the active pipeline. (Do not widen to
+        # IsWon here — that pulled in 60+ historical accounts.)
         opp_id_rows = sfdc.query_all(
             f"SELECT AccountId FROM Opportunity "
             f"WHERE ({f_se} = '{uid}' OR {f_se_sup} = '{uid}') "
-            f"AND (IsClosed = false OR IsWon = true) "
+            f"AND IsClosed = false "
             f"AND AccountId != null"
         )
         se_account_ids: set[str] = (
@@ -431,14 +430,10 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
     )
     ps_idx: dict[str, int] = {r["pse__Account__c"]: int(r.get("cnt", 0)) for r in ps_raw if r.get("pse__Account__c")}
 
-    # Build per-account SE name from opportunities (Primary_SE__r.Name).
-    # This covers accounts that are in scope via opportunity but have no ATM SE
-    # entry. Must match the account-scope filter (open OR closed-won) — otherwise
-    # a mature account in the book only via closed-won opps (e.g. Western Union)
-    # gets an empty se_name and is filtered out of any se_name-scoped query
-    # (list_sfdc_accounts(se_name=...), get_my_sfdc_accounts). ORDER BY IsClosed
-    # so OPEN opps are seen first and their SE wins; closed-won only fills the
-    # gap for accounts with no open-opp SE.
+    # Build per-account primary/supporting SE name from OPEN opportunities.
+    # Scope is already open-opp-only, so every in-scope account has an open opp;
+    # deriving SE names from open opps keeps both fields reflecting the current
+    # engagement (no stale closed-won SEs bleeding into supporting SE).
     opp_se_idx: dict[str, str] = {}
     opp_sup_se_idx: dict[str, str] = {}
     if se_user_id and accounts_raw:
@@ -448,26 +443,19 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
         f_se_sup_rel = _rel_name(f_se_sup)
         try:
             opp_se_rows = sfdc.query_all(
-                f"SELECT AccountId, {f_se_rel}.Name, {f_se_sup_rel}.Name, IsClosed "
-                f"FROM Opportunity WHERE (IsClosed = false OR IsWon = true) "
-                f"AND AccountId IN ({id_list}) ORDER BY IsClosed ASC"
+                f"SELECT AccountId, {f_se_rel}.Name, {f_se_sup_rel}.Name "
+                f"FROM Opportunity WHERE IsClosed = false AND AccountId IN ({id_list})"
             )
             for r in opp_se_rows:
                 aid = r.get("AccountId", "")
                 if aid:
-                    is_open = not r.get("IsClosed", True)
                     _se_rel_obj  = r.get(f_se_rel) or {}
                     _sup_rel_obj = r.get(f_se_sup_rel) or {}
                     se_nm  = (_se_rel_obj.get("Name") if isinstance(_se_rel_obj, dict) else "") or ""
                     sup_nm = (_sup_rel_obj.get("Name") if isinstance(_sup_rel_obj, dict) else "") or ""
-                    # PRIMARY SE establishes account ownership → derive from open
-                    # OR closed-won (so mature won accounts like WU resolve to the
-                    # SE who owns them). SUPPORTING SE is a transient per-opp role
-                    # → derive from OPEN opps only, else a years-old closed-won opp
-                    # wrongly shows someone as the account's current supporting SE.
                     if se_nm and aid not in opp_se_idx:
                         opp_se_idx[aid] = se_nm
-                    if sup_nm and is_open and aid not in opp_sup_se_idx:
+                    if sup_nm and aid not in opp_sup_se_idx:
                         opp_sup_se_idx[aid] = sup_nm
         except Exception as e:
             print(f"[sfdc_sync] opp se lookup (non-fatal): {e}")
@@ -830,9 +818,10 @@ def query_sfdc_accounts(se_name: str = "",
                 f"SELECT a.org_name, a.ae_name, a.se_name, a.csm_name, "
                 f"a.contract_end_date, a.active_ps_projects "
                 f"FROM `{_bucket}`.`{_scope}`.`{_ACCTS_COLL}` a "
-                f"WHERE LOWER(a.se_name) LIKE $1 "
-                f"   OR LOWER(a.ae_name) LIKE $1 "
-                f"   OR LOWER(a.csm_name) LIKE $1 "
+                f"WHERE a._type = 'account' "
+                f"  AND (LOWER(a.se_name) LIKE $1 "
+                f"    OR LOWER(a.ae_name) LIKE $1 "
+                f"    OR LOWER(a.csm_name) LIKE $1) "
                 f"ORDER BY a.org_name",
                 QueryOptions(positional_parameters=[f"%{se_name.lower()}%"],
                              timeout=timedelta(seconds=20)),
@@ -842,6 +831,7 @@ def query_sfdc_accounts(se_name: str = "",
                 f"SELECT a.org_name, a.ae_name, a.se_name, a.csm_name, "
                 f"a.contract_end_date, a.active_ps_projects "
                 f"FROM `{_bucket}`.`{_scope}`.`{_ACCTS_COLL}` a "
+                f"WHERE a._type = 'account' "
                 f"ORDER BY a.org_name LIMIT 200",
                 QueryOptions(timeout=timedelta(seconds=20)),
             ))
