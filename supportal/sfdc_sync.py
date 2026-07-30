@@ -349,10 +349,18 @@ def sync_accounts(sfdc: SFDCClient | None = None, cluster=None,
             f"SELECT AccountId FROM AccountTeamMember "
             f"WHERE UserId = '{uid}' AND AccountId != null"
         )
+        # NB: intentionally NOT filtered by IsClosed. This query decides which
+        # ACCOUNTS are in the SE's scope — an account is yours if you were ever
+        # the primary/supporting SE on any of its opportunities, open or closed.
+        # Filtering to open-only silently drops mature accounts whose opps are
+        # all closed-won (e.g. Western Union: 51 closed opps with the user as SE,
+        # 0 open) — and this org does not populate standard AccountTeamMember, so
+        # there is no other path to rescue them. The open/closed distinction still
+        # applies later where it matters (the pipeline/opportunity listing).
         opp_id_rows = sfdc.query_all(
             f"SELECT AccountId FROM Opportunity "
             f"WHERE ({f_se} = '{uid}' OR {f_se_sup} = '{uid}') "
-            f"AND IsClosed = false AND AccountId != null"
+            f"AND AccountId != null"
         )
         se_account_ids: set[str] = (
             {r["AccountId"] for r in atm_id_rows if r.get("AccountId")}
