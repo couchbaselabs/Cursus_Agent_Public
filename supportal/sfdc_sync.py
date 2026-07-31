@@ -889,6 +889,100 @@ def query_sfdc_accounts(se_name: str = "",
         return f"query_sfdc_accounts error: {e}"
 
 
+def lookup_account_live(account_name: str, cluster=None) -> str:
+    """Ad-hoc, read-only LIVE Salesforce lookup for ANY account by name.
+
+    Unlike the SE-scoped sync (`sync_sfdc_data` / `list_sfdc_accounts`), this
+    queries Salesforce directly for any account — not just the current user's
+    book — and returns AE (owner), account type, closed-won TCV, and open
+    opportunities with their SE. It does NOT write to Couchbase or touch the
+    SE-scoped mirror — results are ephemeral (answer-a-question, don't store).
+    Read-only; never mutates Salesforce.
+
+    Use for "what's the ARR/deal size for <account>?", "who's the AE on
+    <account>?", "how big is <account>?" for accounts you don't own.
+    """
+    try:
+        fm = load_field_mapping(cluster, None)
+    except Exception:
+        fm = dict(DEFAULT_FIELD_MAPPING)
+    f_tcv = fm.get("opp_tcv", "Amount")
+    f_se_rel     = _rel_name(fm["opp_se_primary"])
+    f_sup_rel    = _rel_name(fm["opp_se_supporting"])
+
+    try:
+        client = SFDCClient()
+        sf = client.connect()
+    except Exception as e:
+        return f"Live SFDC lookup unavailable (auth failed): {e}"
+
+    # Base org URL for record links — normalize token_host to scheme://host
+    # (the stored value may include the /services/oauth2/token path).
+    import urllib.parse as _up
+    _pp = _up.urlparse(client._cfg.get("token_host", ""))
+    org_base = f"{_pp.scheme}://{_pp.netloc}" if _pp.netloc else "https://couchbase.my.salesforce.com"
+
+    name_q = _soql_str(f"%{account_name}%")
+    try:
+        accts = sf.query_all(
+            f"SELECT Id, Name, Type, Industry, Owner.Name "
+            f"FROM Account WHERE Name LIKE {name_q} AND IsDeleted = false "
+            f"ORDER BY Name LIMIT 10"
+        )
+    except Exception as e:
+        return f"Live SFDC account query failed: {e}"
+    if not accts:
+        return f"No Salesforce account found matching '{account_name}'."
+
+    out: list[str] = []
+    for a in accts:
+        aid = a["Id"]
+        owner = (a.get("Owner") or {}).get("Name", "—")
+        out.append(f"## {a.get('Name','')}  ({a.get('Type') or '—'}, {a.get('Industry') or '—'})")
+        out.append(f"- **AE (owner):** {owner}   ·   SFDC: {org_base}/{aid}")
+
+        # Closed-won TCV
+        try:
+            won = sf.query_all(
+                f"SELECT SUM({f_tcv}) tcv, COUNT(Id) cnt "
+                f"FROM Opportunity WHERE IsWon = true AND AccountId = '{aid}'"
+            )
+            tcv = float((won[0].get("tcv") if won else 0) or 0)
+            wcnt = int((won[0].get("cnt") if won else 0) or 0)
+            out.append(f"- **Closed-Won TCV:** ${tcv:,.0f} across {wcnt} won opps (lifetime bookings, not annual ARR)")
+        except Exception as e:
+            out.append(f"- Closed-Won TCV: lookup failed ({e})")
+
+        # Open opps
+        try:
+            opps = sf.query_all(
+                f"SELECT Name, StageName, CloseDate, {f_tcv}, "
+                f"{f_se_rel}.Name, {f_sup_rel}.Name "
+                f"FROM Opportunity WHERE IsClosed = false AND AccountId = '{aid}' "
+                f"ORDER BY CloseDate"
+            )
+            if opps:
+                out.append(f"- **Open opportunities ({len(opps)}):**")
+                out.append("")
+                out.append("| Opp | Stage | Close | Amount | Primary SE | Supporting SE |")
+                out.append("|-----|-------|-------|--------|-----------|---------------|")
+                for o in opps:
+                    amt = float(o.get(f_tcv) or 0)
+                    se  = (o.get(f_se_rel.split('.')[0]) or {}).get("Name") if isinstance(o.get(f_se_rel.split('.')[0]), dict) else None
+                    sup = (o.get(f_sup_rel.split('.')[0]) or {}).get("Name") if isinstance(o.get(f_sup_rel.split('.')[0]), dict) else None
+                    out.append(f"| {o.get('Name','')[:44]} | {o.get('StageName','')} "
+                               f"| {(o.get('CloseDate') or '')[:10]} | ${amt:,.0f} "
+                               f"| {se or '—'} | {sup or '—'} |")
+                out.append("")
+            else:
+                out.append("- Open opportunities: none")
+        except Exception as e:
+            out.append(f"- Open opportunities: lookup failed ({e})")
+
+    out.append("\n_Live read-only Salesforce lookup — not stored locally. Values are lifetime won-bookings TCV, not current annual ARR._")
+    return "\n".join(out)
+
+
 def get_field_mapping_text(cb_url: str = "", bucket: str = "",
                            username: str = "", password: str = "",
                            use_tls: bool = False, scope: str = "") -> str:

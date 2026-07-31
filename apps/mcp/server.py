@@ -3844,12 +3844,42 @@ def get_se_opportunities(se_name: str) -> str:
 
 @mcp.tool()
 def list_sfdc_accounts(se_name: str = "") -> str:
-    """List Salesforce accounts, optionally filtered to a specific SE."""
+    """List Salesforce accounts, optionally filtered to a specific SE.
+
+    NOTE: this reads the LOCAL SE-scoped mirror (the current user's book only).
+    To look up ANY account regardless of ownership (e.g. Starbucks), use
+    lookup_sfdc_account instead — it queries Salesforce live.
+    """
     try:
         from supportal.sfdc_sync import query_sfdc_accounts
         return query_sfdc_accounts(se_name, *_sfdc_cb_args())
     except Exception as exc:
         return f"list_sfdc_accounts error: {exc}"
+
+
+@mcp.tool()
+def lookup_sfdc_account(account_name: str) -> str:
+    """Ad-hoc, READ-ONLY, LIVE Salesforce lookup for ANY account by name —
+    regardless of whether you own it.
+
+    Unlike list_sfdc_accounts / get_account_opportunities (which read the local
+    SE-scoped mirror = your book only), this queries Salesforce directly and
+    returns AE (owner), account type, closed-won TCV, and open opportunities
+    with their SE. Results are NOT stored — ephemeral, answer-a-question only.
+    Never writes to Salesforce or Couchbase.
+
+    Use for questions about accounts you don't own:
+    "what's the deal size / ARR for Starbucks?", "how big is <account>?",
+    "who's the AE/SE on <account>?". Matches account name with a wildcard, so a
+    partial name works; returns up to 10 matches.
+    """
+    if not account_name.strip():
+        return "account_name is required."
+    try:
+        from supportal.sfdc_sync import lookup_account_live
+        return lookup_account_live(account_name)
+    except Exception as exc:
+        return f"lookup_sfdc_account error: {exc}"
 
 
 @mcp.tool()
