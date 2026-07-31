@@ -54,6 +54,8 @@ flowchart TD
 
 ## Quick start
 
+> **New to this? Start here:** [`docs/quickstart-ticket-interrogation.md`](docs/quickstart-ticket-interrogation.md) — a Docker-based runbook from `git clone` to asking Claude questions about a customer's support tickets, including the Claude Desktop / Claude Code MCP setup and a copy-paste bootstrap prompt.
+
 ### Docker (recommended)
 
 The fastest path — no local Python or Couchbase required.
