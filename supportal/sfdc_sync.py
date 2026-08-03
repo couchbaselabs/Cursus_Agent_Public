@@ -983,6 +983,99 @@ def lookup_account_live(account_name: str, cluster=None) -> str:
     return "\n".join(out)
 
 
+def get_se_opp_worklist(se_user_id: str = "", se_name: str = "",
+                        window_quarters: int = 3, behind_days: int = 0,
+                        cluster=None) -> str:
+    """LIVE, READ-ONLY SFDC worklist for the SE-Section weekly-update tool.
+
+    Returns the current SE's OPEN opportunities in the CQ+`window_quarters`
+    window (default CQ+3 = this fiscal quarter + next 3), ranked by SE-Section
+    staleness (`SE_Update_Age__c` = "SE Section Days Since Last Update"), with
+    the current SE-Section values needed to prepare updates. Read-only; never
+    writes to Salesforce or Couchbase.
+
+    Args:
+        se_user_id:      SFDC User.Id of the SE (preferred). If empty, resolved
+                         from se_name.
+        se_name:         SE full name (fallback if se_user_id not given).
+        window_quarters: forward fiscal-quarter horizon (default 3 = CQ+3).
+        behind_days:     if > 0, only opps whose SE section is at least this
+                         many days stale (the "behind / catch-up" list).
+    """
+    try:
+        fm = load_field_mapping(cluster, None)
+    except Exception:
+        fm = dict(DEFAULT_FIELD_MAPPING)
+    f_se = fm["opp_se_primary"]          # Primary_SE__c
+
+    try:
+        client = SFDCClient()
+        sf = client.connect()
+    except Exception as e:
+        return f"Live SFDC worklist unavailable (auth failed): {e}"
+
+    uid = (se_user_id or "").strip() or (_se_sfdc_user_id(sf, se_name) or "")
+    if not uid:
+        return ("No SFDC user resolved. Set sfdc_user_id in settings, or pass a "
+                "valid se_name.")
+
+    import urllib.parse as _up
+    _pp = _up.urlparse(client._cfg.get("token_host", ""))
+    org_base = f"{_pp.scheme}://{_pp.netloc}" if _pp.netloc else "https://couchbase.my.salesforce.com"
+
+    n = max(0, int(window_quarters or 0))
+    # SOQL fiscal-quarter literals — no manual date math. CQ..CQ+n.
+    if n > 0:
+        window = f"(CloseDate = THIS_FISCAL_QUARTER OR CloseDate = NEXT_N_FISCAL_QUARTERS:{n})"
+    else:
+        window = "CloseDate = THIS_FISCAL_QUARTER"
+
+    try:
+        rows = sf.query_all(
+            f"SELECT Id, Name, Account.Name, StageName, CloseDate, "
+            f"SE_Update_Age__c, Last_updated_SE_Section__c, "
+            f"SE_Next_Steps__c, SE_Technical_Risk__c, SE_Technical_Win__c, POC_Stage__c "
+            f"FROM Opportunity "
+            f"WHERE {f_se} = '{uid}' AND IsClosed = false AND {window} "
+            f"ORDER BY SE_Update_Age__c DESC NULLS FIRST"
+        )
+    except Exception as e:
+        return f"SE worklist query failed: {e}"
+
+    if behind_days > 0:
+        rows = [r for r in rows if (r.get("SE_Update_Age__c") or 0) >= behind_days]
+    if not rows:
+        return (f"No open opportunities in the CQ+{n} window"
+                + (f" stale ≥ {behind_days}d" if behind_days else "")
+                + " where you are SE Opp Primary.")
+
+    def _trunc(v, cap=60):
+        s = (v or "").strip().replace("\n", " ")
+        return (s[:cap] + "…") if len(s) > cap else (s or "—")
+
+    hdr = ["| Age(d) | Account | Opportunity | Stage | Close | SE Next Steps (current) | Tech Risk | Link |",
+           "|-------:|---------|-------------|-------|-------|-------------------------|-----------|------|"]
+    out = [f"## SE-Section worklist — CQ+{n}, {len(rows)} open opps"
+           + (f" (behind ≥ {behind_days}d)" if behind_days else "")
+           + ", ranked by SE-Section staleness\n"]
+    out.extend(hdr)
+    for r in rows:
+        acct = (r.get("Account") or {}).get("Name", "—")
+        age  = r.get("SE_Update_Age__c")
+        out.append(
+            f"| {int(age) if age is not None else '—'} "
+            f"| {acct} | {_trunc(r.get('Name'), 40)} "
+            f"| {r.get('StageName','')} | {(r.get('CloseDate') or '')[:10]} "
+            f"| {_trunc(r.get('SE_Next_Steps__c'))} "
+            f"| {_trunc(r.get('SE_Technical_Risk__c'), 22)} "
+            f"| {org_base}/{r['Id']} |"
+        )
+    out.append("\n_Live read-only SFDC. SE_Update_Age is SFDC-computed (do not edit). "
+               "Prepare SE_Next_Steps + validate SE_Technical_Risk; apply via the Link. "
+               "Never writes to Salesforce._")
+    return "\n".join(out)
+
+
 def get_field_mapping_text(cb_url: str = "", bucket: str = "",
                            username: str = "", password: str = "",
                            use_tls: bool = False, scope: str = "") -> str:

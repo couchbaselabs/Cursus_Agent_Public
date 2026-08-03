@@ -3739,6 +3739,18 @@ def _sfdc_user_name() -> str:
         return ""
 
 
+def _sfdc_user_id() -> str:
+    """Return the SFDC User.Id stored in the active settings profile."""
+    try:
+        app = _app()
+        s = app._load_settings_file()
+        active = s.get("__last__", "")
+        profile = s.get(active, {}) if active else {}
+        return profile.get("sfdc_user_id", "")
+    except Exception:
+        return ""
+
+
 @mcp.tool()
 def get_account_opportunities(organization: str) -> str:
     """Get open Salesforce opportunities for a specific account."""
@@ -3840,6 +3852,29 @@ def get_se_opportunities(se_name: str) -> str:
         return query_se_opportunities(se_name, *_sfdc_cb_args())
     except Exception as exc:
         return f"get_se_opportunities error: {exc}"
+
+
+@mcp.tool()
+def get_se_opp_worklist(window_quarters: int = 3, behind_days: int = 0) -> str:
+    """The current SE's weekly SE-Section worklist — LIVE, READ-ONLY from SFDC.
+
+    Returns your OPEN opportunities in the CQ+window_quarters window (default
+    CQ+3 = this fiscal quarter + next 3) where you are SE Opp Primary, ranked by
+    SE-Section staleness (SE_Update_Age__c = "SE Section Days Since Last Update"),
+    with current SE_Next_Steps / SE_Technical_Risk and a deep-link per opp.
+
+    This is the discovery step for the SE weekly-update workflow: it tells you
+    which opportunities' SE Section is going stale so you can refresh them. It
+    NEVER writes to Salesforce. Pass behind_days>0 for the "catch-up" list (only
+    opps at least that many days stale). Uses the SE identity in settings
+    (sfdc_user_id / sfdc_user_name).
+    """
+    try:
+        from supportal.sfdc_sync import get_se_opp_worklist as _wl
+        return _wl(se_user_id=_sfdc_user_id(), se_name=_sfdc_user_name(),
+                   window_quarters=window_quarters, behind_days=behind_days)
+    except Exception as exc:
+        return f"get_se_opp_worklist error: {exc}"
 
 
 @mcp.tool()
