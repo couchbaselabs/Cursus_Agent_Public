@@ -1076,6 +1076,115 @@ def get_se_opp_worklist(se_user_id: str = "", se_name: str = "",
     return "\n".join(out)
 
 
+# ── GATED WRITE (SE-Section field updates) ────────────────────────────────────
+# The ONLY SFDC write path in Cursus. Read-only-to-customer-systems is the tenet;
+# this is the explicit, gated exception: dry-run by default, field-whitelisted,
+# audited. Never writes anything unless dry_run is explicitly False.
+
+# Whitelist of SE-Section fields this tool may write. Computed rollups
+# (SE_Update_Age__c, *_days, *Last_Updated*) are intentionally absent — they are
+# formula fields and must never be targeted.
+_SE_WRITABLE_FIELDS = {
+    "SE_Next_Steps__c", "SE_Technical_Risk__c", "SE_Technical_Win__c",
+    "SE_Arch_Sizing_Validated__c", "SE_Tech_Decision_Criteria__c", "SE_Use_Case__c",
+    "SE_Next_Steps_Date_Planned_On__c", "SE_Technical_Win_Loss_Notes__c",
+    "POC_Win_Lost_Notes__c", "POC_Stage__c", "POC_Start_Date__c", "POC_End_Date__c",
+    "SE_Date_Tech_Win_is_in_Progress__c", "SE_Technical_Win_Date__c",
+    "CBSE_Improvement_Link__c",
+}
+
+
+def apply_se_opp_updates(opp_id: str, fields: dict | str, dry_run: bool = True,
+                         cluster=None) -> str:
+    """GATED WRITE — update SE-Section fields on ONE opportunity in Salesforce.
+
+    THE ONLY tool in Cursus that writes to a customer system of record. Safe by
+    construction:
+      - dry_run=True (DEFAULT) → returns the PLAN (current → proposed per field),
+        writes NOTHING. You must pass dry_run=False to write.
+      - only fields in _SE_WRITABLE_FIELDS are allowed; anything else is rejected
+        (never the SFDC-computed rollups).
+      - every real write is audited to a `sewrite::<opp>::<ts>` marker doc.
+
+    Args:
+        opp_id:  the 15/18-char Opportunity Id.
+        fields:  dict (or JSON string) of {SFDC_api_name: value} to set. Only the
+                 SE-Section whitelist is permitted.
+        dry_run: True (default) plans without writing; False performs the write.
+    """
+    import json as _json
+    if isinstance(fields, str):
+        try:
+            fields = _json.loads(fields) if fields.strip() else {}
+        except Exception as e:
+            return _json.dumps({"error": f"fields is not valid JSON: {e}"})
+    if not isinstance(fields, dict) or not fields:
+        return _json.dumps({"error": "No fields to update."})
+    if not opp_id:
+        return _json.dumps({"error": "opp_id is required."})
+
+    # Whitelist enforcement — reject anything not an approved SE-Section field.
+    rejected = [k for k in fields if k not in _SE_WRITABLE_FIELDS]
+    if rejected:
+        return _json.dumps({"error": "Refused: fields not in the SE-Section write "
+                                     "whitelist (computed/rollup fields are never "
+                                     "writable).", "rejected": rejected,
+                            "allowed": sorted(_SE_WRITABLE_FIELDS)})
+
+    try:
+        client = SFDCClient()
+        sf = client.connect()
+    except Exception as e:
+        return _json.dumps({"error": f"SFDC auth failed: {e}"})
+
+    # Read current values for the plan / audit (before/after).
+    cols = ", ".join(fields.keys())
+    try:
+        cur_rows = sf.query_all(
+            f"SELECT Id, Name, {cols} FROM Opportunity WHERE Id = '{opp_id}' LIMIT 1")
+        current = cur_rows[0] if cur_rows else {}
+    except Exception as e:
+        return _json.dumps({"error": f"Could not read current opp values: {e}"})
+    if not current:
+        return _json.dumps({"error": f"Opportunity '{opp_id}' not found."})
+
+    plan = {k: {"current": current.get(k), "proposed": v} for k, v in fields.items()}
+    name = current.get("Name", "")
+
+    if dry_run:
+        return _json.dumps({"dry_run": True, "opp_id": opp_id, "opp_name": name,
+                            "would_set": plan,
+                            "note": "No write performed. Call again with dry_run=False to apply."},
+                           default=str)
+
+    # ── Real write ────────────────────────────────────────────────────────────
+    try:
+        sf.Opportunity.update(opp_id, dict(fields))  # 204 on success
+    except Exception as e:
+        return _json.dumps({"error": f"SFDC write failed: {e}", "opp_id": opp_id,
+                            "attempted": plan}, default=str)
+
+    # Best-effort audit marker.
+    audited = False
+    try:
+        import time as _t
+        cfg = _cb_cfg()
+        cl = cluster or _cb_cluster(cfg)
+        col = _get_collection(cl, cfg["bucket"], cfg["scope"], "markers")
+        ts = int(_t.time())
+        col.upsert(f"sewrite::{opp_id}::{ts}", {
+            "_type": "sewrite", "opp_id": opp_id, "opp_name": name,
+            "changes": plan, "written_at": ts, "written_by": "tool:apply_se_opp_updates",
+        })
+        audited = True
+    except Exception:
+        pass
+
+    return _json.dumps({"dry_run": False, "written": True, "opp_id": opp_id,
+                        "opp_name": name, "changed": plan, "audited": audited},
+                       default=str)
+
+
 def get_field_mapping_text(cb_url: str = "", bucket: str = "",
                            username: str = "", password: str = "",
                            use_tls: bool = False, scope: str = "") -> str:

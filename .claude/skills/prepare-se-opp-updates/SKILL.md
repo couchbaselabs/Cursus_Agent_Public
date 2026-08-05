@@ -58,9 +58,21 @@ SE Technical Risk
 
 End with a one-line summary: how many opps are in the list, how many are ≥7 days stale, and the single most-overdue one to do first.
 
+## Step 5 (optional) — Apply, only on explicit confirmation (gated write)
+
+By default this skill is **prepare-only**: hand the human the values + deep-links and let them apply in Salesforce. A gated write exists but is **opt-in and confirmation-required**:
+
+- Only if the user **explicitly asks to apply/write** the updates (e.g. "go ahead and update it", "apply these"), use `mcp__cursus__apply_se_opp_updates`.
+- **Always dry-run first**: call it with `dry_run=true` (the default) and show the plan (current → proposed) for the specific opp.
+- **Get explicit confirmation of the exact values** from the user, then — and only then — call again with `dry_run=false` for that one opp. One opportunity at a time; never batch-write without per-opp confirmation.
+- Only SE-Section whitelist fields can be written (the tool rejects anything else, including computed rollups). If the user asks to write a non-writable field, explain it's not permitted.
+- After a write, confirm what changed (the tool returns the applied diff + audit status).
+
+Do NOT write on your own initiative. Prepare-and-hand-off is the default; writing happens only when the user asks and confirms the values.
+
 ## Rules
 
-- **Read-only. Never call any write/mutate tool.** The output is edits for the human to apply via the Salesforce deep-link. If the user asks you to "just update it in Salesforce," explain that direct SFDC writes aren't enabled yet (that's a future gated capability) and hand them the prepared values + link.
+- **Prepare-first, write only on explicit confirmation.** Default output is edits for the human to apply via the deep-link. The gated write (Step 5) fires only when the user asks to apply AND confirms the exact values, dry-run first, one opp at a time.
 - **No fabrication.** Every drafted value must be grounded in a tool result; where context is thin, say so and keep the draft conservative.
 - **Meaningful, not clock-gaming.** Prepare substantive updates; don't propose trivial edits whose only purpose is resetting `SE_Update_Age__c`.
 - **Per-caller.** The worklist is scoped to whoever is running it (their `sfdc_user_id`/`sfdc_user_name` in settings) — never hardcode a person or a saved report.

@@ -3960,6 +3960,33 @@ def get_se_opportunities(se_name: str) -> str:
 
 
 @mcp.tool()
+def apply_se_opp_updates(opp_id: str, fields_json: str, dry_run: bool = True) -> str:
+    """GATED WRITE — apply reviewed SE-Section field updates to ONE opportunity.
+
+    The ONLY Cursus tool that writes to Salesforce (a customer system of record).
+    SAFE BY DEFAULT: dry_run=True returns the plan (current → proposed) and writes
+    NOTHING; you must pass dry_run=False to actually write. Only SE-Section
+    whitelist fields are allowed (never SFDC-computed rollups). Every real write is
+    audited to a marker.
+
+    Intended flow: the prepare-se-opp-updates skill drafts values → the human
+    reviews/edits → confirm → call this with dry_run=False for the approved opp.
+    NEVER call with dry_run=False without explicit human confirmation of the values.
+
+    Args:
+        opp_id:      the Opportunity Id.
+        fields_json: JSON object of {SFDC_api_name: value}, e.g.
+                     {"SE_Next_Steps__c": "…", "SE_Technical_Risk__c": "Medium"}.
+        dry_run:     True (default) = plan only; False = write (requires confirmation).
+    """
+    try:
+        from supportal.sfdc_sync import apply_se_opp_updates as _apply
+        return _apply(opp_id, fields_json, dry_run=dry_run)
+    except Exception as exc:
+        return f"apply_se_opp_updates error: {exc}"
+
+
+@mcp.tool()
 def get_se_opp_worklist(window_quarters: int = 3, behind_days: int = 0) -> str:
     """The current SE's weekly SE-Section worklist — LIVE, READ-ONLY from SFDC.
 
