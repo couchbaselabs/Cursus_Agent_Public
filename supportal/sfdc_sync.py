@@ -1185,6 +1185,97 @@ def apply_se_opp_updates(opp_id: str, fields: dict | str, dry_run: bool = True,
                        default=str)
 
 
+def get_se_manager_rollup(manager_email: str = "", se_user_id: str = "",
+                          window_quarters: int = 3, behind_days: int = 0,
+                          cluster=None) -> str:
+    """LIVE, READ-ONLY manager rollup — "who's behind across the team" on SE-Section hygiene.
+
+    Aggregates open opps in the CQ+window whose SE Manager is `manager_email`,
+    grouped by SE (Primary_SE__r.Name), showing per-SE how many opps and how
+    stale their SE Sections are (SE_Update_Age__c). Read-only; never writes.
+
+    If manager_email is empty, resolves the current SE's own manager from their
+    book (the most common SE_Manager_Email__c on their open opps) — so an SE can
+    run it to see where they stand relative to the team.
+
+    Args:
+        manager_email:   SE Manager email (e.g. iain.armstrong@couchbase.com).
+        se_user_id:      current SE's SFDC User.Id, used to resolve manager_email
+                         when it's not given.
+        window_quarters: forward fiscal-quarter horizon (default 3 = CQ+3).
+        behind_days:     if > 0, only count opps at least this many days stale.
+    """
+    import json as _json
+    f_se = "Primary_SE__c"
+    try:
+        client = SFDCClient()
+        sf = client.connect()
+    except Exception as e:
+        return f"Live SFDC manager rollup unavailable (auth failed): {e}"
+
+    n = max(0, int(window_quarters or 0))
+    window = (f"(CloseDate = THIS_FISCAL_QUARTER OR CloseDate = NEXT_N_FISCAL_QUARTERS:{n})"
+              if n > 0 else "CloseDate = THIS_FISCAL_QUARTER")
+
+    mgr = (manager_email or "").strip()
+    if not mgr and (se_user_id or "").strip():
+        # Resolve the SE's manager = modal SE_Manager_Email__c across their open opps.
+        try:
+            rows = sf.query_all(
+                f"SELECT SE_Manager_Email__c FROM Opportunity "
+                f"WHERE {f_se} = '{se_user_id}' AND IsClosed = false AND {window} "
+                f"AND SE_Manager_Email__c != null")
+            from collections import Counter
+            c = Counter((r.get("SE_Manager_Email__c") or "").strip() for r in rows if r.get("SE_Manager_Email__c"))
+            mgr = c.most_common(1)[0][0] if c else ""
+        except Exception:
+            mgr = ""
+    if not mgr:
+        return _json.dumps({"error": "No SE Manager resolved. Pass manager_email, or "
+                                     "ensure the SE has open opps with SE_Manager_Email__c set."})
+
+    try:
+        rows = sf.query_all(
+            f"SELECT Id, Name, Account.Name, StageName, SE_Update_Age__c, "
+            f"Primary_SE__r.Name "
+            f"FROM Opportunity "
+            f"WHERE SE_Manager_Email__c = {_soql_str(mgr)} AND IsClosed = false AND {window} "
+            f"ORDER BY SE_Update_Age__c DESC NULLS FIRST")
+    except Exception as e:
+        return f"Manager rollup query failed: {e}"
+
+    if behind_days > 0:
+        rows = [r for r in rows if (r.get("SE_Update_Age__c") or 0) >= behind_days]
+    if not rows:
+        return f"No open opps in CQ+{n} for manager {mgr}" + (f" stale ≥ {behind_days}d" if behind_days else "") + "."
+
+    # Aggregate per SE.
+    per_se: dict[str, dict] = {}
+    for r in rows:
+        se = (r.get("Primary_SE__r") or {}).get("Name") or "(no SE assigned)"
+        age = r.get("SE_Update_Age__c") or 0
+        d = per_se.setdefault(se, {"opps": 0, "total_age": 0, "behind7": 0, "worst": None, "worst_age": -1})
+        d["opps"] += 1
+        d["total_age"] += age
+        if age >= 7:
+            d["behind7"] += 1
+        if age > d["worst_age"]:
+            d["worst_age"] = age
+            d["worst"] = f"{(r.get('Account') or {}).get('Name','')} — {r.get('Name','')[:34]} ({int(age)}d)"
+
+    order = sorted(per_se.items(), key=lambda kv: -kv[1]["total_age"])
+    out = [f"## SE-Section rollup for manager {mgr} — CQ+{n}"
+           + (f", behind ≥ {behind_days}d" if behind_days else "")
+           + f"  ({len(rows)} opps, {len(per_se)} SEs)\n",
+           "| SE | Opps | ≥7d stale | Total SE-Section days | Most overdue |",
+           "|----|-----:|----------:|----------------------:|--------------|"]
+    for se, d in order:
+        out.append(f"| {se} | {d['opps']} | {d['behind7']} | {int(d['total_age'])} | {d['worst'] or '—'} |")
+    out.append("\n_Live read-only SFDC. Ranked by total SE-Section staleness (most-behind SE first). "
+               "SE_Update_Age is SFDC-computed. Never writes to Salesforce._")
+    return "\n".join(out)
+
+
 def get_field_mapping_text(cb_url: str = "", bucket: str = "",
                            username: str = "", password: str = "",
                            use_tls: bool = False, scope: str = "") -> str:

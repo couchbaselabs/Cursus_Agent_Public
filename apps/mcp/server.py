@@ -4010,6 +4010,30 @@ def get_se_opp_worklist(window_quarters: int = 3, behind_days: int = 0) -> str:
 
 
 @mcp.tool()
+def get_se_manager_rollup(manager_email: str = "", window_quarters: int = 3,
+                          behind_days: int = 0) -> str:
+    """Manager rollup — LIVE, READ-ONLY "who's behind across the team" on SE-Section hygiene.
+
+    Aggregates every OPEN opp in the CQ+window whose SE Manager is manager_email,
+    grouped by SE (Primary SE / SE Opp Primary), showing per-SE: how many opps,
+    how many are ≥7 days stale, total SE-Section staleness days, and the single
+    most-overdue opp — ranked most-behind-SE first. This is the team view that
+    rolls up to the SE manager (e.g. Iain Armstrong).
+
+    If manager_email is omitted, resolves the CURRENT SE's own manager from their
+    book (the most common SE_Manager_Email__c on their open opps), so an SE can
+    run it to see where they stand relative to the team. NEVER writes to SFDC.
+    Pass behind_days>0 to count only opps at least that many days stale.
+    """
+    try:
+        from supportal.sfdc_sync import get_se_manager_rollup as _roll
+        return _roll(manager_email=manager_email, se_user_id=_sfdc_user_id(),
+                     window_quarters=window_quarters, behind_days=behind_days)
+    except Exception as exc:
+        return f"get_se_manager_rollup error: {exc}"
+
+
+@mcp.tool()
 def list_sfdc_accounts(se_name: str = "") -> str:
     """List Salesforce accounts, optionally filtered to a specific SE.
 
