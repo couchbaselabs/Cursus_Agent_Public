@@ -5,9 +5,9 @@ description: Prepare weekly SE-Section opportunity updates for the current SE �
 
 # Prepare SE-Section Opportunity Updates (v0.2)
 
-Every SE must keep the **SE Section** of their opportunities current in Salesforce each week (Next Steps, Technical Risk, POC status…) and everyone falls behind. This skill finds the opportunities going stale and **prepares** the updates from real context — the SE reviews and applies them in Salesforce. It **never writes to Salesforce** (assist tier; a gated write may come later).
+Every SE must keep the **SE Section** of their opportunities current in Salesforce each week (Next Steps, Technical Risk, POC status…) and everyone falls behind. This skill finds the opportunities going stale and **prepares** the updates from real context — the SE reviews and applies them in Salesforce. It is **prepare-first**: by default it writes nothing; an **opt-in, per-opp gated write** (Step 5) applies a confirmed value only when you explicitly ask.
 
-**Scope of v0.1:** the **SE-Section fields** only — primarily `SE Next Steps` (drafted) and `SE Technical Risk` (validated). Activity logging (Events/Tasks from meetings) is a later increment that depends on the harvester; do not attempt it here.
+**Scope of v0.2:** the **SE-Section fields** only — primarily `SE Next Steps` (drafted) and `SE Technical Risk` (validated). Activity logging (Events/Tasks from meetings) is a later increment that depends on the harvester; do not attempt it here.
 
 ## Step 1 — Get the worklist
 
@@ -59,7 +59,7 @@ Recommend a value for **every** opp — including resolving every opp that curre
 - **Unchanged** is a valid recommendation — state it explicitly with the reason.
 Every recommendation needs a one-line evidence-based **Why**. Risk is a judgment call, so frame it as "confirm/adjust", but always commit to a recommended value.
 
-Do NOT touch the SFDC-computed rollups (SE Section Days Since Last Update, POC Days Open, any "days"/"Last Updated" field). In v0.1 leave the other SE-Section fields (SDK type, POC dates, Tech Win, etc.) alone unless the user asks.
+Do NOT touch the SFDC-computed rollups (SE Section Days Since Last Update, POC Days Open, any "days"/"Last Updated" field). In v0.2 leave the other SE-Section fields (SDK type, POC dates, Tech Win, etc.) alone unless the user asks.
 
 ## Step 4 — Present the review package (CODIFIED OUTPUT)
 
