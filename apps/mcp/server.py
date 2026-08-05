@@ -773,6 +773,72 @@ def check_connectivity() -> str:
 # SCRAPE JOBS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _open_job_cluster():
+    """Open a CB cluster for cross-process job reads. Returns (cluster, cfg) or (None, None).
+
+    Scrape jobs are tracked in per-process memory (app._SCRAPE_JOBS), so a job
+    started on one MCP process/instance is invisible to another. They are also
+    persisted to CB as scrape_job::<id> docs — this lets get_scrape_status /
+    wait_for_scrape fall back to that shared record, so job status is visible
+    across the multiple run_mcp.py processes a typical setup runs.
+    """
+    try:
+        cfg = _cfg()
+        app = _app()
+        from couchbase.cluster import Cluster
+        from couchbase.options import ClusterOptions
+        from couchbase.auth import PasswordAuthenticator
+        from datetime import timedelta
+        conn = app._cb_conn_str(cfg["cb_url"], cfg["use_tls"])
+        c = Cluster(conn, ClusterOptions(PasswordAuthenticator(cfg["username"], cfg["password"])))
+        c.wait_until_ready(timedelta(seconds=5))
+        return c, cfg
+    except Exception:
+        return None, None
+
+
+def _job_from_cb(job_id: str, cluster=None, cfg=None) -> dict | None:
+    """Read a scrape_job::<id> doc from CB. Reuses `cluster` if given, else opens one."""
+    if not job_id:
+        return None
+    close = False
+    try:
+        if cluster is None:
+            cluster, cfg = _open_job_cluster()
+            close = True
+        if cluster is None:
+            return None
+        return cluster.bucket(cfg["bucket"]).scope(cfg["scope"]).collection(
+            cfg["collection"]).get(f"scrape_job::{job_id}").content_as[dict]
+    except Exception:
+        return None
+    finally:
+        if close and cluster is not None:
+            try:
+                cluster.close()
+            except Exception:
+                pass
+
+
+def _recent_jobs_from_cb(limit: int = 10) -> list[dict]:
+    """Query recent scrape_job:: docs from CB (used when in-memory state is empty)."""
+    cluster, cfg = _open_job_cluster()
+    if cluster is None:
+        return []
+    try:
+        ks = f"`{cfg['bucket']}`.`{cfg['scope']}`.`{cfg['collection']}`"
+        return list(cluster.query(
+            f"SELECT j.* FROM {ks} j WHERE META(j).id LIKE 'scrape_job::%' "
+            f"ORDER BY j.started_at DESC LIMIT {int(limit)}"))
+    except Exception:
+        return []
+    finally:
+        try:
+            cluster.close()
+        except Exception:
+            pass
+
+
 @mcp.tool()
 def get_scrape_status(job_id: str = "") -> str:
     """
@@ -783,17 +849,19 @@ def get_scrape_status(job_id: str = "") -> str:
     """
     app = _app()
     jobs = app._SCRAPE_JOBS
-    if not jobs:
-        return json.dumps({"message": "No scrape jobs in this session."})
-
     now = time.time()
-    if job_id and job_id in jobs:
-        jobs_to_show = [jobs[job_id]]
-    elif job_id:
-        return json.dumps({"error": f"Job '{job_id}' not found.",
-                           "recent_ids": list(jobs)[-5:]})
+    if job_id:
+        # In-memory first, then the shared CB record (cross-process/instance).
+        j = jobs.get(job_id) or _job_from_cb(job_id)
+        if not j:
+            return json.dumps({"error": f"Job '{job_id}' not found (checked memory + CB).",
+                               "recent_ids": list(jobs)[-5:]})
+        jobs_to_show = [j]
     else:
-        jobs_to_show = list(reversed(list(jobs.values())))[:10]
+        jobs_to_show = (list(reversed(list(jobs.values())))[:10] if jobs
+                        else _recent_jobs_from_cb(10))
+        if not jobs_to_show:
+            return json.dumps({"message": "No scrape jobs found (in-memory or persisted)."})
 
     out = []
     for j in jobs_to_show:
@@ -899,14 +967,31 @@ def wait_for_scrape(job_id: str = "", timeout_s: int = 240) -> str:
     timeout_s = min(max(int(timeout_s), 5), 570)
     deadline = time.time() + timeout_s
 
+    # If the target job isn't in this process's memory, open ONE CB connection and
+    # reuse it across the poll loop so a job running on another MCP process/instance
+    # is still visible (its scrape_job:: doc is updated by the owning process).
+    _cb = _cbcfg = None
+    if job_id and job_id not in app._SCRAPE_JOBS:
+        _cb, _cbcfg = _open_job_cluster()
+
     def _watched() -> list[dict]:
         jobs = app._SCRAPE_JOBS
         if job_id:
-            return [jobs[job_id]] if job_id in jobs else []
+            if job_id in jobs:
+                return [jobs[job_id]]
+            if _cb is not None:
+                j = _job_from_cb(job_id, _cb, _cbcfg)
+                return [j] if j else []
+            return []
         return [j for j in jobs.values()]
 
     if job_id and not _watched():
-        return json.dumps({"error": f"Job '{job_id}' not found.",
+        if _cb is not None:
+            try:
+                _cb.close()
+            except Exception:
+                pass
+        return json.dumps({"error": f"Job '{job_id}' not found (checked memory + CB).",
                            "recent_ids": list(app._SCRAPE_JOBS)[-5:]})
 
     while time.time() < deadline:
@@ -930,6 +1015,11 @@ def wait_for_scrape(job_id: str = "", timeout_s: int = 240) -> str:
     }
     if reaped:
         out["reaped_lost_jobs"] = reaped
+    if _cb is not None:
+        try:
+            _cb.close()
+        except Exception:
+            pass
     return json.dumps(out, default=str)
 
 
@@ -1564,13 +1654,22 @@ def get_failure_insights(days: int = 7, organization: str = "") -> str:
 @mcp.tool()
 def check_data_freshness(organization: str) -> str:
     """
-    Verify the local ticket cache against LIVE Supportal data and persist a
-    freshness marker documenting the result.
+    Presence-only reconciliation of the local ticket cache vs LIVE Supportal
+    snapshot references. NARROW SIGNAL — see the warning below.
 
-    Compares the set of ticket IDs referenced by the org's live snapshots
-    (snapshot.zendesk[] via the Supportal Analytics API) against ticket IDs
-    present in the local Couchbase cache. Any ID present live but missing
-    locally means the local cache is behind and a rescrape is warranted.
+    ⚠️ NOT THE FRESHNESS GATE. This detects only ticket IDs that are MISSING
+    locally (present in the org's live snapshot.zendesk[] but not in the cache).
+    It does NOT detect STATUS DRIFT — a ticket that changed open→solved/archived,
+    or a priority change, will still be reported `fresh` here because its ID is
+    present. It also only sees tickets that produced a snapshot (a subset). So a
+    `fresh` result here says nothing about whether open/pending statuses are
+    current. Do NOT use it to decide whether an org needs refreshing.
+
+    USE `smart_refresh` AS THE FRESHNESS GATE instead: it diffs the Supportal
+    listing (which exposes status/solved/priority) on six signals — new, status
+    change, solved change, priority escalation, stub, stale-open — and re-pulls
+    what changed. `check_data_freshness` is a complementary check for the narrow
+    "are any snapshot-referenced tickets missing entirely?" case only.
 
     Note the check is one-directional by design: local tickets that never
     produced a snapshot won't appear in live snapshot.zendesk[] arrays, so
@@ -1594,6 +1693,12 @@ def check_data_freshness(organization: str) -> str:
             cookie=cfg["cookie"],
             verified_by="tool:check_data_freshness",
         )
+        if isinstance(marker, dict):
+            marker["signal"] = "presence_only"
+            marker["status_drift_detected"] = None  # this check cannot detect status drift
+            marker["note"] = ("Presence-only: 'fresh' means no snapshot-referenced ticket ID "
+                              "is missing locally. It does NOT confirm open/pending statuses are "
+                              "current. Use smart_refresh as the freshness gate.")
         return json.dumps(marker, default=str)
     except Exception as exc:
         _log_tool_failure("check_data_freshness", exc, organization)
