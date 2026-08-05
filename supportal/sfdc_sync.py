@@ -1053,8 +1053,8 @@ def get_se_opp_worklist(se_user_id: str = "", se_name: str = "",
         s = (v or "").strip().replace("\n", " ")
         return (s[:cap] + "…") if len(s) > cap else (s or "—")
 
-    hdr = ["| Age(d) | Account | Opportunity | Stage | Close | SE Next Steps (current) | Tech Risk | Link |",
-           "|-------:|---------|-------------|-------|-------|-------------------------|-----------|------|"]
+    hdr = ["| Age(d) | Account | Opportunity | Opp ID | Stage | Close | SE Next Steps (current) | Tech Risk | Link |",
+           "|-------:|---------|-------------|--------|-------|-------|-------------------------|-----------|------|"]
     out = [f"## SE-Section worklist — CQ+{n}, {len(rows)} open opps"
            + (f" (behind ≥ {behind_days}d)" if behind_days else "")
            + ", ranked by SE-Section staleness\n"]
@@ -1064,7 +1064,7 @@ def get_se_opp_worklist(se_user_id: str = "", se_name: str = "",
         age  = r.get("SE_Update_Age__c")
         out.append(
             f"| {int(age) if age is not None else '—'} "
-            f"| {acct} | {_trunc(r.get('Name'), 40)} "
+            f"| {acct} | {_trunc(r.get('Name'), 40)} | {r['Id']} "
             f"| {r.get('StageName','')} | {(r.get('CloseDate') or '')[:10]} "
             f"| {_trunc(r.get('SE_Next_Steps__c'))} "
             f"| {_trunc(r.get('SE_Technical_Risk__c'), 22)} "

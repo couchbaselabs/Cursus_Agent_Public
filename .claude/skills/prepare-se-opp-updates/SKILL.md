@@ -1,9 +1,9 @@
 ---
 name: prepare-se-opp-updates
-description: Prepare weekly SE-Section opportunity updates for the current SE — a review package of proposed SE Next Steps + validated SE Technical Risk for the opportunities whose SE Section is going stale, so the SE can apply them in Salesforce fast. Use when the user asks to "prep my SE updates", "what SE opps am I behind on", "update my opportunities", "SE section updates", or wants to catch up their weekly Salesforce SE hygiene. v0.1 — SE-Section fields only (activity logging comes later). READ-ONLY: never writes to Salesforce; produces edits for the human to apply.
+description: Prepare weekly SE-Section opportunity updates for the current SE — a review package of dated SE Next Steps notes (grouped by account motion) plus a fixed-column risk table (Account | Opportunity | Opp ID | Stage | Close | Current Risk | Recommended Risk | Why) for the opportunities whose SE Section is going stale, so the SE can apply them in Salesforce fast. Use when the user asks to "prep my SE updates", "what SE opps am I behind on", "update my opportunities", "SE section updates", or wants to catch up their weekly Salesforce SE hygiene. v0.2 — SE-Section fields only (activity logging comes later). Prepare-first; optional gated per-opp write on explicit confirmation.
 ---
 
-# Prepare SE-Section Opportunity Updates (v0.1)
+# Prepare SE-Section Opportunity Updates (v0.2)
 
 Every SE must keep the **SE Section** of their opportunities current in Salesforce each week (Next Steps, Technical Risk, POC status…) and everyone falls behind. This skill finds the opportunities going stale and **prepares** the updates from real context — the SE reviews and applies them in Salesforce. It **never writes to Salesforce** (assist tier; a gated write may come later).
 
@@ -29,34 +29,64 @@ For each opportunity in scope, pull the account's recent support signals (this i
 
 Keep it light — a couple of calls per account. If an account has no local ticket data, note that and draft from the opp's own fields (stage, current Next Steps) rather than inventing signals. **Never fabricate a ticket, number, or event** — every claim in a drafted update must trace to a tool result.
 
-## Step 3 — Prepare the two SE-Section fields
+## Step 3 — Prepare the two SE-Section fields (CODIFIED FORMAT)
 
-Per opportunity, produce a proposed update:
+Per opportunity, produce a proposed update in **exactly** these two shapes.
 
-- **SE Next Steps** (`SE_Next_Steps__c`) — DRAFT concrete next steps from: the current Next Steps (what was planned), the sales stage, and the open tickets/signals from Step 2. One to three specific, dated-where-possible actions. Make it something the SE would actually paste.
-- **SE Technical Risk** (`SE_Technical_Risk__c`) — VALIDATE, don't assert: show the current value, then a *suggested* value/annotation derived from signals (e.g. open P1s or degraded cluster health → elevated risk; clean → low). Frame it as "confirm/adjust", because risk is a judgment call.
+### 3a — SE Next Steps (`SE_Next_Steps__c`) — the dated narrative note
 
-Do NOT touch the SFDC-computed rollups (SE Section Days Since Last Update, POC Days Open, the "days"/"Last Updated" fields), and in v0.1 leave the other SE-Section fields (SDK type, POC dates, Tech Win, etc.) alone unless the user asks — keep the output focused and trustworthy.
-
-## Step 4 — Present the review package
-
-Render one block per opportunity, ranked by staleness (most stale first):
+DRAFT a concrete update from the current Next Steps (what was planned), the sales stage, and the signals from Step 2. **Every drafted note follows this template verbatim:**
 
 ```
-### <Account> — <Opportunity>   ·   stale <N> days   ·   <stage>, close <date>
-Open <SFDC link>
-
-SE Next Steps
-  current:  <current or "(empty)">
-  proposed: <drafted next steps>
-  because:  <the tickets/signals that justify it>
-
-SE Technical Risk
-  current:  <current or "(empty)">
-  suggested: <value/annotation>  — confirm or adjust
+<YYYY-MM-DD> <SE-initials>: <2–5 sentence narrative grounded in real signals — what
+moved this week, who's involved, what the state is>. Next: <1–3 specific, named actions>.
 ```
 
-End with a one-line summary: how many opps are in the list, how many are ≥7 days stale, and the single most-overdue one to do first.
+- **Date** = today (ISO). **Initials** = the running SE's initials (derive from `sfdc_user_name` in settings — e.g. "Austin Gonyou" → `AG`). This mirrors how SEs hand-stamp the field, so a human can paste it as-is.
+- The narrative must name real people, dates, ticket/meeting references from Step 2 — **never generic filler**. If context is thin, say so plainly and keep it short rather than padding.
+- **Always end with a `Next:` clause** — the forward actions are the point of the field. One to three, specific and named ("push Travis's team for TSO sign-off", not "follow up").
+- **Meaningful, not clock-gaming** — the note must describe a real change; do not draft a cosmetic edit whose only purpose is resetting `SE_Update_Age__c`. If nothing genuinely moved, say the opp is **genuinely stalled** (see Step 4) rather than manufacturing an update.
+
+### 3b — Shared-account motion (group, don't repeat)
+
+When several opps sit on **one account motion** (e.g. NetDocuments' 4 opps all driven by one POC thread, GoDaddy's 6 on one biweekly-sync motion), write the shared context **once** as a short account preamble, then per-opp notes that carry only that opp's **delta** (its specific phase/scope/next-step). Don't paste the same paragraph into every opp — the per-opp `Next:` is where they diverge.
+
+### 3c — SE Technical Risk (`SE_Technical_Risk__c`) — assessed, not asserted
+
+Recommend a value for **every** opp — including resolving every opp that currently shows `—`/empty to a real assessed value (`Low`/`Medium`/`High`). Risk can move in **either direction** on evidence:
+- **Down** when signals de-risk it: a logged Technical Win, a clean cluster, verbal/procurement reached.
+- **Up** when signals elevate it: open P1s, an unresolved competitive comparison ("stonewalled"), or **no activity trace for months** (a stalled opp is *higher* risk than a merely stale one, not lower).
+- **Unchanged** is a valid recommendation — state it explicitly with the reason.
+Every recommendation needs a one-line evidence-based **Why**. Risk is a judgment call, so frame it as "confirm/adjust", but always commit to a recommended value.
+
+Do NOT touch the SFDC-computed rollups (SE Section Days Since Last Update, POC Days Open, any "days"/"Last Updated" field). In v0.1 leave the other SE-Section fields (SDK type, POC dates, Tech Win, etc.) alone unless the user asks.
+
+## Step 4 — Present the review package (CODIFIED OUTPUT)
+
+Two artifacts, in this order.
+
+### 4a — Drafted notes, grouped by account
+
+Group opps under their account (shared-motion preamble once per Step 3b), most-stale account/opp first. Per opp:
+
+```
+<Account> — <Opportunity> — <Stage>, close <date>
+<the dated SE_Next_Steps note from Step 3a>
+```
+
+### 4b — The consolidated risk table (FIXED COLUMNS, in this order)
+
+Always render this exact table — one row per opp in scope, same order as the notes:
+
+```
+| Account | Opportunity | Opp ID | Stage | Close | Current Risk | Recommended Risk | Why |
+```
+
+- **Opp ID** = the 18-char SFDC Id straight from the worklist's `Opp ID` column (the deep-link is `https://couchbase.my.salesforce.com/<id>`). Never infer or fabricate an Id; if an opp wasn't in the worklist, cross-check it via `lookup_sfdc_account` before putting an Id in the table.
+- **Current Risk** = the live `SE_Technical_Risk__c` value (`—` if empty). **Recommended Risk** = your Step 3c assessment. **Why** = the one-line evidence.
+- When Recommended ≠ Current, that delta is the actionable signal — surface the notable ones (biggest risk increases, especially newly-`—`→High) as one or two explicit call-outs beneath the table, not buried in a row.
+
+End with a one-line summary: how many opps, how many are ≥7 days stale, the single most-overdue to do first, and any opp flagged **genuinely stalled** (real deal risk, not just update-hygiene) that needs a human check-in rather than a note.
 
 ## Step 5 (optional) — Apply, only on explicit confirmation (gated write)
 
