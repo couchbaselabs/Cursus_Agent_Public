@@ -1,6 +1,6 @@
 ---
 name: prepare-se-opp-updates
-description: Prepare weekly SE-Section opportunity updates for the current SE — a review package of dated SE Next Steps notes (grouped by account motion) plus a fixed-column risk table (Account | Opportunity | Opp ID | Stage | Close | Current Risk | Recommended Risk | Why) for the opportunities whose SE Section is going stale, so the SE can apply them in Salesforce fast. Use when the user asks to "prep my SE updates", "what SE opps am I behind on", "update my opportunities", "SE section updates", or wants to catch up their weekly Salesforce SE hygiene. v0.2 — SE-Section fields only (activity logging comes later). Prepare-first; optional gated per-opp write on explicit confirmation.
+description: Prepare weekly SE-Section opportunity updates for the current SE — a prepared-updates table (Account | Opportunity | Opp ID | Last Update | Proposed Next Steps | Justification, with Next Steps and Justification as separate columns and the current on-file value reiterated as a reality check) plus a risk table (Account | Opportunity | Opp ID | Stage | Close | Current Risk | Recommended Risk | Why) for the opportunities whose SE Section is going stale, so the SE can apply them in Salesforce fast. Use when the user asks to "prep my SE updates", "what SE opps am I behind on", "update my opportunities", "SE section updates", or wants to catch up their weekly Salesforce SE hygiene. v0.2 — SE-Section fields only (activity logging comes later). Prepare-first; optional gated per-opp write on explicit confirmation.
 ---
 
 # Prepare SE-Section Opportunity Updates (v0.2)
@@ -33,9 +33,16 @@ Keep it light — a couple of calls per account. If an account has no local tick
 
 Per opportunity, produce a proposed update in **exactly** these two shapes.
 
-### 3a — SE Next Steps (`SE_Next_Steps__c`) — the dated narrative note
+### 3a — Reality-check against the last update FIRST
 
-DRAFT a concrete update from the current Next Steps (what was planned), the sales stage, and the signals from Step 2. **Every drafted note follows this template verbatim:**
+`SE_Next_Steps__c` is an **append-log**: SEs stack dated entries newest-first and never overwrite. The worklist surfaces the **latest entry** (plus a count of prior entries) in its "Current SE Next Steps — latest entry (reality check)" block, with the last-updated date. Before drafting anything, **restate that latest entry** and anchor the new draft to it:
+- The new draft must be **consistent with and advance from** what's actually on file — it continues the story, it doesn't contradict or silently discard the prior state. If your Step-2 signals conflict with the last entry, that conflict is itself worth surfacing (something changed), not papering over.
+- **The prepared value PREPENDS a new dated line above the existing log — it never replaces it.** When presenting (and if ever applying) the update, preserve the prior entries; overwriting the field would destroy the note history.
+- **If none exists on file** (empty / "(none on file)"), there's no baseline to check against — that's fine; draft fresh from Step 2, and the rest of the logic proceeds normally.
+
+### 3b — SE Next Steps (`SE_Next_Steps__c`) — the dated narrative note
+
+DRAFT a concrete update from the last update (3a), the sales stage, and the signals from Step 2. **Every drafted note follows this template verbatim:**
 
 ```
 <YYYY-MM-DD> <SE-initials>: <2–5 sentence narrative grounded in real signals — what
@@ -46,12 +53,13 @@ moved this week, who's involved, what the state is>. Next: <1–3 specific, name
 - The narrative must name real people, dates, ticket/meeting references from Step 2 — **never generic filler**. If context is thin, say so plainly and keep it short rather than padding.
 - **Always end with a `Next:` clause** — the forward actions are the point of the field. One to three, specific and named ("push Travis's team for TSO sign-off", not "follow up").
 - **Meaningful, not clock-gaming** — the note must describe a real change; do not draft a cosmetic edit whose only purpose is resetting `SE_Update_Age__c`. If nothing genuinely moved, say the opp is **genuinely stalled** (see Step 4) rather than manufacturing an update.
+- **Keep the forward actions and the evidence separable** — the `Next:` clause is the actions; the evidence/reasoning that justifies them is presented in its own column (Step 4a), not fused into one blob.
 
-### 3b — Shared-account motion (group, don't repeat)
+### 3c — Shared-account motion (group, don't repeat)
 
 When several opps sit on **one account motion** (e.g. NetDocuments' 4 opps all driven by one POC thread, GoDaddy's 6 on one biweekly-sync motion), write the shared context **once** as a short account preamble, then per-opp notes that carry only that opp's **delta** (its specific phase/scope/next-step). Don't paste the same paragraph into every opp — the per-opp `Next:` is where they diverge.
 
-### 3c — SE Technical Risk (`SE_Technical_Risk__c`) — assessed, not asserted
+### 3d — SE Technical Risk (`SE_Technical_Risk__c`) — assessed, not asserted
 
 Recommend a value for **every** opp — including resolving every opp that currently shows `—`/empty to a real assessed value (`Low`/`Medium`/`High`). Risk can move in **either direction** on evidence:
 - **Down** when signals de-risk it: a logged Technical Win, a clean cluster, verbal/procurement reached.
@@ -65,25 +73,29 @@ Do NOT touch the SFDC-computed rollups (SE Section Days Since Last Update, POC D
 
 Two artifacts, in this order.
 
-### 4a — Drafted notes, grouped by account
+### 4a — The prepared-updates table (FIXED COLUMNS, in this order)
 
-Group opps under their account (shared-motion preamble once per Step 3b), most-stale account/opp first. Per opp:
+Group by account (shared-motion preamble once per Step 3c), most-stale account/opp first. Render this exact table — **Next Steps and Justification are separate columns**, and the **Last Update** column reiterates the current on-file value as the reality-check:
 
 ```
-<Account> — <Opportunity> — <Stage>, close <date>
-<the dated SE_Next_Steps note from Step 3a>
+| Account | Opportunity | Opp ID | Last Update (current) | Proposed Next Steps | Justification |
 ```
+
+- **Last Update (current)** = the untruncated current `SE_Next_Steps__c` from the worklist's full-text reality-check block, condensed to its gist + the last-updated date (e.g. "6/22: right-sized env, awaiting…"). If none on file, put `— (none on file)` — that's the "no baseline, draft fresh" case, and the rest of the row proceeds normally.
+- **Proposed Next Steps** = the dated note from Step 3b — the value to paste into `SE_Next_Steps__c` (narrative + `Next:` actions).
+- **Justification** = the evidence/reasoning that grounds the proposed step — the tickets, meetings, wins, signals from Step 2 (e.g. "7/31 PATH mobile rebuy win; biweekly sync 8/18"). This is the "because", kept in its own column, **never** fused into the Next Steps blob.
+- **Opp ID** = the 18-char SFDC Id straight from the worklist's `Opp ID` column. Never infer or fabricate an Id.
 
 ### 4b — The consolidated risk table (FIXED COLUMNS, in this order)
 
-Always render this exact table — one row per opp in scope, same order as the notes:
+Always render this exact table too — one row per opp in scope, same order as 4a:
 
 ```
 | Account | Opportunity | Opp ID | Stage | Close | Current Risk | Recommended Risk | Why |
 ```
 
-- **Opp ID** = the 18-char SFDC Id straight from the worklist's `Opp ID` column (the deep-link is `https://couchbase.my.salesforce.com/<id>`). Never infer or fabricate an Id; if an opp wasn't in the worklist, cross-check it via `lookup_sfdc_account` before putting an Id in the table.
-- **Current Risk** = the live `SE_Technical_Risk__c` value (`—` if empty). **Recommended Risk** = your Step 3c assessment. **Why** = the one-line evidence.
+- **Opp ID** = same as 4a (the deep-link is `https://couchbase.my.salesforce.com/<id>`); if an opp wasn't in the worklist, cross-check it via `lookup_sfdc_account` before putting an Id in the table.
+- **Current Risk** = the live `SE_Technical_Risk__c` value (`—` if empty). **Recommended Risk** = your Step 3d assessment. **Why** = the one-line evidence.
 - When Recommended ≠ Current, that delta is the actionable signal — surface the notable ones (biggest risk increases, especially newly-`—`→High) as one or two explicit call-outs beneath the table, not buried in a row.
 
 End with a one-line summary: how many opps, how many are ≥7 days stale, the single most-overdue to do first, and any opp flagged **genuinely stalled** (real deal risk, not just update-hygiene) that needs a human check-in rather than a note.

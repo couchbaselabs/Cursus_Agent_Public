@@ -1070,6 +1070,41 @@ def get_se_opp_worklist(se_user_id: str = "", se_name: str = "",
             f"| {_trunc(r.get('SE_Technical_Risk__c'), 22)} "
             f"| {org_base}/{r['Id']} |"
         )
+    # SE Next Steps is an APPEND-LOG: SEs stack dated entries newest-first
+    # ("2026-02-04  AH: … 2026-01-28  AH: …"), they don't overwrite. The table
+    # above truncates to 60 chars (useless as a reality check), so surface the
+    # LATEST dated entry in full here — the real "last update" — plus a count of
+    # prior entries, so drafting can anchor to what's actually current without
+    # drowning in the whole history. Note for any apply: PREPEND, never replace.
+    import re as _re
+    _stamp_re = _re.compile(r"\d{4}-\d{2}-\d{2}\s+[A-Za-z]{2,4}\s*:")
+
+    def _latest_entry(text: str):
+        t = (text or "").strip().replace("\n", " ")
+        if not t:
+            return None, 0
+        starts = [m.start() for m in _stamp_re.finditer(t)]
+        if len(starts) <= 1:
+            return t, 0
+        # newest-first: latest = from first stamp to the second stamp.
+        return t[starts[0]:starts[1]].strip(), len(starts) - 1
+
+    out.append("\n### Current SE Next Steps — latest entry (reality check)")
+    out.append("_SE_Next_Steps is an append-log (newest-first). Anchor the draft to the "
+               "latest entry below; an apply must PREPEND a new dated line, never overwrite._\n")
+    for r in rows:
+        acct = (r.get("Account") or {}).get("Name", "—")
+        lu = (r.get("Last_updated_SE_Section__c") or "")[:10]
+        latest, prior = _latest_entry(r.get("SE_Next_Steps__c"))
+        stamp = f"last updated {lu}" if lu else "no last-update date"
+        if latest:
+            more = f" _(+{prior} prior entr{'y' if prior == 1 else 'ies'} on file)_" if prior else ""
+            body = f"{latest}{more}"
+        else:
+            body = "_(none on file — no reality-check baseline; draft fresh)_"
+        out.append(f"- **{acct} — {_trunc(r.get('Name'), 40)}** "
+                   f"({r['Id']}, {stamp}): {body}")
+
     out.append("\n_Live read-only SFDC. SE_Update_Age is SFDC-computed (do not edit). "
                "Prepare SE_Next_Steps + validate SE_Technical_Risk; apply via the Link. "
                "Never writes to Salesforce._")
