@@ -84,8 +84,8 @@
 </head>
 <body>
 
-<h1>Cursus Agent <span class="version">v2.7.88 · main</span></h1>
-<p class="subtitle">Architecture overview — updated 2026-07-27</p>
+<h1>Cursus Agent <span class="version">v2.7.89 · main</span></h1>
+<p class="subtitle">Architecture overview — updated 2026-08-06</p>
 
 <!-- ── Status row ── -->
 <div class="status-row">
@@ -124,6 +124,8 @@
   <div class="flow-node"><div class="label">Couchbase</div><div class="sub">transcripts.accounts · transcripts.opportunities</div></div>
   <div class="arrow">→</div>
   <div class="flow-node" style="border-color:#22c55e;background:#f0fdf4"><div class="label">get_account_intelligence</div><div class="sub">correlated brief: tickets + ARR + opps</div></div>
+  <div class="arrow">→</div>
+  <div class="flow-node" style="border-color:#f59e0b;background:#fffbeb"><div class="label">apply_se_opp_updates ⇢ SFDC</div><div class="sub">gated write: dry-run default · whitelist · audited</div></div>
 </div>
 
 <!-- ── App layer ── -->
@@ -179,15 +181,18 @@
       <li class="done">stdio transport (Claude Desktop / Claude Code / Cursor)</li>
       <li class="done">SSE transport (Gemini / remote clients) via run_mcp.py --transport sse</li>
       <li class="done">Config from active Strabo profile + env var overrides</li>
-      <li class="done">SFDC tools: get_my_sfdc_accounts · get_account_intelligence · sync_sfdc_data</li>
+      <li class="done">SFDC read: accounts · intel · opps · contacts · SE worklist · manager rollup</li>
+      <li class="done">SFDC gated WRITE: apply_se_opp_updates (dry-run default · whitelist · audited)</li>
       <li class="done">Getting-started guide: docs/mcp-getting-started.md · port 8768</li>
     </ul>
     <div style="margin-top:8px;font-size:11px;color:#7c3aed;font-weight:600">
       Tickets: query_tickets · get_ticket · search_tickets · score_ticket<br>
-      Customers: list_customers · get_customer_health · get_portfolio_status<br>
-      SFDC: get_my_sfdc_accounts · get_account_intelligence · list_sfdc_accounts · sync_sfdc_data<br>
-      Jobs: get_scrape_status · rescrape_customer_tickets · cancel_scrape_job<br>
-      Assets: list_assets · get_asset
+      Customers: list_customers · get_customer_health · get_portfolio_status · get_morning_briefing<br>
+      SFDC read: get_my_sfdc_accounts · get_account_intelligence · lookup_sfdc_account · get_se_opp_worklist · get_se_manager_rollup<br>
+      SFDC write (gated): apply_se_opp_updates<br>
+      Pins: pin_opportunity · pin_account · reconcile_pins<br>
+      Refresh: smart_refresh · rescrape_customer_tickets · check_data_freshness · wait_for_scrape<br>
+      Assets/reports: generate_health_report · generate_ticket_report · list_assets · export_asset
     </div>
     <div style="margin-top:4px;font-size:11px;color:#7c3aed">
       Resources: customers://list · tickets://{org} · health://{org}
