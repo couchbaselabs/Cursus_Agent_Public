@@ -56,6 +56,8 @@ flowchart TD
 ## Quick start
 
 > **New to this? Start here:** [`docs/quickstart-ticket-interrogation.md`](docs/quickstart-ticket-interrogation.md) — a Docker-based runbook from `git clone` to asking Claude questions about a customer's support tickets, including the Claude Desktop / Claude Code MCP setup and a copy-paste bootstrap prompt.
+>
+> **Setting up? Read [`docs/prerequisites.md`](docs/prerequisites.md) first** — every dependency (Couchbase, VPN, LLM provider, Salesforce) with its config keys and what breaks if missing, plus the external LLM-client connectors (Gmail, Google Drive, Jira, Slack…) you enable in Claude/your MCP host, not in this repo.
 
 ### Docker (recommended)
 
