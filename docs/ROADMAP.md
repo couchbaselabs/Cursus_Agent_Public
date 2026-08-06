@@ -1,7 +1,7 @@
 # Cursus Agent — Roadmap
 
-**Current version:** v2.7.60  
-**Last updated:** 2026-07-27
+**Current version:** v2.7.87  
+**Last updated:** 2026-08-06
 
 ---
 
@@ -26,7 +26,7 @@
 - [x] **Fleet analytics tools** — `query_fleet_tickets`, `list_at_risk_clusters`, `fleet_version_distribution`, `fleet_cbse_impact`
 
 ### MCP server
-- [x] **MCP tool server (v2.7.x)** — 40+ tools across tickets, customers, scrape jobs, assets, brand kits, report generation, and observability; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation
+- [x] **MCP tool server (v2.7.x)** — 48 tools across tickets, customers, scrape jobs, assets, brand kits, report generation, SFDC, and observability; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation
 - [x] **Report generation tools** — `generate_health_report`, `generate_ticket_report`, `generate_cluster_health_chart`
 - [x] **Observability tools** — `check_data_freshness`, `get_failure_insights`, `record_feedback`, `record_insight`, `record_automation_run`
 - [x] **Brand kit tools** — `save_customer_brand`, `get_customer_brand`
@@ -45,7 +45,7 @@
 - [x] **Customers tab** — role filter chips: Primary / Supporting / Other / Pinned
 - [x] **`× All Customers` descope button** — expand view to all accounts in CB
 - [x] **Tickets, Data, Reports tabs**
-- [x] **Embedded assistant panel** — same 40+ tools as Strabo/Corax
+- [x] **Embedded assistant panel** — same 48 tools as Strabo/Corax
 - [x] **`run_unified.py` launcher**
 
 ### Salesforce integration
@@ -55,8 +55,23 @@
 - [x] **`transcripts.accounts` collection** — `org_name`, `se_name`, `supporting_se_name`, `ae_name`, `csm_name`, `arr`, `contract_end_date`, `account_type`, `active_ps_projects`, `org_aliases[]`
 - [x] **`transcripts.opportunities` collection** — stage, ARR, close date, SE fields, products
 - [x] **6-hour auto-sync loop** — starts on Cursus Unified startup
-- [x] **MCP SFDC tools** — `get_my_sfdc_accounts`, `get_account_intelligence`, `list_sfdc_accounts`, `sync_sfdc_data`, `get_account_opportunities`, `get_sfdc_field_mapping`, `update_sfdc_field_mapping`
+- [x] **Closed-won TCV rollup** — per-account total contract value from closed-won opportunities
+- [x] **Faithful mirror** — SFDC stays the source of truth for facts (SE/ARR/stage/TCV); never masked with local overrides; mismatches surfaced with source opp ID + link for a human to fix in SFDC
+- [x] **MCP SFDC read tools** — `get_my_sfdc_accounts`, `get_account_intelligence`, `list_sfdc_accounts`, `lookup_sfdc_account` (ad-hoc live any-account), `sync_sfdc_data`, `get_account_opportunities`, `get_account_contacts`, `get_sfdc_field_mapping`, `update_sfdc_field_mapping`
 - [x] **`get_account_intelligence`** — correlated brief: open tickets + SFDC ARR/products/team + open opportunities
+
+### SFDC SE weekly-update tooling (v2.7.8x)
+- [x] **`get_se_opp_worklist`** — live read-only weekly SE-Section worklist (CQ+3 default), ranked by `SE_Update_Age__c` staleness, with current values, latest-entry reality-check (SE_Next_Steps is an append-log), and Opp IDs
+- [x] **`apply_se_opp_updates`** — the **first and only Cursus write to a customer system of record**; gated by construction: `dry_run=True` default (returns plan), SE-Section field whitelist rejecting computed rollups, audited to a `sewrite::<opp>::<ts>` marker
+- [x] **`get_se_manager_rollup`** — live read-only "who's-behind across the team" rollup, grouped by SE via `SE_Manager_Email__c`, ranked by total SE-Section staleness (rolls up to the SE manager)
+- [x] **`prepare-se-opp-updates` skill** — worklist → per-account context → prepared Next-Steps + Justification table + risk table; prepare-first, optional gated per-opp write on explicit confirmation
+
+### Opportunity/account pinning (v2.7.78)
+- [x] **Pin tools** — `pin_opportunity`, `pin_account`, `unpin`, `list_pins`, `reconcile_pins`; additive personal "owned/watching" lens in `transcripts.pins`, never an override
+- [x] **Reconciliation view** — surfaces pin-vs-SFDC mismatches (pinned-not-in-SFDC / SFDC-not-pinned); governance, never mutates SFDC
+
+### Skills
+- [x] **`.claude/skills/`** — `prepare-se-opp-updates`, `daily-freshness-check`, `portfolio-account-status`, `ae-support-sync`
 
 ### Docker
 - [x] **Docker Compose** — single `docker compose up` starts app + fully-initialised Couchbase + MCP SSE server; ports 8765/8766/8767/8768

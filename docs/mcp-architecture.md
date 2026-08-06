@@ -17,7 +17,7 @@ flowchart TB
     subgraph server["Cursus MCP Server — apps/mcp/server.py"]
         direction TB
         TR["Transport layer (run_mcp.py)\nstdio (default) · SSE :8768"]
-        REG["Tool + resource registry\n@mcp.tool() · @mcp.resource()\n40 tools · 3 resources"]
+        REG["Tool + resource registry\n@mcp.tool() · @mcp.resource()\n48 tools · 3 resources"]
         DISP["Dispatch engine  _app()\nimportlib → apps.strabo.app\n(single shared implementation)"]
         TR --> REG --> DISP
     end
@@ -71,7 +71,7 @@ Transport selection lives entirely in `run_mcp.py`; the tool code is transport-a
 
 ## 3. Tool catalog (what's incorporated)
 
-40 tools + 3 resources, grouped by domain. All are defined in `apps/mcp/server.py` with `@mcp.tool()`.
+48 tools + 3 resources, grouped by domain. All are defined in `apps/mcp/server.py` with `@mcp.tool()`.
 
 ### Tickets & search
 | Tool | Purpose |
@@ -108,12 +108,22 @@ Transport selection lives entirely in `run_mcp.py`; the tool code is transport-a
 | `list_assets` · `get_asset` · `export_asset` | Saved-asset lifecycle |
 | `save_customer_brand` · `get_customer_brand` | Per-customer brand kits (colors, logo, terminology) |
 
-### Salesforce (read-only)
+### Salesforce (read + one gated write)
 | Tool | Purpose |
 |---|---|
-| `sync_sfdc_data` | Refresh the local SFDC mirror (accounts + opportunities). **Never writes to Salesforce** |
+| `sync_sfdc_data` | Refresh the local SFDC mirror (accounts + opportunities) |
 | `get_my_sfdc_accounts` · `list_sfdc_accounts` · `get_account_opportunities` · `get_se_opportunities` · `get_account_intelligence` | Account/opportunity/ARR views, blended with support health |
-| `get_sfdc_field_mapping` · `update_sfdc_field_mapping` | Inspect/adjust the SFDC→CB field map (mapping only — still read-only against SFDC) |
+| `lookup_sfdc_account` | Ad-hoc **live read-only** lookup for ANY account (AE, type, closed-won TCV, open opps) — not just your book; ephemeral |
+| `get_se_opp_worklist` | Live read-only weekly SE-Section worklist (CQ+3), ranked by staleness, with latest-entry reality-check + Opp IDs |
+| `get_se_manager_rollup` | Live read-only "who's-behind across the team" rollup, grouped by SE, rolls up to the SE manager |
+| `apply_se_opp_updates` | **The one gated WRITE.** `dry_run=True` default (returns plan); SE-Section field whitelist rejects computed rollups; every real write audited to a `sewrite::` marker. First write to a customer system of record |
+| `get_sfdc_field_mapping` · `update_sfdc_field_mapping` | Inspect/adjust the SFDC→CB field map (mapping only) |
+
+### Pins (personal lens)
+| Tool | Purpose |
+|---|---|
+| `pin_opportunity` · `pin_account` · `unpin` · `list_pins` | Tag an opp/account as "owned"/"watching" in `transcripts.pins` — additive lens, never overrides the faithful SFDC mirror |
+| `reconcile_pins` | Surface pin-vs-SFDC mismatches (pinned-not-in-SFDC / SFDC-not-pinned); governance, never mutates SFDC |
 
 ### Observability / governance
 | Tool | Purpose |

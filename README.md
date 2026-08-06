@@ -28,7 +28,7 @@ flowchart TD
 
     CX["💬 Corax  localhost:8766\nPassword auth\nThread sidebar (resume sessions)\nSame agent tools as Strabo\nAsset storage (charts & tables → CB)\nShared history with Strabo"]
 
-    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n50+ tools — query · search · score\nsmart_refresh · rescrape · health\nbriefing · assets · brand kits · reports\ncluster topology (nutshell) · freshness\nSFDC (read-only): accounts · intel · opps\nquery_supportal_analytics\nobservability: insights · feedback\nrecord_automation_run · failure KB\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients\n(see docs/mcp-architecture.md)"]
+    MCP["🔌 Cursus MCP Server  :8768\n─────────────────────\n48 tools — query · search · score\nsmart_refresh · rescrape · health\nbriefing · assets · brand kits · reports\ncluster topology (nutshell) · freshness\nSFDC read: accounts · intel · opps · contacts\nSE worklist · manager rollup · pins\nSFDC gated WRITE: apply_se_opp_updates\n(dry-run default · field whitelist · audited)\nquery_supportal_analytics\nobservability: insights · feedback\nrecord_automation_run · failure KB\nstdio → Claude Desktop / Claude Code\nSSE  → remote MCP clients\n(see docs/mcp-architecture.md)"]
 
     AI["🤖 AI Clients\nClaude Desktop\nClaude Code (TUI / GUI)\nCursor · Gemini · other MCP hosts"]
 
@@ -37,6 +37,7 @@ flowchart TD
     EXT -->|"Analytics API (direct HTTP)"| CX
     EXT -->|"Supportal API (rescrape)"| MCP
     SF -->|"OAuth REST sync (6h)"| CB
+    MCP -.->|"gated SE-Section write (opt-in, dry-run default)"| SF
     PW -->|"upsert tickets & snapshots"| CB
     LLM <-->|"chat & embed inference"| ST
     LLM <-->|"chat & embed inference"| CX
@@ -266,7 +267,7 @@ After sync, `transcripts.accounts` and `transcripts.opportunities` are populated
 
 ### Step 7 — (Optional) Wire the MCP server
 
-To use the 25 Cursus MCP tools from Claude Desktop or Claude Code, see **[`docs/mcp-getting-started.md`](docs/mcp-getting-started.md)** for the full setup guide.
+To use the 48 Cursus MCP tools from Claude Desktop or Claude Code, see **[`docs/mcp-getting-started.md`](docs/mcp-getting-started.md)** for the full setup guide.
 
 Quick summary for Claude Desktop — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -304,7 +305,7 @@ The primary development surface. Fleet-management shell with an embedded assista
 | **Tickets** | Cross-customer ticket view with filters |
 | **Data** | Data freshness status and scrape controls |
 | **Reports** | Generate and publish customer and portfolio reports |
-| **Assistant** | Embedded agent panel — same 40+ tools as Strabo/Corax |
+| **Assistant** | Embedded agent panel — same 48 tools as Strabo/Corax |
 
 Run with: `venv/bin/python run_unified.py`
 
@@ -332,88 +333,100 @@ Run with: `venv/bin/python run_unified.py`
 
 ---
 
-## Agent tools
+## MCP & agent tools
 
-Both UIs share the same tool-calling loop (up to 5 turns per message). The 40+ tools are grouped by purpose:
+The MCP server exposes **48 tools**, and the in-app agent (Strabo / Corax / Unified) calls the same set through its tool-calling loop (up to 5 turns per message). Grouped by purpose:
 
-### Salesforce & account intelligence
+### Salesforce & account intelligence (18)
 | Tool | Description |
 |------|-------------|
-| `get_my_sfdc_accounts` | List all SE-scoped SFDC accounts from the local `transcripts.accounts` collection |
+| `get_my_sfdc_accounts` | List the current SE's SFDC accounts from the local `transcripts.accounts` mirror |
 | `get_account_intelligence` | Correlated brief: open tickets + SFDC ARR/products/team + open opportunities for an account |
-| `list_sfdc_accounts` | List SFDC accounts with optional filters (account type, ARR range) |
-| `sync_sfdc_data` | Trigger an on-demand SFDC sync (accounts + opportunities); returns sync summary |
 | `get_account_opportunities` | Open opportunities for an account with stage, ARR, and close date |
-| `get_sfdc_field_mapping` | Show current field mapping between SFDC API names and CB schema |
-| `update_sfdc_field_mapping` | Update field mapping for a specific SFDC object type |
+| `list_sfdc_accounts` | List the local SE-scoped account mirror (your book), optional filters |
+| `lookup_sfdc_account` | Ad-hoc, **live, read-only** lookup for ANY account by name (AE, type, closed-won TCV, open opps) — not just your book; ephemeral |
+| `sync_sfdc_data` | Trigger an on-demand SFDC sync (accounts + opportunities); returns sync summary |
+| `get_account_contacts` | Cache-first AE/TSE/CSM + renewal flags per org (marker doc → live zdorg fallback) |
+| `get_sfdc_field_mapping` | Show the current SFDC-API-name → CB-schema field mapping |
+| `update_sfdc_field_mapping` | Update the field mapping for a specific SFDC object type |
+| `get_se_opportunities` | The SE's opportunities from the local mirror |
+| `get_se_opp_worklist` | **Live, read-only** weekly SE-Section worklist (CQ+3 default) ranked by staleness, with current values + latest-entry reality-check + Opp IDs |
+| `apply_se_opp_updates` | **Gated SE-Section WRITE** — the only Cursus write to a customer system: `dry_run=True` default (returns plan), field whitelist, audited to `sewrite::` marker |
+| `get_se_manager_rollup` | **Live, read-only** manager "who's behind across the team" rollup, grouped by SE, ranked by total SE-Section staleness |
+| `pin_opportunity` | Pin an opportunity as "owned"/"watching" — additive personal lens, never overrides SFDC |
+| `pin_account` | Pin an account as owned/watching |
+| `unpin` | Remove a pin |
+| `list_pins` | List your pins, optional tag filter |
+| `reconcile_pins` | Surface pin-vs-SFDC mismatches (pinned-not-in-SFDC / SFDC-not-pinned) — governance, never mutates SFDC |
 
-### Data retrieval — Couchbase (local)
+### Tickets & customers (6)
 | Tool | Description |
 |------|-------------|
-| `query_tickets` | N1QL ticket search with filters (org, priority, status, CB version, CBSE, date range) |
-| `count_tickets` | Aggregate counts by field |
+| `query_tickets` | N1QL ticket search with filters (org, priority, status, CB version, CBSE, feature area, date range) |
+| `search_tickets` | Hybrid FTS + vector search over embedded ticket text |
 | `get_ticket` | Single ticket detail; auto-fetches live from Supportal if not in CB |
-| `list_organizations` | All orgs with open ticket counts |
-| `search_customer_names` | Fuzzy name resolution (5-step chain: LIKE → FTS → per-word → difflib) |
-| `check_data_freshness` | Report staleness of local CB data vs. configurable thresholds |
-| `vector_search` | Semantic similarity search over embedded ticket text |
-| `query_local_snapshots` | Filter stored cluster snapshots by org, version, health |
+| `find_customers` | Fuzzy customer-name resolution (5-step chain: LIKE → CB → FTS → per-word → difflib) |
+| `list_customers` | All orgs with open ticket counts |
+| `get_customer_health` | Composite health for an org: open P1/P2, active tickets, score coverage |
 
-### Scraping & refresh
+### Scraping, refresh & connectivity (7)
 | Tool | Description |
 |------|-------------|
-| `scrape_customer_tickets` | Full scrape of a customer's ticket history into CB |
-| `rescrape_customer_tickets` | Discovers NEW tickets from Supportal + refreshes stale existing ones |
-| `rescrape_ticket` | Re-fetch a single ticket live from Supportal |
-| `fetch_snapshots` | Fetch and store cluster snapshot topology for a customer |
-| `sync_snapshots` | Sync snapshot listing from the Supportal Analytics API |
-| `backfill_snapshot_topology` | Backfill topology fields on tickets that have snapshot IDs |
-| `backfill_last_comment_at` | Backfill last-comment timestamps on stored tickets |
-| `get_scrape_status` | Check progress of a running background scrape job |
+| `smart_refresh` | **The freshness gate** — six-signal status-aware diff off the Supportal listing (new/status/solved/priority/stub/stale) and re-pulls what changed |
+| `rescrape_customer_tickets` | Full rescrape: discover NEW tickets + refresh stale existing ones |
+| `check_data_freshness` | Presence-only reconciliation (snapshot-referenced IDs); **informational, not the gate** |
+| `check_connectivity` | Probe Supportal (VPN/GlobalProtect) + LLM provider model-loaded preflight |
+| `get_scrape_status` | Progress of a background scrape job (cross-process safe via CB job doc) |
+| `wait_for_scrape` | Start-and-await a scrape job for any client (cross-process safe) |
+| `cancel_scrape_job` | Cancel a running background scrape job |
 
-### Live Supportal API
+### Live Supportal API & cluster health (3)
 | Tool | Description |
 |------|-------------|
-| `list_supportal_customers` | Live customer list from the Supportal Analytics API |
-| `query_supportal` | Raw Analytics SQL++ query against the Supportal data warehouse |
-| `get_briefing` | 24-hour digest of recent activity for a customer |
+| `query_supportal_analytics` | Live Analytics API query (snapshot / cluster / customer / zdorg / nutshellresults) |
+| `query_cluster_topology` | Live cluster topology: nodes, services, RAM/CPU, buckets, version |
+| `generate_cluster_health_chart` | Cluster health composite chart (active clusters, real snapshot timestamps, GA-version KPIs) |
 
-### Cluster health & snapshots
+### Scoring, briefing & portfolio (3)
 | Tool | Description |
 |------|-------------|
-| `get_cluster_health` | Full cluster topology: nodes, services, RAM, CPU, buckets, bad/warn items |
-| `cluster_hw_chart` | Hardware profile chart (RAM / CPU distribution across nodes) |
-| `analyze_snapshot` | Fetch a snapshot live and return a structured health summary; optionally save analysis notes |
+| `score_ticket` | LLM complexity/sentiment score for a ticket (provider-agnostic) |
+| `get_portfolio_status` | Ranked portfolio overview: health, open P1s, SLA status across customers |
+| `get_morning_briefing` | Cross-account digest of recent changes for the daily routine |
 
-### Analytics & scoring
+### Reports, assets & brand (7)
 | Tool | Description |
 |------|-------------|
-| `score_ticket` | LLM complexity/sentiment score for a single ticket |
-| `batch_score_tickets` | Bulk score up to 50 tickets (unscored only, or force re-score) |
-| `get_customer_health_score` | Composite health score for an org (0–100) |
-| `check_sla_compliance` | SLA compliance check across a customer's open tickets |
-| `get_portfolio_status` | Ranked portfolio overview: health, open P1s, SLA status across all customers |
-| `get_digest` | Fleet-wide or customer-scoped digest of recent changes |
+| `generate_health_report` | Full customer health/trend report (full-history lookbacks, period close-rate) |
+| `generate_ticket_report` | Ticket-level narrative report for a customer/window |
+| `export_asset` | Export a saved asset (report / chart / table) to disk |
+| `get_asset` | Fetch a stored asset by id |
+| `list_assets` | List saved assets |
+| `save_customer_brand` | Save a customer brand kit (logo, palette) to CB |
+| `get_customer_brand` | Fetch a customer brand kit |
 
-### Fleet-wide analytics
+### Observability & governance (4)
 | Tool | Description |
 |------|-------------|
-| `query_fleet_tickets` | Cross-org N1QL with group-by (priority, status, version, CBSE) |
-| `list_at_risk_clusters` | Clusters with elevated bad/warn items and no open ticket |
-| `fleet_version_distribution` | CB version distribution across all stored snapshots |
-| `fleet_cbse_impact` | CBSEs ranked by number of unique orgs affected |
+| `get_failure_insights` | One-call governance report over the `markers` + `automation_run` collections |
+| `record_automation_run` | Native run record (outcome ok/degraded/failed) for scheduled/agent runs |
+| `record_feedback` | Capture human feedback into the uniform `feedback` collection |
+| `record_insight` | Record an observed data pattern (candidate → validated governance) |
 
-### Output & persistence
-| Tool | Description |
-|------|-------------|
-| `generate_chart` | Render an ECharts visualisation (12 chart types, 6 colour palettes) |
-| `generate_table` | Render a filterable data table |
-| `generate_customer_report` | Full markdown narrative report for a customer |
-| `save_artifact` | Explicitly save a report / CSV / JSON / HTML asset to CB |
-| `save_query` | Save a natural-language query for reuse |
-| `list_saved_queries` | List previously saved queries for a customer |
-| `tag_ticket` | Apply a label to a ticket doc in CB |
-| `get_current_time` | Current UTC timestamp |
+## Skills
+
+Repeatable, multi-step workflows live in [`.claude/skills/`](.claude/skills/) — invoked by name in Claude Code (`/<skill>`) or auto-selected by description:
+
+| Skill | Purpose |
+|-------|---------|
+| `prepare-se-opp-updates` | Weekly SE-Section hygiene: worklist → per-account context → prepared Next-Steps + Justification table + risk table, with latest-entry reality-check; prepare-first, optional gated per-opp write |
+| `daily-freshness-check` | Correct-order daily monitor: connectivity → per-org `smart_refresh` gate → optional presence check → `record_automation_run` → brief |
+| `portfolio-account-status` | Generate an account status report from the brand-scoped template |
+| `ae-support-sync` | Reconcile AE/TSE/CSM contacts against live zdorg for an org |
+
+## Prompt library
+
+**35 curated prompts across 7 categories** (`supportal/prompt_library.py`): Morning Routine, Ticket Investigation, Health & SLA, Cluster & Snapshot, Fleet Analysis, Reporting, Data Freshness. `{customer}` injection; two-step browser in Corax.
 
 ---
 
@@ -488,7 +501,7 @@ apps/
   unified/app.py           Cursus Unified — NiceGUI, fleet shell (primary dev surface)
   strabo/app.py            Strabo dashboard — NiceGUI, all UI logic
   corax/app.py             Corax chat handler — Chainlit, session management
-  mcp/server.py            Cursus MCP server — 40+ tools for Claude Desktop / Code
+  mcp/server.py            Cursus MCP server — 48 tools for Claude Desktop / Code
 supportal/
   agent_tools.py           All 40+ agent tool definitions + LLM tool-calling loop
   sfdc_sync.py             Salesforce sync — sync_all(), sync_accounts(), sync_opportunities()
@@ -530,15 +543,18 @@ Items below represent the planned development trajectory. Contributors should ch
 - **Strabo dashboard** — 6 tabs, 12 chart types, 6 palettes, SVG/PNG export, drill-down analytics
 - **Corax chat UI** — thread sidebar, session resume, asset storage, file upload, shared history with Strabo
 - **Assets system** — auto-save charts/tables/reports to CB; preview, download, delete in both UIs
-- **Prompt library** — 28 curated prompts across 7 categories; customer-injection; two-step browser
+- **Prompt library** — 35 curated prompts across 7 categories; customer-injection; two-step browser
 - **Auth removal** — all Supportal endpoints confirmed open (v2.6.2); cookie plumbing retained
 - **Fuzzy customer resolution** — 5-step chain (LIKE → local CB → Supportal FTS → per-word → difflib)
 - **Cursus supervisor** — watchfiles-based hot-reload; per-app restart routing; 2s debounce
 - **Fleet analytics** — `query_fleet_tickets`, `list_at_risk_clusters`, `fleet_version_distribution`, `fleet_cbse_impact`
-- **MCP tool server** — 40+ tools across tickets, customers, scrape jobs, assets, brand kits, report generation, and observability; `generate_health_report`, `generate_ticket_report`, `generate_cluster_health_report`, `check_data_freshness`, `query_supportal_analytics`, `save/get_customer_brand`, `get_failure_insights`, `record_feedback`, `record_insight`, `record_automation_run`; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation
+- **MCP tool server** — 48 tools across tickets, customers, scrape jobs, assets, brand kits, report generation, SFDC, and observability; `generate_health_report`, `generate_ticket_report`, `generate_cluster_health_chart`, `smart_refresh`, `check_data_freshness`, `query_supportal_analytics`, `save/get_customer_brand`, `get_failure_insights`, `record_feedback`, `record_insight`, `record_automation_run`; stdio (Claude Desktop/Code) and SSE (remote) transports; `alwaysAllow` configured for prompt-free operation
 - **Observability & governance framework (v2.7.x)** — durable failure-knowledge base in the `markers` collection (`failurelog::`, `toolfailure::`, `pipelinefailure::`, `freshness::`, `cronrun::` docs); `classify_error()` stamps every entry with an aggregatable `error_code`; `get_failure_insights` is the one-call governance report; LMStudio preflight in `check_connectivity`; human-feedback capture via `record_feedback`; `insights` collection with candidate→validated governance
 - **Cursus Unified shell** — fleet-management NiceGUI app on port 8767; Overview KPIs, Customers tab with Primary/Supporting/Other/Pinned role filter chips, Tickets/Data/Reports tabs, embedded assistant panel, `× All Customers` descope button; primary active development surface
-- **Salesforce integration (v2.7.x)** — `supportal/sfdc_sync.py`: `sync_all()`, `sync_accounts()`, `sync_opportunities()`, `get_account_sfdc_context()`; SE-scoped sync (only accounts where SE is Primary_SE or Opp_SE_Supporting on an open opportunity); `transcripts.accounts` + `transcripts.opportunities` CB collections; `se_name` derived from open opportunity Primary_SE field; 6-hour auto-sync loop on Cursus Unified startup; MCP tools: `get_my_sfdc_accounts`, `get_account_intelligence`, `list_sfdc_accounts`, `sync_sfdc_data`, `get_account_opportunities`, `get_sfdc_field_mapping`, `update_sfdc_field_mapping`; `get_account_intelligence` returns correlated brief (open tickets + ARR + products + team + open opps)
+- **Salesforce integration (v2.7.x)** — `supportal/sfdc_sync.py`: `sync_all()`, `sync_accounts()`, `sync_opportunities()`, `get_account_sfdc_context()`; SE-scoped sync (only accounts where SE is `Primary_SE__c` on an open opportunity); `transcripts.accounts` + `transcripts.opportunities` CB collections; closed-won TCV rollup; 6-hour auto-sync loop on Cursus Unified startup; **faithful mirror** (SFDC stays the source of truth — never masked with local overrides); MCP tools: `get_my_sfdc_accounts`, `get_account_intelligence`, `list_sfdc_accounts`, `lookup_sfdc_account` (ad-hoc live any-account), `sync_sfdc_data`, `get_account_opportunities`, `get_account_contacts`, `get_sfdc_field_mapping`, `update_sfdc_field_mapping`
+- **SE weekly-update tooling (v2.7.8x)** — `get_se_opp_worklist` (live read-only CQ+3 SE-Section worklist ranked by staleness, latest-entry reality-check, Opp IDs); `apply_se_opp_updates` — the **first and only Cursus write to a customer system of record**, gated by construction (`dry_run=True` default, SE-Section field whitelist that rejects computed rollups, audited to a `sewrite::` marker); `get_se_manager_rollup` (read-only "who's-behind across the team", rolls up to the SE manager); `prepare-se-opp-updates` skill produces the prepared Next-Steps + Justification + risk tables
+- **Opportunity/account pinning (v2.7.78)** — `pin_opportunity`, `pin_account`, `unpin`, `list_pins`, `reconcile_pins`; additive personal "owned/watching" lens in `transcripts.pins`, never an override; reconciliation surfaces pin-vs-SFDC mismatches
+- **Skills** — `.claude/skills/`: `prepare-se-opp-updates`, `daily-freshness-check`, `portfolio-account-status`, `ae-support-sync`
 - **Docker** — single `docker compose up` starts app + fully-initialised Couchbase + MCP SSE server on :8768
 
 ### Phase 3 — Fleet dashboard (UI)

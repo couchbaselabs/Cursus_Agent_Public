@@ -30,7 +30,7 @@ contract, pays off three times. That contract is the first artifact.
 
 | Asset | What it is | Role in the target |
 |---|---|---|
-| **Cursus** (this repo, v2.7.80) | 46 MCP tools + 70 agent-tool registry entries; support/SFDC/topology/report domain; CB as data+vector+FTS backend | Domain **Source** + **Method** provider; the first real workload |
+| **Cursus** (this repo, v2.7.87) | 48 MCP tools + 70 agent-tool registry entries; support/SFDC/topology/report domain; CB as data+vector+FTS backend | Domain **Source** + **Method** provider; the first real workload |
 | CB collections `transcripts.*` | tickets, snapshots, assets, brands, **markers**, **insights**, accounts, opportunities, pins | markers = Observe substrate; insights/feedback = Reinforce substrate; the rest = domain data Sources |
 | `call_llm_with_tools` | the agentic tool-calling loop (claude/gemini/openai/ollama/lmstudio/bedrock) | the runtime the loop executes inside |
 | Memory system (`MEMORY.md` + files) | hand-maintained resident index → retrievable store | the **primitive** of the resident salience-set + cue store |

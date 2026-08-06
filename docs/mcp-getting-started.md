@@ -286,7 +286,9 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `get_asset` | Fetch a single asset with full content |
 | `generate_health_report` | Generate a full customer health report HTML from live CB data, apply brand colors, save as asset |
 | `generate_ticket_report` | Generate a response cadence visualization for a single ticket, save as HTML asset |
-| `generate_cluster_health_report` | Build a per-cluster health chart enriched with live Supportal cluster names, save as asset |
+| `generate_cluster_health_chart` | Build a per-cluster health chart enriched with live Supportal cluster names, save as asset |
+| `export_asset` | Export a saved asset (report / chart / table) to disk |
+| `wait_for_scrape` | Start-and-await a scrape job; cross-process safe via the shared Couchbase job doc |
 | `save_customer_brand` | Save a customer brand kit (colors, logo, terminology) to CB |
 | `get_customer_brand` | Retrieve a saved brand kit for a customer |
 | `check_data_freshness` | Compare live Supportal ticket IDs vs local CB cache; write a freshness marker; flag orgs needing rescrape |
@@ -304,9 +306,17 @@ Point your MCP client at `http://localhost:8768/sse`. For remote access, expose 
 | `get_account_opportunities` | Open opportunities + ARR for an account, with per-opportunity Primary SE |
 | `get_account_intelligence` | Blended account view — SFDC account/opps + support health + contacts in one call |
 | `get_se_opportunities` | Opportunities across an SE's book of business |
-| `sync_sfdc_data` | Read-only refresh of the local Salesforce mirror (accounts + opportunities). Never writes to Salesforce |
+| `lookup_sfdc_account` | Ad-hoc live read-only lookup for ANY account by name (AE, type, closed-won TCV, open opps) — not just your book; ephemeral |
+| `get_se_opp_worklist` | Live read-only weekly SE-Section worklist (CQ+3), ranked by staleness, with current values, latest-entry reality-check, and Opp IDs |
+| `get_se_manager_rollup` | Live read-only "who's-behind across the team" rollup, grouped by SE, rolls up to the SE manager |
+| `apply_se_opp_updates` | **The one gated write.** `dry_run=True` default returns a plan; SE-Section field whitelist rejects computed rollups; every real write audited to a `sewrite::` marker |
+| `get_sfdc_field_mapping` | Show the current SFDC-API-name → CB-schema field mapping |
+| `update_sfdc_field_mapping` | Update the field mapping for a specific SFDC object type |
+| `pin_opportunity` · `pin_account` · `unpin` · `list_pins` | Tag an opp/account as "owned"/"watching" — additive personal lens, never overrides SFDC |
+| `reconcile_pins` | Surface pin-vs-SFDC mismatches; governance, never mutates SFDC |
+| `sync_sfdc_data` | Refresh the local Salesforce mirror (accounts + opportunities) |
 
-> **Read-only Salesforce:** all SFDC tools only ever read from Salesforce into the local Couchbase mirror. Nothing writes back to SFDC.
+> **Salesforce is read-only except one gated write:** every SFDC tool reads into the local Couchbase mirror, with the single exception of `apply_se_opp_updates` — an explicit, opt-in SE-Section write that defaults to a dry run, enforces a field whitelist, and audits every applied change. Nothing else writes back to SFDC.
 
 ## VPN requirement
 
